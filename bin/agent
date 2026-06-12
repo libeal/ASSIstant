@@ -1,0 +1,228 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
+
+# shellcheck source=../lib/common.sh
+source "${ROOT_DIR}/lib/common.sh"
+# shellcheck source=../lib/config.sh
+source "${ROOT_DIR}/lib/config.sh"
+# shellcheck source=../lib/audit.sh
+source "${ROOT_DIR}/lib/audit.sh"
+# shellcheck source=../lib/context.sh
+source "${ROOT_DIR}/lib/context.sh"
+# shellcheck source=../lib/sense.sh
+source "${ROOT_DIR}/lib/sense.sh"
+# shellcheck source=../lib/skills.sh
+source "${ROOT_DIR}/lib/skills.sh"
+# shellcheck source=../lib/doctor.sh
+source "${ROOT_DIR}/lib/doctor.sh"
+# shellcheck source=../lib/ai.sh
+source "${ROOT_DIR}/lib/ai.sh"
+# shellcheck source=../lib/policy.sh
+source "${ROOT_DIR}/lib/policy.sh"
+# shellcheck source=../lib/executor.sh
+source "${ROOT_DIR}/lib/executor.sh"
+# shellcheck source=../lib/editor.sh
+source "${ROOT_DIR}/lib/editor.sh"
+# shellcheck source=../lib/interactive.sh
+source "${ROOT_DIR}/lib/interactive.sh"
+# shellcheck source=../lib/orchestrator.sh
+source "${ROOT_DIR}/lib/orchestrator.sh"
+
+linux_agent_init_env "${ROOT_DIR}"
+linux_agent_load_config
+
+linux_agent_usage() {
+    cat <<'EOF'
+用法:
+  agent                         进入四模式 REPL，默认工作模式
+  agent work "<自然语言指令>"     工作模式单次请求
+  agent edit "<自然语言指令>"     编辑或新建 skill
+  agent script <skill>/<script> [json-args]
+                                执行已登记 skill 脚本
+  agent terminal "<shell命令>"   终端模式单次执行并记录审计
+  agent plan "<自然语言指令>"     只生成计划，不执行工具
+  agent doctor                    检查依赖、配置和 skill 目录
+  agent sense <topic>           采集环境信息
+  agent tools list              列出可用 skill 脚本索引
+  agent skills validate         校验 skill 目录
+  agent audit <session-id>      查看审计摘要
+
+REPL 命令:
+  /work                         切换到工作模式
+  /edit                         切换到编辑模式
+  /script                       切换到脚本模式
+  /terminal                     切换到终端模式
+  /mode                         打开模式选择菜单
+  /help                         显示帮助
+  /exit                         退出
+
+提示:
+  输入 / 或 /前缀 后回车会打开命令菜单，可用上下键选择。
+  编辑模式保存脚本前会打开 $EDITOR、nano 或 vi 供你确认/修改。
+  终端模式直接执行本机 shell 命令，不走正则阻断或审批，但会写入审计日志。
+EOF
+}
+
+linux_agent_interactive() {
+    local current_mode="work"
+    local user_input selected_mode
+    linux_agent_print_info "Linux 运维 Agent 已就绪，默认工作模式。输入 / 或 /help 查看命令，/exit 结束。"
+    while true; do
+        linux_agent_read_repl_input "${current_mode}" user_input || break
+
+        if [[ "${user_input}" == /* ]]; then
+            user_input="$(linux_agent_slash_command_complete "${user_input}")" || continue
+        fi
+
+        case "${user_input}" in
+            /exit|exit)
+                break
+                ;;
+            /work)
+                current_mode="work"
+                linux_agent_print_info "已切换到工作模式。"
+                continue
+                ;;
+            /edit)
+                current_mode="edit"
+                linux_agent_print_info "已切换到编辑模式。"
+                continue
+                ;;
+            /script)
+                current_mode="script"
+                linux_agent_print_info "已切换到脚本模式。输入形如 ops-basic/process-inspect '{\"pattern\":\"systemd\"}'。"
+                continue
+                ;;
+            /terminal)
+                current_mode="terminal"
+                linux_agent_print_info "已切换到终端模式。普通输入会直接交给 bash -lc 执行；/mode 或 /work 可返回。"
+                continue
+                ;;
+            /mode)
+                selected_mode="$(linux_agent_mode_menu "${current_mode}")" || continue
+                current_mode="${selected_mode}"
+                linux_agent_print_info "已切换到${current_mode}模式。"
+                continue
+                ;;
+            /help)
+                linux_agent_usage
+                continue
+                ;;
+        esac
+        if [[ "${user_input}" == "/exit" ]]; then
+            break
+        fi
+        [[ -z "${user_input}" ]] && continue
+        if [[ "${current_mode}" == "terminal" ]]; then
+            linux_agent_process_terminal_request "${user_input}"
+        else
+            linux_agent_process_request "${user_input}" "${current_mode}"
+        fi
+    done
+}
+
+main() {
+    local command="${1:-interactive}"
+    case "${command}" in
+        interactive)
+            linux_agent_interactive
+            ;;
+        work)
+            shift || true
+            if [[ $# -eq 0 ]]; then
+                linux_agent_print_error "缺少自然语言指令。"
+                exit 1
+            fi
+            linux_agent_process_request "$*" "work"
+            ;;
+        edit)
+            shift || true
+            if [[ $# -eq 0 ]]; then
+                linux_agent_print_error "缺少编辑需求。"
+                exit 1
+            fi
+            linux_agent_process_request "$*" "edit"
+            ;;
+        script)
+            shift || true
+            if [[ $# -eq 0 ]]; then
+                linux_agent_print_error "请提供 skill/script。"
+                exit 1
+            fi
+            ref="$1"
+            shift || true
+            args="${1:-}"
+            [[ -z "${args}" ]] && args='{}'
+            linux_agent_process_script_request "${ref}" "${args}"
+            ;;
+        terminal)
+            shift || true
+            if [[ $# -eq 0 ]]; then
+                linux_agent_print_error "缺少 shell 命令。"
+                exit 1
+            fi
+            linux_agent_process_terminal_request "$*"
+            ;;
+        plan)
+            shift || true
+            if [[ $# -eq 0 ]]; then
+                linux_agent_print_error "缺少自然语言指令。"
+                exit 1
+            fi
+            LINUX_AGENT_FORCE_PLAN=1 linux_agent_process_request "$*" "plan"
+            ;;
+        doctor)
+            linux_agent_doctor
+            ;;
+        sense)
+            shift || true
+            linux_agent_sense_topic "${1:-all}"
+            ;;
+        tools)
+            shift || true
+            case "${1:-}" in
+                list)
+                    linux_agent_skill_index_text
+                    ;;
+                *)
+                    linux_agent_print_error "仅支持 'agent tools list'。"
+                    exit 1
+                    ;;
+            esac
+            ;;
+        skills)
+            shift || true
+            case "${1:-}" in
+                validate)
+                    linux_agent_validate_skills
+                    ;;
+                *)
+                    linux_agent_print_error "仅支持 'agent skills validate'。"
+                    exit 1
+                    ;;
+            esac
+            ;;
+        audit)
+            shift || true
+            if [[ $# -eq 0 ]]; then
+                linux_agent_print_error "请提供 session-id。"
+                exit 1
+            fi
+            linux_agent_show_audit "$1"
+            ;;
+        -h|--help|help)
+            linux_agent_usage
+            ;;
+        *)
+            linux_agent_print_error "未知命令: ${command}"
+            linux_agent_usage
+            exit 1
+            ;;
+    esac
+}
+
+main "$@"

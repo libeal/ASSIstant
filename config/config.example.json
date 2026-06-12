@@ -1,0 +1,12 @@
+{
+  "provider": "OpenAI-Compatible",
+  "api_url": "https://api.openai.com/v1/chat/completions",
+  "api_key": "please-set-your-api-key",
+  "model": "gpt-4.1-mini",
+  "request_timeout_sec": 90,
+  "context_turns": 6,
+  "audit_mode": "safe_summary",
+  "audit_text_limit": 1000,
+  "skills_dir": "",
+  "remote_script_policy": "download_review"
+}
