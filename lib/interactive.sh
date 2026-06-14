@@ -33,13 +33,19 @@ linux_agent_read_repl_input() {
   local mode="$1"
   local output_var="$2"
   local input=""
+  local read_status=0
+  local stty_state=""
 
   if [[ -t 0 ]]; then
-    IFS= read -e -r -p $'\n'"[${mode}]> " input || return 1
+    stty_state="$(stty -g 2>/dev/null || true)"
+    [[ -n "${stty_state}" ]] && stty susp undef 2>/dev/null || true
+    IFS= read -e -r -p $'\n'"[${mode}]> " input || read_status=$?
+    [[ -n "${stty_state}" ]] && stty "${stty_state}" 2>/dev/null || true
   else
     printf '\n[%s]> ' "${mode}"
-    IFS= read -r input || return 1
+    IFS= read -r input || read_status=$?
   fi
+  [[ "${read_status}" -eq 0 ]] || return 1
 
   printf -v "${output_var}" '%s' "${input}"
 }

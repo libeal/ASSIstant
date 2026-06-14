@@ -44,24 +44,19 @@ linux_agent_build_request_context() {
     local current_request="$1"
     local environment_context="$2"
     local mode="${3:-work}"
-    local skill_index
 
-    skill_index="$(linux_agent_skill_index_text 2>/dev/null || true)"
-    skill_index="$(linux_agent_sanitize_text "${skill_index}")"
     current_request="$(linux_agent_sanitize_text "${current_request}")"
     environment_context="$(linux_agent_sanitize_json "${environment_context}")"
 
     jq -cn \
         --arg mode "${mode}" \
         --arg current_request "${current_request}" \
-        --arg skill_index "${skill_index}" \
         --argjson conversation_context "$(linux_agent_history_window)" \
         --argjson environment_context "${environment_context}" \
         '{
             mode:$mode,
             conversation_context:$conversation_context,
             current_request:$current_request,
-            environment_context:$environment_context,
-            skill_index:$skill_index
+            environment_context:$environment_context
         }'
 }

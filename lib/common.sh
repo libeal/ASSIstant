@@ -20,7 +20,6 @@ linux_agent_init_env() {
 
     mkdir -p \
         "${LINUX_AGENT_LOG_DIR}" \
-        "${LINUX_AGENT_SESSION_DIR}" \
         "${LINUX_AGENT_SKILLS_DIR}" \
         "${LINUX_AGENT_TMP_DIR}" \
         "${root_dir}/config"
@@ -99,7 +98,7 @@ linux_agent_sanitize_text() {
                    "[REDACTED_SECRET]")
             | gsub("(?i)(api[_-]?key|token|password|passwd|secret|credential|private[_-]?key)[[:space:]]*[:=][[:space:]]*[^\\n\\r;,}]+";
                    "[REDACTED_SECRET]")
-            | gsub("(?i)(sk|tp|ghp|github_pat|xox[baprs]|akia)[A-Za-z0-9_./+=:-]{12,}"; "[REDACTED_TOKEN]");
+            | gsub("(?i)((sk|tp)[_-][A-Za-z0-9_./+=:-]{12,}|(ghp|github_pat|xox[baprs]|akia)[A-Za-z0-9_./+=:-]{12,})"; "[REDACTED_TOKEN]");
         redact_string | trim
     '
 }
@@ -125,7 +124,7 @@ linux_agent_sanitize_json() {
                        "[REDACTED_SECRET]")
                 | gsub("(?i)(api[_-]?key|token|password|passwd|secret|credential|private[_-]?key)[[:space:]]*[:=][[:space:]]*[^\\n\\r;,}]+";
                        "[REDACTED_SECRET]")
-                | gsub("(?i)(sk|tp|ghp|github_pat|xox[baprs]|akia)[A-Za-z0-9_./+=:-]{12,}"; "[REDACTED_TOKEN]");
+                | gsub("(?i)((sk|tp)[_-][A-Za-z0-9_./+=:-]{12,}|(ghp|github_pat|xox[baprs]|akia)[A-Za-z0-9_./+=:-]{12,})"; "[REDACTED_TOKEN]");
             def sanitize:
                 if type == "object" then
                     with_entries(

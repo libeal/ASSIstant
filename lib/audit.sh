@@ -4,7 +4,9 @@ set -euo pipefail
 
 LINUX_AGENT_SESSION_ID=""
 LINUX_AGENT_AUDIT_LOG=""
-LINUX_AGENT_SESSION_MD=""
+LINUX_AGENT_SESSION_ACTIVE=0
+LINUX_AGENT_SESSION_FINISHED=0
+LINUX_AGENT_LAST_BUSINESS_STATUS=""
 
 linux_agent_audit_safe_summary() {
     local stage="$1"
@@ -58,7 +60,41 @@ linux_agent_audit_safe_summary() {
                 {value:(. | tostring | preview)}
             end;
 
-        if $stage == "received" then
+        if ($stage == "command_started" or $stage == "command_finished") then
+            {
+                command:(.command // null),
+                args_preview:(.args // "" | preview),
+                status:(.status // null),
+                exit_code:(.exit_code // null)
+            }
+        elif ($stage == "turn_started" or $stage == "turn_finished") then
+            {
+                mode:(.mode // null),
+                input_preview:(.input // "" | preview),
+                status:(.status // null)
+            }
+        elif $stage == "control_event" then
+            {
+                event:(.event // null),
+                mode:(.mode // null),
+                value_preview:(.value // "" | preview),
+                status:(.status // null)
+            }
+        elif $stage == "ai_files_manifest" then
+            {
+                file_count:(.file_count // ((.files // []) | length)),
+                files:[(.files // [])[] | {
+                    relative_path:(.relative_path // null),
+                    path:(.path // null),
+                    purpose:(.purpose // null),
+                    included_as:(.included_as // null),
+                    exists:(.exists // null),
+                    readable:(.readable // null),
+                    size_bytes:(.size_bytes // null),
+                    sha256:(.sha256 // null)
+                }]
+            }
+        elif $stage == "received" then
             {
                 mode:(.mode // null),
                 input_preview:(.input // .command // .ref // "" | preview),
@@ -76,7 +112,8 @@ linux_agent_audit_safe_summary() {
                 current_request_preview:(.current_request // "" | preview),
                 conversation_turns:(if (.conversation_context? | type) == "array" then (.conversation_context | length) else 0 end),
                 environment_keys:(if (.environment_context? | type) == "object" then (.environment_context | keys) else [] end),
-                skill_index_chars:(.skill_index // "" | length)
+                skill_index_chars:(.skill_index // "" | length),
+                fixed_context_excluded:(has("skill_index") | not)
             }
         elif ($stage == "planned" or $stage == "repair_planned" or $stage == "revision_planned") then
             {
@@ -138,6 +175,28 @@ linux_agent_audit_safe_summary() {
                     finding_count:(if (.review.findings? | type) == "array" then (.review.findings | length) else 0 end)
                 }
             }
+        elif ($stage | startswith("observer_")) then
+            {
+                status:(.status // null),
+                backend:(.backend // "auditd"),
+                scope:(.scope // null),
+                audit_key:(.audit_key // null),
+                root_pid:(.root_pid // null),
+                start_time:(.start_time // null),
+                end_time:(.end_time // null),
+                exec_count:(.exec_count // null),
+                file_event_count:(.file_event_count // null),
+                process_count:(if (.processes? | type) == "array" then (.processes | length) else 0 end),
+                file_event_sample_count:(if (.file_events? | type) == "array" then (.file_events | length) else 0 end),
+                sudo_available:(.sudo_available // null),
+                sudo_authenticated:(.sudo_authenticated // null),
+                sudo_exit_code:(.sudo_exit_code // null),
+                auditctl_exit_code:(.auditctl_exit_code // null),
+                reason_code:(.reason_code // null),
+                reason:(.reason // null),
+                diagnostic:(.diagnostic // null),
+                notes:(.notes // [])
+            }
         elif ($stage == "executed" or $stage == "script_executed" or $stage == "terminal_executed" or $stage == "edit_applied") then
             result_summary(.)
             + {
@@ -171,32 +230,32 @@ linux_agent_audit_payload() {
 
 linux_agent_start_session() {
     local user_input="$1"
-    local request_summary
+
+    if [[ "${LINUX_AGENT_SESSION_ACTIVE:-0}" -eq 1 && "${LINUX_AGENT_SESSION_FINISHED:-0}" -eq 0 ]]; then
+        return 0
+    fi
 
     LINUX_AGENT_SESSION_ID="$(linux_agent_new_session_id)"
     LINUX_AGENT_AUDIT_LOG="${LINUX_AGENT_LOG_DIR}/${LINUX_AGENT_SESSION_ID}.jsonl"
-    LINUX_AGENT_SESSION_MD="${LINUX_AGENT_SESSION_DIR}/${LINUX_AGENT_SESSION_ID}.md"
-    request_summary="$(linux_agent_sanitize_text "${user_input}")"
+    LINUX_AGENT_SESSION_ACTIVE=1
+    LINUX_AGENT_SESSION_FINISHED=0
 
     : > "${LINUX_AGENT_AUDIT_LOG}"
-    cat > "${LINUX_AGENT_SESSION_MD}" <<EOF
-# Linux 运维 Agent 会话
-
-- 会话 ID: ${LINUX_AGENT_SESSION_ID}
-- 开始时间: $(linux_agent_now_iso)
-- 请求摘要: ${request_summary}
-- 审计模式: $(linux_agent_audit_mode)
-
-## 事件摘要
-
-EOF
+    linux_agent_log_event "session_started" "$(jq -cn --arg request "${user_input}" --arg audit_mode "$(linux_agent_audit_mode)" '{request:$request, audit_mode:$audit_mode}')"
+    if declare -F linux_agent_observer_session_start >/dev/null 2>&1; then
+        linux_agent_observer_session_start "session" "$(jq -cn --arg request "${user_input}" '{request:$request}')"
+    fi
 }
 
 linux_agent_log_event() {
     local stage="$1"
     local payload="${2:-}"
     local safe_payload
+    [[ -n "${LINUX_AGENT_AUDIT_LOG:-}" ]] || return 0
     [[ -z "${payload}" ]] && payload='{}'
+    if [[ "${stage}" == "finished" ]] && printf '%s' "${payload}" | jq -e . >/dev/null 2>&1; then
+        LINUX_AGENT_LAST_BUSINESS_STATUS="$(jq -r '.status // empty' <<<"${payload}")"
+    fi
     safe_payload="$(linux_agent_audit_payload "${stage}" "${payload}")"
     jq -cn \
         --arg ts "$(linux_agent_now_iso)" \
@@ -207,42 +266,7 @@ linux_agent_log_event() {
 }
 
 linux_agent_append_session_note() {
-    local title="$1"
-    local body="$2"
-    local safe_body stage
-    stage="${title}"
-    case "${title}" in
-        "环境感知（已脱敏）") stage="sensed" ;;
-        "模型规划") stage="planned" ;;
-        "执行结果") stage="executed" ;;
-        "脚本执行结果") stage="script_executed" ;;
-        "终端模式执行结果") stage="terminal_executed" ;;
-        "失败后的回滚或修复建议") stage="repair_planned" ;;
-        "工作计划修改需求") stage="work_revision_requested" ;;
-        "修改后的工作计划") stage="revision_planned" ;;
-        "Skill 编辑计划") stage="edit_planned" ;;
-        "Skill 修改需求") stage="edit_revision_requested" ;;
-        "Skill 保存结果") stage="edit_applied" ;;
-        Step\ *) stage="step_${title#Step }" ;;
-    esac
-
-    if [[ "$(linux_agent_audit_mode)" == "redacted_verbose" ]]; then
-        if printf '%s' "${body}" | jq -e . >/dev/null 2>&1; then
-            safe_body="$(linux_agent_sanitize_json "${body}")"
-        else
-            safe_body="$(linux_agent_sanitize_text "${body}")"
-        fi
-    else
-        if printf '%s' "${body}" | jq -e . >/dev/null 2>&1; then
-            safe_body="$(linux_agent_audit_safe_summary "${stage}" "$(linux_agent_sanitize_json "${body}")")"
-        else
-            safe_body="$(jq -cn --arg note "safe_summary 模式已省略自由文本内容。" --arg title "${title}" --arg preview "$(linux_agent_sanitize_text "${body}" 200)" '{title:$title, note:$note, preview:$preview}')"
-        fi
-    fi
-    {
-        printf '### %s\n\n' "${title}"
-        printf '```\n%s\n```\n\n' "${safe_body}"
-    } >> "${LINUX_AGENT_SESSION_MD}"
+    :
 }
 
 linux_agent_log_step_status() {
@@ -258,27 +282,92 @@ linux_agent_log_step_status() {
         --argjson detail "${detail}" \
         '{status:$status, step:$step, detail:$detail}')"
     linux_agent_log_event "step_${status}" "${event_payload}"
-
-    linux_agent_append_session_note "Step ${status}" "${event_payload}"
 }
 
 linux_agent_finish_session() {
     local final_status="$1"
-    {
-        printf '## 会话结果\n\n'
-        printf -- '- 结束时间: %s\n' "$(linux_agent_now_iso)"
-        printf -- '- 最终状态: %s\n' "${final_status}"
-    } >> "${LINUX_AGENT_SESSION_MD}"
+    if [[ "${LINUX_AGENT_SESSION_ACTIVE:-0}" -ne 1 || "${LINUX_AGENT_SESSION_FINISHED:-0}" -eq 1 ]]; then
+        return 0
+    fi
+    LINUX_AGENT_SESSION_FINISHED=1
+    if declare -F linux_agent_log_ai_files_manifest >/dev/null 2>&1; then
+        linux_agent_log_ai_files_manifest
+    fi
+    if declare -F linux_agent_observer_session_finish >/dev/null 2>&1; then
+        linux_agent_observer_session_finish "${final_status}"
+    fi
+    linux_agent_log_event "session_finished" "$(jq -cn --arg status "${final_status}" '{status:$status}')"
+    LINUX_AGENT_SESSION_ACTIVE=0
+}
+
+linux_agent_log_command_started() {
+    local command="$1"
+    local args="${2:-}"
+    linux_agent_log_event "command_started" "$(jq -cn --arg command "${command}" --arg args "${args}" '{command:$command, args:$args}')"
+}
+
+linux_agent_log_command_finished() {
+    local command="$1"
+    local status="$2"
+    local exit_code="${3:-0}"
+    linux_agent_log_event "command_finished" "$(jq -cn --arg command "${command}" --arg status "${status}" --argjson exit_code "${exit_code}" '{command:$command, status:$status, exit_code:$exit_code}')"
+}
+
+linux_agent_log_turn_started() {
+    local mode="$1"
+    local input="$2"
+    linux_agent_log_event "turn_started" "$(jq -cn --arg mode "${mode}" --arg input "${input}" '{mode:$mode, input:$input}')"
+}
+
+linux_agent_log_turn_finished() {
+    local mode="$1"
+    local status="$2"
+    linux_agent_log_event "turn_finished" "$(jq -cn --arg mode "${mode}" --arg status "${status}" '{mode:$mode, status:$status}')"
+}
+
+linux_agent_log_control_event() {
+    local event="$1"
+    local mode="${2:-}"
+    local value="${3:-}"
+    local status="${4:-}"
+    linux_agent_log_event "control_event" "$(jq -cn --arg event "${event}" --arg mode "${mode}" --arg value "${value}" --arg status "${status}" '{event:$event, mode:$mode, value:$value, status:$status}')"
 }
 
 linux_agent_show_audit() {
     local session_id="$1"
-    local md_file="${LINUX_AGENT_SESSION_DIR}/${session_id}.md"
     local log_file="${LINUX_AGENT_LOG_DIR}/${session_id}.jsonl"
+    local report
 
-    [[ -f "${md_file}" ]] && linux_agent_sanitize_text "$(cat "${md_file}")"
-    if [[ -f "${log_file}" ]]; then
-        printf '\n# JSONL 审计流\n\n'
-        linux_agent_sanitize_text "$(cat "${log_file}")"
+    if [[ ! -f "${log_file}" ]]; then
+        linux_agent_print_error "未找到审计日志: ${session_id}"
+        return 1
     fi
+
+    report="$(jq -s -r '
+        def count_stage($s): map(select(.stage == $s)) | length;
+        . as $events
+        | ($events | map(select(.stage == "session_started")) | first) as $started
+        | ($events | map(select(.stage == "session_finished")) | last) as $finished
+        | ($events | map(select(.stage == "observer_session_finished")) | last) as $observer
+        | "- 会话 ID: " + (($started.session_id // $finished.session_id // "unknown") | tostring),
+          "- 开始时间: " + (($started.timestamp // "unknown") | tostring),
+          "- 最终状态: " + (($finished.payload.status // $observer.payload.final_status // "unknown") | tostring),
+          "- Observer 状态: " + (($observer.payload.status // "unknown") | tostring),
+          "- Observer backend: " + (($observer.payload.backend // "auditd") | tostring),
+          "- audit_key: " + (($observer.payload.audit_key // "null") | tostring),
+          "- Observer reason_code: " + (($observer.payload.reason_code // "null") | tostring),
+          "- Observer diagnostic: " + (($observer.payload.diagnostic // "null") | tostring),
+          "- exec_count: " + (($observer.payload.exec_count // 0) | tostring),
+          "- file_event_count: " + (($observer.payload.file_event_count // 0) | tostring),
+          "- execution_finished: " + (($events | count_stage("execution_finished")) | tostring),
+          "- observer_unavailable: " + (($events | count_stage("observer_unavailable")) | tostring),
+          "- observer_failed: " + (($events | count_stage("observer_failed")) | tostring)
+    ' "${log_file}")"
+    printf '# 审计报告\n\n'
+    linux_agent_sanitize_text "${report}"
+
+    printf '\n# JSONL 审计流\n\n'
+    while IFS= read -r line; do
+        linux_agent_sanitize_text "${line}"
+    done < "${log_file}"
 }

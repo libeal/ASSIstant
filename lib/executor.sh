@@ -320,7 +320,8 @@ linux_agent_compact_execution_result() {
                         status:(.result.status // null),
                         exit_code:(.result.exit_code // null),
                         tool:(.result.output.tool // null),
-                        action:(.result.output.action // null)
+                        action:(.result.output.action // null),
+                        observer:(.result.observer // null)
                     }
                 }
             ]
@@ -432,37 +433,76 @@ linux_agent_prepare_remote_step() {
         }' <<<"${step_json}"
 }
 
+linux_agent_execute_observed_command_output() {
+    local scope="$1"
+    local subject_json="$2"
+    shift 2
+    [[ "${1:-}" == "--" ]] && shift
+
+    local stdout_file stderr_file run_meta exit_code observer stdout_text stderr_text combined
+    stdout_file="$(mktemp "${LINUX_AGENT_TMP_DIR}/observer.stdout.XXXXXX")"
+    stderr_file="$(mktemp "${LINUX_AGENT_TMP_DIR}/observer.stderr.XXXXXX")"
+
+    run_meta="$(linux_agent_run_observed_process "${scope}" "${subject_json}" "${stdout_file}" "${stderr_file}" -- "$@")"
+    exit_code="$(jq -r '.exit_code' <<<"${run_meta}")"
+    observer="$(jq -c '.observer' <<<"${run_meta}")"
+    stdout_text="$(cat "${stdout_file}" 2>/dev/null || true)"
+    stderr_text="$(cat "${stderr_file}" 2>/dev/null || true)"
+    rm -f "${stdout_file}" "${stderr_file}"
+
+    combined="${stdout_text}"
+    if [[ -n "${stderr_text}" ]]; then
+        if [[ -n "${combined}" ]]; then
+            combined="${combined}"$'\n'"${stderr_text}"
+        else
+            combined="${stderr_text}"
+        fi
+    fi
+
+    if printf '%s' "${combined}" | jq -e . >/dev/null 2>&1; then
+        jq -cn \
+            --argjson output "$(printf '%s' "${combined}" | jq -c .)" \
+            --argjson exit_code "${exit_code}" \
+            --argjson observer "${observer}" \
+            '{ok:($exit_code == 0), exit_code:$exit_code, output:$output, observer:$observer}'
+    else
+        jq -cn \
+            --arg output "${combined}" \
+            --argjson exit_code "${exit_code}" \
+            --argjson observer "${observer}" \
+            '{ok:($exit_code == 0), exit_code:$exit_code, output:{raw:$output}, observer:$observer}'
+    fi
+}
+
 linux_agent_execute_step_command() {
     local step_json="$1"
-    local executor_type output exit_code
+    local executor_type subject
+    local -a command_args
     executor_type="$(jq -r '.executor_type' <<<"${step_json}")"
-    exit_code=0
 
     case "${executor_type}" in
         skill_script)
-            output="$(linux_agent_run_skill_script \
-                "$(jq -r '.skill_script' <<<"${step_json}")" \
-                "$(jq -c '.arguments // {}' <<<"${step_json}")" 2>&1)" || exit_code=$?
+            local ref script_path args
+            ref="$(jq -r '.skill_script' <<<"${step_json}")"
+            script_path="$(linux_agent_skill_script_path "${ref}")"
+            args="$(jq -c '.arguments // {}' <<<"${step_json}")"
+            command_args=(bash "${script_path}" "${args}")
             ;;
         shell)
-            output="$(bash -lc "$(jq -r '.command // empty' <<<"${step_json}")" 2>&1)" || exit_code=$?
+            command_args=(bash -lc "$(jq -r '.command // empty' <<<"${step_json}")")
             ;;
         remote_script)
-            output="$(bash "$(jq -r '.downloaded_path' <<<"${step_json}")" "$(jq -c '.arguments // {}' <<<"${step_json}")" 2>&1)" || exit_code=$?
+            command_args=(bash "$(jq -r '.downloaded_path' <<<"${step_json}")" "$(jq -c '.arguments // {}' <<<"${step_json}")")
             ;;
         *)
-            output="unsupported executor_type: ${executor_type}"
-            exit_code=2
+            jq -cn --arg executor_type "${executor_type}" \
+                '{ok:false, exit_code:2, output:{raw:("unsupported executor_type: " + $executor_type)}}'
+            return 0
             ;;
     esac
 
-    if printf '%s' "${output}" | jq -e . >/dev/null 2>&1; then
-        jq -cn --argjson output "$(printf '%s' "${output}" | jq -c .)" --argjson exit_code "${exit_code}" \
-            '{ok:($exit_code == 0), exit_code:$exit_code, output:$output}'
-    else
-        jq -cn --arg output "${output}" --argjson exit_code "${exit_code}" \
-            '{ok:($exit_code == 0), exit_code:$exit_code, output:{raw:$output}}'
-    fi
+    subject="$(jq -cn --argjson step "${step_json}" '{kind:"work_step", step:$step}')"
+    linux_agent_execute_observed_command_output "step_${executor_type}" "${subject}" -- "${command_args[@]}"
 }
 
 linux_agent_skipped_steps_after() {
@@ -516,10 +556,10 @@ linux_agent_request_repair_plan() {
         }')"
     failure_context="$(linux_agent_sanitize_json "${failure_context}")"
 
+    linux_agent_record_ai_request_files "${failure_context}"
     repair="$(linux_agent_call_ai_with_context "生成回滚或报错解决方案" "${failure_context}" "repair")"
     repair="$(linux_agent_normalize_model_response "${repair}")"
     linux_agent_log_event "repair_planned" "${repair}"
-    linux_agent_append_session_note "失败后的回滚或修复建议" "$(jq . <<<"${repair}")"
     printf '\n# 回滚或修复建议（不会自动执行）\n' >&2
     printf '%s\n' "$(jq . <<<"${repair}")" >&2
 }
@@ -531,10 +571,8 @@ linux_agent_request_revised_work_plan() {
     local current_step="$4"
     local revision_request="$5"
     local remaining_steps="$6"
-    local revision_context request_context revised_plan skill_index
+    local revision_context request_context revised_plan
 
-    skill_index="$(linux_agent_skill_index_text 2>/dev/null || true)"
-    skill_index="$(linux_agent_sanitize_text "${skill_index}")"
     revision_context="$(jq -cn \
         --arg input "${user_input}" \
         --arg revision_request "${revision_request}" \
@@ -554,19 +592,17 @@ linux_agent_request_revised_work_plan() {
     request_context="$(jq -cn \
         --arg mode "work_revision" \
         --arg current_request "${revision_request}" \
-        --arg skill_index "${skill_index}" \
         --argjson conversation_context "$(linux_agent_history_window)" \
         --argjson environment_context "$(linux_agent_sanitize_json "${revision_context}")" \
         '{
             mode:$mode,
             conversation_context:$conversation_context,
             current_request:$current_request,
-            environment_context:$environment_context,
-            skill_index:$skill_index
+            environment_context:$environment_context
         }')"
 
     linux_agent_log_event "work_revision_requested" "${revision_context}"
-    linux_agent_append_session_note "工作计划修改需求" "${revision_context}"
+    linux_agent_record_ai_request_files "${request_context}"
     revised_plan="$(linux_agent_call_ai_with_context "${revision_request}" "${request_context}" "work_plan")"
     revised_plan="$(linux_agent_normalize_model_response "${revised_plan}")"
     if ! linux_agent_validate_work_response "${revised_plan}" || [[ "$(jq -r '.response_type // empty' <<<"${revised_plan}")" != "work_plan" ]]; then
@@ -576,7 +612,6 @@ linux_agent_request_revised_work_plan() {
     fi
 
     linux_agent_log_event "revision_planned" "${revised_plan}"
-    linux_agent_append_session_note "修改后的工作计划" "$(jq . <<<"${revised_plan}")"
     printf '\n# 根据修改需求生成续写计划\n' >&2
     printf '%s\n' "$(jq . <<<"${revised_plan}")" >&2
     printf '%s\n' "${revised_plan}"

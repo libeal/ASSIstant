@@ -13,7 +13,7 @@ linux_agent_doctor_check_command() {
 
 linux_agent_doctor() {
     local required_commands='["bash","jq","curl","find","du","df","ps","grep","tar"]'
-    local optional_commands='["systemctl","journalctl","ss","ip","lsof","sudo"]'
+    local optional_commands='["systemctl","journalctl","ss","ip","lsof","sudo","auditctl","ausearch","auditd"]'
     local required_results='[]'
     local optional_available='[]'
     local optional_missing='[]'

@@ -23,6 +23,8 @@ source "${ROOT_DIR}/lib/doctor.sh"
 source "${ROOT_DIR}/lib/ai.sh"
 # shellcheck source=../lib/policy.sh
 source "${ROOT_DIR}/lib/policy.sh"
+# shellcheck source=../lib/observer.sh
+source "${ROOT_DIR}/lib/observer.sh"
 # shellcheck source=../lib/executor.sh
 source "${ROOT_DIR}/lib/executor.sh"
 # shellcheck source=../lib/editor.sh
@@ -34,6 +36,62 @@ source "${ROOT_DIR}/lib/orchestrator.sh"
 
 linux_agent_init_env "${ROOT_DIR}"
 linux_agent_load_config
+
+LINUX_AGENT_MAIN_COMMAND=""
+LINUX_AGENT_COMMAND_FINISHED=0
+LINUX_AGENT_FINAL_STATUS=""
+
+linux_agent_finish_run() {
+    local final_status="$1"
+    local exit_code="${2:-0}"
+    [[ -n "${LINUX_AGENT_MAIN_COMMAND:-}" ]] || return 0
+
+    if [[ "${LINUX_AGENT_COMMAND_FINISHED:-0}" -eq 0 ]]; then
+        linux_agent_log_command_finished "${LINUX_AGENT_MAIN_COMMAND}" "${final_status}" "${exit_code}"
+        LINUX_AGENT_COMMAND_FINISHED=1
+    fi
+    linux_agent_finish_session "${final_status}"
+}
+
+linux_agent_status_for_exit_code() {
+    local exit_code="$1"
+    if [[ -n "${LINUX_AGENT_FINAL_STATUS:-}" ]]; then
+        printf '%s\n' "${LINUX_AGENT_FINAL_STATUS}"
+    elif [[ "${exit_code}" -eq 0 ]]; then
+        printf '%s\n' "${LINUX_AGENT_LAST_BUSINESS_STATUS:-completed}"
+    else
+        printf 'failed\n'
+    fi
+}
+
+linux_agent_on_exit() {
+    local exit_code=$?
+    local final_status
+    set +e
+    final_status="$(linux_agent_status_for_exit_code "${exit_code}")"
+    linux_agent_finish_run "${final_status}" "${exit_code}"
+}
+
+linux_agent_on_int() {
+    set +e
+    LINUX_AGENT_FINAL_STATUS="interrupted"
+    linux_agent_log_control_event "signal_int" "" "INT" "interrupted"
+    exit 130
+}
+
+linux_agent_on_term() {
+    set +e
+    LINUX_AGENT_FINAL_STATUS="terminated"
+    linux_agent_log_control_event "signal_term" "" "TERM" "terminated"
+    exit 143
+}
+
+linux_agent_on_tstp() {
+    set +e
+    LINUX_AGENT_FINAL_STATUS="exited_ctrl_z"
+    linux_agent_log_control_event "ctrl_z" "" "SIGTSTP" "exited"
+    exit 0
+}
 
 linux_agent_usage() {
     cat <<'EOF'
@@ -69,46 +127,67 @@ EOF
 
 linux_agent_interactive() {
     local current_mode="work"
-    local user_input selected_mode
+    local user_input original_input selected_mode turn_status
     linux_agent_print_info "Linux 运维 Agent 已就绪，默认工作模式。输入 / 或 /help 查看命令，/exit 结束。"
     while true; do
-        linux_agent_read_repl_input "${current_mode}" user_input || break
+        if ! linux_agent_read_repl_input "${current_mode}" user_input; then
+            linux_agent_log_control_event "eof" "${current_mode}" "" "eof"
+            LINUX_AGENT_FINAL_STATUS="eof"
+            break
+        fi
+        if [[ "${user_input}" == *$'\032'* ]]; then
+            linux_agent_log_control_event "ctrl_z" "${current_mode}" "SUB" "exited"
+            LINUX_AGENT_FINAL_STATUS="exited_ctrl_z"
+            break
+        fi
 
+        original_input="${user_input}"
         if [[ "${user_input}" == /* ]]; then
-            user_input="$(linux_agent_slash_command_complete "${user_input}")" || continue
+            if ! user_input="$(linux_agent_slash_command_complete "${user_input}")"; then
+                linux_agent_log_control_event "slash_rejected" "${current_mode}" "${original_input}" "rejected"
+                continue
+            fi
         fi
 
         case "${user_input}" in
             /exit|exit)
+                linux_agent_log_control_event "exit" "${current_mode}" "${user_input}" "exited"
+                LINUX_AGENT_FINAL_STATUS="exited"
                 break
                 ;;
             /work)
                 current_mode="work"
+                linux_agent_log_control_event "mode_changed" "${current_mode}" "${user_input}" "work"
                 linux_agent_print_info "已切换到工作模式。"
                 continue
                 ;;
             /edit)
                 current_mode="edit"
+                linux_agent_log_control_event "mode_changed" "${current_mode}" "${user_input}" "edit"
                 linux_agent_print_info "已切换到编辑模式。"
                 continue
                 ;;
             /script)
                 current_mode="script"
+                linux_agent_log_control_event "mode_changed" "${current_mode}" "${user_input}" "script"
                 linux_agent_print_info "已切换到脚本模式。输入形如 ops-basic/process-inspect '{\"pattern\":\"systemd\"}'。"
                 continue
                 ;;
             /terminal)
                 current_mode="terminal"
+                linux_agent_log_control_event "mode_changed" "${current_mode}" "${user_input}" "terminal"
                 linux_agent_print_info "已切换到终端模式。普通输入会直接交给 bash -lc 执行；/mode 或 /work 可返回。"
                 continue
                 ;;
             /mode)
                 selected_mode="$(linux_agent_mode_menu "${current_mode}")" || continue
                 current_mode="${selected_mode}"
+                linux_agent_log_control_event "mode_changed" "${current_mode}" "${user_input}" "${selected_mode}"
                 linux_agent_print_info "已切换到${current_mode}模式。"
                 continue
                 ;;
             /help)
+                linux_agent_log_control_event "help" "${current_mode}" "${user_input}" "shown"
                 linux_agent_usage
                 continue
                 ;;
@@ -117,10 +196,20 @@ linux_agent_interactive() {
             break
         fi
         [[ -z "${user_input}" ]] && continue
+        linux_agent_log_turn_started "${current_mode}" "${user_input}"
+        set +e
         if [[ "${current_mode}" == "terminal" ]]; then
             linux_agent_process_terminal_request "${user_input}"
         else
             linux_agent_process_request "${user_input}" "${current_mode}"
+        fi
+        turn_status=$?
+        set -e
+        if [[ "${turn_status}" -eq 0 ]]; then
+            linux_agent_log_turn_finished "${current_mode}" "${LINUX_AGENT_LAST_BUSINESS_STATUS:-completed}"
+        else
+            linux_agent_log_turn_finished "${current_mode}" "failed"
+            return "${turn_status}"
         fi
     done
 }
@@ -225,4 +314,30 @@ main() {
     esac
 }
 
-main "$@"
+linux_agent_run() {
+    local command="${1:-interactive}"
+    local args_summary="$*"
+
+    if [[ "${command}" == "audit" ]]; then
+        main "$@"
+        return $?
+    fi
+
+    LINUX_AGENT_MAIN_COMMAND="${command}"
+    linux_agent_start_session "agent ${args_summary:-interactive}"
+    linux_agent_log_command_started "${command}" "${args_summary}"
+
+    trap linux_agent_on_exit EXIT
+    trap linux_agent_on_int INT
+    trap linux_agent_on_term TERM
+    trap linux_agent_on_tstp TSTP
+
+    main "$@"
+    local exit_code=$?
+    LINUX_AGENT_FINAL_STATUS="$(linux_agent_status_for_exit_code "${exit_code}")"
+    linux_agent_finish_run "${LINUX_AGENT_FINAL_STATUS}" "${exit_code}"
+    trap - EXIT INT TERM TSTP
+    return "${exit_code}"
+}
+
+linux_agent_run "$@"

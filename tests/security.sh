@@ -20,6 +20,11 @@ source "${ROOT_DIR}/lib/executor.sh"
 linux_agent_init_env "${ROOT_DIR}"
 linux_agent_load_config
 
+request_context="$(linux_agent_build_request_context "检查磁盘" '{"topic":"disk"}' "work")"
+grep -q '"current_request":"检查磁盘"' <<<"${request_context}"
+grep -q '"environment_context":{"topic":"disk"}' <<<"${request_context}"
+! jq -e 'has("skill_index")' <<<"${request_context}" >/dev/null
+
 secret_json='{"api_key":"TEST_API_SECRET_123456","nested":{"password":"TEST_PASS_123456"},"headers":{"Authorization":"Bearer TEST_BEARER_1234567890"},"pem":"-----BEGIN RSA PRIVATE KEY-----\nabc\n-----END RSA PRIVATE KEY-----"}'
 redacted_json="$(linux_agent_sanitize_json "${secret_json}")"
 ! grep -q 'TEST_API_SECRET\|TEST_PASS\|TEST_BEARER\|BEGIN RSA PRIVATE KEY' <<<"${redacted_json}"
@@ -36,15 +41,13 @@ safe_session_id="${LINUX_AGENT_SESSION_ID}"
 linux_agent_log_event "request_context_built" "$(jq -cn \
     --arg current_request 'token=TEST_CONTEXT_TOKEN' \
     '{mode:"work", current_request:$current_request, conversation_context:[{role:"user", content:"password=TEST_HISTORY_PASS"}], environment_context:{raw:"Bearer TEST_ENV_BEARER_1234567890"}, skill_index:"secret=TEST_SKILL_SECRET"}')"
-linux_agent_append_session_note "环境感知（已脱敏）" "$(jq -cn \
-    --arg top_processes 'TEST_RESOURCE_PROCESS_RAW' \
-    --arg memory_summary 'TEST_RESOURCE_MEMORY_RAW' \
-    '{topic:"resource", top_processes:$top_processes, memory_summary:$memory_summary}')"
 linux_agent_log_event "script_manual_edit" "$(jq -cn --arg diff 'password=TEST_DIFF_PASS\n+token=TEST_DIFF_TOKEN' '{skill:"demo", script:"x.sh", diff:$diff}')"
-linux_agent_append_session_note "自由文本" 'Bearer TEST_NOTE_BEARER_1234567890'
 linux_agent_finish_session "tested"
+audit_output="$(bash "${ROOT_DIR}/bin/agent" audit "${safe_session_id}")"
 ! grep -R -q 'TEST_AUDIT_SECRET\|TEST_AUDIT_PASS\|TEST_CONTEXT_TOKEN\|TEST_HISTORY_PASS\|TEST_ENV_BEARER\|TEST_SKILL_SECRET\|TEST_RESOURCE_PROCESS_RAW\|TEST_RESOURCE_MEMORY_RAW\|TEST_DIFF_PASS\|TEST_NOTE_BEARER' \
-    "${ROOT_DIR}/logs/${safe_session_id}.jsonl" "${ROOT_DIR}/sessions/${safe_session_id}.md"
+    "${ROOT_DIR}/logs/${safe_session_id}.jsonl"
+! grep -q 'TEST_AUDIT_SECRET\|TEST_AUDIT_PASS\|TEST_CONTEXT_TOKEN\|TEST_HISTORY_PASS\|TEST_ENV_BEARER\|TEST_SKILL_SECRET\|TEST_DIFF_PASS' <<<"${audit_output}"
+[[ ! -e "${ROOT_DIR}/sessions/${safe_session_id}.md" ]]
 grep -q '"stage":"script_manual_edit"' "${ROOT_DIR}/logs/${safe_session_id}.jsonl"
 grep -q '"diff_lines"' "${ROOT_DIR}/logs/${safe_session_id}.jsonl"
 
@@ -53,7 +56,9 @@ linux_agent_start_session '检查很长的文本'
 verbose_session_id="${LINUX_AGENT_SESSION_ID}"
 linux_agent_log_event "received" "$(jq -cn --arg input 'abcdefghijklmnopqrstuvwxyz0123456789 password=TEST_VERBOSE_PASS' '{mode:"work", input:$input}')"
 linux_agent_finish_session "tested"
-! grep -R -q 'TEST_VERBOSE_PASS' "${ROOT_DIR}/logs/${verbose_session_id}.jsonl" "${ROOT_DIR}/sessions/${verbose_session_id}.md"
+verbose_audit_output="$(bash "${ROOT_DIR}/bin/agent" audit "${verbose_session_id}")"
+! grep -R -q 'TEST_VERBOSE_PASS' "${ROOT_DIR}/logs/${verbose_session_id}.jsonl"
+! grep -q 'TEST_VERBOSE_PASS' <<<"${verbose_audit_output}"
 grep -q '\[TRUNCATED\]' "${ROOT_DIR}/logs/${verbose_session_id}.jsonl"
 
 http_step='{"id":"remote-1","title":"remote","executor_type":"remote_script","url":"http://example.test/install.sh","arguments":{},"reason":"test","expected_effect":"test","risk_level":"low","rollback_hint":"none"}'

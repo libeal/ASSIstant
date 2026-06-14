@@ -7,6 +7,15 @@
   "context_turns": 6,
   "audit_mode": "safe_summary",
   "audit_text_limit": 1000,
+  "observer": {
+    "enabled": "auto",
+    "backend": "auditd",
+    "mode": "observe",
+    "lifecycle": "session",
+    "privilege": "sudo_interactive",
+    "auditd_rule_mode": "temporary",
+    "max_events": 200
+  },
   "skills_dir": "",
   "remote_script_policy": "download_review"
 }

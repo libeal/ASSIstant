@@ -236,10 +236,8 @@ linux_agent_request_revised_edit_package() {
     local original_edit_json="$1"
     local script_name="$2"
     local revision_request="$3"
-    local skill_index revision_context request_context revised_edit_json
+    local revision_context request_context revised_edit_json
 
-    skill_index="$(linux_agent_skill_index_text 2>/dev/null || true)"
-    skill_index="$(linux_agent_sanitize_text "${skill_index}")"
     revision_context="$(jq -cn \
         --arg revision_request "${revision_request}" \
         --arg script "${script_name}" \
@@ -253,25 +251,22 @@ linux_agent_request_revised_edit_package() {
     request_context="$(jq -cn \
         --arg mode "edit_revision" \
         --arg current_request "${revision_request}" \
-        --arg skill_index "${skill_index}" \
         --argjson conversation_context "$(linux_agent_history_window)" \
         --argjson environment_context "$(linux_agent_sanitize_json "${revision_context}")" \
         '{
             mode:$mode,
             conversation_context:$conversation_context,
             current_request:$current_request,
-            environment_context:$environment_context,
-            skill_index:$skill_index
+            environment_context:$environment_context
         }')"
 
     linux_agent_log_event "edit_revision_requested" "${revision_context}"
-    linux_agent_append_session_note "Skill 修改需求" "${revision_context}"
+    linux_agent_record_ai_request_files "${request_context}"
     revised_edit_json="$(linux_agent_call_ai_with_context "${revision_request}" "${request_context}" "edit")"
     if ! linux_agent_validate_edit_response "${revised_edit_json}"; then
         revised_edit_json="$(linux_agent_mock_edit_package "${revision_request}")"
     fi
     linux_agent_log_event "edit_planned" "${revised_edit_json}"
-    linux_agent_append_session_note "Skill 编辑计划" "$(jq . <<<"${revised_edit_json}")"
     if linux_agent_output_json_enabled; then
         printf '%s\n' "$(jq . <<<"${revised_edit_json}")" >&2
     else
@@ -331,7 +326,6 @@ linux_agent_edit_script_content() {
             --arg script "${script_name}" \
             --arg diff "${diff_text}" \
             '{skill:$skill, script:$script, diff:$diff}')"
-        linux_agent_append_session_note "用户手动修改脚本 ${skill_name}/${script_name}" "${diff_text}"
         printf '\n# 用户修改 diff\n\n%s\n' "${diff_text}" >&2
     fi
 
@@ -470,18 +464,17 @@ linux_agent_process_edit_request() {
     local mode="${2:-edit}"
     local context_json request_context edit_json result final_status
 
-    linux_agent_start_session "${user_input}"
     linux_agent_log_event "received" "$(jq -cn --arg input "${user_input}" --arg mode "${mode}" '{input:$input, mode:$mode}')"
 
     context_json="$(jq -cn '{edit_mode:true}')"
     request_context="$(linux_agent_build_request_context "${user_input}" "${context_json}" "edit")"
+    linux_agent_record_ai_request_files "${request_context}"
     edit_json="$(linux_agent_call_ai_with_context "${user_input}" "${request_context}" "edit")"
     if ! linux_agent_validate_edit_response "${edit_json}"; then
         edit_json="$(linux_agent_mock_edit_package "${user_input}")"
     fi
 
     linux_agent_log_event "edit_planned" "${edit_json}"
-    linux_agent_append_session_note "Skill 编辑计划" "$(jq . <<<"${edit_json}")"
     if linux_agent_output_json_enabled; then
         printf '%s\n' "$(jq . <<<"${edit_json}")"
     else
@@ -490,7 +483,6 @@ linux_agent_process_edit_request() {
 
     result="$(linux_agent_apply_skill_edit_package "${edit_json}")"
     linux_agent_log_event "edit_applied" "${result}"
-    linux_agent_append_session_note "Skill 保存结果" "$(jq . <<<"${result}")"
     if linux_agent_output_json_enabled; then
         printf '%s\n' "$(jq . <<<"${result}")"
     else
@@ -504,7 +496,6 @@ linux_agent_process_edit_request() {
     fi
 
     linux_agent_log_event "finished" "$(jq -cn --arg status "${final_status}" '{status:$status}')"
-    linux_agent_finish_session "${final_status}"
     linux_agent_record_turn "user" "${user_input}" "edit"
     linux_agent_record_turn "assistant" "$(jq -c '.skill // {}' <<<"${edit_json}")" "${final_status}"
 }

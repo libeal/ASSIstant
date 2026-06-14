@@ -75,6 +75,33 @@ copy_project() {
         "${target}/"
 }
 
+project_session="${tmp_root}/project-session"
+copy_project "${project_session}"
+session_output="$(cd "${project_session}" && printf '/terminal\nprintf one\nprintf two\n/exit\n' | LINUX_AGENT_MOCK=1 bash bin/agent 2>&1)"
+grep -q 'one' <<<"${session_output}"
+grep -q 'two' <<<"${session_output}"
+session_log_count="$(find "${project_session}/logs" -name '*.jsonl' | wc -l | tr -d ' ')"
+[[ "${session_log_count}" -eq 1 ]]
+session_log="$(find "${project_session}/logs" -name '*.jsonl' -print -quit)"
+[[ "$(jq -r 'select(.stage=="session_started") | .stage' "${session_log}" | wc -l | tr -d ' ')" -eq 1 ]]
+[[ "$(jq -r 'select(.stage=="session_finished") | .stage' "${session_log}" | wc -l | tr -d ' ')" -eq 1 ]]
+[[ "$(jq -r 'select(.stage=="turn_started") | .stage' "${session_log}" | wc -l | tr -d ' ')" -eq 2 ]]
+observer_line="$(jq -r '.stage' "${session_log}" | awk '/^observer_/ {print NR; exit}')"
+turn_line="$(jq -r '.stage' "${session_log}" | awk '$0=="turn_started" {print NR; exit}')"
+[[ -n "${observer_line}" && -n "${turn_line}" && "${observer_line}" -lt "${turn_line}" ]]
+session_id="$(basename "${session_log}" .jsonl)"
+audit_output="$(cd "${project_session}" && bash bin/agent audit "${session_id}")"
+grep -q '# 审计报告' <<<"${audit_output}"
+[[ "$(find "${project_session}/logs" -name '*.jsonl' | wc -l | tr -d ' ')" -eq 1 ]]
+
+project_ctrlz="${tmp_root}/project-ctrlz"
+copy_project "${project_ctrlz}"
+ctrlz_output="$(cd "${project_ctrlz}" && printf '\032\n' | LINUX_AGENT_MOCK=1 bash bin/agent 2>&1)"
+grep -q 'Linux 运维 Agent 已就绪' <<<"${ctrlz_output}"
+ctrlz_log="$(find "${project_ctrlz}/logs" -name '*.jsonl' -print -quit)"
+grep -q '"event":"ctrl_z"' "${ctrlz_log}"
+[[ "$(jq -r 'select(.stage=="session_finished") | .payload.status' "${ctrlz_log}" | tail -1)" == "exited_ctrl_z" ]]
+
 project_edit="${tmp_root}/project-edit"
 copy_project "${project_edit}"
 editor_modify="${tmp_root}/editor-modify.sh"
@@ -94,8 +121,8 @@ grep -q '候选校验: 通过' <<<"${edit_output}"
 ! grep -q '"ok": true' <<<"${edit_output}"
 ! grep -q '批准保存该脚本' <<<"${edit_output}"
 grep -q 'manual edit marker' "${project_edit}/skills/custom-generated/scripts/generated.sh"
-grep -R -q '用户手动修改脚本' "${project_edit}/sessions"
 grep -R -q 'script_manual_edit' "${project_edit}/logs"
+[[ ! -d "${project_edit}/sessions" ]]
 
 project_edit_json="${tmp_root}/project-edit-json"
 copy_project "${project_edit_json}"
@@ -173,7 +200,7 @@ grep -q '编辑器未保存脚本' <<<"${revised_edit_output}"
 grep -q 'Skill 保存结果: 成功' <<<"${revised_edit_output}"
 grep -q 'revised edit marker' "${project_revised_edit}/skills/custom-generated/scripts/generated.sh"
 grep -R -q 'edit_revision_requested' "${project_revised_edit}/logs"
-grep -R -q 'Skill 修改需求' "${project_revised_edit}/sessions"
+[[ ! -d "${project_revised_edit}/sessions" ]]
 
 project_vi="${tmp_root}/project-vi"
 copy_project "${project_vi}"

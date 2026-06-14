@@ -7,18 +7,17 @@ linux_agent_process_work_request() {
     local mode="${2:-work}"
     local topic context_json request_context response_json execution_json final_status response_type
 
-    linux_agent_start_session "${user_input}"
     linux_agent_log_event "received" "$(jq -cn --arg input "${user_input}" --arg mode "${mode}" '{input:$input, mode:$mode}')"
 
     topic="$(linux_agent_detect_topic "${user_input}")"
     context_json="$(linux_agent_sense_topic "${topic}")"
     context_json="$(linux_agent_redact_json "${context_json}")"
     linux_agent_log_event "sensed" "${context_json}"
-    linux_agent_append_session_note "环境感知（已脱敏）" "$(jq . <<<"${context_json}")"
 
     request_context="$(linux_agent_build_request_context "${user_input}" "${context_json}" "work")"
     linux_agent_log_event "request_context_built" "${request_context}"
 
+    linux_agent_record_ai_request_files "${request_context}"
     response_json="$(linux_agent_call_ai_with_context "${user_input}" "${request_context}" "work_plan")"
     response_json="$(linux_agent_normalize_model_response "${response_json}")"
     if ! linux_agent_validate_work_response "${response_json}"; then
@@ -28,25 +27,21 @@ linux_agent_process_work_request() {
 
     if [[ "${LINUX_AGENT_FORCE_PLAN:-0}" == "1" && "$(jq -r '.response_type' <<<"${response_json}")" == "work_plan" ]]; then
         linux_agent_log_event "planned" "${response_json}"
-        linux_agent_append_session_note "模型规划" "$(jq . <<<"${response_json}")"
         linux_agent_print_work_plan "${response_json}"
         final_status="planned"
         linux_agent_log_event "finished" "$(jq -cn --arg status "${final_status}" '{status:$status}')"
-        linux_agent_finish_session "${final_status}"
         linux_agent_record_turn "user" "${user_input}" "${mode}"
         linux_agent_record_turn "assistant" "$(jq -r '.summary' <<<"${response_json}")" "${final_status}"
         return 0
     fi
 
     linux_agent_log_event "planned" "${response_json}"
-    linux_agent_append_session_note "模型规划" "$(jq . <<<"${response_json}")"
 
     response_type="$(jq -r '.response_type' <<<"${response_json}")"
     if [[ "${response_type}" == "answer" ]]; then
         printf '%s\n' "$(jq -r '.answer' <<<"${response_json}")"
         final_status="answered"
         linux_agent_log_event "finished" "$(jq -cn --arg status "${final_status}" '{status:$status}')"
-        linux_agent_finish_session "${final_status}"
         linux_agent_record_turn "user" "${user_input}" "${mode}"
         linux_agent_record_turn "assistant" "$(jq -r '.answer' <<<"${response_json}")" "${final_status}"
         return 0
@@ -54,7 +49,6 @@ linux_agent_process_work_request() {
 
     execution_json="$(linux_agent_execute_work_plan "${response_json}" "${user_input}")"
     linux_agent_log_event "executed" "${execution_json}"
-    linux_agent_append_session_note "执行结果" "$(jq . <<<"${execution_json}")"
     if linux_agent_output_json_enabled; then
         printf '%s\n' "$(linux_agent_compact_execution_result "${execution_json}" | jq .)"
     else
@@ -63,7 +57,6 @@ linux_agent_process_work_request() {
 
     final_status="$(jq -r '.status' <<<"${execution_json}")"
     linux_agent_log_event "finished" "$(jq -cn --arg status "${final_status}" '{status:$status}')"
-    linux_agent_finish_session "${final_status}"
     linux_agent_record_turn "user" "${user_input}" "${mode}"
     linux_agent_record_turn "assistant" "$(jq -c '{status:.status, results:(.results | length)}' <<<"${execution_json}")" "${final_status}"
 }
@@ -74,7 +67,6 @@ linux_agent_process_script_request() {
     local review material result final_status
     [[ -z "${arguments_json}" ]] && arguments_json='{}'
 
-    linux_agent_start_session "script ${ref}"
     linux_agent_log_event "received" "$(jq -cn --arg ref "${ref}" --argjson args "${arguments_json}" '{mode:"script", ref:$ref, arguments:$args}')"
 
     if ! linux_agent_skill_is_registered "${ref}"; then
@@ -85,7 +77,7 @@ linux_agent_process_script_request() {
         else
             linux_agent_print_script_result "${result}"
         fi
-        linux_agent_finish_session "blocked"
+        linux_agent_log_event "finished" "$(jq -cn '{status:"blocked"}')"
         return 0
     fi
 
@@ -101,7 +93,7 @@ linux_agent_process_script_request() {
         else
             linux_agent_print_script_result "${result}"
         fi
-        linux_agent_finish_session "blocked"
+        linux_agent_log_event "finished" "$(jq -cn '{status:"blocked"}')"
         return 0
     fi
 
@@ -113,18 +105,15 @@ linux_agent_process_script_request() {
         else
             linux_agent_print_script_result "${result}"
         fi
-        linux_agent_finish_session "rejected"
+        linux_agent_log_event "finished" "$(jq -cn '{status:"rejected"}')"
         return 0
     fi
 
-    result="$(linux_agent_run_skill_script "${ref}" "${arguments_json}" 2>&1 || true)"
-    if printf '%s' "${result}" | jq -e . >/dev/null 2>&1; then
-        result="$(jq -c . <<<"${result}")"
-    else
-        result="$(jq -cn --arg raw "${result}" '{ok:false, output:{raw:$raw}}')"
-    fi
+    local script_path subject
+    script_path="$(linux_agent_skill_script_path "${ref}")"
+    subject="$(jq -cn --arg ref "${ref}" --argjson arguments "${arguments_json}" '{kind:"script_command", ref:$ref, arguments:$arguments}')"
+    result="$(linux_agent_execute_observed_command_output "script" "${subject}" -- bash "${script_path}" "${arguments_json}")"
     linux_agent_log_event "script_executed" "${result}"
-    linux_agent_append_session_note "脚本执行结果" "$(jq . <<<"${result}")"
     if linux_agent_output_json_enabled; then
         printf '%s\n' "$(jq . <<<"${result}")"
     else
@@ -137,23 +126,21 @@ linux_agent_process_script_request() {
         final_status="failed"
     fi
     linux_agent_log_event "finished" "$(jq -cn --arg status "${final_status}" '{status:$status}')"
-    linux_agent_finish_session "${final_status}"
 }
 
 linux_agent_process_terminal_request() {
     local command_text="$1"
-    local stdout_file stderr_file stdout_preview stderr_preview exit_code final_status result
+    local stdout_file stderr_file stdout_preview stderr_preview exit_code final_status result run_meta observer subject
 
-    linux_agent_start_session "terminal ${command_text}"
     linux_agent_log_event "received" "$(jq -cn --arg command "${command_text}" '{mode:"terminal", command:$command}')"
 
     stdout_file="$(mktemp "${LINUX_AGENT_TMP_DIR}/terminal.stdout.XXXXXX")"
     stderr_file="$(mktemp "${LINUX_AGENT_TMP_DIR}/terminal.stderr.XXXXXX")"
 
-    set +e
-    bash -lc "${command_text}" >"${stdout_file}" 2>"${stderr_file}"
-    exit_code=$?
-    set -e
+    subject="$(jq -cn --arg command "${command_text}" '{kind:"terminal_command", command:$command}')"
+    run_meta="$(linux_agent_run_observed_process "terminal" "${subject}" "${stdout_file}" "${stderr_file}" -- bash -lc "${command_text}")"
+    exit_code="$(jq -r '.exit_code' <<<"${run_meta}")"
+    observer="$(jq -c '.observer' <<<"${run_meta}")"
 
     stdout_preview="$(head -c 4000 "${stdout_file}" || true)"
     stderr_preview="$(head -c 4000 "${stderr_file}" || true)"
@@ -169,17 +156,16 @@ linux_agent_process_terminal_request() {
         --arg stderr_preview "${stderr_preview}" \
         --arg status "${final_status}" \
         --argjson exit_code "${exit_code}" \
-        '{ok:($exit_code == 0), status:$status, command:$command, exit_code:$exit_code, stdout_preview:$stdout_preview, stderr_preview:$stderr_preview}')"
+        --argjson observer "${observer}" \
+        '{ok:($exit_code == 0), status:$status, command:$command, exit_code:$exit_code, stdout_preview:$stdout_preview, stderr_preview:$stderr_preview, observer:$observer}')"
 
     linux_agent_log_event "terminal_executed" "${result}"
-    linux_agent_append_session_note "终端模式执行结果" "$(jq . <<<"${result}")"
     if linux_agent_output_json_enabled; then
         printf '%s\n' "$(jq . <<<"${result}")"
     else
         linux_agent_print_terminal_result "${result}"
     fi
     linux_agent_log_event "finished" "$(jq -cn --arg status "${final_status}" '{status:$status}')"
-    linux_agent_finish_session "${final_status}"
 
     rm -f "${stdout_file}" "${stderr_file}"
     return 0

@@ -3,15 +3,113 @@
 set -euo pipefail
 
 LINUX_AGENT_LAST_AI_PAYLOAD=""
+LINUX_AGENT_AI_FILE_MANIFEST='[]'
+
+linux_agent_ai_file_metadata() {
+    local path="$1"
+    local purpose="$2"
+    local included_as="$3"
+    local resolved exists readable size sha rel_path
+
+    resolved="$(readlink -f "${path}" 2>/dev/null || printf '%s' "${path}")"
+    exists=false
+    readable=false
+    size=""
+    sha=""
+    rel_path="${resolved}"
+
+    if [[ -n "${LINUX_AGENT_ROOT:-}" && "${resolved}" == "${LINUX_AGENT_ROOT}/"* ]]; then
+        rel_path="${resolved#${LINUX_AGENT_ROOT}/}"
+    fi
+    if [[ -f "${resolved}" ]]; then
+        exists=true
+        size="$(stat -c '%s' "${resolved}" 2>/dev/null || printf '')"
+        if [[ -r "${resolved}" ]]; then
+            readable=true
+            sha="$(sha256sum "${resolved}" 2>/dev/null | awk '{print $1}' || true)"
+        fi
+    fi
+
+    jq -cn \
+        --arg path "${resolved}" \
+        --arg relative_path "${rel_path}" \
+        --arg purpose "${purpose}" \
+        --arg included_as "${included_as}" \
+        --arg sha256 "${sha}" \
+        --arg size_bytes "${size}" \
+        --argjson exists "${exists}" \
+        --argjson readable "${readable}" \
+        '{
+            path:$path,
+            relative_path:$relative_path,
+            purpose:$purpose,
+            included_as:$included_as,
+            exists:$exists,
+            readable:$readable,
+            size_bytes:($size_bytes | tonumber?),
+            sha256:(if $sha256 == "" then null else $sha256 end)
+        }'
+}
+
+linux_agent_record_ai_file() {
+    local path="$1"
+    local purpose="$2"
+    local included_as="$3"
+    local entry
+
+    entry="$(linux_agent_ai_file_metadata "${path}" "${purpose}" "${included_as}")"
+    LINUX_AGENT_AI_FILE_MANIFEST="$(jq -cn \
+        --argjson prior "${LINUX_AGENT_AI_FILE_MANIFEST:-[]}" \
+        --argjson entry "${entry}" \
+        '
+        ($prior + [$entry])
+        | group_by(.path + "\u0000" + .purpose + "\u0000" + .included_as)
+        | map(.[0])
+        ')"
+}
+
+linux_agent_log_ai_files_manifest() {
+    local manifest="${LINUX_AGENT_AI_FILE_MANIFEST:-[]}"
+    if [[ "$(jq 'length' <<<"${manifest}")" -eq 0 ]]; then
+        return 0
+    fi
+    if declare -F linux_agent_log_event >/dev/null 2>&1; then
+        linux_agent_log_event "ai_files_manifest" "$(jq -cn --argjson files "${manifest}" '{files:$files, file_count:($files | length)}')"
+    fi
+}
 
 linux_agent_build_system_prompt() {
     local prompt_file="${LINUX_AGENT_ROOT}/prompts/system.txt"
-    local skill_index
+    local skill_index skill_index_path
+    linux_agent_record_ai_file "${prompt_file}" "system_prompt" "system_message"
+    skill_index_path="$(linux_agent_skill_index_path 2>/dev/null || true)"
+    [[ -n "${skill_index_path}" ]] && linux_agent_record_ai_file "${skill_index_path}" "skill_index" "system_prompt_appendix"
     skill_index="$(linux_agent_skill_index_text 2>/dev/null || true)"
 
     jq -Rs --arg skill_index "${skill_index}" '
         . + "\n\n当前 skill 索引：\n" + $skill_index
     ' < "${prompt_file}"
+}
+
+linux_agent_record_ai_request_context_files() {
+    local request_context="$1"
+
+    if ! printf '%s' "${request_context}" | jq -e . >/dev/null 2>&1; then
+        return 0
+    fi
+    # Fixed request files are recorded at the point where they are attached.
+    # Dynamic request_context currently carries no local file bodies.
+}
+
+linux_agent_record_ai_request_files() {
+    local request_context="$1"
+    local prompt_file="${LINUX_AGENT_ROOT}/prompts/system.txt"
+    local skill_index_path
+
+    linux_agent_record_ai_file "${prompt_file}" "system_prompt" "system_message"
+    skill_index_path="$(linux_agent_skill_index_path 2>/dev/null || true)"
+    [[ -n "${skill_index_path}" ]] && linux_agent_record_ai_file "${skill_index_path}" "skill_index" "system_prompt_appendix"
+    linux_agent_record_ai_request_context_files "${request_context}"
 }
 
 linux_agent_mock_work_plan() {
@@ -210,6 +308,7 @@ linux_agent_call_ai_with_context() {
 
     safe_current_request="$(linux_agent_sanitize_text "${current_request}")"
     safe_request_context="$(linux_agent_sanitize_json "${request_context}")"
+    linux_agent_record_ai_request_context_files "${safe_request_context}"
 
     if [[ "${LINUX_AGENT_MOCK:-0}" == "1" ]]; then
         case "${purpose}" in
