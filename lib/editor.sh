@@ -252,17 +252,15 @@ linux_agent_request_revised_edit_package() {
         --arg mode "edit_revision" \
         --arg current_request "${revision_request}" \
         --argjson conversation_context "$(linux_agent_history_window)" \
-        --argjson environment_context "$(linux_agent_sanitize_json "${revision_context}")" \
         '{
             mode:$mode,
             conversation_context:$conversation_context,
-            current_request:$current_request,
-            environment_context:$environment_context
+            current_request:$current_request
         }')"
 
     linux_agent_log_event "edit_revision_requested" "${revision_context}"
     linux_agent_record_ai_request_files "${request_context}"
-    revised_edit_json="$(linux_agent_call_ai_with_context "${revision_request}" "${request_context}" "edit")"
+    revised_edit_json="$(linux_agent_call_ai_with_context "${revision_request}" "${request_context}" "edit" "${revision_context}")"
     if ! linux_agent_validate_edit_response "${revised_edit_json}"; then
         revised_edit_json="$(linux_agent_mock_edit_package "${revision_request}")"
     fi
@@ -469,7 +467,7 @@ linux_agent_process_edit_request() {
     context_json="$(jq -cn '{edit_mode:true}')"
     request_context="$(linux_agent_build_request_context "${user_input}" "${context_json}" "edit")"
     linux_agent_record_ai_request_files "${request_context}"
-    edit_json="$(linux_agent_call_ai_with_context "${user_input}" "${request_context}" "edit")"
+    edit_json="$(linux_agent_call_ai_with_context "${user_input}" "${request_context}" "edit" "${context_json}")"
     if ! linux_agent_validate_edit_response "${edit_json}"; then
         edit_json="$(linux_agent_mock_edit_package "${user_input}")"
     fi

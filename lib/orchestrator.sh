@@ -18,7 +18,7 @@ linux_agent_process_work_request() {
     linux_agent_log_event "request_context_built" "${request_context}"
 
     linux_agent_record_ai_request_files "${request_context}"
-    response_json="$(linux_agent_call_ai_with_context "${user_input}" "${request_context}" "work_plan")"
+    response_json="$(linux_agent_call_ai_with_context "${user_input}" "${request_context}" "work_plan" "${context_json}")"
     response_json="$(linux_agent_normalize_model_response "${response_json}")"
     if ! linux_agent_validate_work_response "${response_json}"; then
         linux_agent_print_warn "模型响应不符合 work_plan schema，改用 Mock 响应兜底。"

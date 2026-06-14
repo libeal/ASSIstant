@@ -12,6 +12,10 @@ source "${ROOT_DIR}/lib/config.sh"
 source "${ROOT_DIR}/lib/audit.sh"
 # shellcheck source=../lib/context.sh
 source "${ROOT_DIR}/lib/context.sh"
+# shellcheck source=../lib/skills.sh
+source "${ROOT_DIR}/lib/skills.sh"
+# shellcheck source=../lib/ai.sh
+source "${ROOT_DIR}/lib/ai.sh"
 # shellcheck source=../lib/policy.sh
 source "${ROOT_DIR}/lib/policy.sh"
 # shellcheck source=../lib/executor.sh
@@ -22,8 +26,24 @@ linux_agent_load_config
 
 request_context="$(linux_agent_build_request_context "检查磁盘" '{"topic":"disk"}' "work")"
 grep -q '"current_request":"检查磁盘"' <<<"${request_context}"
-grep -q '"environment_context":{"topic":"disk"}' <<<"${request_context}"
+! jq -e 'has("environment_context")' <<<"${request_context}" >/dev/null
 ! jq -e 'has("skill_index")' <<<"${request_context}" >/dev/null
+payload_context="$(linux_agent_build_ai_payload_context "${request_context}" '{"topic":"disk"}')"
+grep -q '"environment_context":{"topic":"disk"}' <<<"${payload_context}"
+mock_repair="$(LINUX_AGENT_MOCK=1 linux_agent_call_ai_with_context "repair" "${request_context}" "repair" '{"topic":"disk"}')"
+grep -q '"environment_context":{"topic":"disk"}' <<<"$(jq -r '.failure_context' <<<"${mock_repair}")"
+
+cleanup_root="$(mktemp -d)"
+linux_agent_init_env "${cleanup_root}"
+mkdir -p "${LINUX_AGENT_TMP_DIR}/nested"
+printf stale > "${LINUX_AGENT_TMP_DIR}/stale.tmp"
+printf stale > "${LINUX_AGENT_TMP_DIR}/nested/file.tmp"
+linux_agent_cleanup_tmp_dir
+[[ -d "${LINUX_AGENT_TMP_DIR}" ]]
+[[ -z "$(find "${LINUX_AGENT_TMP_DIR}" -mindepth 1 -print -quit)" ]]
+rm -rf "${cleanup_root}"
+linux_agent_init_env "${ROOT_DIR}"
+linux_agent_load_config
 
 secret_json='{"api_key":"TEST_API_SECRET_123456","nested":{"password":"TEST_PASS_123456"},"headers":{"Authorization":"Bearer TEST_BEARER_1234567890"},"pem":"-----BEGIN RSA PRIVATE KEY-----\nabc\n-----END RSA PRIVATE KEY-----"}'
 redacted_json="$(linux_agent_sanitize_json "${secret_json}")"

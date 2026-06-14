@@ -91,16 +91,6 @@ linux_agent_build_system_prompt() {
     ' < "${prompt_file}"
 }
 
-linux_agent_record_ai_request_context_files() {
-    local request_context="$1"
-
-    if ! printf '%s' "${request_context}" | jq -e . >/dev/null 2>&1; then
-        return 0
-    fi
-    # Fixed request files are recorded at the point where they are attached.
-    # Dynamic request_context currently carries no local file bodies.
-}
-
 linux_agent_record_ai_request_files() {
     local request_context="$1"
     local prompt_file="${LINUX_AGENT_ROOT}/prompts/system.txt"
@@ -109,7 +99,6 @@ linux_agent_record_ai_request_files() {
     linux_agent_record_ai_file "${prompt_file}" "system_prompt" "system_message"
     skill_index_path="$(linux_agent_skill_index_path 2>/dev/null || true)"
     [[ -n "${skill_index_path}" ]] && linux_agent_record_ai_file "${skill_index_path}" "skill_index" "system_prompt_appendix"
-    linux_agent_record_ai_request_context_files "${request_context}"
 }
 
 linux_agent_mock_work_plan() {
@@ -304,11 +293,18 @@ linux_agent_call_ai_with_context() {
     local current_request="$1"
     local request_context="$2"
     local purpose="${3:-work_plan}"
-    local safe_current_request safe_request_context
+    local runtime_context
+    local safe_current_request safe_request_context payload_context
+
+    if [[ $# -gt 3 && -n "${4:-}" ]]; then
+        runtime_context="$4"
+    else
+        runtime_context='{}'
+    fi
 
     safe_current_request="$(linux_agent_sanitize_text "${current_request}")"
     safe_request_context="$(linux_agent_sanitize_json "${request_context}")"
-    linux_agent_record_ai_request_context_files "${safe_request_context}"
+    payload_context="$(linux_agent_build_ai_payload_context "${safe_request_context}" "${runtime_context}")"
 
     if [[ "${LINUX_AGENT_MOCK:-0}" == "1" ]]; then
         case "${purpose}" in
@@ -316,7 +312,7 @@ linux_agent_call_ai_with_context() {
                 linux_agent_mock_edit_package "${safe_current_request}"
                 ;;
             repair)
-                linux_agent_mock_repair_plan "${safe_request_context}"
+                linux_agent_mock_repair_plan "${payload_context}"
                 ;;
             *)
                 linux_agent_mock_work_plan "${safe_current_request}"
@@ -336,7 +332,7 @@ linux_agent_call_ai_with_context() {
         linux_agent_print_warn "配置不完整，自动进入 Mock 模式。"
         case "${purpose}" in
             edit) linux_agent_mock_edit_package "${safe_current_request}" ;;
-            repair) linux_agent_mock_repair_plan "${safe_request_context}" ;;
+            repair) linux_agent_mock_repair_plan "${payload_context}" ;;
             *) linux_agent_mock_work_plan "${safe_current_request}" ;;
         esac
         return 0
@@ -346,7 +342,7 @@ linux_agent_call_ai_with_context() {
         --arg model "${model}" \
         --arg system_prompt "${system_prompt}" \
         --arg purpose "${purpose}" \
-        --argjson request_context "${safe_request_context}" \
+        --argjson request_context "${payload_context}" \
         '{
             model:$model,
             temperature:0.2,
@@ -368,7 +364,7 @@ linux_agent_call_ai_with_context() {
         linux_agent_print_warn "模型请求失败，改用 Mock 响应兜底。"
         case "${purpose}" in
             edit) linux_agent_mock_edit_package "${safe_current_request}" ;;
-            repair) linux_agent_mock_repair_plan "${safe_request_context}" ;;
+            repair) linux_agent_mock_repair_plan "${payload_context}" ;;
             *) linux_agent_mock_work_plan "${safe_current_request}" ;;
         esac
         return 0
@@ -379,7 +375,7 @@ linux_agent_call_ai_with_context() {
         linux_agent_print_warn "模型返回为空，改用 Mock 响应兜底。"
         case "${purpose}" in
             edit) linux_agent_mock_edit_package "${safe_current_request}" ;;
-            repair) linux_agent_mock_repair_plan "${safe_request_context}" ;;
+            repair) linux_agent_mock_repair_plan "${payload_context}" ;;
             *) linux_agent_mock_work_plan "${safe_current_request}" ;;
         esac
         return 0
@@ -389,7 +385,7 @@ linux_agent_call_ai_with_context() {
         linux_agent_print_warn "模型 JSON 内容无效，改用 Mock 响应兜底。"
         case "${purpose}" in
             edit) linux_agent_mock_edit_package "${safe_current_request}" ;;
-            repair) linux_agent_mock_repair_plan "${safe_request_context}" ;;
+            repair) linux_agent_mock_repair_plan "${payload_context}" ;;
             *) linux_agent_mock_work_plan "${safe_current_request}" ;;
         esac
         return 0

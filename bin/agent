@@ -51,6 +51,7 @@ linux_agent_finish_run() {
         LINUX_AGENT_COMMAND_FINISHED=1
     fi
     linux_agent_finish_session "${final_status}"
+    linux_agent_cleanup_tmp_dir
 }
 
 linux_agent_status_for_exit_code() {

@@ -4,25 +4,60 @@ set -euo pipefail
 
 LINUX_AGENT_ROOT=""
 LINUX_AGENT_LOG_DIR=""
-LINUX_AGENT_SESSION_DIR=""
 LINUX_AGENT_CONFIG_FILE=""
 LINUX_AGENT_SKILLS_DIR=""
+LINUX_AGENT_TMP_ROOT=""
 LINUX_AGENT_TMP_DIR=""
 
 linux_agent_init_env() {
     local root_dir="$1"
     LINUX_AGENT_ROOT="${root_dir}"
     LINUX_AGENT_LOG_DIR="${root_dir}/logs"
-    LINUX_AGENT_SESSION_DIR="${root_dir}/sessions"
     LINUX_AGENT_CONFIG_FILE="${root_dir}/config/config.json"
     LINUX_AGENT_SKILLS_DIR="${root_dir}/skills"
-    LINUX_AGENT_TMP_DIR="${root_dir}/tmp"
+    LINUX_AGENT_TMP_ROOT="${root_dir}/tmp"
+    LINUX_AGENT_TMP_DIR="${LINUX_AGENT_TMP_ROOT}"
 
     mkdir -p \
         "${LINUX_AGENT_LOG_DIR}" \
         "${LINUX_AGENT_SKILLS_DIR}" \
-        "${LINUX_AGENT_TMP_DIR}" \
+        "${LINUX_AGENT_TMP_ROOT}" \
         "${root_dir}/config"
+}
+
+linux_agent_use_session_tmp_dir() {
+    local scope="$1"
+    local safe_scope
+
+    [[ -n "${LINUX_AGENT_TMP_ROOT:-}" ]] || return 0
+    safe_scope="$(printf '%s' "${scope}" | tr -c 'A-Za-z0-9_.-' '_' | cut -c 1-80)"
+    [[ -n "${safe_scope}" ]] || safe_scope="process_$$"
+    LINUX_AGENT_TMP_DIR="${LINUX_AGENT_TMP_ROOT}/${safe_scope}"
+    mkdir -p "${LINUX_AGENT_TMP_DIR}"
+}
+
+linux_agent_cleanup_tmp_dir() {
+    local tmp_dir="${LINUX_AGENT_TMP_DIR:-}"
+    local tmp_root="${LINUX_AGENT_TMP_ROOT:-${LINUX_AGENT_ROOT:-}/tmp}"
+    local resolved_tmp resolved_root
+
+    [[ -n "${tmp_dir}" && -n "${tmp_root}" ]] || return 0
+
+    resolved_tmp="$(readlink -f "${tmp_dir}" 2>/dev/null || true)"
+    resolved_root="$(readlink -f "${tmp_root}" 2>/dev/null || true)"
+    [[ -n "${resolved_tmp}" && -n "${resolved_root}" ]] || return 0
+
+    if [[ "${resolved_tmp}" == "/" || ( "${resolved_tmp}" != "${resolved_root}" && "${resolved_tmp}" != "${resolved_root}/"* ) ]]; then
+        linux_agent_print_warn "跳过临时目录清理，路径不在项目 tmp 内: ${tmp_dir}"
+        return 0
+    fi
+
+    if [[ "${resolved_tmp}" == "${resolved_root}" ]]; then
+        mkdir -p "${resolved_tmp}"
+        find "${resolved_tmp}" -mindepth 1 -maxdepth 1 -exec rm -rf -- {} + 2>/dev/null || true
+    else
+        rm -rf -- "${resolved_tmp}" 2>/dev/null || true
+    fi
 }
 
 linux_agent_print_info() {

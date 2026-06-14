@@ -593,17 +593,15 @@ linux_agent_request_revised_work_plan() {
         --arg mode "work_revision" \
         --arg current_request "${revision_request}" \
         --argjson conversation_context "$(linux_agent_history_window)" \
-        --argjson environment_context "$(linux_agent_sanitize_json "${revision_context}")" \
         '{
             mode:$mode,
             conversation_context:$conversation_context,
-            current_request:$current_request,
-            environment_context:$environment_context
+            current_request:$current_request
         }')"
 
     linux_agent_log_event "work_revision_requested" "${revision_context}"
     linux_agent_record_ai_request_files "${request_context}"
-    revised_plan="$(linux_agent_call_ai_with_context "${revision_request}" "${request_context}" "work_plan")"
+    revised_plan="$(linux_agent_call_ai_with_context "${revision_request}" "${request_context}" "work_plan" "${revision_context}")"
     revised_plan="$(linux_agent_normalize_model_response "${revised_plan}")"
     if ! linux_agent_validate_work_response "${revised_plan}" || [[ "$(jq -r '.response_type // empty' <<<"${revised_plan}")" != "work_plan" ]]; then
         jq -cn --arg error "模型未返回可执行的续写工作计划。" --argjson raw "${revised_plan}" \
@@ -777,17 +775,4 @@ linux_agent_execute_work_plan() {
 
     jq -cn --arg status "${status}" --arg execution_user "${execution_user}" --arg sudo_probe "${sudo_probe}" --argjson results "${results}" \
         '{status:$status, execution_user:$execution_user, sudo_probe:$sudo_probe, results:$results}'
-}
-
-linux_agent_execute_response() {
-    local response_json="$1"
-    local plan_json
-
-    plan_json="$(linux_agent_normalize_model_response "${response_json}")"
-    if [[ "$(jq -r '.response_type // empty' <<<"${plan_json}")" != "work_plan" ]]; then
-        jq -cn '{status:"answered", results:[]}'
-        return 0
-    fi
-
-    linux_agent_execute_work_plan "${plan_json}" "$(jq -r '.summary // "work-plan"' <<<"${plan_json}")"
 }

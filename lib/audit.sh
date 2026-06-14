@@ -113,7 +113,8 @@ linux_agent_audit_safe_summary() {
                 conversation_turns:(if (.conversation_context? | type) == "array" then (.conversation_context | length) else 0 end),
                 environment_keys:(if (.environment_context? | type) == "object" then (.environment_context | keys) else [] end),
                 skill_index_chars:(.skill_index // "" | length),
-                fixed_context_excluded:(has("skill_index") | not)
+                fixed_context_excluded:(has("skill_index") | not),
+                runtime_context_excluded:(has("environment_context") | not)
             }
         elif ($stage == "planned" or $stage == "repair_planned" or $stage == "revision_planned") then
             {
@@ -236,6 +237,9 @@ linux_agent_start_session() {
     fi
 
     LINUX_AGENT_SESSION_ID="$(linux_agent_new_session_id)"
+    if declare -F linux_agent_use_session_tmp_dir >/dev/null 2>&1; then
+        linux_agent_use_session_tmp_dir "${LINUX_AGENT_SESSION_ID}"
+    fi
     LINUX_AGENT_AUDIT_LOG="${LINUX_AGENT_LOG_DIR}/${LINUX_AGENT_SESSION_ID}.jsonl"
     LINUX_AGENT_SESSION_ACTIVE=1
     LINUX_AGENT_SESSION_FINISHED=0
@@ -263,10 +267,6 @@ linux_agent_log_event() {
         --arg stage "${stage}" \
         --argjson payload "${safe_payload}" \
         '{timestamp:$ts, session_id:$session_id, stage:$stage, payload:$payload}' >> "${LINUX_AGENT_AUDIT_LOG}"
-}
-
-linux_agent_append_session_note() {
-    :
 }
 
 linux_agent_log_step_status() {
