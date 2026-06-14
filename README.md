@@ -49,32 +49,62 @@ REPL 内部命令：
 
 ## 配置
 
-首次运行时，如果 `config/config.json` 不存在，`lib/config.sh` 会从 `config/config.example.json` 复制一份。
+首次运行时，如果 `config/config.json` 不存在，`lib/config.sh` 会从 `config/config.example.json` 复制一份。实际运行只读取 `config/config.json`，示例文件只作为模板。
 
-| 字段 | 默认值 | 作用 |
+最小可用配置通常只需要改三项：
+
+```json
+{
+  "api_url": "https://api.openai.com/v1/chat/completions",
+  "api_key": "你的密钥",
+  "model": "gpt-4.1-mini"
+}
+```
+
+### 配置文件开关
+
+| 字段 | 默认值 | 有效值 | 作用 |
+| --- | --- | --- | --- |
+| `provider` | `OpenAI-Compatible` | 任意字符串 | 配置说明字段，当前运行逻辑不根据它分支。 |
+| `api_url` | `https://api.openai.com/v1/chat/completions` | Chat Completions 兼容 URL | AI 请求地址。支持 OpenAI-compatible 接口。 |
+| `api_key` | `please-set-your-api-key` | 非空字符串 | API 密钥。本地 `config/config.json` 被 `.gitignore` 忽略；占位值会触发 mock 兜底。 |
+| `model` | `gpt-4.1-mini` | 接口支持的模型名 | AI 请求中的 `model`。 |
+| `request_timeout_sec` | `90` | 正整数 | `curl --max-time` 超时时间；请求失败会退回 mock 响应。 |
+| `context_turns` | `6` | 非负整数 | 发送给 AI 的历史轮数窗口；`0` 表示不带历史。 |
+| `audit_mode` | `safe_summary` | `safe_summary`、`redacted_verbose` | JSONL 审计写入模式。未知值会按 `safe_summary` 处理。 |
+| `audit_text_limit` | `1000` | 正整数 | 审计、上下文、输出预览的脱敏后文本截断长度。 |
+| `observer.enabled` | `auto` | `auto`、`disabled` | observer 总开关。`auto` 会尝试启用 auditd；失败只记录降级事件。 |
+| `observer.backend` | `auditd` | 当前仅 `auditd` | 模板说明字段；当前实现固定使用 auditd。 |
+| `observer.mode` | `observe` | 当前仅 `observe` | 模板说明字段；当前 observer 只观察和汇总，不阻断业务执行。 |
+| `observer.lifecycle` | `session` | 当前仅 `session` | 模板说明字段；当前按运行级会话启动、结束和汇总。 |
+| `observer.privilege` | `sudo_interactive` | `sudo_interactive`、`passwordless`、`none` | 非 root 用户启用 auditd observer 时的 sudo 策略。 |
+| `observer.auditd_rule_mode` | `temporary` | 当前仅 `temporary` | 模板说明字段；当前只安装临时 auditd 规则，结束时清理。 |
+| `observer.max_events` | `200` | 正整数 | `ausearch` 结果解析后保留的事件样本上限；非法值回退到 `200`。 |
+| `skills_dir` | 空字符串 | 目录路径或空字符串 | 自定义 skill 根目录；留空使用项目内 `skills/`。 |
+| `remote_script_policy` | `download_review` | `download_review`、`disabled` | 远程脚本步骤策略。`download_review` 表示只允许 HTTPS 下载后预览、哈希和审批；`disabled` 表示完全禁用。 |
+
+`test_config.sh` 可以检查这些配置：
+
+```bash
+bash test_config.sh
+bash test_config.sh --live
+```
+
+默认检查不会访问网络；`--live` 会用 `config.json` 中的 `api_url`、`model` 和 `api_key` 发送一次最小请求。
+
+### 环境变量开关
+
+| 变量 | 示例 | 作用 |
 | --- | --- | --- |
-| `provider` | `OpenAI-Compatible` | 配置说明字段。 |
-| `api_url` | OpenAI Chat Completions URL | Chat Completions 兼容接口地址。 |
-| `api_key` | 占位值 | API 密钥；本地 `config/config.json` 被 `.gitignore` 忽略。 |
-| `model` | `gpt-4.1-mini` | 调用的模型名。 |
-| `request_timeout_sec` | `90` | AI 请求超时时间。 |
-| `context_turns` | `6` | 上传给 AI 的历史会话轮数；`0` 表示不带历史。 |
-| `audit_mode` | `safe_summary` | 审计写入模式：`safe_summary` 或 `redacted_verbose`。 |
-| `audit_text_limit` | `1000` | 审计自由文本截断长度。 |
-| `observer.enabled` | `auto` | observer 开关：`auto` 或 `disabled`。 |
-| `observer.lifecycle` | `session` | observer 生命周期；当前按会话启动和汇总。 |
-| `observer.privilege` | `sudo_interactive` | observer 提权策略：`sudo_interactive`、`passwordless`、`none`。 |
-| `observer.max_events` | `200` | observer 会话报告中的事件样本上限。 |
-| `skills_dir` | 空字符串 | 自定义 skill 目录；留空使用项目内 `skills/`。 |
-| `remote_script_policy` | `download_review` | 远程脚本策略：`download_review` 或 `disabled`。 |
+| `EDITOR` | `EDITOR=nano` | 编辑模式打开脚本确认文件时使用的编辑器。未设置时只回退到 `vi`；当前不读取 `VISUAL`。 |
+| `LINUX_AGENT_OUTPUT_JSON` | `LINUX_AGENT_OUTPUT_JSON=1` | 将 `work`、`script`、`terminal`、`edit` 的最终输出切换为机器可读 JSON。 |
+| `LINUX_AGENT_MOCK` | `LINUX_AGENT_MOCK=1` | 不调用真实 AI API，使用内置 mock 响应，适合测试流程。 |
 
-环境变量：
+内部运行状态变量如 `LINUX_AGENT_TMP_DIR`、`LINUX_AGENT_SESSION_ID`、`LINUX_AGENT_AUDIT_LOG`、`LINUX_AGENT_FORCE_PLAN` 由程序自己设置，不建议作为外部配置入口。
 
-| 变量 | 作用 |
-| --- | --- |
-| `LINUX_AGENT_OUTPUT_JSON=1` | 将 work、script、terminal、edit 的最终输出切换为机器可读 JSON。 |
-| `LINUX_AGENT_MOCK=1` | 不调用真实 AI API，使用内置 mock 响应验证流程。 |
-| `EDITOR=<命令>` | 编辑模式打开脚本确认/修改时使用的编辑器。 |
+
+
+
 
 ## 总体运行逻辑
 
@@ -113,7 +143,7 @@ REPL 内部命令：
 6. 如果返回 `work_plan`，`lib/executor.sh` 展示计划并逐步执行。
 7. 每个步骤先经过 `lib/policy.sh` 正则审查。
 8. 用户可选择执行、拒绝、跳过/修改或终止。
-9. 步骤执行通过 observer wrapper 运行，写入 `execution_started` / `execution_finished`。
+9. 步骤执行通过 observer 执行封装运行，写入 `execution_started` / `execution_finished`。
 10. 步骤失败时中断当前计划，请 AI 生成修复建议；修复建议不会自动执行。
 
 支持的步骤执行器：
