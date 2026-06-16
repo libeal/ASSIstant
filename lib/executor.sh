@@ -2,6 +2,15 @@
 
 set -euo pipefail
 
+linux_agent_api_read_input_line() {
+    return 1
+}
+
+linux_agent_api_has_pending_decision_lines() {
+    [[ "${LINUX_AGENT_API_MODE:-0}" == "1" ]] || return 1
+    jq -e 'type == "array" and length > 0' <<<"${LINUX_AGENT_API_INPUT_JSON:-[]}" >/dev/null 2>&1
+}
+
 linux_agent_probe_sudo() {
     if ! command -v sudo >/dev/null 2>&1; then
         printf 'unavailable\n'
@@ -19,6 +28,11 @@ linux_agent_probe_sudo() {
 
 linux_agent_confirm_execution() {
     local prompt="$1"
+    local api_answer=""
+    if linux_agent_api_read_input_line api_answer; then
+        [[ "${api_answer}" =~ ^[Yy]$ ]]
+        return $?
+    fi
     printf '%s [y/N]: ' "${prompt}" >&2
     local answer=""
     IFS= read -r answer || true
@@ -72,8 +86,16 @@ linux_agent_prompt_step_decision() {
     local answer=""
 
     while true; do
-        printf '%s [y/n/s/t]: ' "${prompt}" >&2
-        IFS= read -r answer || true
+        if [[ "${LINUX_AGENT_API_MODE:-0}" == "1" ]] && ! linux_agent_api_has_pending_decision_lines; then
+            printf -v "${result_var}" '%s' "approval_required"
+            return 0
+        fi
+        if linux_agent_api_read_input_line answer; then
+            :
+        else
+            printf '%s [y/n/s/t]: ' "${prompt}" >&2
+            IFS= read -r answer || true
+        fi
         case "${answer,,}" in
             y|yes)
                 printf -v "${result_var}" '%s' "approve"
@@ -91,7 +113,15 @@ linux_agent_prompt_step_decision() {
                 printf -v "${result_var}" '%s' "terminate"
                 return 0
                 ;;
+            approval_required)
+                printf -v "${result_var}" '%s' "approval_required"
+                return 0
+                ;;
             *)
+                if [[ "${LINUX_AGENT_API_MODE:-0}" == "1" ]]; then
+                    printf -v "${result_var}" '%s' "reject"
+                    return 0
+                fi
                 printf '请输入 y 执行、n 拒绝、s 跳过/修改、t 终止。\n' >&2
                 ;;
         esac
@@ -103,6 +133,10 @@ linux_agent_prompt_revision_request() {
     local result_var="$2"
     local request=""
 
+    if linux_agent_api_read_input_line request; then
+        printf -v "${result_var}" '%s' "${request}"
+        return 0
+    fi
     printf '%s' "${prompt}" >&2
     IFS= read -r request || true
     printf -v "${result_var}" '%s' "${request}"
@@ -606,6 +640,18 @@ linux_agent_request_repair_plan() {
     linux_agent_record_ai_request_files "${failure_context}"
     repair="$(linux_agent_call_ai_with_context "生成回滚或报错解决方案" "${failure_context}" "repair")"
     repair="$(linux_agent_normalize_model_response "${repair}")"
+    if linux_agent_ai_response_is_error "${repair}"; then
+        linux_agent_log_event "repair_failed" "${repair}"
+        printf '\n# 回滚或修复建议\n' >&2
+        printf '无法生成修复建议: %s\n' "$(linux_agent_ai_error_text "${repair}")" >&2
+        return 0
+    fi
+    if ! linux_agent_validate_work_response "${repair}" || [[ "$(jq -r '.response_type // empty' <<<"${repair}")" != "work_plan" ]]; then
+        linux_agent_log_event "repair_invalid_response" "${repair}"
+        printf '\n# 回滚或修复建议\n' >&2
+        printf '无法生成修复建议: 模型响应不符合 work_plan schema。\n' >&2
+        return 0
+    fi
     linux_agent_log_event "repair_planned" "${repair}"
     printf '\n# 回滚或修复建议（不会自动执行）\n' >&2
     printf '%s\n' "$(jq . <<<"${repair}")" >&2
@@ -735,7 +781,7 @@ linux_agent_execute_work_plan() {
         if [[ "$(jq -r '.approval_required' <<<"${review}")" == "true" ]]; then
             printf '审查风险: %s，发现项: %s\n' "$(jq -r '.risk_level' <<<"${review}")" "$(jq '.findings | length' <<<"${review}")" >&2
         fi
-        if linux_agent_should_auto_execute_step "${step}" "${review}"; then
+        if linux_agent_should_auto_execute_step "${step}" "${review}" && ! linux_agent_api_has_pending_decision_lines; then
             step_decision="approve"
             auto_approved=1
             linux_agent_log_step_status "${step}" "auto_approved" "${review}"
@@ -744,6 +790,18 @@ linux_agent_execute_work_plan() {
             linux_agent_prompt_step_decision "批准执行该步骤？" step_decision
         fi
         case "${step_decision}" in
+            approval_required)
+                linux_agent_log_step_status "${step}" "approval_required" "${review}"
+                jq -cn \
+                    --arg status "approval_required" \
+                    --arg execution_user "${execution_user}" \
+                    --arg sudo_probe "${sudo_probe}" \
+                    --argjson approval_step "${step}" \
+                    --argjson review "${review}" \
+                    --argjson results "${results}" \
+                    '{status:$status, execution_user:$execution_user, sudo_probe:$sudo_probe, approval_step:$approval_step, review:$review, results:$results}'
+                return 0
+                ;;
             reject)
                 linux_agent_log_step_status "${step}" "rejected"
                 skipped="$(linux_agent_skipped_steps_after "${plan_json}" "${i}")"

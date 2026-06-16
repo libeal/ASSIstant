@@ -3,16 +3,19 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-export LINUX_AGENT_MOCK=1
+# shellcheck source=helpers.sh
+source "${ROOT_DIR}/tests/helpers.sh"
 
 tmp_root="$(mktemp -d)"
 cleanup() {
+    stop_fake_ai_server
     if [[ -n "${THINKING_SESSION_ID:-}" ]]; then
         rm -rf "/tmp/${THINKING_SESSION_ID}"
     fi
     rm -rf "${tmp_root}"
 }
 trap cleanup EXIT
+start_fake_ai_server "$((21000 + RANDOM % 1000))" "${tmp_root}"
 
 copy_project() {
     local target="$1"
@@ -25,6 +28,7 @@ copy_project() {
         "${ROOT_DIR}/prompts" \
         "${ROOT_DIR}/skills" \
         "${target}/"
+    configure_fake_ai "${target}"
 }
 
 assert_single_run_session() {
@@ -46,7 +50,7 @@ assert_ai_file_manifest() {
     local project="${tmp_root}/session-ai-files"
     local log_file
     copy_project "${project}"
-    (cd "${project}" && LINUX_AGENT_MOCK=1 bash bin/agent plan "帮我检查磁盘空间是否异常" >/dev/null 2>&1)
+    (cd "${project}" && bash bin/agent work "查看cpu占用,内存环境" >/dev/null 2>&1)
     log_file="$(find "${project}/logs" -name '*.jsonl' -print -quit)"
     grep -q '"stage":"ai_files_manifest"' "${log_file}"
     grep -q '"relative_path":"skills/INDEX.md"' "${log_file}"
@@ -65,7 +69,7 @@ assert_thinking_trace() {
         tmp_config="$(mktemp)"
         jq '.agent_loop.thinking_trace_enabled=true' config/config.json > "${tmp_config}"
         mv "${tmp_config}" config/config.json
-        LINUX_AGENT_MOCK=1 bash bin/agent work "查看cpu继续深入" >/dev/null 2>&1
+        bash bin/agent work "查看cpu继续深入" >/dev/null 2>&1
     )
     log_file="$(find "${project}/logs" -name '*.jsonl' -print -quit)"
     session_id="$(basename "${log_file}" .jsonl)"
@@ -80,7 +84,7 @@ assert_simple_plan_skips_reflection() {
     local project="${tmp_root}/simple-no-reflect"
     local log_file
     copy_project "${project}"
-    (cd "${project}" && LINUX_AGENT_MOCK=1 bash bin/agent work "查看cpu占用,内存环境" >/dev/null 2>&1)
+    (cd "${project}" && bash bin/agent work "查看cpu占用,内存环境" >/dev/null 2>&1)
     log_file="$(find "${project}/logs" -name '*.jsonl' -print -quit)"
     ! grep -q '"stage":"agent_reflection_requested"' "${log_file}"
     ! grep -q '"stage":"agent_reflection_planned"' "${log_file}"
@@ -91,7 +95,7 @@ assert_no_default_thinking_trace() {
     local project="${tmp_root}/thinking-default-off"
     local log_file session_id
     copy_project "${project}"
-    (cd "${project}" && LINUX_AGENT_MOCK=1 bash bin/agent work "查看cpu占用,内存环境" >/dev/null 2>&1)
+    (cd "${project}" && bash bin/agent work "查看cpu占用,内存环境" >/dev/null 2>&1)
     log_file="$(find "${project}/logs" -name '*.jsonl' -print -quit)"
     session_id="$(basename "${log_file}" .jsonl)"
     [[ ! -e "/tmp/${session_id}/thinking" ]]
@@ -106,22 +110,27 @@ assert_checkpoint_stop() {
         tmp_config="$(mktemp)"
         jq '.agent_loop.checkpoint_turns=1' config/config.json > "${tmp_config}"
         mv "${tmp_config}" config/config.json
-        LINUX_AGENT_MOCK=1 bash bin/agent work "查看cpu继续深入" <<< $'n\n' 2>&1
+        bash bin/agent work "查看cpu继续深入" <<< $'n\n' 2>&1
     )"
     grep -q '允许继续深入' <<<"${output}"
     grep -q '工作流执行完成: status=checkpoint_stopped' <<<"${output}"
 }
 
-output="$(bash "${ROOT_DIR}/bin/agent" work "帮我检查磁盘空间是否异常" <<< $'y\ny\n' 2>&1)"
-plan_output="$(bash "${ROOT_DIR}/bin/agent" plan "帮我检查磁盘空间是否异常")"
+project_main="${tmp_root}/main-work"
+copy_project "${project_main}"
+output="$(cd "${project_main}" && bash bin/agent work "帮我检查磁盘空间是否异常" <<< $'y\ny\n' 2>&1)"
+plan_removed_output="$(bash "${ROOT_DIR}/bin/agent" plan "帮我检查磁盘空间是否异常" 2>&1 || true)"
 script_output="$(bash "${ROOT_DIR}/bin/agent" script ops-basic/resource-inspect '{"top_n":1}' <<< $'y\n' 2>&1)"
-json_output="$(LINUX_AGENT_OUTPUT_JSON=1 bash "${ROOT_DIR}/bin/agent" work "查看cpu占用,内存环境" 2>/dev/null)"
+project_json="${tmp_root}/json-work"
+copy_project "${project_json}"
+json_output="$(cd "${project_json}" && LINUX_AGENT_OUTPUT_JSON=1 bash bin/agent work "查看cpu占用,内存环境" 2>/dev/null)"
 script_json_output="$(LINUX_AGENT_OUTPUT_JSON=1 bash "${ROOT_DIR}/bin/agent" script ops-basic/resource-inspect '{"top_n":1}' <<< $'y\n' 2>/dev/null)"
 tools_output="$(bash "${ROOT_DIR}/bin/agent" tools list)"
 
 grep -q '工作流执行完成: status=executed' <<<"${output}"
 grep -q '步骤输出' <<<"${output}"
-grep -q '# 工作计划' <<<"${plan_output}"
+grep -q '# 工作计划' <<<"${output}"
+grep -q '未知命令: plan' <<<"${plan_removed_output}"
 grep -q '脚本执行结果: 成功' <<<"${script_output}"
 grep -q '系统负载' <<<"${script_output}"
 grep -q '"status": "executed"' <<<"${json_output}"

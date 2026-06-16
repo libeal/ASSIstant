@@ -3,43 +3,74 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-export LINUX_AGENT_MOCK=1
+# shellcheck source=helpers.sh
+source "${ROOT_DIR}/tests/helpers.sh"
 
-failure_output="$(bash "${ROOT_DIR}/bin/agent" work "请演示失败中断" <<< $'y\n' 2>&1)"
+tmp_root="$(mktemp -d)"
+cleanup() {
+    stop_fake_ai_server
+    rm -rf "${tmp_root}"
+}
+trap cleanup EXIT
+start_fake_ai_server "$((22000 + RANDOM % 1000))" "${tmp_root}"
+
+copy_project() {
+    local target="$1"
+    mkdir -p "${target}"
+    cp -a \
+        "${ROOT_DIR}/bin" \
+        "${ROOT_DIR}/config" \
+        "${ROOT_DIR}/lib" \
+        "${ROOT_DIR}/policies" \
+        "${ROOT_DIR}/prompts" \
+        "${ROOT_DIR}/skills" \
+        "${target}/"
+    configure_fake_ai "${target}"
+}
+
+run_agent_cmd() {
+    local name="$1"
+    shift
+    local project="${tmp_root}/${name}"
+    copy_project "${project}"
+    (cd "${project}" && "$@")
+}
+
+failure_output="$(run_agent_cmd failure bash bin/agent work "请演示失败中断" <<< $'y\n' 2>&1)"
 grep -q '工作流执行完成: status=failed' <<<"${failure_output}"
 grep -q '步骤执行结果: 失败' <<<"${failure_output}"
 grep -q '回滚或修复建议' <<<"${failure_output}"
 
-blocked_output="$(bash "${ROOT_DIR}/bin/agent" work "帮我检查磁盘空间是否异常" <<< $'n\n' 2>&1)"
+blocked_output="$(run_agent_cmd blocked bash bin/agent work "帮我检查磁盘空间是否异常" <<< $'n\n' 2>&1)"
 grep -q '工作流执行完成: status=rejected' <<<"${blocked_output}"
 
-skip_empty_output="$(bash "${ROOT_DIR}/bin/agent" work "帮我检查磁盘空间是否异常" <<< $'s\n\ny\n' 2>&1)"
+skip_empty_output="$(run_agent_cmd skip-empty bash bin/agent work "帮我检查磁盘空间是否异常" <<< $'s\n\ny\n' 2>&1)"
 grep -q '已跳过当前步骤' <<<"${skip_empty_output}"
 grep -q '工作流执行完成: status=executed' <<<"${skip_empty_output}"
 
-skip_json_output="$(LINUX_AGENT_OUTPUT_JSON=1 bash "${ROOT_DIR}/bin/agent" work "帮我检查磁盘空间是否异常" <<< $'s\n\ny\n' 2>/dev/null)"
+skip_json_output="$(run_agent_cmd skip-json env LINUX_AGENT_OUTPUT_JSON=1 bash bin/agent work "帮我检查磁盘空间是否异常" <<< $'s\n\ny\n' 2>/dev/null)"
 grep -q '"status": "executed"' <<<"${skip_json_output}"
 grep -q '"status": "skipped"' <<<"${skip_json_output}"
 grep -q '"action": "skipped_by_user"' <<<"${skip_json_output}"
 
-revision_output="$(bash "${ROOT_DIR}/bin/agent" work "帮我检查磁盘空间是否异常" <<< $'s\n查看cpu占用\ny\n' 2>&1)"
+revision_output="$(run_agent_cmd revision bash bin/agent work "帮我检查磁盘空间是否异常" <<< $'s\n查看cpu占用\ny\n' 2>&1)"
 grep -q '根据修改需求生成续写计划' <<<"${revision_output}"
 grep -q '系统负载' <<<"${revision_output}"
 grep -q '工作流执行完成: status=executed' <<<"${revision_output}"
 
-terminated_output="$(bash "${ROOT_DIR}/bin/agent" work "请演示失败中断" <<< $'t\n' 2>&1)"
+terminated_output="$(run_agent_cmd terminated bash bin/agent work "请演示失败中断" <<< $'t\n' 2>&1)"
 grep -q '工作流执行完成: status=terminated' <<<"${terminated_output}"
 ! grep -q '步骤输出' <<<"${terminated_output}"
 
 invalid_script="$(bash "${ROOT_DIR}/bin/agent" script /tmp/not-allowed.sh '{}' 2>&1 || true)"
 grep -q '脚本状态: blocked' <<<"${invalid_script}"
 
-quiet_output="$(bash "${ROOT_DIR}/bin/agent" work "帮我检查磁盘空间是否异常" <<< $'y\ny\n' 2>&1)"
+quiet_output="$(run_agent_cmd quiet bash bin/agent work "帮我检查磁盘空间是否异常" <<< $'y\ny\n' 2>&1)"
 grep -q '工作流执行完成: status=executed' <<<"${quiet_output}"
 grep -q '步骤输出' <<<"${quiet_output}"
 ! grep -q '输出摘要（已脱敏' <<<"${quiet_output}"
 
-resource_output="$(bash "${ROOT_DIR}/bin/agent" work "查看cpu占用,内存环境" 2>&1)"
+resource_output="$(run_agent_cmd resource bash bin/agent work "查看cpu占用,内存环境" 2>&1)"
 grep -q '工作流执行完成: status=executed' <<<"${resource_output}"
 grep -q '系统负载' <<<"${resource_output}"
 grep -q '内存' <<<"${resource_output}"
@@ -47,19 +78,19 @@ grep -q '低风险步骤已自动批准执行' <<<"${resource_output}"
 ! grep -q '"ok": true' <<<"${resource_output}"
 ! grep -q '"tool"' <<<"${resource_output}"
 
-json_output="$(LINUX_AGENT_OUTPUT_JSON=1 bash "${ROOT_DIR}/bin/agent" work "查看cpu占用,内存环境" 2>/dev/null)"
+json_output="$(run_agent_cmd json env LINUX_AGENT_OUTPUT_JSON=1 bash bin/agent work "查看cpu占用,内存环境" 2>/dev/null)"
 grep -q '"status": "executed"' <<<"${json_output}"
 grep -q '"tool": "system.resource.inspect"' <<<"${json_output}"
 grep -q '"auto_executed_count": 1' <<<"${json_output}"
 grep -q '"final_answer": ""' <<<"${json_output}"
 grep -q '"stopped_reason": "资源检查 skill 的预期输出已经满足当前请求，执行成功后无需再次反思。"' <<<"${json_output}"
 
-continue_output="$(bash "${ROOT_DIR}/bin/agent" work "查看cpu继续深入" 2>&1)"
+continue_output="$(run_agent_cmd continue bash bin/agent work "查看cpu继续深入" 2>&1)"
 grep -q '工作流执行完成: status=executed' <<<"${continue_output}"
 grep -q '补充查看 CPU 与内存资源概况' <<<"${continue_output}"
 [[ "$(grep -c '低风险步骤已自动批准执行' <<<"${continue_output}")" -ge 2 ]]
 
-invalid_reflect_output="$(bash "${ROOT_DIR}/bin/agent" work "查看cpu 非法继续决策" 2>&1)"
+invalid_reflect_output="$(run_agent_cmd invalid-reflect bash bin/agent work "查看cpu 非法继续决策" 2>&1)"
 grep -q '模型反思响应缺少合法 continue_decision' <<<"${invalid_reflect_output}"
 grep -q '工作流执行完成: status=executed' <<<"${invalid_reflect_output}"
 

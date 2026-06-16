@@ -96,6 +96,9 @@ linux_agent_audit_mode() {
 
     case "${mode}" in
         safe_summary|redacted_verbose)
+            if declare -F linux_agent_audit_boundary_payload_mode >/dev/null 2>&1; then
+                mode="$(linux_agent_audit_boundary_payload_mode "${mode}")"
+            fi
             printf '%s\n' "${mode}"
             ;;
         *)
@@ -111,6 +114,9 @@ linux_agent_audit_text_limit() {
     fi
     if [[ ! "${limit}" =~ ^[0-9]+$ || "${limit}" -le 0 ]]; then
         limit=1000
+    fi
+    if declare -F linux_agent_audit_boundary_text_limit >/dev/null 2>&1; then
+        limit="$(linux_agent_audit_boundary_text_limit "${limit}")"
     fi
     printf '%s\n' "${limit}"
 }

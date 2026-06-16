@@ -101,241 +101,30 @@ linux_agent_record_ai_request_files() {
     [[ -n "${skill_index_path}" ]] && linux_agent_record_ai_file "${skill_index_path}" "skill_index" "system_prompt_appendix"
 }
 
-linux_agent_mock_work_plan() {
-    local user_input="$1"
-    if [[ "${user_input}" == *"失败"* ]]; then
-        jq -cn '
-            {
-              response_type:"work_plan",
-              summary:"演示失败中断：先执行一个会失败的命令，随后计划中的步骤应被标记为未执行。",
-              continue_decision:{should_continue:true, reason:"该演示计划预期失败，执行后需要根据失败结果生成后续判断。"},
-              steps:[
-                {
-                  id:"step-1",
-                  title:"执行失败演示命令",
-                  executor_type:"shell",
-                  command:"false",
-                  arguments:{},
-                  reason:"用于验证失败后中断和修复计划请求。",
-                  expected_effect:"命令返回非 0，当前计划中断。",
-                  risk_level:"low",
-                  rollback_hint:"无需回滚。"
-                },
-                {
-                  id:"step-2",
-                  title:"不应执行的后续步骤",
-                  executor_type:"skill_script",
-                  skill_script:"ops-basic/process-inspect",
-                  arguments:{pattern:"systemd"},
-                  reason:"验证未执行步骤状态。",
-                  expected_effect:"该步骤不应展示执行。",
-                  risk_level:"low",
-                  rollback_hint:"无需回滚。"
-                }
-              ]
-            }
-        '
-    elif [[ "${user_input}" == *"cpu"* || "${user_input}" == *"CPU"* || "${user_input}" == *"内存"* || "${user_input}" == *"memory"* || "${user_input}" == *"资源"* || "${user_input}" == *"负载"* ]]; then
-        local should_continue=false
-        local continue_reason="资源检查 skill 的预期输出已经满足当前请求，执行成功后无需再次反思。"
-        if [[ "${user_input}" == *"继续深入"* || "${user_input}" == *"非法继续决策"* ]]; then
-            should_continue=true
-            continue_reason="该测试请求明确要求继续深入，执行第一轮资源检查后需要反思下一步。"
-        fi
-        jq -cn --argjson should_continue "${should_continue}" --arg continue_reason "${continue_reason}" '
-            {
-              response_type:"work_plan",
-              summary:"使用受控资源检查 skill 查看 CPU、内存与高占用进程。",
-              continue_decision:{should_continue:$should_continue, reason:$continue_reason},
-              steps:[
-                {
-                  id:"step-1",
-                  title:"查看 CPU 与内存资源概况",
-                  executor_type:"skill_script",
-                  skill_script:"ops-basic/resource-inspect",
-                  arguments:{top_n:10},
-                  reason:"通过受控只读 skill 采集 CPU 负载、内存使用和高占用进程，避免自由拼接 shell。",
-                  expected_effect:"返回 CPU/内存概况和资源占用最高的进程列表。",
-                  risk_level:"low",
-                  rollback_hint:"只读操作，无需回滚。"
-                }
-              ]
-            }
-        '
-    elif [[ "${user_input}" == *"磁盘"* || "${user_input}" == *"垃圾"* || "${user_input}" == *"日志"* ]]; then
-        jq -cn '
-            {
-              response_type:"work_plan",
-              summary:"先只读检查磁盘热点和日志候选，再由用户决定是否继续清理。",
-              continue_decision:{should_continue:false, reason:"计划中的磁盘和日志候选检查已覆盖当前请求，执行成功后无需再次反思。"},
-              steps:[
-                {
-                  id:"step-1",
-                  title:"检查磁盘热点",
-                  executor_type:"skill_script",
-                  skill_script:"ops-basic/disk-hotspots",
-                  arguments:{path:"/var", top_n:10},
-                  reason:"定位大目录和大文件，避免盲目清理。",
-                  expected_effect:"返回 /var 下磁盘占用和日志热点摘要。",
-                  risk_level:"low",
-                  rollback_hint:"只读操作，无需回滚。"
-                },
-                {
-                  id:"step-2",
-                  title:"生成日志清理候选",
-                  executor_type:"skill_script",
-                  skill_script:"ops-basic/log-cleanup-plan",
-                  arguments:{root_path:"/var/log", min_size_mb:100, max_depth:2, limit:20},
-                  reason:"识别可清理日志并排除关键日志。",
-                  expected_effect:"返回候选文件、排除原因和建议清理方式。",
-                  risk_level:"medium",
-                  rollback_hint:"只读扫描，无需回滚。"
-                }
-              ]
-            }
-        '
-    else
-        jq -cn --arg input "${user_input}" '
-            {
-              response_type:"answer",
-              summary:"测试模式下直接返回问答响应。",
-              continue_decision:{should_continue:false, reason:"该请求不需要执行工具。"},
-              answer:("已收到请求：" + $input),
-              steps:[]
-            }
-        '
-    fi
+linux_agent_ai_error() {
+    local status="$1"
+    local message="$2"
+    local detail="${3:-}"
+    jq -cn \
+        --arg status "${status}" \
+        --arg error "${message}" \
+        --arg detail "$(linux_agent_sanitize_text "${detail}" 1000)" \
+        '{
+            ok:false,
+            response_type:"error",
+            status:$status,
+            error:$error
+        } + (if $detail == "" then {} else {detail:$detail} end)'
 }
 
-linux_agent_mock_edit_package() {
-    local user_input="$1"
-    jq -cn --arg request "${user_input}" '
-        {
-          response_type:"skill_edit",
-          skill:{
-            name:"custom-generated",
-            description:"根据用户需求生成的本地运维辅助 skill。"
-          },
-          scripts:[
-            {
-              name:"generated.sh",
-              description:"输出当前请求摘要，作为可审批脚本模板。",
-              content:"#/usr/bin/env bash\nset -euo pipefail\nargs=\"${1:-}\"\n[[ -z \"${args}\" ]] && args='\''{}'\''\nprintf '\''{\"ok\":true,\"tool\":\"custom-generated/generated\",\"args\":%s,\"note\":\"generated skill placeholder\"}\\n'\'' \"${args}\"\n"
-            }
-          ],
-          notes:("mock edit package for: " + $request)
-        }
-    ' | sed 's/#\/usr/#!\/usr/'
+linux_agent_ai_response_is_error() {
+    local response_json="$1"
+    jq -e '(.ok == false) and (.status | type == "string") and (.error | type == "string")' <<<"${response_json}" >/dev/null 2>&1
 }
 
-linux_agent_mock_repair_plan() {
-    local failure_context="$1"
-    jq -cn --arg context "${failure_context}" '
-        {
-          response_type:"work_plan",
-          summary:"当前计划执行失败。建议先保留现场日志，检查失败输出，再重新生成更保守的诊断步骤；该修复计划不会自动执行。",
-          steps:[
-            {
-              id:"repair-1",
-              title:"检查失败输出",
-              executor_type:"shell",
-              command:"printf %s \"$FAILURE_CONTEXT\"",
-              arguments:{},
-              reason:"让用户根据失败上下文做人工判断。",
-              expected_effect:"展示失败上下文摘要。",
-              risk_level:"low",
-              rollback_hint:"无需回滚。"
-            }
-          ],
-          failure_context:$context
-        }
-    '
-}
-
-linux_agent_mock_work_reflect() {
-    local reflection_context="$1"
-    local original_request status iteration has_resource has_disk
-
-    original_request="$(jq -r '.environment_context.agent_observation.original_request // .agent_observation.original_request // .original_request // .current_request // empty' <<<"${reflection_context}" 2>/dev/null || true)"
-    status="$(jq -r '.environment_context.agent_observation.execution.status // .agent_observation.execution.status // .execution.status // empty' <<<"${reflection_context}" 2>/dev/null || true)"
-    iteration="$(jq -r '.environment_context.agent_observation.iteration // .agent_observation.iteration // 1' <<<"${reflection_context}" 2>/dev/null || printf '1')"
-    has_resource="$(jq -r '[.. | objects | .skill_script? // empty] | any(. == "ops-basic/resource-inspect")' <<<"${reflection_context}" 2>/dev/null || printf 'false')"
-    has_disk="$(jq -r '[.. | objects | .skill_script? // empty] | any(. == "ops-basic/disk-hotspots")' <<<"${reflection_context}" 2>/dev/null || printf 'false')"
-
-    if [[ "${original_request}" == *"继续深入"* && "${iteration}" == "1" ]]; then
-        jq -cn '
-            {
-              response_type:"work_plan",
-              summary:"继续深入：补充查看 CPU 与内存资源概况。",
-              continue_decision:{should_continue:false, reason:"补充资源检查的预期输出已经满足继续深入请求，执行成功后无需再次反思。"},
-              thinking_summary:"第一轮结果不足以完成测试场景，因此继续采集资源概况。",
-              steps:[
-                {
-                  id:"reflect-1",
-                  title:"补充查看 CPU 与内存资源概况",
-                  executor_type:"skill_script",
-                  skill_script:"ops-basic/resource-inspect",
-                  arguments:{top_n:5},
-                  reason:"补充系统资源观察，帮助判断当前异常是否与负载有关。",
-                  expected_effect:"返回 CPU、内存与高占用进程摘要。",
-                  risk_level:"low",
-                  rollback_hint:"只读操作，无需回滚。"
-                }
-              ]
-            }
-        '
-        return 0
-    fi
-
-    if [[ "${original_request}" == *"非法继续决策"* ]]; then
-        jq -cn '{response_type:"answer", summary:"缺少 continue_decision 的非法 mock 响应。", answer:"invalid"}'
-        return 0
-    fi
-
-    if [[ "${status}" == "failed" ]]; then
-        jq -cn '
-            {
-              response_type:"answer",
-              summary:"执行失败后停止自动深入。",
-              continue_decision:{should_continue:false, reason:"当前计划已有失败步骤，需要人工查看失败输出后再决定。"},
-              thinking_summary:"失败结果显示当前流程不适合自动继续。",
-              answer:"当前计划执行失败，已保留失败输出和修复建议；请根据输出确认下一步。"
-            }
-        '
-        return 0
-    fi
-
-    if [[ "${has_resource}" == "true" ]]; then
-        jq -cn '
-            {
-              response_type:"answer",
-              summary:"资源检查已完成。",
-              continue_decision:{should_continue:false, reason:"资源检查结果已经足够回答当前请求。"},
-              thinking_summary:"已获得资源 skill 返回的信息，可以结束本轮。",
-              answer:"资源检查已完成，已根据 skill 返回的 CPU、内存和进程摘要结束本轮诊断。"
-            }
-        '
-    elif [[ "${has_disk}" == "true" ]]; then
-        jq -cn '
-            {
-              response_type:"answer",
-              summary:"磁盘检查已完成。",
-              continue_decision:{should_continue:false, reason:"磁盘热点信息已经采集完成；清理类动作需要用户明确批准。"},
-              thinking_summary:"已获得磁盘 skill 返回的信息，后续清理不应自动继续。",
-              answer:"磁盘检查已完成，已根据 skill 返回的磁盘热点摘要结束本轮；如需清理，应先人工确认候选项。"
-            }
-        '
-    else
-        jq -cn --arg status "${status:-executed}" '
-            {
-              response_type:"answer",
-              summary:"观察已完成。",
-              continue_decision:{should_continue:false, reason:"当前观察结果不足以支持安全的自动下一步，停止深入。"},
-              thinking_summary:"没有发现需要继续自动执行的低风险步骤。",
-              answer:("当前执行状态为 " + $status + "，本轮已停止自动深入。")
-            }
-        '
-    fi
+linux_agent_ai_error_text() {
+    local response_json="$1"
+    jq -r '.error // .status // "AI 调用失败。"' <<<"${response_json}" 2>/dev/null || printf 'AI 调用失败。\n'
 }
 
 linux_agent_validate_work_response() {
@@ -433,24 +222,6 @@ linux_agent_call_ai_with_context() {
     safe_request_context="$(linux_agent_sanitize_json "${request_context}")"
     payload_context="$(linux_agent_build_ai_payload_context "${safe_request_context}" "${runtime_context}")"
 
-    if [[ "${LINUX_AGENT_MOCK:-0}" == "1" ]]; then
-        case "${purpose}" in
-            edit)
-                linux_agent_mock_edit_package "${safe_current_request}"
-                ;;
-            repair)
-                linux_agent_mock_repair_plan "${payload_context}"
-                ;;
-            work_reflect)
-                linux_agent_mock_work_reflect "${payload_context}"
-                ;;
-            *)
-                linux_agent_mock_work_plan "${safe_current_request}"
-                ;;
-        esac
-        return 0
-    fi
-
     local api_url api_key model timeout_sec system_prompt payload response content
     api_url="$(linux_agent_config_get '.api_url')"
     api_key="$(linux_agent_config_get '.api_key')"
@@ -459,13 +230,7 @@ linux_agent_call_ai_with_context() {
     system_prompt="$(linux_agent_build_system_prompt | jq -r '.')"
 
     if [[ -z "${api_url}" || -z "${api_key}" || -z "${model}" || "${api_key}" == "please-set-your-api-key" ]]; then
-        linux_agent_print_warn "配置不完整，自动进入 Mock 模式。"
-        case "${purpose}" in
-            edit) linux_agent_mock_edit_package "${safe_current_request}" ;;
-            repair) linux_agent_mock_repair_plan "${payload_context}" ;;
-            work_reflect) linux_agent_mock_work_reflect "${payload_context}" ;;
-            *) linux_agent_mock_work_plan "${safe_current_request}" ;;
-        esac
+        linux_agent_ai_error "ai_config_missing" "AI 配置不完整，请配置 api_url、api_key 和 model。"
         return 0
     fi
 
@@ -491,37 +256,28 @@ linux_agent_call_ai_with_context() {
         -H "Authorization: Bearer ${api_key}" \
         -H "Content-Type: application/json" \
         -d "${payload}" \
-        "${api_url}")"; then
-        linux_agent_print_warn "模型请求失败，改用 Mock 响应兜底。"
-        case "${purpose}" in
-            edit) linux_agent_mock_edit_package "${safe_current_request}" ;;
-            repair) linux_agent_mock_repair_plan "${payload_context}" ;;
-            work_reflect) linux_agent_mock_work_reflect "${payload_context}" ;;
-            *) linux_agent_mock_work_plan "${safe_current_request}" ;;
-        esac
+        "${api_url}" 2>&1)"; then
+        linux_agent_ai_error "ai_request_failed" "模型请求失败。" "${response}"
         return 0
     fi
 
-    content="$(jq -r '.choices[0].message.content // empty' <<<"${response}")"
+    if ! content="$(jq -r '.choices[0].message.content // empty' <<<"${response}" 2>/dev/null)"; then
+        linux_agent_ai_error "ai_invalid_response" "模型接口返回的响应不是合法 JSON。" "${response}"
+        return 0
+    fi
     if [[ -z "${content}" ]]; then
-        linux_agent_print_warn "模型返回为空，改用 Mock 响应兜底。"
-        case "${purpose}" in
-            edit) linux_agent_mock_edit_package "${safe_current_request}" ;;
-            repair) linux_agent_mock_repair_plan "${payload_context}" ;;
-            work_reflect) linux_agent_mock_work_reflect "${payload_context}" ;;
-            *) linux_agent_mock_work_plan "${safe_current_request}" ;;
-        esac
+        local api_error
+        api_error="$(jq -r '.error.message // empty' <<<"${response}" 2>/dev/null || true)"
+        if [[ -n "${api_error}" ]]; then
+            linux_agent_ai_error "ai_empty_response" "模型返回为空。" "${api_error}"
+        else
+            linux_agent_ai_error "ai_empty_response" "模型返回为空。" "${response}"
+        fi
         return 0
     fi
 
     if ! jq -e . <<<"${content}" >/dev/null 2>&1; then
-        linux_agent_print_warn "模型 JSON 内容无效，改用 Mock 响应兜底。"
-        case "${purpose}" in
-            edit) linux_agent_mock_edit_package "${safe_current_request}" ;;
-            repair) linux_agent_mock_repair_plan "${payload_context}" ;;
-            work_reflect) linux_agent_mock_work_reflect "${payload_context}" ;;
-            *) linux_agent_mock_work_plan "${safe_current_request}" ;;
-        esac
+        linux_agent_ai_error "ai_invalid_json" "模型返回的 content 不是合法 JSON。" "${content}"
         return 0
     fi
 

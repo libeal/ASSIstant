@@ -8,6 +8,333 @@ LINUX_AGENT_SESSION_ACTIVE=0
 LINUX_AGENT_SESSION_FINISHED=0
 LINUX_AGENT_LAST_BUSINESS_STATUS=""
 
+linux_agent_audit_boundaries_path() {
+    printf '%s/policies/audit-boundaries.json\n' "${LINUX_AGENT_ROOT}"
+}
+
+linux_agent_audit_boundary_default_config() {
+    cat <<'JSON'
+{
+  "observing": {
+    "audit_payload_mode": "safe_summary",
+    "audit_text_limit": 1000,
+    "application_events": [
+      "session_started",
+      "session_finished",
+      "command_started",
+      "command_finished",
+      "turn_started",
+      "turn_finished",
+      "control_event",
+      "received",
+      "sensed",
+      "request_context_built",
+      "ai_failed",
+      "ai_invalid_response",
+      "planned",
+      "finished",
+      "executed",
+      "agent_loop_*",
+      "agent_reflection_*",
+      "agent_checkpoint_*",
+      "work_revision_requested",
+      "revision_planned",
+      "repair_*",
+      "step_*",
+      "script_*",
+      "terminal_executed",
+      "edit_*",
+      "ai_files_manifest",
+      "execution_started",
+      "execution_finished",
+      "observer_*"
+    ],
+    "observer_syscalls": [
+      "execve",
+      "execveat",
+      "open",
+      "openat",
+      "creat",
+      "truncate",
+      "ftruncate",
+      "rename",
+      "renameat",
+      "unlink",
+      "unlinkat",
+      "chmod",
+      "fchmod",
+      "chown",
+      "fchown",
+      "mkdir",
+      "rmdir"
+    ],
+    "observer_result_fields": [
+      "exec_count",
+      "file_event_count",
+      "processes",
+      "file_events"
+    ],
+    "observer_max_events": 200
+  },
+  "allowed_to_observe": {
+    "audit_payload_modes": [
+      "safe_summary",
+      "redacted_verbose"
+    ],
+    "audit_text_limit": {
+      "min": 1,
+      "max": 100000
+    },
+    "application_events": [
+      "session_started",
+      "session_finished",
+      "command_started",
+      "command_finished",
+      "turn_started",
+      "turn_finished",
+      "control_event",
+      "received",
+      "sensed",
+      "request_context_built",
+      "ai_failed",
+      "ai_invalid_response",
+      "planned",
+      "finished",
+      "executed",
+      "agent_loop_*",
+      "agent_reflection_*",
+      "agent_checkpoint_*",
+      "work_revision_requested",
+      "revision_planned",
+      "repair_*",
+      "step_*",
+      "script_*",
+      "terminal_executed",
+      "edit_*",
+      "script_manual_edit",
+      "ai_files_manifest",
+      "execution_started",
+      "execution_finished",
+      "observer_*"
+    ],
+    "observer_syscalls": [
+      "execve",
+      "execveat",
+      "open",
+      "openat",
+      "openat2",
+      "creat",
+      "truncate",
+      "ftruncate",
+      "rename",
+      "renameat",
+      "renameat2",
+      "unlink",
+      "unlinkat",
+      "chmod",
+      "fchmod",
+      "fchmodat",
+      "chown",
+      "fchown",
+      "fchownat",
+      "mkdir",
+      "mkdirat",
+      "rmdir",
+      "symlink",
+      "symlinkat",
+      "link",
+      "linkat"
+    ],
+    "observer_result_fields": [
+      "exec_count",
+      "file_event_count",
+      "processes",
+      "file_events"
+    ],
+    "observer_max_events": {
+      "min": 1,
+      "max": 1000
+    }
+  }
+}
+JSON
+}
+
+linux_agent_audit_boundary_config() {
+    local path
+    path="$(linux_agent_audit_boundaries_path)"
+    if [[ -f "${path}" ]] && jq -e 'type == "object"' "${path}" >/dev/null 2>&1; then
+        jq -c . "${path}"
+        return 0
+    fi
+    linux_agent_audit_boundary_default_config | jq -c .
+}
+
+linux_agent_audit_boundary_values() {
+    local jq_path="$1"
+    linux_agent_audit_boundary_config | jq -r "${jq_path}[]? | strings" 2>/dev/null || true
+}
+
+linux_agent_audit_boundary_pattern_matches() {
+    local pattern="$1"
+    local value="$2"
+    local prefix
+    if [[ "${pattern}" == "all" ]]; then
+        return 0
+    fi
+    if [[ "${pattern}" == *"*" ]]; then
+        prefix="${pattern%\*}"
+        [[ "${value}" == "${prefix}"* ]]
+        return $?
+    fi
+    [[ "${value}" == "${pattern}" ]]
+}
+
+linux_agent_audit_boundary_entry_allowed() {
+    local entry="$1"
+    local allowed_path="$2"
+    local allowed
+    while IFS= read -r allowed; do
+        [[ -z "${allowed}" ]] && continue
+        if [[ "${entry}" == *"*" ]]; then
+            if [[ "${allowed}" == "all" || "${allowed}" == "${entry}" ]]; then
+                return 0
+            fi
+        elif linux_agent_audit_boundary_pattern_matches "${allowed}" "${entry}"; then
+            return 0
+        fi
+    done < <(linux_agent_audit_boundary_values "${allowed_path}")
+    return 1
+}
+
+linux_agent_audit_boundary_selected_patterns() {
+    local selected_path="$1"
+    local allowed_path="$2"
+    local entry
+    while IFS= read -r entry; do
+        [[ -z "${entry}" ]] && continue
+        if linux_agent_audit_boundary_entry_allowed "${entry}" "${allowed_path}"; then
+            printf '%s\n' "${entry}"
+        fi
+    done < <(linux_agent_audit_boundary_values "${selected_path}")
+}
+
+linux_agent_audit_boundary_selected_exact_values() {
+    local selected_path="$1"
+    local allowed_path="$2"
+    local entry
+    while IFS= read -r entry; do
+        [[ -z "${entry}" || "${entry}" == *"*"* ]] && continue
+        if linux_agent_audit_boundary_entry_allowed "${entry}" "${allowed_path}"; then
+            printf '%s\n' "${entry}"
+        fi
+    done < <(linux_agent_audit_boundary_values "${selected_path}") | awk '!seen[$0]++'
+}
+
+linux_agent_audit_boundary_observes_value() {
+    local value="$1"
+    local selected_path="$2"
+    local allowed_path="$3"
+    local entry matched=1
+    while IFS= read -r entry; do
+        [[ -z "${entry}" ]] && continue
+        if linux_agent_audit_boundary_pattern_matches "${entry}" "${value}"; then
+            matched=0
+        fi
+    done < <(linux_agent_audit_boundary_selected_patterns "${selected_path}" "${allowed_path}")
+    return "${matched}"
+}
+
+linux_agent_audit_boundary_should_log_stage() {
+    local stage="$1"
+    linux_agent_audit_boundary_observes_value \
+        "${stage}" \
+        '.observing.application_events' \
+        '.allowed_to_observe.application_events'
+}
+
+linux_agent_audit_boundary_payload_mode() {
+    local fallback="${1:-safe_summary}"
+    local mode
+    mode="$(linux_agent_audit_boundary_config | jq -r '.observing.audit_payload_mode // empty' 2>/dev/null || true)"
+    if [[ -n "${mode}" ]] && linux_agent_audit_boundary_entry_allowed "${mode}" '.allowed_to_observe.audit_payload_modes'; then
+        printf '%s\n' "${mode}"
+        return 0
+    fi
+    printf '%s\n' "${fallback}"
+}
+
+linux_agent_audit_boundary_number() {
+    local value_path="$1"
+    local min_path="$2"
+    local max_path="$3"
+    local fallback="$4"
+    local config value min max
+    config="$(linux_agent_audit_boundary_config)"
+    value="$(jq -r "${value_path} // empty" <<<"${config}" 2>/dev/null || true)"
+    min="$(jq -r "${min_path} // 1" <<<"${config}" 2>/dev/null || true)"
+    max="$(jq -r "${max_path} // empty" <<<"${config}" 2>/dev/null || true)"
+
+    if [[ ! "${value}" =~ ^[0-9]+$ || "${value}" -le 0 ]]; then
+        value="${fallback}"
+    fi
+    if [[ "${min}" =~ ^[0-9]+$ && "${value}" -lt "${min}" ]]; then
+        value="${min}"
+    fi
+    if [[ "${max}" =~ ^[0-9]+$ && "${max}" -gt 0 && "${value}" -gt "${max}" ]]; then
+        value="${max}"
+    fi
+    printf '%s\n' "${value}"
+}
+
+linux_agent_audit_boundary_text_limit() {
+    linux_agent_audit_boundary_number \
+        '.observing.audit_text_limit' \
+        '.allowed_to_observe.audit_text_limit.min' \
+        '.allowed_to_observe.audit_text_limit.max' \
+        "${1:-1000}"
+}
+
+linux_agent_audit_boundary_observer_max_events() {
+    linux_agent_audit_boundary_number \
+        '.observing.observer_max_events' \
+        '.allowed_to_observe.observer_max_events.min' \
+        '.allowed_to_observe.observer_max_events.max' \
+        "${1:-200}"
+}
+
+linux_agent_audit_boundary_observer_syscalls() {
+    linux_agent_audit_boundary_selected_exact_values \
+        '.observing.observer_syscalls' \
+        '.allowed_to_observe.observer_syscalls'
+}
+
+linux_agent_audit_boundary_observer_field_enabled() {
+    local field="$1"
+    linux_agent_audit_boundary_observes_value \
+        "${field}" \
+        '.observing.observer_result_fields' \
+        '.allowed_to_observe.observer_result_fields'
+}
+
+linux_agent_audit_boundary_runtime_summary() {
+    local events syscalls fields payload_mode text_limit max_events
+    events="$(linux_agent_audit_boundary_selected_patterns '.observing.application_events' '.allowed_to_observe.application_events' | jq -R -s 'split("\n") | map(select(length > 0))')"
+    syscalls="$(linux_agent_audit_boundary_observer_syscalls | jq -R -s 'split("\n") | map(select(length > 0))')"
+    fields="$(linux_agent_audit_boundary_selected_exact_values '.observing.observer_result_fields' '.allowed_to_observe.observer_result_fields' | jq -R -s 'split("\n") | map(select(length > 0))')"
+    payload_mode="$(linux_agent_audit_boundary_payload_mode "$(linux_agent_audit_mode)")"
+    text_limit="$(linux_agent_audit_boundary_text_limit "$(linux_agent_audit_text_limit)")"
+    max_events="$(linux_agent_audit_boundary_observer_max_events "$(linux_agent_observer_max_events 2>/dev/null || printf '200')")"
+    jq -cn \
+        --arg payload_mode "${payload_mode}" \
+        --argjson text_limit "${text_limit}" \
+        --argjson application_events "${events}" \
+        --argjson observer_syscalls "${syscalls}" \
+        --argjson observer_result_fields "${fields}" \
+        --argjson observer_max_events "${max_events}" \
+        '{audit_payload_mode:$payload_mode, audit_text_limit:$text_limit, application_events:$application_events, observer_syscalls:$observer_syscalls, observer_result_fields:$observer_result_fields, observer_max_events:$observer_max_events}'
+}
+
 linux_agent_audit_safe_summary() {
     local stage="$1"
     local payload="$2"
@@ -250,6 +577,7 @@ linux_agent_audit_payload() {
 
 linux_agent_start_session() {
     local user_input="$1"
+    local boundary_summary
 
     if [[ "${LINUX_AGENT_SESSION_ACTIVE:-0}" -eq 1 && "${LINUX_AGENT_SESSION_FINISHED:-0}" -eq 0 ]]; then
         return 0
@@ -264,7 +592,12 @@ linux_agent_start_session() {
     LINUX_AGENT_SESSION_FINISHED=0
 
     : > "${LINUX_AGENT_AUDIT_LOG}"
-    linux_agent_log_event "session_started" "$(jq -cn --arg request "${user_input}" --arg audit_mode "$(linux_agent_audit_mode)" '{request:$request, audit_mode:$audit_mode}')"
+    boundary_summary="$(linux_agent_audit_boundary_runtime_summary)"
+    linux_agent_log_event "session_started" "$(jq -cn \
+        --arg request "${user_input}" \
+        --arg audit_mode "$(linux_agent_audit_mode)" \
+        --argjson audit_boundary "${boundary_summary}" \
+        '{request:$request, audit_mode:$audit_mode, audit_boundary:$audit_boundary}')"
     if declare -F linux_agent_observer_session_start >/dev/null 2>&1; then
         linux_agent_observer_session_start "session" "$(jq -cn --arg request "${user_input}" '{request:$request}')"
     fi
@@ -278,6 +611,9 @@ linux_agent_log_event() {
     [[ -z "${payload}" ]] && payload='{}'
     if [[ "${stage}" == "finished" ]] && printf '%s' "${payload}" | jq -e . >/dev/null 2>&1; then
         LINUX_AGENT_LAST_BUSINESS_STATUS="$(jq -r '.status // empty' <<<"${payload}")"
+    fi
+    if ! linux_agent_audit_boundary_should_log_stage "${stage}"; then
+        return 0
     fi
     safe_payload="$(linux_agent_audit_payload "${stage}" "${payload}")"
     jq -cn \

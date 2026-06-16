@@ -142,4 +142,41 @@ grep -q '"sudo_authenticated":true' "${LINUX_AGENT_AUDIT_LOG}"
 PATH="${fail_bin}:${PATH}" linux_agent_finish_session "tested"
 grep -q '"diagnostic"' "${LINUX_AGENT_AUDIT_LOG}"
 
+boundary_project="${tmp_root}/boundary-project"
+mkdir -p "${boundary_project}"
+cp -a "${ROOT_DIR}/config" "${ROOT_DIR}/policies" "${boundary_project}/"
+linux_agent_init_env "${boundary_project}"
+linux_agent_load_config
+LINUX_AGENT_CONFIG_JSON="$(jq '.observer.enabled="disabled"' <<<"${LINUX_AGENT_CONFIG_JSON}")"
+boundary_tmp="$(mktemp)"
+jq '.observing.application_events=["session_started","session_finished"] | .observing.observer_syscalls=[]' \
+    "${boundary_project}/policies/audit-boundaries.json" > "${boundary_tmp}"
+mv "${boundary_tmp}" "${boundary_project}/policies/audit-boundaries.json"
+linux_agent_start_session "audit boundary application event filter"
+linux_agent_log_event "received" "$(jq -cn '{mode:"work", input:"should not be logged"}')"
+linux_agent_log_event "planned" "$(jq -cn '{response_type:"answer", answer:"should not be logged"}')"
+linux_agent_finish_session "filtered"
+grep -q '"stage":"session_started"' "${LINUX_AGENT_AUDIT_LOG}"
+grep -q '"stage":"session_finished"' "${LINUX_AGENT_AUDIT_LOG}"
+! grep -q '"stage":"received"' "${LINUX_AGENT_AUDIT_LOG}"
+! grep -q '"stage":"planned"' "${LINUX_AGENT_AUDIT_LOG}"
+
+boundary_syscall_project="${tmp_root}/boundary-syscall-project"
+mkdir -p "${boundary_syscall_project}"
+cp -a "${ROOT_DIR}/config" "${ROOT_DIR}/policies" "${boundary_syscall_project}/"
+linux_agent_init_env "${boundary_syscall_project}"
+linux_agent_load_config
+LINUX_AGENT_CONFIG_JSON="$(jq '.observer.enabled="auto" | .observer.max_events=5' <<<"${LINUX_AGENT_CONFIG_JSON}")"
+boundary_tmp="$(mktemp)"
+jq '.observing.application_events=["session_started","observer_*","session_finished"] | .observing.observer_syscalls=["execve"] | .observing.observer_result_fields=["exec_count"]' \
+    "${boundary_syscall_project}/policies/audit-boundaries.json" > "${boundary_tmp}"
+mv "${boundary_tmp}" "${boundary_syscall_project}/policies/audit-boundaries.json"
+: > "${audit_calls}"
+PATH="${fake_bin}:${PATH}" linux_agent_start_session "audit boundary syscall filter"
+PATH="${fake_bin}:${PATH}" linux_agent_finish_session "filtered"
+grep -Eq -- '-S execve([[:space:]]|$)' "${audit_calls}"
+! grep -Eq -- '-S openat([[:space:]]|$)' "${audit_calls}"
+observer_payload="$(jq -c 'select(.stage=="observer_session_finished") | .payload' "${LINUX_AGENT_AUDIT_LOG}" | tail -1)"
+jq -e '.exec_count >= 1 and .file_event_count == null and (.file_events | length) == 0' <<<"${observer_payload}" >/dev/null
+
 printf 'observer: ok\n'

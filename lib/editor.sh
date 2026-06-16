@@ -261,8 +261,20 @@ linux_agent_request_revised_edit_package() {
     linux_agent_log_event "edit_revision_requested" "${revision_context}"
     linux_agent_record_ai_request_files "${request_context}"
     revised_edit_json="$(linux_agent_call_ai_with_context "${revision_request}" "${request_context}" "edit" "${revision_context}")"
+    if linux_agent_ai_response_is_error "${revised_edit_json}"; then
+        linux_agent_log_event "ai_failed" "${revised_edit_json}"
+        jq -cn \
+            --arg status "$(jq -r '.status' <<<"${revised_edit_json}")" \
+            --arg error "$(linux_agent_ai_error_text "${revised_edit_json}")" \
+            --argjson response "${revised_edit_json}" \
+            '{ok:false, status:$status, error:$error, response:$response}'
+        return 1
+    fi
     if ! linux_agent_validate_edit_response "${revised_edit_json}"; then
-        revised_edit_json="$(linux_agent_mock_edit_package "${revision_request}")"
+        linux_agent_log_event "ai_invalid_response" "${revised_edit_json}"
+        jq -cn --argjson response "${revised_edit_json}" \
+            '{ok:false, status:"ai_invalid_response", error:"模型响应不符合 skill_edit schema。", response:$response}'
+        return 1
     fi
     linux_agent_log_event "edit_planned" "${revised_edit_json}"
     if linux_agent_output_json_enabled; then
@@ -360,6 +372,120 @@ linux_agent_commit_staged_skill() {
     return 1
 }
 
+linux_agent_review_edit_package() {
+    local edit_json="$1"
+    local skill_name scripts_json reviews ok
+    local script_items=()
+
+    if ! linux_agent_validate_edit_response "${edit_json}"; then
+        jq -cn '{ok:false, status:"invalid_edit_package", error:"skill_edit JSON 不符合 schema。"}'
+        return 0
+    fi
+
+    skill_name="$(jq -r '.skill.name' <<<"${edit_json}")"
+    scripts_json="$(jq -c '.scripts' <<<"${edit_json}")"
+    reviews='[]'
+    ok="true"
+    mapfile -t script_items < <(jq -c '.scripts[]' <<<"${edit_json}")
+
+    for script in "${script_items[@]}"; do
+        [[ -z "${script}" ]] && continue
+        local script_name content review
+        script_name="$(jq -r '.name' <<<"${script}")"
+        content="$(jq -r '.content' <<<"${script}")"
+        if [[ -z "${content}" ]]; then
+            review="$(jq -cn '{approved:false, approval_required:true, risk_level:"critical", findings:[{severity:"critical", code:"SCRIPT_EMPTY", message:"脚本内容不能为空。"}]}')"
+        else
+            review="$(linux_agent_policy_review_text "edit:${skill_name}/${script_name}" "${content}")"
+        fi
+        if [[ "$(jq -r '.approved // false' <<<"${review}")" != "true" ]]; then
+            ok="false"
+        fi
+        reviews="$(jq -cn \
+            --argjson prior "${reviews}" \
+            --arg name "${script_name}" \
+            --arg description "$(jq -r '.description' <<<"${script}")" \
+            --argjson review "${review}" \
+            '$prior + [{name:$name, description:$description, review:$review}]')"
+    done
+
+    jq -cn \
+        --argjson ok "${ok}" \
+        --arg skill "${skill_name}" \
+        --arg description "$(jq -r '.skill.description' <<<"${edit_json}")" \
+        --argjson scripts "${scripts_json}" \
+        --argjson reviews "${reviews}" \
+        '{ok:$ok, status:(if $ok then "approved" else "blocked" end), skill:$skill, description:$description, scripts:$scripts, reviews:$reviews}'
+}
+
+linux_agent_apply_skill_edit_package_direct() {
+    local edit_json="$1"
+    local review_json skill_name description skill_dir scripts_json edit_root staging_skill_dir staging_scripts_dir candidate_index
+    local validation global_validation committed_scripts
+    local script_items=()
+
+    review_json="$(linux_agent_review_edit_package "${edit_json}")"
+    if [[ "$(jq -r '.ok // false' <<<"${review_json}")" != "true" ]]; then
+        jq -cn --argjson review "${review_json}" \
+            '{ok:false, status:($review.status // "blocked"), review:$review}'
+        return 0
+    fi
+
+    skill_name="$(jq -r '.skill.name' <<<"${edit_json}")"
+    description="$(jq -r '.skill.description' <<<"${edit_json}")"
+    skill_dir="$(linux_agent_skills_dir)/${skill_name}"
+    scripts_json="$(jq -c '.scripts' <<<"${edit_json}")"
+    edit_root="${LINUX_AGENT_TMP_DIR}/edit/${skill_name}"
+    staging_skill_dir="${edit_root}/staged"
+    staging_scripts_dir="${staging_skill_dir}/scripts"
+    candidate_index="${edit_root}/INDEX.md"
+    committed_scripts="$(jq -c '[.scripts[].name]' <<<"${edit_json}")"
+
+    rm -rf "${edit_root}"
+    mkdir -p "${staging_scripts_dir}" "${staging_skill_dir}/references" "${staging_skill_dir}/assets"
+    mapfile -t script_items < <(jq -c '.scripts[]' <<<"${edit_json}")
+
+    for script in "${script_items[@]}"; do
+        [[ -z "${script}" ]] && continue
+        local script_name content script_path
+        script_name="$(jq -r '.name' <<<"${script}")"
+        content="$(jq -r '.content' <<<"${script}")"
+        script_path="${staging_scripts_dir}/${script_name}"
+        printf '%s\n' "${content}" > "${script_path}"
+        chmod +x "${script_path}"
+    done
+
+    linux_agent_render_skill_md "${skill_name}" "${description}" "${scripts_json}" > "${staging_skill_dir}/SKILL.md"
+    if [[ -f "$(linux_agent_skill_index_path)" ]]; then
+        cp "$(linux_agent_skill_index_path)" "${candidate_index}"
+    fi
+    linux_agent_write_skill_index "${candidate_index}" "${skill_name}" "${description}" "${scripts_json}"
+    validation="$(linux_agent_validate_skill_at "${skill_name}" "${staging_skill_dir}" "${candidate_index}")"
+    if [[ "$(jq -r '.ok // false' <<<"${validation}")" != "true" ]]; then
+        rm -rf "${edit_root}"
+        jq -cn --arg skill "${skill_name}" --argjson validation "${validation}" --argjson review "${review_json}" \
+            '{ok:false, status:"validation_failed", skill:$skill, validation:$validation, review:$review}'
+        return 0
+    fi
+
+    if ! linux_agent_commit_staged_skill "${skill_name}" "${staging_skill_dir}" "${candidate_index}"; then
+        rm -rf "${edit_root}"
+        jq -cn --arg skill "${skill_name}" '{ok:false, status:"commit_failed", skill:$skill}'
+        return 0
+    fi
+
+    rm -rf "${edit_root}"
+    global_validation="$(linux_agent_validate_skills)"
+    jq -cn \
+        --arg skill "${skill_name}" \
+        --arg skill_dir "${skill_dir}" \
+        --argjson scripts "${committed_scripts}" \
+        --argjson validation "${validation}" \
+        --argjson global_validation "${global_validation}" \
+        --argjson review "${review_json}" \
+        '{ok:true, status:"edited", skill:$skill, skill_dir:$skill_dir, scripts:$scripts, validation:$validation, global_validation:$global_validation, review:$review}'
+}
+
 linux_agent_apply_skill_edit_package() {
     local edit_json="$1"
     local skill_name description skill_dir scripts_json edit_root staging_skill_dir staging_scripts_dir candidate_index
@@ -398,7 +524,14 @@ linux_agent_apply_skill_edit_package() {
                 linux_agent_prompt_edit_revision_request edit_revision_request
                 if [[ -n "${edit_revision_request}" ]]; then
                     rm -rf "${edit_root}"
-                    revised_edit_json="$(linux_agent_request_revised_edit_package "${edit_json}" "${script_name}" "${edit_revision_request}")"
+                    if ! revised_edit_json="$(linux_agent_request_revised_edit_package "${edit_json}" "${script_name}" "${edit_revision_request}")"; then
+                        if ! jq -e . <<<"${revised_edit_json}" >/dev/null 2>&1; then
+                            revised_edit_json="$(jq -cn --arg raw "${revised_edit_json}" '{raw:$raw}')"
+                        fi
+                        jq -cn --arg skill "${skill_name}" --arg script "${script_name}" --argjson detail "${revised_edit_json}" \
+                            '{ok:false, status:"edit_revision_failed", skill:$skill, script:$script, detail:$detail}'
+                        return 0
+                    fi
                     linux_agent_apply_skill_edit_package "${revised_edit_json}"
                     return 0
                 fi
@@ -468,8 +601,17 @@ linux_agent_process_edit_request() {
     request_context="$(linux_agent_build_request_context "${user_input}" "${context_json}" "edit")"
     linux_agent_record_ai_request_files "${request_context}"
     edit_json="$(linux_agent_call_ai_with_context "${user_input}" "${request_context}" "edit" "${context_json}")"
+    if linux_agent_ai_response_is_error "${edit_json}"; then
+        linux_agent_log_event "ai_failed" "${edit_json}"
+        linux_agent_print_error "$(linux_agent_ai_error_text "${edit_json}")"
+        linux_agent_log_event "finished" "$(jq -cn '{status:"ai_failed"}')"
+        return 1
+    fi
     if ! linux_agent_validate_edit_response "${edit_json}"; then
-        edit_json="$(linux_agent_mock_edit_package "${user_input}")"
+        linux_agent_log_event "ai_invalid_response" "${edit_json}"
+        linux_agent_print_error "模型响应不符合 skill_edit schema。"
+        linux_agent_log_event "finished" "$(jq -cn '{status:"ai_invalid_response"}')"
+        return 1
     fi
 
     linux_agent_log_event "edit_planned" "${edit_json}"

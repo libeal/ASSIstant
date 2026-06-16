@@ -3,6 +3,16 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# shellcheck source=helpers.sh
+source "${ROOT_DIR}/tests/helpers.sh"
+
+tmp_root="$(mktemp -d)"
+cleanup() {
+    stop_fake_ai_server
+    rm -rf "${tmp_root}"
+}
+trap cleanup EXIT
+start_fake_ai_server "$((25000 + RANDOM % 1000))" "${tmp_root}"
 
 # shellcheck source=../lib/common.sh
 source "${ROOT_DIR}/lib/common.sh"
@@ -23,6 +33,12 @@ source "${ROOT_DIR}/lib/executor.sh"
 
 linux_agent_init_env "${ROOT_DIR}"
 linux_agent_load_config
+LINUX_AGENT_CONFIG_JSON="$(jq --arg api_url "${FAKE_AI_URL}" '
+    .api_url = $api_url
+    | .api_key = "test-api-key"
+    | .model = "fake-chat-completions"
+    | .request_timeout_sec = 10
+' <<<"${LINUX_AGENT_CONFIG_JSON}")"
 
 request_context="$(linux_agent_build_request_context "检查磁盘" '{"topic":"disk"}' "work")"
 grep -q '"current_request":"检查磁盘"' <<<"${request_context}"
@@ -30,8 +46,8 @@ grep -q '"current_request":"检查磁盘"' <<<"${request_context}"
 ! jq -e 'has("skill_index")' <<<"${request_context}" >/dev/null
 payload_context="$(linux_agent_build_ai_payload_context "${request_context}" '{"topic":"disk"}')"
 grep -q '"environment_context":{"topic":"disk"}' <<<"${payload_context}"
-mock_repair="$(LINUX_AGENT_MOCK=1 linux_agent_call_ai_with_context "repair" "${request_context}" "repair" '{"topic":"disk"}')"
-grep -q '"environment_context":{"topic":"disk"}' <<<"$(jq -r '.failure_context' <<<"${mock_repair}")"
+repair_response="$(linux_agent_call_ai_with_context "repair" "${request_context}" "repair" '{"topic":"disk"}')"
+jq -e '(.failure_context | fromjson).environment_context.topic == "disk"' <<<"${repair_response}" >/dev/null
 
 string_args_response="$(jq -cn '{
     response_type:"work_plan",
@@ -94,15 +110,24 @@ audit_output="$(bash "${ROOT_DIR}/bin/agent" audit "${safe_session_id}")"
 grep -q '"stage":"script_manual_edit"' "${ROOT_DIR}/logs/${safe_session_id}.jsonl"
 grep -q '"diff_lines"' "${ROOT_DIR}/logs/${safe_session_id}.jsonl"
 
-LINUX_AGENT_CONFIG_JSON="$(jq '.audit_mode="redacted_verbose" | .audit_text_limit=20' <<<"${LINUX_AGENT_CONFIG_JSON}")"
+verbose_project="${tmp_root}/verbose-project"
+mkdir -p "${verbose_project}"
+cp -a "${ROOT_DIR}/config" "${ROOT_DIR}/policies" "${verbose_project}/"
+linux_agent_init_env "${verbose_project}"
+linux_agent_load_config
+LINUX_AGENT_CONFIG_JSON="$(jq '.audit_mode="safe_summary" | .audit_text_limit=1000' <<<"${LINUX_AGENT_CONFIG_JSON}")"
+boundary_tmp="$(mktemp)"
+jq '.observing.audit_payload_mode="redacted_verbose" | .observing.audit_text_limit=20 | .observing.application_events=["session_started","received","session_finished"]' \
+    "${verbose_project}/policies/audit-boundaries.json" > "${boundary_tmp}"
+mv "${boundary_tmp}" "${verbose_project}/policies/audit-boundaries.json"
 linux_agent_start_session '检查很长的文本'
 verbose_session_id="${LINUX_AGENT_SESSION_ID}"
 linux_agent_log_event "received" "$(jq -cn --arg input 'abcdefghijklmnopqrstuvwxyz0123456789 password=TEST_VERBOSE_PASS' '{mode:"work", input:$input}')"
 linux_agent_finish_session "tested"
-verbose_audit_output="$(bash "${ROOT_DIR}/bin/agent" audit "${verbose_session_id}")"
-! grep -R -q 'TEST_VERBOSE_PASS' "${ROOT_DIR}/logs/${verbose_session_id}.jsonl"
+verbose_audit_output="$(linux_agent_show_audit "${verbose_session_id}")"
+! grep -R -q 'TEST_VERBOSE_PASS' "${verbose_project}/logs/${verbose_session_id}.jsonl"
 ! grep -q 'TEST_VERBOSE_PASS' <<<"${verbose_audit_output}"
-grep -q '\[TRUNCATED\]' "${ROOT_DIR}/logs/${verbose_session_id}.jsonl"
+grep -q '\[TRUNCATED\]' "${verbose_project}/logs/${verbose_session_id}.jsonl"
 
 http_step='{"id":"remote-1","title":"remote","executor_type":"remote_script","url":"http://example.test/install.sh","arguments":{},"reason":"test","expected_effect":"test","risk_level":"low","rollback_hint":"none"}'
 http_result="$(linux_agent_prepare_remote_step "${http_step}" 2>&1 || true)"

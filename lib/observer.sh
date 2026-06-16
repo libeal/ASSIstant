@@ -34,6 +34,9 @@ linux_agent_observer_max_events() {
     if [[ ! "${max_events}" =~ ^[0-9]+$ || "${max_events}" -le 0 ]]; then
         max_events=200
     fi
+    if declare -F linux_agent_audit_boundary_observer_max_events >/dev/null 2>&1; then
+        max_events="$(linux_agent_audit_boundary_observer_max_events "${max_events}")"
+    fi
     printf '%s\n' "${max_events}"
 }
 
@@ -181,17 +184,31 @@ linux_agent_observer_remove_syscall_rule() {
 linux_agent_observer_session_start() {
     local scope="${1:-session}"
     local subject_json="${2:-}"
-    local preflight key uid start_time installed='[]' notes='[]'
+    local preflight key uid start_time installed='[]' notes='[]' selected_syscalls boundary_summary
     [[ -n "${subject_json}" ]] || subject_json='{}'
 
+    boundary_summary="$(linux_agent_audit_boundary_runtime_summary)"
     preflight="$(linux_agent_observer_preflight)"
     if [[ "$(jq -r '.status' <<<"${preflight}")" != "available" ]]; then
         LINUX_AGENT_OBSERVER_SESSION_CONTEXT="$(jq -cn \
             --arg scope "${scope}" \
             --argjson subject "${subject_json}" \
             --argjson preflight "${preflight}" \
+            --argjson audit_boundary "${boundary_summary}" \
             --arg start_time "$(linux_agent_now_iso)" \
-            '{status:$preflight.status, backend:"auditd", lifecycle:"session", scope:$scope, subject:$subject, start_time:$start_time, reason:($preflight.reason // null), reason_code:($preflight.reason_code // null), diagnostic:($preflight.diagnostic // null), sudo_available:($preflight.sudo_available // null), sudo_authenticated:($preflight.sudo_authenticated // null), sudo_exit_code:($preflight.sudo_exit_code // null), auditctl_exit_code:($preflight.auditctl_exit_code // null), preflight:$preflight}')"
+            '{status:$preflight.status, backend:"auditd", lifecycle:"session", scope:$scope, subject:$subject, start_time:$start_time, audit_boundary:$audit_boundary, reason:($preflight.reason // null), reason_code:($preflight.reason_code // null), diagnostic:($preflight.diagnostic // null), sudo_available:($preflight.sudo_available // null), sudo_authenticated:($preflight.sudo_authenticated // null), sudo_exit_code:($preflight.sudo_exit_code // null), auditctl_exit_code:($preflight.auditctl_exit_code // null), preflight:$preflight}')"
+        linux_agent_observer_log_event "observer_unavailable" "${LINUX_AGENT_OBSERVER_SESSION_CONTEXT}"
+        return 0
+    fi
+
+    selected_syscalls="$(linux_agent_audit_boundary_observer_syscalls | jq -R -s 'split("\n") | map(select(length > 0))')"
+    if [[ "$(jq 'length' <<<"${selected_syscalls}")" -eq 0 ]]; then
+        LINUX_AGENT_OBSERVER_SESSION_CONTEXT="$(jq -cn \
+            --arg scope "${scope}" \
+            --argjson subject "${subject_json}" \
+            --argjson audit_boundary "${boundary_summary}" \
+            --arg start_time "$(linux_agent_now_iso)" \
+            '{status:"disabled", backend:"auditd", lifecycle:"session", scope:$scope, subject:$subject, start_time:$start_time, audit_boundary:$audit_boundary, reason_code:"audit_boundary_no_observer_syscalls", reason:"audit boundary selected no observer syscalls", diagnostic:"Add allowed syscalls to policies/audit-boundaries.json observing.observer_syscalls to enable auditd observer."}')"
         linux_agent_observer_log_event "observer_unavailable" "${LINUX_AGENT_OBSERVER_SESSION_CONTEXT}"
         return 0
     fi
@@ -202,14 +219,14 @@ linux_agent_observer_session_start() {
 
     local syscall
 
-    #观察点
-    for syscall in execve execveat open openat creat truncate ftruncate rename renameat unlink unlinkat chmod fchmod chown fchown mkdir rmdir; do
+    while IFS= read -r syscall; do
+        [[ -z "${syscall}" ]] && continue
         if linux_agent_observer_install_syscall_rule "${uid}" "${key}" "${syscall}"; then
             installed="$(jq -cn --argjson prior "${installed}" --arg syscall "${syscall}" '$prior + [$syscall]')"
         else
             notes="$(jq -cn --argjson prior "${notes}" --arg syscall "${syscall}" '$prior + ["failed to install syscall rule: " + $syscall]')"
         fi
-    done
+    done < <(jq -r '.[]' <<<"${selected_syscalls}")
 
     if [[ "$(jq 'length' <<<"${installed}")" -eq 0 ]]; then
         LINUX_AGENT_OBSERVER_SESSION_CONTEXT="$(jq -cn \
@@ -218,7 +235,8 @@ linux_agent_observer_session_start() {
             --arg audit_key "${key}" \
             --arg start_time "${start_time}" \
             --argjson notes "${notes}" \
-            '{status:"failed", backend:"auditd", lifecycle:"session", scope:$scope, subject:$subject, audit_key:$audit_key, start_time:$start_time, notes:$notes}')"
+            --argjson audit_boundary "${boundary_summary}" \
+            '{status:"failed", backend:"auditd", lifecycle:"session", scope:$scope, subject:$subject, audit_key:$audit_key, start_time:$start_time, audit_boundary:$audit_boundary, notes:$notes}')"
         linux_agent_observer_log_event "observer_failed" "${LINUX_AGENT_OBSERVER_SESSION_CONTEXT}"
         return 0
     fi
@@ -231,17 +249,34 @@ linux_agent_observer_session_start() {
         --arg start_time "${start_time}" \
         --argjson installed_syscalls "${installed}" \
         --argjson notes "${notes}" \
-        '{status:"running", backend:"auditd", lifecycle:"session", scope:$scope, subject:$subject, audit_key:$audit_key, uid:($uid|tonumber), start_time:$start_time, installed_syscalls:$installed_syscalls, notes:$notes}')"
+        --argjson audit_boundary "${boundary_summary}" \
+        '{status:"running", backend:"auditd", lifecycle:"session", scope:$scope, subject:$subject, audit_key:$audit_key, uid:($uid|tonumber), start_time:$start_time, installed_syscalls:$installed_syscalls, audit_boundary:$audit_boundary, notes:$notes}')"
     linux_agent_observer_log_event "observer_session_started" "${LINUX_AGENT_OBSERVER_SESSION_CONTEXT}"
 }
 
 linux_agent_observer_parse_ausearch() {
     local raw="$1"
     local audit_key="$2"
-    local max_events
+    local max_events include_exec_count=false include_file_event_count=false include_processes=false include_file_events=false
     max_events="$(linux_agent_observer_max_events)"
+    if linux_agent_audit_boundary_observer_field_enabled "exec_count"; then
+        include_exec_count=true
+    fi
+    if linux_agent_audit_boundary_observer_field_enabled "file_event_count"; then
+        include_file_event_count=true
+    fi
+    if linux_agent_audit_boundary_observer_field_enabled "processes"; then
+        include_processes=true
+    fi
+    if linux_agent_audit_boundary_observer_field_enabled "file_events"; then
+        include_file_events=true
+    fi
     jq -Rn \
         --arg audit_key "${audit_key}" \
+        --argjson include_exec_count "${include_exec_count}" \
+        --argjson include_file_event_count "${include_file_event_count}" \
+        --argjson include_processes "${include_processes}" \
+        --argjson include_file_events "${include_file_events}" \
         --argjson max_events "${max_events}" '
         def field($name):
             (try capture("(^|[[:space:]])" + $name + "=(?<v>\"[^\"]*\"|[^[:space:]]+)").v catch null)
@@ -259,20 +294,22 @@ linux_agent_observer_parse_ausearch() {
             name:(field("name") // null),
             key:(field("key") // $audit_key)
         }] as $events
+        | ($events | map(select(.raw_type == "EXECVE" or (.raw_type == "SYSCALL" and (.syscall == "59" or .syscall == "execve" or .syscall == "execveat"))))) as $exec_events
+        | ($events | map(select(.name != null or (.syscall != null and (.raw_type == "PATH" or .raw_type == "SYSCALL"))))) as $file_events
         | {
             status:"observed",
             backend:"auditd",
             audit_key:$audit_key,
-            exec_count:($events | map(select(.raw_type == "EXECVE" or (.raw_type == "SYSCALL" and (.syscall == "59" or .syscall == "execve" or .syscall == "execveat")))) | length),
-            file_event_count:($events | map(select(.name != null or (.syscall != null and (.raw_type == "PATH" or .raw_type == "SYSCALL")))) | length),
-            processes:($events
+            exec_count:(if $include_exec_count then ($exec_events | length) else null end),
+            file_event_count:(if $include_file_event_count then ($file_events | length) else null end),
+            processes:(if $include_processes then ($events
                 | map(select(.pid != null) | {pid:(.pid|tonumber?), ppid:(.ppid|tonumber?), comm, exe})
                 | unique_by(.pid, .comm, .exe)
-                | .[0:$max_events]),
-            file_events:($events
+                | .[0:$max_events]) else [] end),
+            file_events:(if $include_file_events then ($events
                 | map(select(.name != null) | {name, syscall, success})
                 | unique_by(.name, .syscall, .success)
-                | .[0:$max_events])
+                | .[0:$max_events]) else [] end)
         }
     ' <<<"${raw}"
 }

@@ -29,6 +29,8 @@ source "${ROOT_DIR}/lib/observer.sh"
 source "${ROOT_DIR}/lib/executor.sh"
 # shellcheck source=../lib/editor.sh
 source "${ROOT_DIR}/lib/editor.sh"
+# shellcheck source=../lib/api.sh
+source "${ROOT_DIR}/lib/api.sh"
 # shellcheck source=../lib/interactive.sh
 source "${ROOT_DIR}/lib/interactive.sh"
 # shellcheck source=../lib/orchestrator.sh
@@ -103,11 +105,12 @@ linux_agent_usage() {
   agent script <skill>/<script> [json-args]
                                 执行已登记 skill 脚本
   agent terminal "<shell命令>"   终端模式单次执行并记录审计
-  agent plan "<自然语言指令>"     只生成计划，不执行工具
   agent doctor                    检查依赖、配置和 skill 目录
   agent sense <topic>           采集环境信息
   agent tools list              列出可用 skill 脚本索引
   agent skills validate         校验 skill 目录
+  agent api <resource> <action> [json]
+                                机器可读 JSON API，供 Web 前端调用
   agent audit <session-id>      查看审计摘要
 
 REPL 命令:
@@ -257,14 +260,6 @@ main() {
             fi
             linux_agent_process_terminal_request "$*"
             ;;
-        plan)
-            shift || true
-            if [[ $# -eq 0 ]]; then
-                linux_agent_print_error "缺少自然语言指令。"
-                exit 1
-            fi
-            LINUX_AGENT_FORCE_PLAN=1 linux_agent_process_request "$*" "plan"
-            ;;
         doctor)
             linux_agent_doctor
             ;;
@@ -296,6 +291,10 @@ main() {
                     ;;
             esac
             ;;
+        api)
+            shift || true
+            linux_agent_api_dispatch "${1:-health}" "${2:-}" "${3:-}"
+            ;;
         audit)
             shift || true
             if [[ $# -eq 0 ]]; then
@@ -320,6 +319,10 @@ linux_agent_run() {
     local args_summary="$*"
 
     if [[ "${command}" == "audit" ]]; then
+        main "$@"
+        return $?
+    fi
+    if [[ "${command}" == "api" && "$(linux_agent_api_needs_session "${2:-health}" "${3:-}")" != "true" ]]; then
         main "$@"
         return $?
     fi

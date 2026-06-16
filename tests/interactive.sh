@@ -3,7 +3,8 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-export LINUX_AGENT_MOCK=1
+# shellcheck source=helpers.sh
+source "${ROOT_DIR}/tests/helpers.sh"
 
 # shellcheck source=../lib/interactive.sh
 source "${ROOT_DIR}/lib/interactive.sh"
@@ -49,13 +50,29 @@ grep -q '"stdout_preview": "terminal-json-mode"' <<<"${terminal_machine_json}"
 
 tmp_root="$(mktemp -d)"
 cleanup() {
+    stop_fake_ai_server
     rm -rf "${tmp_root}"
 }
 trap cleanup EXIT
+start_fake_ai_server "$((24000 + RANDOM % 1000))" "${tmp_root}"
 
 if command -v script >/dev/null 2>&1; then
+    backspace_project="${tmp_root}/project-backspace"
+    mkdir -p "${backspace_project}"
+    cp -a \
+        "${ROOT_DIR}/bin" \
+        "${ROOT_DIR}/config" \
+        "${ROOT_DIR}/lib" \
+        "${ROOT_DIR}/policies" \
+        "${ROOT_DIR}/prompts" \
+        "${ROOT_DIR}/skills" \
+        "${backspace_project}/"
+    configure_fake_ai "${backspace_project}"
+    tmp_config="$(mktemp)"
+    jq '.observer.enabled="disabled"' "${backspace_project}/config/config.json" > "${tmp_config}"
+    mv "${tmp_config}" "${backspace_project}/config/config.json"
     backspace_typescript="${tmp_root}/backspace.typescript"
-    printf '/terminal\necho 中文AB\177\177CD\n/exit\n' | script -q -e -c "bash ${ROOT_DIR}/bin/agent" "${backspace_typescript}" >/dev/null
+    (cd "${backspace_project}" && printf '/terminal\necho 中文AB\177\177CD\n/exit\n' | script -q -e -c "bash bin/agent" "${backspace_typescript}" >/dev/null)
     backspace_output="$(tr -d '\r' < "${backspace_typescript}")"
     grep -q '\[terminal\]> echo 中文CD' <<<"${backspace_output}"
     grep -q '中文CD' <<<"${backspace_output}"
@@ -73,11 +90,12 @@ copy_project() {
         "${ROOT_DIR}/prompts" \
         "${ROOT_DIR}/skills" \
         "${target}/"
+    configure_fake_ai "${target}"
 }
 
 project_session="${tmp_root}/project-session"
 copy_project "${project_session}"
-session_output="$(cd "${project_session}" && printf '/terminal\nprintf one\nprintf two\n/exit\n' | LINUX_AGENT_MOCK=1 bash bin/agent 2>&1)"
+session_output="$(cd "${project_session}" && printf '/terminal\nprintf one\nprintf two\n/exit\n' | bash bin/agent 2>&1)"
 grep -q 'one' <<<"${session_output}"
 grep -q 'two' <<<"${session_output}"
 session_log_count="$(find "${project_session}/logs" -name '*.jsonl' | wc -l | tr -d ' ')"
@@ -96,7 +114,7 @@ grep -q '# 审计报告' <<<"${audit_output}"
 
 project_ctrlz="${tmp_root}/project-ctrlz"
 copy_project "${project_ctrlz}"
-ctrlz_output="$(cd "${project_ctrlz}" && printf '\032\n' | LINUX_AGENT_MOCK=1 bash bin/agent 2>&1)"
+ctrlz_output="$(cd "${project_ctrlz}" && printf '\032\n' | bash bin/agent 2>&1)"
 grep -q 'Linux 运维 Agent 已就绪' <<<"${ctrlz_output}"
 ctrlz_log="$(find "${project_ctrlz}/logs" -name '*.jsonl' -print -quit)"
 grep -q '"event":"ctrl_z"' "${ctrlz_log}"
@@ -111,7 +129,7 @@ printf '\n# manual edit marker\n' >> "$1"
 EOF
 chmod +x "${editor_modify}"
 
-edit_output="$(cd "${project_edit}" && EDITOR="${editor_modify}" LINUX_AGENT_MOCK=1 bash bin/agent edit "创建一个测试 skill" 2>&1)"
+edit_output="$(cd "${project_edit}" && EDITOR="${editor_modify}" bash bin/agent edit "创建一个测试 skill" 2>&1)"
 grep -q 'Skill 编辑计划' <<<"${edit_output}"
 grep -q 'Skill 保存结果: 成功' <<<"${edit_output}"
 grep -q '候选校验: 通过' <<<"${edit_output}"
@@ -126,7 +144,7 @@ grep -R -q 'script_manual_edit' "${project_edit}/logs"
 
 project_edit_json="${tmp_root}/project-edit-json"
 copy_project "${project_edit_json}"
-edit_json_output="$(cd "${project_edit_json}" && EDITOR="${editor_modify}" LINUX_AGENT_MOCK=1 LINUX_AGENT_OUTPUT_JSON=1 bash bin/agent edit "创建一个 JSON 兼容测试 skill" 2>&1)"
+edit_json_output="$(cd "${project_edit_json}" && EDITOR="${editor_modify}" LINUX_AGENT_OUTPUT_JSON=1 bash bin/agent edit "创建一个 JSON 兼容测试 skill" 2>&1)"
 grep -q '"response_type": "skill_edit"' <<<"${edit_json_output}"
 grep -q '"ok": true' <<<"${edit_json_output}"
 
@@ -139,7 +157,7 @@ printf '#!/usr/bin/env bash\nrm -rf /\n' > "$1"
 EOF
 chmod +x "${editor_block}"
 
-blocked_output="$(cd "${project_blocked}" && EDITOR="${editor_block}" LINUX_AGENT_MOCK=1 bash bin/agent edit "创建一个危险测试 skill" 2>&1 || true)"
+blocked_output="$(cd "${project_blocked}" && EDITOR="${editor_block}" bash bin/agent edit "创建一个危险测试 skill" 2>&1 || true)"
 grep -q '脚本审查: 阻断' <<<"${blocked_output}"
 grep -q 'Skill 保存结果: 失败，status=blocked' <<<"${blocked_output}"
 [[ ! -f "${project_blocked}/skills/custom-generated/scripts/generated.sh" ]]
@@ -154,7 +172,7 @@ exit 1
 EOF
 chmod +x "${editor_fail}"
 
-failed_output="$(cd "${project_failed}" && EDITOR="${editor_fail}" LINUX_AGENT_MOCK=1 bash bin/agent edit "创建一个失败测试 skill" 2>&1 || true)"
+failed_output="$(cd "${project_failed}" && EDITOR="${editor_fail}" bash bin/agent edit "创建一个失败测试 skill" 2>&1 || true)"
 grep -q 'Skill 保存结果: 失败，status=editor_failed' <<<"${failed_output}"
 [[ ! -d "${project_failed}/skills/custom-generated" ]]
 
@@ -168,7 +186,7 @@ exit 0
 EOF
 chmod +x "${editor_cancel}"
 
-cancelled_output="$(cd "${project_cancelled}" && EDITOR="${editor_cancel}" LINUX_AGENT_MOCK=1 bash bin/agent edit "创建一个取消保存测试 skill" 2>&1 || true)"
+cancelled_output="$(cd "${project_cancelled}" && EDITOR="${editor_cancel}" bash bin/agent edit "创建一个取消保存测试 skill" 2>&1 || true)"
 grep -q 'Skill 保存结果: 失败，status=editor_cancelled' <<<"${cancelled_output}"
 grep -q '编辑器未保存脚本' <<<"${cancelled_output}"
 [[ ! -d "${project_cancelled}/skills/custom-generated" ]]
@@ -193,7 +211,6 @@ revised_edit_output="$(
     cd "${project_revised_edit}" && \
     EDITOR_COUNTER="${tmp_root}/editor-count" \
     EDITOR="${editor_cancel_then_save}" \
-    LINUX_AGENT_MOCK=1 \
     bash bin/agent edit "创建一个需要修改后保存的 skill" <<< $'请重新生成更简单的脚本\n' 2>&1
 )"
 grep -q '编辑器未保存脚本' <<<"${revised_edit_output}"
@@ -212,14 +229,14 @@ printf '\n# default vi marker\n' >> "$1"
 EOF
 chmod +x "${fake_bin}/vi"
 
-vi_output="$(cd "${project_vi}" && env -u EDITOR PATH="${fake_bin}:${PATH}" LINUX_AGENT_MOCK=1 bash bin/agent edit "创建一个默认 vi 测试 skill" 2>&1)"
+vi_output="$(cd "${project_vi}" && env -u EDITOR PATH="${fake_bin}:${PATH}" bash bin/agent edit "创建一个默认 vi 测试 skill" 2>&1)"
 grep -q 'Skill 保存结果: 成功' <<<"${vi_output}"
 grep -q 'default vi marker' "${project_vi}/skills/custom-generated/scripts/generated.sh"
 
 project_global_warning="${tmp_root}/project-global-warning"
 copy_project "${project_global_warning}"
 mkdir -p "${project_global_warning}/skills/broken-empty/scripts"
-global_warning_output="$(cd "${project_global_warning}" && EDITOR="${editor_modify}" LINUX_AGENT_MOCK=1 bash bin/agent edit "创建一个带历史坏 skill 的测试" 2>&1)"
+global_warning_output="$(cd "${project_global_warning}" && EDITOR="${editor_modify}" bash bin/agent edit "创建一个带历史坏 skill 的测试" 2>&1)"
 grep -q 'Skill 保存结果: 成功' <<<"${global_warning_output}"
 grep -q '全局校验: 失败' <<<"${global_warning_output}"
 grep -q 'manual edit marker' "${project_global_warning}/skills/custom-generated/scripts/generated.sh"

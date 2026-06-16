@@ -21,5 +21,12 @@
     "max_events": 200
   },
   "skills_dir": "",
-  "remote_script_policy": "download_review"
+  "remote_script_policy": "download_review",
+  "web": {
+    "enabled": true,
+    "host": "127.0.0.1",
+    "port": 8765,
+    "token": "",
+    "job_retention_hours": 24
+  }
 }

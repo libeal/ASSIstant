@@ -75,6 +75,7 @@ validate_config() {
     print_ok "config/config.json JSON 格式合法"
 
     local api_url api_key model timeout context_turns audit_mode audit_text_limit remote_policy skills_dir
+    local web_enabled web_host web_port web_token web_retention
     local loop_enabled auto_low auto_shell observation_limit thinking_trace checkpoint_turns
     api_url="$(json_get '.api_url')"
     api_key="$(json_get '.api_key')"
@@ -85,6 +86,11 @@ validate_config() {
     audit_text_limit="$(json_get '.audit_text_limit')"
     remote_policy="$(json_get '.remote_script_policy')"
     skills_dir="$(json_get '.skills_dir')"
+    web_enabled="$(json_get '.web.enabled')"
+    web_host="$(json_get '.web.host')"
+    web_port="$(json_get '.web.port')"
+    web_token="$(json_get '.web.token')"
+    web_retention="$(json_get '.web.job_retention_hours')"
     loop_enabled="$(json_get '.agent_loop.enabled_for_work')"
     auto_low="$(json_get '.agent_loop.auto_execute_low_risk')"
     auto_shell="$(json_get '.agent_loop.auto_execute_shell_low_risk')"
@@ -219,6 +225,52 @@ validate_config() {
     else
         print_error "skills_dir 留空，但项目内 skills/ 不存在"
         failures=$((failures + 1))
+    fi
+
+    if jq -e 'has("web")' "${CONFIG_FILE}" >/dev/null 2>&1; then
+        if [[ -z "${web_enabled}" || "${web_enabled}" == "true" || "${web_enabled}" == "false" ]]; then
+            print_ok "web.enabled 合法: ${web_enabled:-默认 true}"
+        else
+            print_error "web.enabled 必须是 true 或 false"
+            failures=$((failures + 1))
+        fi
+
+        if [[ -z "${web_host}" ]]; then
+            print_warn "web.host 未配置，将默认监听 127.0.0.1"
+        elif [[ "${web_host}" =~ ^[A-Za-z0-9_.:-]+$ ]]; then
+            print_ok "web.host 合法: ${web_host}"
+        else
+            print_error "web.host 含有不支持的字符"
+            failures=$((failures + 1))
+        fi
+
+        if [[ -z "${web_port}" ]]; then
+            print_warn "web.port 未配置，将默认使用 8765"
+        elif [[ "${web_port}" =~ ^[0-9]+$ && "${web_port}" -gt 0 && "${web_port}" -le 65535 ]]; then
+            print_ok "web.port 合法: ${web_port}"
+        else
+            print_error "web.port 必须是 1-65535 的整数"
+            failures=$((failures + 1))
+        fi
+
+        if [[ -z "${web_token}" ]]; then
+            print_warn "web.token 未配置，bin/agent-web 会生成本次运行的临时 token"
+        elif [[ ${#web_token} -lt 12 ]]; then
+            print_warn "web.token 较短，仅建议本机临时使用"
+        else
+            print_ok "web.token 已配置（未打印 token）"
+        fi
+
+        if [[ -z "${web_retention}" ]]; then
+            print_warn "web.job_retention_hours 未配置，将默认使用 24"
+        elif [[ "${web_retention}" =~ ^[0-9]+$ && "${web_retention}" -gt 0 ]]; then
+            print_ok "web.job_retention_hours 合法: ${web_retention}"
+        else
+            print_error "web.job_retention_hours 必须是正整数"
+            failures=$((failures + 1))
+        fi
+    else
+        print_warn "web 配置段未配置；CLI 不受影响，bin/agent-web 会使用本机默认值和临时 token"
     fi
 
     return "${failures}"

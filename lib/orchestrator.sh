@@ -3,10 +3,6 @@
 set -euo pipefail
 
 linux_agent_agent_loop_enabled() {
-    [[ "${LINUX_AGENT_FORCE_PLAN:-0}" == "1" ]] && {
-        printf 'false\n'
-        return 0
-    }
     linux_agent_config_bool_default '.agent_loop.enabled_for_work' 'true'
 }
 
@@ -199,6 +195,11 @@ linux_agent_request_agent_reflection() {
     response_json="$(linux_agent_normalize_model_response "${response_json}")"
     linux_agent_store_thinking_summary "${response_json}" "${iteration}"
 
+    if linux_agent_ai_response_is_error "${response_json}"; then
+        linux_agent_print_warn "$(linux_agent_ai_error_text "${response_json}")"
+        response_json="$(linux_agent_fallback_reflection_response "$(linux_agent_ai_error_text "${response_json}")")"
+    fi
+
     if ! linux_agent_validate_work_response "${response_json}"; then
         linux_agent_print_warn "模型反思响应缺少合法 continue_decision，停止自动深入。"
         response_json="$(linux_agent_fallback_reflection_response "模型反思响应无效，已停止自动深入。")"
@@ -341,22 +342,20 @@ linux_agent_process_work_request() {
     response_json="$(linux_agent_call_ai_with_context "${user_input}" "${request_context}" "work_plan" "${context_json}")"
     response_json="$(linux_agent_normalize_model_response "${response_json}")"
     linux_agent_store_thinking_summary "${response_json}" "initial"
+    if linux_agent_ai_response_is_error "${response_json}"; then
+        linux_agent_log_event "ai_failed" "${response_json}"
+        linux_agent_print_error "$(linux_agent_ai_error_text "${response_json}")"
+        linux_agent_log_event "finished" "$(jq -cn '{status:"ai_failed"}')"
+        return 1
+    fi
     if ! linux_agent_validate_work_response "${response_json}"; then
-        linux_agent_print_warn "模型响应不符合 work_plan schema，改用 Mock 响应兜底。"
-        response_json="$(linux_agent_mock_work_plan "${user_input}")"
+        linux_agent_log_event "ai_invalid_response" "${response_json}"
+        linux_agent_print_error "模型响应不符合 work schema。"
+        linux_agent_log_event "finished" "$(jq -cn '{status:"ai_invalid_response"}')"
+        return 1
     fi
 
     safe_response="$(linux_agent_response_without_thinking "${response_json}")"
-    if [[ "${LINUX_AGENT_FORCE_PLAN:-0}" == "1" && "$(jq -r '.response_type' <<<"${response_json}")" == "work_plan" ]]; then
-        linux_agent_log_event "planned" "${safe_response}"
-        linux_agent_print_work_plan "${response_json}"
-        final_status="planned"
-        linux_agent_log_event "finished" "$(jq -cn --arg status "${final_status}" '{status:$status}')"
-        linux_agent_record_turn "user" "${user_input}" "${mode}"
-        linux_agent_record_turn "assistant" "$(jq -r '.summary' <<<"${response_json}")" "${final_status}"
-        return 0
-    fi
-
     linux_agent_log_event "planned" "${safe_response}"
 
     response_type="$(jq -r '.response_type' <<<"${response_json}")"
@@ -527,7 +526,7 @@ linux_agent_process_request() {
         terminal)
             linux_agent_process_terminal_request "${user_input}"
             ;;
-        work|interactive|oneshot|plan|*)
+        work|interactive|oneshot|*)
             linux_agent_process_work_request "${user_input}" "${mode}"
             ;;
     esac
