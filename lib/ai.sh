@@ -108,6 +108,7 @@ linux_agent_mock_work_plan() {
             {
               response_type:"work_plan",
               summary:"演示失败中断：先执行一个会失败的命令，随后计划中的步骤应被标记为未执行。",
+              continue_decision:{should_continue:true, reason:"该演示计划预期失败，执行后需要根据失败结果生成后续判断。"},
               steps:[
                 {
                   id:"step-1",
@@ -135,10 +136,17 @@ linux_agent_mock_work_plan() {
             }
         '
     elif [[ "${user_input}" == *"cpu"* || "${user_input}" == *"CPU"* || "${user_input}" == *"内存"* || "${user_input}" == *"memory"* || "${user_input}" == *"资源"* || "${user_input}" == *"负载"* ]]; then
-        jq -cn '
+        local should_continue=false
+        local continue_reason="资源检查 skill 的预期输出已经满足当前请求，执行成功后无需再次反思。"
+        if [[ "${user_input}" == *"继续深入"* || "${user_input}" == *"非法继续决策"* ]]; then
+            should_continue=true
+            continue_reason="该测试请求明确要求继续深入，执行第一轮资源检查后需要反思下一步。"
+        fi
+        jq -cn --argjson should_continue "${should_continue}" --arg continue_reason "${continue_reason}" '
             {
               response_type:"work_plan",
               summary:"使用受控资源检查 skill 查看 CPU、内存与高占用进程。",
+              continue_decision:{should_continue:$should_continue, reason:$continue_reason},
               steps:[
                 {
                   id:"step-1",
@@ -159,6 +167,7 @@ linux_agent_mock_work_plan() {
             {
               response_type:"work_plan",
               summary:"先只读检查磁盘热点和日志候选，再由用户决定是否继续清理。",
+              continue_decision:{should_continue:false, reason:"计划中的磁盘和日志候选检查已覆盖当前请求，执行成功后无需再次反思。"},
               steps:[
                 {
                   id:"step-1",
@@ -190,6 +199,7 @@ linux_agent_mock_work_plan() {
             {
               response_type:"answer",
               summary:"测试模式下直接返回问答响应。",
+              continue_decision:{should_continue:false, reason:"该请求不需要执行工具。"},
               answer:("已收到请求：" + $input),
               steps:[]
             }
@@ -242,24 +252,127 @@ linux_agent_mock_repair_plan() {
     '
 }
 
+linux_agent_mock_work_reflect() {
+    local reflection_context="$1"
+    local original_request status iteration has_resource has_disk
+
+    original_request="$(jq -r '.environment_context.agent_observation.original_request // .agent_observation.original_request // .original_request // .current_request // empty' <<<"${reflection_context}" 2>/dev/null || true)"
+    status="$(jq -r '.environment_context.agent_observation.execution.status // .agent_observation.execution.status // .execution.status // empty' <<<"${reflection_context}" 2>/dev/null || true)"
+    iteration="$(jq -r '.environment_context.agent_observation.iteration // .agent_observation.iteration // 1' <<<"${reflection_context}" 2>/dev/null || printf '1')"
+    has_resource="$(jq -r '[.. | objects | .skill_script? // empty] | any(. == "ops-basic/resource-inspect")' <<<"${reflection_context}" 2>/dev/null || printf 'false')"
+    has_disk="$(jq -r '[.. | objects | .skill_script? // empty] | any(. == "ops-basic/disk-hotspots")' <<<"${reflection_context}" 2>/dev/null || printf 'false')"
+
+    if [[ "${original_request}" == *"继续深入"* && "${iteration}" == "1" ]]; then
+        jq -cn '
+            {
+              response_type:"work_plan",
+              summary:"继续深入：补充查看 CPU 与内存资源概况。",
+              continue_decision:{should_continue:false, reason:"补充资源检查的预期输出已经满足继续深入请求，执行成功后无需再次反思。"},
+              thinking_summary:"第一轮结果不足以完成测试场景，因此继续采集资源概况。",
+              steps:[
+                {
+                  id:"reflect-1",
+                  title:"补充查看 CPU 与内存资源概况",
+                  executor_type:"skill_script",
+                  skill_script:"ops-basic/resource-inspect",
+                  arguments:{top_n:5},
+                  reason:"补充系统资源观察，帮助判断当前异常是否与负载有关。",
+                  expected_effect:"返回 CPU、内存与高占用进程摘要。",
+                  risk_level:"low",
+                  rollback_hint:"只读操作，无需回滚。"
+                }
+              ]
+            }
+        '
+        return 0
+    fi
+
+    if [[ "${original_request}" == *"非法继续决策"* ]]; then
+        jq -cn '{response_type:"answer", summary:"缺少 continue_decision 的非法 mock 响应。", answer:"invalid"}'
+        return 0
+    fi
+
+    if [[ "${status}" == "failed" ]]; then
+        jq -cn '
+            {
+              response_type:"answer",
+              summary:"执行失败后停止自动深入。",
+              continue_decision:{should_continue:false, reason:"当前计划已有失败步骤，需要人工查看失败输出后再决定。"},
+              thinking_summary:"失败结果显示当前流程不适合自动继续。",
+              answer:"当前计划执行失败，已保留失败输出和修复建议；请根据输出确认下一步。"
+            }
+        '
+        return 0
+    fi
+
+    if [[ "${has_resource}" == "true" ]]; then
+        jq -cn '
+            {
+              response_type:"answer",
+              summary:"资源检查已完成。",
+              continue_decision:{should_continue:false, reason:"资源检查结果已经足够回答当前请求。"},
+              thinking_summary:"已获得资源 skill 返回的信息，可以结束本轮。",
+              answer:"资源检查已完成，已根据 skill 返回的 CPU、内存和进程摘要结束本轮诊断。"
+            }
+        '
+    elif [[ "${has_disk}" == "true" ]]; then
+        jq -cn '
+            {
+              response_type:"answer",
+              summary:"磁盘检查已完成。",
+              continue_decision:{should_continue:false, reason:"磁盘热点信息已经采集完成；清理类动作需要用户明确批准。"},
+              thinking_summary:"已获得磁盘 skill 返回的信息，后续清理不应自动继续。",
+              answer:"磁盘检查已完成，已根据 skill 返回的磁盘热点摘要结束本轮；如需清理，应先人工确认候选项。"
+            }
+        '
+    else
+        jq -cn --arg status "${status:-executed}" '
+            {
+              response_type:"answer",
+              summary:"观察已完成。",
+              continue_decision:{should_continue:false, reason:"当前观察结果不足以支持安全的自动下一步，停止深入。"},
+              thinking_summary:"没有发现需要继续自动执行的低风险步骤。",
+              answer:("当前执行状态为 " + $status + "，本轮已停止自动深入。")
+            }
+        '
+    fi
+}
+
 linux_agent_validate_work_response() {
     local response_json="$1"
     jq -e '
+        def valid_continue:
+          (.continue_decision | type == "object") and
+          (.continue_decision.should_continue | type == "boolean") and
+          (.continue_decision.reason | type == "string");
+        def valid_thinking:
+          ((has("thinking_summary") | not) or (.thinking_summary | type == "string"));
+        def valid_step:
+          (.id | type == "string") and
+          (.title | type == "string") and
+          ((.executor_type == "skill_script") or (.executor_type == "shell") or (.executor_type == "remote_script")) and
+          (.arguments | type == "object") and
+          (.reason | type == "string") and
+          (.expected_effect | type == "string") and
+          ((.risk_level == "low") or (.risk_level == "medium") or (.risk_level == "high") or (.risk_level == "critical")) and
+          (.rollback_hint | type == "string");
         (
-          (.response_type == "answer" and (.summary | type == "string") and (.answer | type == "string")) or
+          (
+            .response_type == "answer" and
+            (.summary | type == "string") and
+            (.answer | type == "string") and
+            valid_continue and
+            (.continue_decision.should_continue == false) and
+            valid_thinking
+          ) or
           (
             .response_type == "work_plan" and
             (.summary | type == "string") and
             (.steps | type == "array") and
-            all(.steps[]?;
-              (.id | type == "string") and
-              (.title | type == "string") and
-              ((.executor_type == "skill_script") or (.executor_type == "shell") or (.executor_type == "remote_script")) and
-              (.reason | type == "string") and
-              (.expected_effect | type == "string") and
-              ((.risk_level == "low") or (.risk_level == "medium") or (.risk_level == "high") or (.risk_level == "critical")) and
-              (.rollback_hint | type == "string")
-            )
+            (.steps | length > 0) and
+            all(.steps[]?; valid_step) and
+            valid_continue and
+            valid_thinking
           )
         )
     ' <<<"${response_json}" >/dev/null
@@ -282,7 +395,21 @@ linux_agent_normalize_model_response() {
     local response_type
     response_type="$(jq -r '.response_type // empty' <<<"${response_json}")"
     if [[ "${response_type}" == "work_plan" || "${response_type}" == "answer" || "${response_type}" == "skill_edit" ]]; then
-        printf '%s\n' "${response_json}"
+        if [[ "${response_type}" == "work_plan" ]]; then
+            jq -c '
+                .steps = ((.steps // []) | map(
+                    if ((has("arguments") | not) or .arguments == null) then
+                        .arguments = {}
+                    elif (.arguments | type) == "string" then
+                        .arguments = ((.arguments | fromjson? | select(type == "object")) // .arguments)
+                    else
+                        .
+                    end
+                ))
+            ' <<<"${response_json}"
+        else
+            printf '%s\n' "${response_json}"
+        fi
         return 0
     fi
 
@@ -314,6 +441,9 @@ linux_agent_call_ai_with_context() {
             repair)
                 linux_agent_mock_repair_plan "${payload_context}"
                 ;;
+            work_reflect)
+                linux_agent_mock_work_reflect "${payload_context}"
+                ;;
             *)
                 linux_agent_mock_work_plan "${safe_current_request}"
                 ;;
@@ -333,6 +463,7 @@ linux_agent_call_ai_with_context() {
         case "${purpose}" in
             edit) linux_agent_mock_edit_package "${safe_current_request}" ;;
             repair) linux_agent_mock_repair_plan "${payload_context}" ;;
+            work_reflect) linux_agent_mock_work_reflect "${payload_context}" ;;
             *) linux_agent_mock_work_plan "${safe_current_request}" ;;
         esac
         return 0
@@ -365,6 +496,7 @@ linux_agent_call_ai_with_context() {
         case "${purpose}" in
             edit) linux_agent_mock_edit_package "${safe_current_request}" ;;
             repair) linux_agent_mock_repair_plan "${payload_context}" ;;
+            work_reflect) linux_agent_mock_work_reflect "${payload_context}" ;;
             *) linux_agent_mock_work_plan "${safe_current_request}" ;;
         esac
         return 0
@@ -376,6 +508,7 @@ linux_agent_call_ai_with_context() {
         case "${purpose}" in
             edit) linux_agent_mock_edit_package "${safe_current_request}" ;;
             repair) linux_agent_mock_repair_plan "${payload_context}" ;;
+            work_reflect) linux_agent_mock_work_reflect "${payload_context}" ;;
             *) linux_agent_mock_work_plan "${safe_current_request}" ;;
         esac
         return 0
@@ -386,6 +519,7 @@ linux_agent_call_ai_with_context() {
         case "${purpose}" in
             edit) linux_agent_mock_edit_package "${safe_current_request}" ;;
             repair) linux_agent_mock_repair_plan "${payload_context}" ;;
+            work_reflect) linux_agent_mock_work_reflect "${payload_context}" ;;
             *) linux_agent_mock_work_plan "${safe_current_request}" ;;
         esac
         return 0

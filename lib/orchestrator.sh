@@ -2,10 +2,329 @@
 
 set -euo pipefail
 
+linux_agent_agent_loop_enabled() {
+    [[ "${LINUX_AGENT_FORCE_PLAN:-0}" == "1" ]] && {
+        printf 'false\n'
+        return 0
+    }
+    linux_agent_config_bool_default '.agent_loop.enabled_for_work' 'true'
+}
+
+linux_agent_thinking_trace_enabled() {
+    linux_agent_config_bool_default '.agent_loop.thinking_trace_enabled' 'false'
+}
+
+linux_agent_agent_observation_limit() {
+    linux_agent_config_positive_int_default '.agent_loop.observation_text_limit' '4000'
+}
+
+linux_agent_agent_checkpoint_turns() {
+    local checkpoint context_turns
+
+    checkpoint="$(linux_agent_config_get_default '.agent_loop.checkpoint_turns' '')"
+    if [[ "${checkpoint}" =~ ^[0-9]+$ && "${checkpoint}" -gt 0 ]]; then
+        printf '%s\n' "${checkpoint}"
+        return 0
+    fi
+
+    context_turns="$(linux_agent_context_turns)"
+    if [[ "${context_turns}" =~ ^[0-9]+$ && "${context_turns}" -gt 0 ]]; then
+        printf '%s\n' "${context_turns}"
+    else
+        printf '6\n'
+    fi
+}
+
+linux_agent_agent_loop_context_json() {
+    jq -cn \
+        --argjson thinking_trace_enabled "$(linux_agent_thinking_trace_enabled)" \
+        --argjson auto_execute_low_risk "$(linux_agent_auto_execute_low_risk_enabled)" \
+        --argjson auto_execute_shell_low_risk "$(linux_agent_auto_execute_shell_low_risk_enabled)" \
+        '{
+            thinking_trace_enabled:$thinking_trace_enabled,
+            auto_execute_low_risk:$auto_execute_low_risk,
+            auto_execute_shell_low_risk:$auto_execute_shell_low_risk
+        }'
+}
+
+linux_agent_add_agent_loop_context() {
+    local request_context="$1"
+    jq -c --argjson agent_loop "$(linux_agent_agent_loop_context_json)" \
+        '. + {agent_loop:$agent_loop}' <<<"${request_context}"
+}
+
+linux_agent_response_without_thinking() {
+    local response_json="$1"
+    jq -c 'del(.thinking_summary)' <<<"${response_json}"
+}
+
+linux_agent_store_thinking_summary() {
+    local response_json="$1"
+    local iteration="$2"
+    local summary safe_session dir path limit
+
+    [[ "$(linux_agent_thinking_trace_enabled)" == "true" ]] || return 0
+    summary="$(jq -r '.thinking_summary // empty' <<<"${response_json}")"
+    [[ -n "${summary}" ]] || return 0
+
+    limit="$(linux_agent_agent_observation_limit)"
+    safe_session="$(printf '%s' "${LINUX_AGENT_SESSION_ID:-session}" | tr -c 'A-Za-z0-9_.-' '_' | cut -c 1-80)"
+    [[ -n "${safe_session}" ]] || safe_session="session"
+    dir="/tmp/${safe_session}/thinking"
+    mkdir -p "${dir}"
+    path="${dir}/iteration-${iteration}.txt"
+    {
+        printf 'session_id=%s\n' "${LINUX_AGENT_SESSION_ID:-}"
+        printf 'iteration=%s\n' "${iteration}"
+        printf 'timestamp=%s\n\n' "$(linux_agent_now_iso)"
+        linux_agent_sanitize_text "${summary}" "${limit}"
+        printf '\n'
+    } > "${path}"
+}
+
+linux_agent_build_agent_observation() {
+    local user_input="$1"
+    local iteration="$2"
+    local plan_json="$3"
+    local execution_json="$4"
+    local environment_context="$5"
+    local limit observation
+
+    limit="$(linux_agent_agent_observation_limit)"
+    observation="$(jq -cn \
+        --arg input "${user_input}" \
+        --argjson iteration "${iteration}" \
+        --argjson plan "${plan_json}" \
+        --argjson execution "${execution_json}" \
+        --argjson environment_context "${environment_context}" \
+        --argjson limit "${limit}" \
+        '
+        def preview:
+            tostring | if length > $limit then .[0:$limit] + "[TRUNCATED]" else . end;
+        def step_summary($s): {
+            id:($s.id // null),
+            title:($s.title // null),
+            executor_type:($s.executor_type // null),
+            skill_script:($s.skill_script // null),
+            risk_level:($s.risk_level // null),
+            has_command:($s | has("command")),
+            url:($s.url // null)
+        };
+        def output_preview($o):
+            if $o == null then null
+            elif ($o | type) == "object" and ($o | has("raw")) then ($o.raw | preview)
+            else ($o | tojson | preview) end;
+        def result_summary($r): {
+            ok:($r.ok // false),
+            status:($r.status // null),
+            exit_code:($r.exit_code // null),
+            tool:($r.output.tool // null),
+            action:($r.output.action // null),
+            auto_approved:($r.auto_approved // false),
+            output_keys:(if ($r.output? | type) == "object" then ($r.output | keys) else [] end),
+            output_preview:output_preview($r.output)
+        };
+        {
+            agent_observation:{
+                original_request:$input,
+                iteration:$iteration,
+                environment_context:$environment_context,
+                plan:{
+                    summary:($plan.summary // ""),
+                    step_count:(($plan.steps // []) | length),
+                    steps:[($plan.steps // [])[] | step_summary(.)]
+                },
+                execution:{
+                    status:($execution.status // "unknown"),
+                    result_count:(($execution.results // []) | length),
+                    auto_executed_count:([($execution.results // [])[] | select(.result.auto_approved == true)] | length),
+                    failed_count:([($execution.results // [])[] | select((.result.ok // false) == false)] | length),
+                    findings:($execution.findings // []),
+                    results:[($execution.results // [])[] | {step:step_summary(.step), result:result_summary(.result)}]
+                }
+            }
+        }')"
+    linux_agent_sanitize_json "${observation}" "${limit}"
+}
+
+linux_agent_fallback_reflection_response() {
+    local reason="$1"
+    jq -cn --arg reason "${reason}" '
+        {
+            response_type:"answer",
+            summary:"反思响应无效，停止自动深入。",
+            continue_decision:{should_continue:false, reason:$reason},
+            answer:$reason
+        }'
+}
+
+linux_agent_plan_should_reflect_after_execution() {
+    local plan_json="$1"
+    [[ "$(jq -r '.continue_decision.should_continue == true' <<<"${plan_json}" 2>/dev/null || printf 'false')" == "true" ]]
+}
+
+linux_agent_plan_stop_reason() {
+    local plan_json="$1"
+    jq -r '.continue_decision.reason // "plan_completed"' <<<"${plan_json}" 2>/dev/null || printf 'plan_completed\n'
+}
+
+linux_agent_request_agent_reflection() {
+    local user_input="$1"
+    local iteration="$2"
+    local observation_json="$3"
+    local reflection_context response_json safe_response status result_count
+
+    reflection_context="$(jq -cn \
+        --arg mode "work_reflect" \
+        --arg current_request "${user_input}" \
+        --argjson conversation_context "$(linux_agent_history_window)" \
+        --argjson agent_loop "$(linux_agent_agent_loop_context_json)" \
+        '{
+            mode:$mode,
+            conversation_context:$conversation_context,
+            current_request:$current_request,
+            agent_loop:$agent_loop
+        }')"
+
+    status="$(jq -r '.agent_observation.execution.status // "unknown"' <<<"${observation_json}")"
+    result_count="$(jq -r '.agent_observation.execution.result_count // 0' <<<"${observation_json}")"
+    linux_agent_log_event "agent_reflection_requested" "$(jq -cn \
+        --argjson iteration "${iteration}" \
+        --arg status "${status}" \
+        --argjson result_count "${result_count}" \
+        '{iteration:$iteration, execution_status:$status, result_count:$result_count}')"
+
+    linux_agent_record_ai_request_files "${reflection_context}"
+    response_json="$(linux_agent_call_ai_with_context "${user_input}" "${reflection_context}" "work_reflect" "${observation_json}")"
+    response_json="$(linux_agent_normalize_model_response "${response_json}")"
+    linux_agent_store_thinking_summary "${response_json}" "${iteration}"
+
+    if ! linux_agent_validate_work_response "${response_json}"; then
+        linux_agent_print_warn "模型反思响应缺少合法 continue_decision，停止自动深入。"
+        response_json="$(linux_agent_fallback_reflection_response "模型反思响应无效，已停止自动深入。")"
+    fi
+
+    safe_response="$(linux_agent_response_without_thinking "${response_json}")"
+    linux_agent_log_event "agent_reflection_planned" "${safe_response}"
+    printf '%s\n' "${response_json}"
+}
+
+linux_agent_run_agent_loop() {
+    local user_input="$1"
+    local mode="$2"
+    local environment_context="$3"
+    local initial_plan="$4"
+    local current_plan execution_json all_results iteration status final_status final_answer stopped_reason
+    local observation_json reflection_json checkpoint_turns auto_executed_count checkpoint_required
+    local execution_user sudo_probe
+
+    current_plan="${initial_plan}"
+    all_results='[]'
+    iteration=0
+    final_status="executed"
+    final_answer=""
+    stopped_reason=""
+    checkpoint_required=false
+    auto_executed_count=0
+    execution_user=""
+    sudo_probe=""
+    checkpoint_turns="$(linux_agent_agent_checkpoint_turns)"
+
+    linux_agent_log_event "agent_loop_started" "$(jq -cn \
+        --arg mode "${mode}" \
+        --argjson checkpoint_turns "${checkpoint_turns}" \
+        --argjson agent_loop "$(linux_agent_agent_loop_context_json)" \
+        '{mode:$mode, checkpoint_turns:$checkpoint_turns, agent_loop:$agent_loop}')"
+
+    while true; do
+        iteration=$((iteration + 1))
+        linux_agent_log_event "agent_loop_iteration_started" "$(jq -cn \
+            --argjson iteration "${iteration}" \
+            --argjson plan "$(linux_agent_response_without_thinking "${current_plan}")" \
+            '{iteration:$iteration, plan:$plan}')"
+
+        execution_json="$(linux_agent_execute_work_plan "${current_plan}" "${user_input}")"
+        execution_user="$(jq -r '.execution_user // empty' <<<"${execution_json}" 2>/dev/null || true)"
+        sudo_probe="$(jq -r '.sudo_probe // empty' <<<"${execution_json}" 2>/dev/null || true)"
+        all_results="$(jq -cn --argjson prior "${all_results}" --argjson next "$(jq '.results // []' <<<"${execution_json}")" '$prior + $next')"
+        status="$(jq -r '.status // "unknown"' <<<"${execution_json}")"
+        final_status="${status}"
+        auto_executed_count="$(jq '[.[] | select(.result.auto_approved == true)] | length' <<<"${all_results}")"
+
+        if [[ "${status}" != "executed" && "${status}" != "failed" ]]; then
+            stopped_reason="${status}"
+            break
+        fi
+
+        if [[ "${status}" == "executed" ]] && ! linux_agent_plan_should_reflect_after_execution "${current_plan}"; then
+            stopped_reason="$(linux_agent_plan_stop_reason "${current_plan}")"
+            break
+        fi
+
+        observation_json="$(linux_agent_build_agent_observation "${user_input}" "${iteration}" "${current_plan}" "${execution_json}" "${environment_context}")"
+        reflection_json="$(linux_agent_request_agent_reflection "${user_input}" "${iteration}" "${observation_json}")"
+
+        if [[ "$(jq -r '.response_type' <<<"${reflection_json}")" == "answer" ]]; then
+            final_answer="$(jq -r '.answer // empty' <<<"${reflection_json}")"
+            if [[ -n "${final_answer}" ]] && ! linux_agent_output_json_enabled; then
+                printf '%s\n' "${final_answer}" >&2
+            fi
+            stopped_reason="$(jq -r '.continue_decision.reason // "model_stopped"' <<<"${reflection_json}")"
+            break
+        fi
+
+        if [[ "$(jq -r '.response_type' <<<"${reflection_json}")" != "work_plan" ]]; then
+            stopped_reason="continue_without_work_plan"
+            break
+        fi
+
+        if (( iteration % checkpoint_turns == 0 )); then
+            checkpoint_required=true
+            linux_agent_log_event "agent_checkpoint_requested" "$(jq -cn \
+                --argjson iteration "${iteration}" \
+                --argjson checkpoint_turns "${checkpoint_turns}" \
+                '{iteration:$iteration, checkpoint_turns:$checkpoint_turns}')"
+            if linux_agent_confirm_execution "已连续迭代 ${iteration} 轮，允许继续深入？"; then
+                linux_agent_log_event "agent_checkpoint_decision" "$(jq -cn \
+                    --argjson iteration "${iteration}" \
+                    '{iteration:$iteration, approved:true}')"
+            else
+                linux_agent_log_event "agent_checkpoint_decision" "$(jq -cn \
+                    --argjson iteration "${iteration}" \
+                    '{iteration:$iteration, approved:false}')"
+                final_status="checkpoint_stopped"
+                stopped_reason="checkpoint_rejected"
+                break
+            fi
+        fi
+
+        current_plan="${reflection_json}"
+    done
+
+    linux_agent_log_event "agent_loop_finished" "$(jq -cn \
+        --arg status "${final_status}" \
+        --arg stopped_reason "${stopped_reason}" \
+        --argjson iterations "${iteration}" \
+        --argjson auto_executed_count "${auto_executed_count}" \
+        '{status:$status, stopped_reason:$stopped_reason, iterations:$iterations, auto_executed_count:$auto_executed_count}')"
+
+    jq -cn \
+        --arg status "${final_status}" \
+        --arg execution_user "${execution_user}" \
+        --arg sudo_probe "${sudo_probe}" \
+        --arg final_answer "${final_answer}" \
+        --arg stopped_reason "${stopped_reason}" \
+        --argjson iterations "${iteration}" \
+        --argjson auto_executed_count "${auto_executed_count}" \
+        --argjson checkpoint_required "${checkpoint_required}" \
+        --argjson results "${all_results}" \
+        '{status:$status, execution_user:$execution_user, sudo_probe:$sudo_probe, iterations:$iterations, auto_executed_count:$auto_executed_count, final_answer:$final_answer, checkpoint_required:$checkpoint_required, stopped_reason:$stopped_reason, results:$results}'
+}
+
 linux_agent_process_work_request() {
     local user_input="$1"
     local mode="${2:-work}"
-    local topic context_json request_context response_json execution_json final_status response_type
+    local topic context_json request_context response_json execution_json final_status response_type safe_response
 
     linux_agent_log_event "received" "$(jq -cn --arg input "${user_input}" --arg mode "${mode}" '{input:$input, mode:$mode}')"
 
@@ -15,18 +334,21 @@ linux_agent_process_work_request() {
     linux_agent_log_event "sensed" "${context_json}"
 
     request_context="$(linux_agent_build_request_context "${user_input}" "${context_json}" "work")"
+    request_context="$(linux_agent_add_agent_loop_context "${request_context}")"
     linux_agent_log_event "request_context_built" "${request_context}"
 
     linux_agent_record_ai_request_files "${request_context}"
     response_json="$(linux_agent_call_ai_with_context "${user_input}" "${request_context}" "work_plan" "${context_json}")"
     response_json="$(linux_agent_normalize_model_response "${response_json}")"
+    linux_agent_store_thinking_summary "${response_json}" "initial"
     if ! linux_agent_validate_work_response "${response_json}"; then
         linux_agent_print_warn "模型响应不符合 work_plan schema，改用 Mock 响应兜底。"
         response_json="$(linux_agent_mock_work_plan "${user_input}")"
     fi
 
+    safe_response="$(linux_agent_response_without_thinking "${response_json}")"
     if [[ "${LINUX_AGENT_FORCE_PLAN:-0}" == "1" && "$(jq -r '.response_type' <<<"${response_json}")" == "work_plan" ]]; then
-        linux_agent_log_event "planned" "${response_json}"
+        linux_agent_log_event "planned" "${safe_response}"
         linux_agent_print_work_plan "${response_json}"
         final_status="planned"
         linux_agent_log_event "finished" "$(jq -cn --arg status "${final_status}" '{status:$status}')"
@@ -35,7 +357,7 @@ linux_agent_process_work_request() {
         return 0
     fi
 
-    linux_agent_log_event "planned" "${response_json}"
+    linux_agent_log_event "planned" "${safe_response}"
 
     response_type="$(jq -r '.response_type' <<<"${response_json}")"
     if [[ "${response_type}" == "answer" ]]; then
@@ -47,7 +369,11 @@ linux_agent_process_work_request() {
         return 0
     fi
 
-    execution_json="$(linux_agent_execute_work_plan "${response_json}" "${user_input}")"
+    if [[ "$(linux_agent_agent_loop_enabled)" == "true" ]]; then
+        execution_json="$(linux_agent_run_agent_loop "${user_input}" "${mode}" "${context_json}" "${response_json}")"
+    else
+        execution_json="$(linux_agent_execute_work_plan "${response_json}" "${user_input}")"
+    fi
     linux_agent_log_event "executed" "${execution_json}"
     if linux_agent_output_json_enabled; then
         printf '%s\n' "$(linux_agent_compact_execution_result "${execution_json}" | jq .)"
@@ -66,6 +392,18 @@ linux_agent_process_script_request() {
     local arguments_json="${2:-}"
     local review material result final_status
     [[ -z "${arguments_json}" ]] && arguments_json='{}'
+
+    if ! arguments_json="$(linux_agent_normalize_json_object_argument "${arguments_json}")"; then
+        result="$(jq -cn --arg ref "${ref}" '{ok:false, status:"blocked", error:"脚本参数必须是 JSON 对象。", ref:$ref}')"
+        linux_agent_log_event "script_blocked" "${result}"
+        if linux_agent_output_json_enabled; then
+            printf '%s\n' "$(jq . <<<"${result}")"
+        else
+            linux_agent_print_script_result "${result}"
+        fi
+        linux_agent_log_event "finished" "$(jq -cn '{status:"blocked"}')"
+        return 0
+    fi
 
     linux_agent_log_event "received" "$(jq -cn --arg ref "${ref}" --argjson args "${arguments_json}" '{mode:"script", ref:$ref, arguments:$args}')"
 

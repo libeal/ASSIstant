@@ -182,3 +182,24 @@ linux_agent_sanitize_json() {
         linux_agent_sanitize_text "${input}" "${limit}"
     fi
 }
+
+linux_agent_normalize_json_object_argument() {
+    local input="${1:-}"
+    [[ -z "${input}" ]] && input='{}'
+
+    if ! printf '%s' "${input}" | jq -e . >/dev/null 2>&1; then
+        return 1
+    fi
+
+    if printf '%s' "${input}" | jq -e 'type == "object"' >/dev/null 2>&1; then
+        jq -c . <<<"${input}"
+        return 0
+    fi
+
+    if printf '%s' "${input}" | jq -e 'type == "string" and ((fromjson? | type) == "object")' >/dev/null 2>&1; then
+        jq -r 'fromjson | tojson' <<<"${input}"
+        return 0
+    fi
+
+    return 1
+}

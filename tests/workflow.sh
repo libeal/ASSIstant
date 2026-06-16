@@ -27,7 +27,7 @@ grep -q '根据修改需求生成续写计划' <<<"${revision_output}"
 grep -q '系统负载' <<<"${revision_output}"
 grep -q '工作流执行完成: status=executed' <<<"${revision_output}"
 
-terminated_output="$(bash "${ROOT_DIR}/bin/agent" work "帮我检查磁盘空间是否异常" <<< $'t\n' 2>&1)"
+terminated_output="$(bash "${ROOT_DIR}/bin/agent" work "请演示失败中断" <<< $'t\n' 2>&1)"
 grep -q '工作流执行完成: status=terminated' <<<"${terminated_output}"
 ! grep -q '步骤输出' <<<"${terminated_output}"
 
@@ -39,16 +39,29 @@ grep -q '工作流执行完成: status=executed' <<<"${quiet_output}"
 grep -q '步骤输出' <<<"${quiet_output}"
 ! grep -q '输出摘要（已脱敏' <<<"${quiet_output}"
 
-resource_output="$(bash "${ROOT_DIR}/bin/agent" work "查看cpu占用,内存环境" <<< $'y\n' 2>&1)"
+resource_output="$(bash "${ROOT_DIR}/bin/agent" work "查看cpu占用,内存环境" 2>&1)"
 grep -q '工作流执行完成: status=executed' <<<"${resource_output}"
 grep -q '系统负载' <<<"${resource_output}"
 grep -q '内存' <<<"${resource_output}"
+grep -q '低风险步骤已自动批准执行' <<<"${resource_output}"
 ! grep -q '"ok": true' <<<"${resource_output}"
 ! grep -q '"tool"' <<<"${resource_output}"
 
-json_output="$(LINUX_AGENT_OUTPUT_JSON=1 bash "${ROOT_DIR}/bin/agent" work "查看cpu占用,内存环境" <<< $'y\n' 2>/dev/null)"
+json_output="$(LINUX_AGENT_OUTPUT_JSON=1 bash "${ROOT_DIR}/bin/agent" work "查看cpu占用,内存环境" 2>/dev/null)"
 grep -q '"status": "executed"' <<<"${json_output}"
 grep -q '"tool": "system.resource.inspect"' <<<"${json_output}"
+grep -q '"auto_executed_count": 1' <<<"${json_output}"
+grep -q '"final_answer": ""' <<<"${json_output}"
+grep -q '"stopped_reason": "资源检查 skill 的预期输出已经满足当前请求，执行成功后无需再次反思。"' <<<"${json_output}"
+
+continue_output="$(bash "${ROOT_DIR}/bin/agent" work "查看cpu继续深入" 2>&1)"
+grep -q '工作流执行完成: status=executed' <<<"${continue_output}"
+grep -q '补充查看 CPU 与内存资源概况' <<<"${continue_output}"
+[[ "$(grep -c '低风险步骤已自动批准执行' <<<"${continue_output}")" -ge 2 ]]
+
+invalid_reflect_output="$(bash "${ROOT_DIR}/bin/agent" work "查看cpu 非法继续决策" 2>&1)"
+grep -q '模型反思响应缺少合法 continue_decision' <<<"${invalid_reflect_output}"
+grep -q '工作流执行完成: status=executed' <<<"${invalid_reflect_output}"
 
 render_input="$(jq -cn --arg table $'COL1\tCOL2\nA\tB' '{ok:true, exit_code:0, output:{ok:true, tool:"demo.render", table:$table, empty:"", count:2}}')"
 render_output="$(

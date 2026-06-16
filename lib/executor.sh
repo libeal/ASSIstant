@@ -25,6 +25,47 @@ linux_agent_confirm_execution() {
     [[ "${answer}" =~ ^[Yy]$ ]]
 }
 
+linux_agent_auto_execute_low_risk_enabled() {
+    linux_agent_config_bool_default '.agent_loop.auto_execute_low_risk' 'true'
+}
+
+linux_agent_auto_execute_shell_low_risk_enabled() {
+    linux_agent_config_bool_default '.agent_loop.auto_execute_shell_low_risk' 'false'
+}
+
+linux_agent_should_auto_execute_step() {
+    local step_json="$1"
+    local review_json="$2"
+    local executor_type ref
+
+    [[ "$(linux_agent_auto_execute_low_risk_enabled)" == "true" ]] || return 1
+    [[ "$(jq -r '.approved // false' <<<"${review_json}")" == "true" ]] || return 1
+    [[ "$(jq -r '.approval_required == false' <<<"${review_json}")" == "true" ]] || return 1
+    [[ "$(jq -r '.risk_level // "unknown"' <<<"${review_json}")" == "low" ]] || return 1
+
+    executor_type="$(jq -r '.executor_type' <<<"${step_json}")"
+    case "${executor_type}" in
+        skill_script)
+            ref="$(jq -r '.skill_script // empty' <<<"${step_json}")"
+            [[ -n "${ref}" ]] && linux_agent_skill_is_registered "${ref}"
+            ;;
+        shell)
+            [[ "$(linux_agent_auto_execute_shell_low_risk_enabled)" == "true" ]]
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+linux_agent_step_arguments_json() {
+    local step_json="$1"
+    local raw_args
+
+    raw_args="$(jq -c 'if has("arguments") then .arguments else {} end' <<<"${step_json}")"
+    linux_agent_normalize_json_object_argument "${raw_args}" || printf '{}\n'
+}
+
 linux_agent_prompt_step_decision() {
     local prompt="$1"
     local result_var="$2"
@@ -86,14 +127,14 @@ linux_agent_print_step_for_approval() {
     case "$(jq -r '.executor_type' <<<"${step_json}")" in
         skill_script)
             printf '脚本: %s\n' "$(jq -r '.skill_script' <<<"${step_json}")"
-            printf '参数: %s\n' "$(jq -c '.arguments // {}' <<<"${step_json}")"
+            printf '参数: %s\n' "$(linux_agent_step_arguments_json "${step_json}")"
             ;;
         shell)
             printf '命令: %s\n' "$(jq -r '.command' <<<"${step_json}")"
             ;;
         remote_script)
             printf '远程脚本: %s\n' "$(jq -r '.url // .command // empty' <<<"${step_json}")"
-            printf '参数: %s\n' "$(jq -c '.arguments // {}' <<<"${step_json}")"
+            printf '参数: %s\n' "$(linux_agent_step_arguments_json "${step_json}")"
             if [[ "$(jq -r 'has("sha256")' <<<"${step_json}")" == "true" ]]; then
                 printf 'sha256: %s\n' "$(jq -r '.sha256' <<<"${step_json}")"
                 printf '大小: %s bytes\n' "$(jq -r '.size_bytes' <<<"${step_json}")"
@@ -306,6 +347,11 @@ linux_agent_compact_execution_result() {
             execution_user,
             sudo_probe,
             findings,
+            iterations,
+            auto_executed_count,
+            final_answer,
+            checkpoint_required,
+            stopped_reason,
             results:[
                 .results[]? | {
                     step:{
@@ -321,6 +367,7 @@ linux_agent_compact_execution_result() {
                         exit_code:(.result.exit_code // null),
                         tool:(.result.output.tool // null),
                         action:(.result.output.action // null),
+                        auto_approved:(.result.auto_approved // false),
                         observer:(.result.observer // null)
                     }
                 }
@@ -357,7 +404,7 @@ linux_agent_step_review_material() {
         skill_script)
             local ref args content
             ref="$(jq -r '.skill_script' <<<"${step_json}")"
-            args="$(jq -c '.arguments // {}' <<<"${step_json}")"
+            args="$(linux_agent_step_arguments_json "${step_json}")"
             content="$(linux_agent_skill_script_content "${ref}" 2>/dev/null || true)"
             printf 'skill_script=%s\narguments=%s\n%s\n' "${ref}" "${args}" "${content}"
             ;;
@@ -485,14 +532,14 @@ linux_agent_execute_step_command() {
             local ref script_path args
             ref="$(jq -r '.skill_script' <<<"${step_json}")"
             script_path="$(linux_agent_skill_script_path "${ref}")"
-            args="$(jq -c '.arguments // {}' <<<"${step_json}")"
+            args="$(linux_agent_step_arguments_json "${step_json}")"
             command_args=(bash "${script_path}" "${args}")
             ;;
         shell)
             command_args=(bash -lc "$(jq -r '.command // empty' <<<"${step_json}")")
             ;;
         remote_script)
-            command_args=(bash "$(jq -r '.downloaded_path' <<<"${step_json}")" "$(jq -c '.arguments // {}' <<<"${step_json}")")
+            command_args=(bash "$(jq -r '.downloaded_path' <<<"${step_json}")" "$(linux_agent_step_arguments_json "${step_json}")")
             ;;
         *)
             jq -cn --arg executor_type "${executor_type}" \
@@ -631,8 +678,9 @@ linux_agent_execute_work_plan() {
 
     local i=0
     while [[ "${i}" -lt "${step_count}" ]]; do
-        local step step_review_text review result skipped prepared step_decision revision_request
+        local step step_review_text review result skipped prepared step_decision revision_request auto_approved
         step="$(jq -c --argjson index "${i}" '.steps[$index]' <<<"${plan_json}")"
+        auto_approved=0
         linux_agent_log_step_status "${step}" "pending"
 
         if [[ "$(jq -r '.executor_type' <<<"${step}")" == "remote_script" ]]; then
@@ -687,7 +735,14 @@ linux_agent_execute_work_plan() {
         if [[ "$(jq -r '.approval_required' <<<"${review}")" == "true" ]]; then
             printf '审查风险: %s，发现项: %s\n' "$(jq -r '.risk_level' <<<"${review}")" "$(jq '.findings | length' <<<"${review}")" >&2
         fi
-        linux_agent_prompt_step_decision "批准执行该步骤？" step_decision
+        if linux_agent_should_auto_execute_step "${step}" "${review}"; then
+            step_decision="approve"
+            auto_approved=1
+            linux_agent_log_step_status "${step}" "auto_approved" "${review}"
+            printf '低风险步骤已自动批准执行: %s\n' "$(jq -r '.title' <<<"${step}")" >&2
+        else
+            linux_agent_prompt_step_decision "批准执行该步骤？" step_decision
+        fi
         case "${step_decision}" in
             reject)
                 linux_agent_log_step_status "${step}" "rejected"
@@ -748,6 +803,9 @@ linux_agent_execute_work_plan() {
         linux_agent_log_step_status "${step}" "approved"
         linux_agent_log_step_status "${step}" "running"
         result="$(linux_agent_execute_step_command "${step}")"
+        if [[ "${auto_approved}" -eq 1 ]]; then
+            result="$(jq -c '. + {auto_approved:true}' <<<"${result}")"
+        fi
         results="$(jq -cn --argjson prior "${results}" --argjson step "${step}" --argjson result "${result}" '$prior + [{step:$step, result:$result}]')"
 
         if [[ "$(jq -r '.ok' <<<"${result}")" == "true" ]]; then

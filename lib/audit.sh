@@ -116,12 +116,31 @@ linux_agent_audit_safe_summary() {
                 fixed_context_excluded:(has("skill_index") | not),
                 runtime_context_excluded:(has("environment_context") | not)
             }
-        elif ($stage == "planned" or $stage == "repair_planned" or $stage == "revision_planned") then
+        elif ($stage == "planned" or $stage == "repair_planned" or $stage == "revision_planned" or $stage == "agent_reflection_planned") then
             {
                 response_type:(.response_type // null),
                 summary_preview:(.summary // "" | preview),
+                continue_decision:(.continue_decision // null),
                 step_count:(if (.steps? | type) == "array" then (.steps | length) else 0 end),
                 steps:[.steps[]? | step_summary(.)]
+            }
+        elif $stage == "agent_reflection_requested" then
+            {
+                iteration:(.iteration // null),
+                execution_status:(.execution_status // null),
+                result_count:(.result_count // null)
+            }
+        elif ($stage == "agent_loop_started" or $stage == "agent_loop_iteration_started" or $stage == "agent_checkpoint_requested" or $stage == "agent_checkpoint_decision" or $stage == "agent_loop_finished") then
+            {
+                mode:(.mode // null),
+                iteration:(.iteration // null),
+                iterations:(.iterations // null),
+                checkpoint_turns:(.checkpoint_turns // null),
+                approved:(.approved // null),
+                status:(.status // null),
+                stopped_reason:(.stopped_reason // null),
+                auto_executed_count:(.auto_executed_count // null),
+                plan_step_count:(if (.plan.steps? | type) == "array" then (.plan.steps | length) else null end)
             }
         elif $stage == "work_revision_requested" then
             {

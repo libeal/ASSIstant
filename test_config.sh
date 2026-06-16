@@ -75,6 +75,7 @@ validate_config() {
     print_ok "config/config.json JSON 格式合法"
 
     local api_url api_key model timeout context_turns audit_mode audit_text_limit remote_policy skills_dir
+    local loop_enabled auto_low auto_shell observation_limit thinking_trace checkpoint_turns
     api_url="$(json_get '.api_url')"
     api_key="$(json_get '.api_key')"
     model="$(json_get '.model')"
@@ -84,6 +85,12 @@ validate_config() {
     audit_text_limit="$(json_get '.audit_text_limit')"
     remote_policy="$(json_get '.remote_script_policy')"
     skills_dir="$(json_get '.skills_dir')"
+    loop_enabled="$(json_get '.agent_loop.enabled_for_work')"
+    auto_low="$(json_get '.agent_loop.auto_execute_low_risk')"
+    auto_shell="$(json_get '.agent_loop.auto_execute_shell_low_risk')"
+    observation_limit="$(json_get '.agent_loop.observation_text_limit')"
+    thinking_trace="$(json_get '.agent_loop.thinking_trace_enabled')"
+    checkpoint_turns="$(json_get '.agent_loop.checkpoint_turns')"
 
     validate_non_empty "api_url" "${api_url}" || failures=$((failures + 1))
     validate_non_empty "api_key" "${api_key}" || failures=$((failures + 1))
@@ -158,6 +165,46 @@ validate_config() {
         print_ok "remote_script_policy 合法: ${remote_policy}"
     else
         print_warn "remote_script_policy 未配置，将默认使用 download_review"
+    fi
+
+    for bool_field in \
+        "agent_loop.enabled_for_work:${loop_enabled}" \
+        "agent_loop.auto_execute_low_risk:${auto_low}" \
+        "agent_loop.auto_execute_shell_low_risk:${auto_shell}" \
+        "agent_loop.thinking_trace_enabled:${thinking_trace}"; do
+        local field_name field_value
+        field_name="${bool_field%%:*}"
+        field_value="${bool_field#*:}"
+        if [[ -z "${field_value}" ]]; then
+            print_warn "${field_name} 未配置，将由程序默认值兜底"
+        elif [[ "${field_value}" == "true" || "${field_value}" == "false" ]]; then
+            print_ok "${field_name} 合法: ${field_value}"
+        else
+            print_error "${field_name} 必须是 true 或 false"
+            failures=$((failures + 1))
+        fi
+    done
+
+    if [[ -n "${observation_limit}" ]]; then
+        if [[ "${observation_limit}" =~ ^[0-9]+$ && "${observation_limit}" -gt 0 ]]; then
+            print_ok "agent_loop.observation_text_limit 合法: ${observation_limit}"
+        else
+            print_error "agent_loop.observation_text_limit 必须是正整数"
+            failures=$((failures + 1))
+        fi
+    else
+        print_warn "agent_loop.observation_text_limit 未配置，将默认使用 4000"
+    fi
+
+    if [[ -n "${checkpoint_turns}" ]]; then
+        if [[ "${checkpoint_turns}" =~ ^[0-9]+$ ]]; then
+            print_ok "agent_loop.checkpoint_turns 合法: ${checkpoint_turns}"
+        else
+            print_error "agent_loop.checkpoint_turns 必须是非负整数"
+            failures=$((failures + 1))
+        fi
+    else
+        print_warn "agent_loop.checkpoint_turns 未配置，将默认使用 context_turns"
     fi
 
     if [[ -n "${skills_dir}" ]]; then

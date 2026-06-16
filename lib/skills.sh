@@ -54,14 +54,15 @@ linux_agent_skill_manifest_path() {
 
 linux_agent_skill_is_registered() {
     local ref="$1"
-    local skill_name script_name skill_md index_path
+    local skill_name script_name skill_md index_path script_path
     linux_agent_skill_ref_is_valid "${ref}" || return 1
     skill_name="$(linux_agent_skill_name_from_ref "${ref}")"
     script_name="$(linux_agent_skill_script_name_from_ref "${ref}")"
     skill_md="$(linux_agent_skill_manifest_path "${skill_name}")"
     index_path="$(linux_agent_skill_index_path)"
+    script_path="$(linux_agent_skill_script_path "${ref}")"
 
-    [[ -f "${skill_md}" && -f "${index_path}" ]] || return 1
+    [[ -f "${skill_md}" && -f "${index_path}" && -f "${script_path}" ]] || return 1
     grep -Eq "(^|[^a-z0-9-])${skill_name}/${script_name%.sh}(\.sh)?([^a-z0-9-]|$)" "${index_path}" || return 1
     grep -Eq "(scripts/${script_name}|${script_name})" "${skill_md}" || return 1
 }
@@ -70,14 +71,34 @@ linux_agent_skill_is_registered_at() {
     local ref="$1"
     local skill_md="$2"
     local index_path="$3"
-    local skill_name script_name
+    local skill_name script_name script_path
     linux_agent_skill_ref_is_valid "${ref}" || return 1
     skill_name="$(linux_agent_skill_name_from_ref "${ref}")"
     script_name="$(linux_agent_skill_script_name_from_ref "${ref}")"
+    script_path="$(dirname "${skill_md}")/scripts/${script_name}"
 
-    [[ -f "${skill_md}" && -f "${index_path}" ]] || return 1
+    [[ -f "${skill_md}" && -f "${index_path}" && -f "${script_path}" ]] || return 1
     grep -Eq "(^|[^a-z0-9-])${skill_name}/${script_name%.sh}(\.sh)?([^a-z0-9-]|$)" "${index_path}" || return 1
     grep -Eq "(scripts/${script_name}|${script_name})" "${skill_md}" || return 1
+}
+
+linux_agent_skill_manifest_declared_script_names_at() {
+    local skill_md="$1"
+    [[ -f "${skill_md}" ]] || return 0
+
+    grep -oE '`scripts/[a-z0-9][a-z0-9-]*\.sh`' "${skill_md}" 2>/dev/null \
+        | tr -d '`' \
+        | sed 's#^scripts/##' \
+        | sort -u
+}
+
+linux_agent_index_declared_refs_at() {
+    local index_path="$1"
+    [[ -f "${index_path}" ]] || return 0
+
+    grep -oE '`[a-z0-9][a-z0-9-]*/[a-z0-9][a-z0-9-]*(\.sh)?`' "${index_path}" 2>/dev/null \
+        | tr -d '`' \
+        | sort -u
 }
 
 linux_agent_skill_script_content() {
@@ -93,6 +114,11 @@ linux_agent_run_skill_script() {
     local arguments_json="${2:-}"
     local script_path
     [[ -z "${arguments_json}" ]] && arguments_json='{}'
+
+    if ! arguments_json="$(linux_agent_normalize_json_object_argument "${arguments_json}")"; then
+        jq -cn --arg ref "${ref}" '{ok:false, error:"skill script arguments must be a JSON object", ref:$ref}'
+        return 1
+    fi
 
     if ! linux_agent_skill_is_registered "${ref}"; then
         jq -cn --arg ref "${ref}" '{ok:false, error:"skill script is not registered", ref:$ref}'
@@ -146,6 +172,17 @@ linux_agent_validate_skill_at() {
         fi
     done < <(find "${skill_dir}/scripts" -maxdepth 1 -type f -name '*.sh' 2>/dev/null | sort)
 
+    while IFS= read -r declared_script; do
+        [[ -n "${declared_script}" ]] || continue
+        if [[ ! -f "${skill_dir}/scripts/${declared_script}" ]]; then
+            ok="false"
+            findings="$(jq -cn \
+                --argjson prior "${findings}" \
+                --arg ref "${skill_name}/${declared_script%.sh}" \
+                '$prior + [{severity:"critical", code:"SKILL_SCRIPT_FILE_MISSING", ref:$ref, message:"脚本已在 SKILL.md 中声明，但 scripts/ 下不存在对应文件。"}]')"
+        fi
+    done < <(linux_agent_skill_manifest_declared_script_names_at "${skill_md}")
+
     jq -cn --argjson ok "${ok}" --arg skill "${skill_name}" --arg skill_dir "${skill_dir}" --arg index_path "${index_path}" --argjson findings "${findings}" \
         '{ok:$ok, skill:$skill, skill_dir:$skill_dir, index_path:$index_path, findings:$findings}'
 }
@@ -172,6 +209,17 @@ linux_agent_validate_skills() {
             findings="$(jq -cn --argjson prior "${findings}" --argjson next "$(jq '.findings' <<<"${skill_result}")" '$prior + $next')"
         fi
     done < <(find "${skills_dir}" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | sort)
+
+    while IFS= read -r ref; do
+        [[ -n "${ref}" ]] || continue
+        if ! linux_agent_skill_is_registered "${ref}"; then
+            ok="false"
+            findings="$(jq -cn \
+                --argjson prior "${findings}" \
+                --arg ref "${ref%.sh}" \
+                '$prior + [{severity:"critical", code:"SKILL_INDEX_BROKEN_REF", ref:$ref, message:"INDEX.md 中声明的脚本缺少对应文件或 SKILL.md 登记。"}]')"
+        fi
+    done < <(linux_agent_index_declared_refs_at "${index_path}")
 
     jq -cn --argjson ok "${ok}" --arg skills_dir "${skills_dir}" --argjson findings "${findings}" \
         '{ok:$ok, skills_dir:$skills_dir, findings:$findings}'

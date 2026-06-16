@@ -33,6 +33,29 @@ grep -q '"environment_context":{"topic":"disk"}' <<<"${payload_context}"
 mock_repair="$(LINUX_AGENT_MOCK=1 linux_agent_call_ai_with_context "repair" "${request_context}" "repair" '{"topic":"disk"}')"
 grep -q '"environment_context":{"topic":"disk"}' <<<"$(jq -r '.failure_context' <<<"${mock_repair}")"
 
+string_args_response="$(jq -cn '{
+    response_type:"work_plan",
+    summary:"string args regression",
+    continue_decision:{should_continue:false, reason:"test"},
+    steps:[{
+        id:"step-1",
+        title:"resource",
+        executor_type:"skill_script",
+        skill_script:"ops-basic/resource-inspect",
+        arguments:"{}",
+        reason:"test",
+        expected_effect:"test",
+        risk_level:"low",
+        rollback_hint:"none"
+    }]
+}')"
+normalized_string_args_response="$(linux_agent_normalize_model_response "${string_args_response}")"
+jq -e '.steps[0].arguments == {}' <<<"${normalized_string_args_response}" >/dev/null
+linux_agent_validate_work_response "${normalized_string_args_response}"
+
+encoded_step_args="$(linux_agent_step_arguments_json "$(jq -cn --arg args '{"top_n":2}' '{arguments:$args}')")"
+grep -q '"top_n":2' <<<"${encoded_step_args}"
+
 cleanup_root="$(mktemp -d)"
 linux_agent_init_env "${cleanup_root}"
 mkdir -p "${LINUX_AGENT_TMP_DIR}/nested"

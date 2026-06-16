@@ -1,19 +1,22 @@
 {
-  "provider": "OpenAI-Compatible",
   "api_url": "https://api.openai.com/v1/chat/completions",
   "api_key": "please-set-your-api-key",
   "model": "gpt-4.1-mini",
   "request_timeout_sec": 90,
   "context_turns": 6,
+  "agent_loop": {
+    "enabled_for_work": true,
+    "auto_execute_low_risk": true,
+    "auto_execute_shell_low_risk": false,
+    "observation_text_limit": 4000,
+    "thinking_trace_enabled": false,
+    "checkpoint_turns": 0
+  },
   "audit_mode": "safe_summary",
   "audit_text_limit": 1000,
   "observer": {
     "enabled": "auto",
-    "backend": "auditd",
-    "mode": "observe",
-    "lifecycle": "session",
     "privilege": "sudo_interactive",
-    "auditd_rule_mode": "temporary",
     "max_events": 200
   },
   "skills_dir": "",

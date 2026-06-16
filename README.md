@@ -4,7 +4,7 @@
 
 ## 模式
 
-- `work`: 根据自然语言请求生成 `answer` 或 `work_plan`，计划会逐步展示、审查、审批、执行。
+- `work`: 根据自然语言请求生成 `answer` 或 `work_plan`，并可在执行后基于观察结果受控迭代；低风险已登记 skill 可自动执行。
 - `edit`: 生成或修改 skill，打开编辑器让用户确认脚本内容，再保存到 `skills/`。
 - `script`: 直接执行已登记的 skill 脚本。
 - `terminal`: 直接执行本机 shell 命令，输出原样给用户，并写入审计。
@@ -65,20 +65,21 @@ REPL 内部命令：
 
 | 字段 | 默认值 | 有效值 | 作用 |
 | --- | --- | --- | --- |
-| `provider` | `OpenAI-Compatible` | 任意字符串 | 配置说明字段，当前运行逻辑不根据它分支。 |
 | `api_url` | `https://api.openai.com/v1/chat/completions` | Chat Completions 兼容 URL | AI 请求地址。支持 OpenAI-compatible 接口。 |
 | `api_key` | `please-set-your-api-key` | 非空字符串 | API 密钥。本地 `config/config.json` 被 `.gitignore` 忽略；占位值会触发 mock 兜底。 |
 | `model` | `gpt-4.1-mini` | 接口支持的模型名 | AI 请求中的 `model`。 |
 | `request_timeout_sec` | `90` | 正整数 | `curl --max-time` 超时时间；请求失败会退回 mock 响应。 |
 | `context_turns` | `6` | 非负整数 | 发送给 AI 的历史轮数窗口；`0` 表示不带历史。 |
+| `agent_loop.enabled_for_work` | `true` | `true`、`false` | 是否让 `work` 模式在计划执行后进入反思/续写循环。 |
+| `agent_loop.auto_execute_low_risk` | `true` | `true`、`false` | 是否自动执行 policy 判定为 clean low-risk 的步骤。默认只自动执行已登记 skill。 |
+| `agent_loop.auto_execute_shell_low_risk` | `false` | `true`、`false` | 是否允许 clean low-risk shell 步骤自动执行；默认关闭，shell 仍需人工确认。 |
+| `agent_loop.observation_text_limit` | `4000` | 正整数 | 每轮 observation 中字符串摘要的最大长度。 |
+| `agent_loop.thinking_trace_enabled` | `false` | `true`、`false` | 是否允许模型返回简短 `thinking_summary` 并保存到 `/tmp/<session-id>/thinking/`；不进入上下文和审计。 |
+| `agent_loop.checkpoint_turns` | `0` | 非负整数 | 大于 0 时每隔该轮数请求继续授权；`0` 表示使用 `context_turns`，非法或小于 1 时回退到 `6`。 |
 | `audit_mode` | `safe_summary` | `safe_summary`、`redacted_verbose` | JSONL 审计写入模式。未知值会按 `safe_summary` 处理。 |
 | `audit_text_limit` | `1000` | 正整数 | 审计、上下文、输出预览的脱敏后文本截断长度。 |
 | `observer.enabled` | `auto` | `auto`、`disabled` | observer 总开关。`auto` 会尝试启用 auditd；失败只记录降级事件。 |
-| `observer.backend` | `auditd` | 当前仅 `auditd` | 模板说明字段；当前实现固定使用 auditd。 |
-| `observer.mode` | `observe` | 当前仅 `observe` | 模板说明字段；当前 observer 只观察和汇总，不阻断业务执行。 |
-| `observer.lifecycle` | `session` | 当前仅 `session` | 模板说明字段；当前按运行级会话启动、结束和汇总。 |
 | `observer.privilege` | `sudo_interactive` | `sudo_interactive`、`passwordless`、`none` | 非 root 用户启用 auditd observer 时的 sudo 策略。 |
-| `observer.auditd_rule_mode` | `temporary` | 当前仅 `temporary` | 模板说明字段；当前只安装临时 auditd 规则，结束时清理。 |
 | `observer.max_events` | `200` | 正整数 | `ausearch` 结果解析后保留的事件样本上限；非法值回退到 `200`。 |
 | `skills_dir` | 空字符串 | 目录路径或空字符串 | 自定义 skill 根目录；留空使用项目内 `skills/`。 |
 | `remote_script_policy` | `download_review` | `download_review`、`disabled` | 远程脚本步骤策略。`download_review` 表示只允许 HTTPS 下载后预览、哈希和审批；`disabled` 表示完全禁用。 |
@@ -120,14 +121,15 @@ bash test_config.sh --live
 
 上下文分成三层：
 
-- 动态 `request_context`: 由 `lib/context.sh` 构造，只包含 `mode`、`conversation_context` 和 `current_request`。
+- 动态 `request_context`: 由 `lib/context.sh` 构造，包含 `mode`、`conversation_context`、`current_request` 和 agent loop 开关摘要。
 - 运行时 `environment_context`: 由 `lib/sense.sh` 采集并脱敏，不存入动态上下文本体，只在 `lib/ai.sh` 组装最终请求体时临时合并。
+- 迭代 observation: `work_reflect` 阶段会临时附加本轮计划、步骤结果、skill 返回摘要和失败信息，不写入会话历史。
 - 固定提示材料: `prompts/system.txt` 和 `skills/INDEX.md`，作为 system prompt 发送。
 
 最终发送给 AI 的 Chat Completions messages 包含：
 
 - 系统提示：基础规则和 skill 索引。
-- `purpose=<work_plan|edit|repair>`。
+- `purpose=<work_plan|work_reflect|edit|repair>`。
 - `request_context=<JSON 字符串>`，其中按需带有运行时 `environment_context`。
 - 用户消息：当前请求文本。
 
@@ -142,9 +144,27 @@ bash test_config.sh --live
 5. 如果返回 `answer`，直接展示回答并记录本轮历史。
 6. 如果返回 `work_plan`，`lib/executor.sh` 展示计划并逐步执行。
 7. 每个步骤先经过 `lib/policy.sh` 正则审查。
-8. 用户可选择执行、拒绝、跳过/修改或终止。
-9. 步骤执行通过 observer 执行封装运行，写入 `execution_started` / `execution_finished`。
-10. 步骤失败时中断当前计划，请 AI 生成修复建议；修复建议不会自动执行。
+8. clean low-risk 的已登记 `skill_script` 会自动批准执行；medium/high/critical、policy 告警、未登记 skill、remote_script 和默认 shell 仍需人工确认或阻断。
+9. 用户可对需审批步骤选择执行、拒绝、跳过/修改或终止。
+10. 步骤执行通过 observer 执行封装运行，写入 `execution_started` / `execution_finished`。
+11. 每轮计划执行成功后，如果该 `work_plan` 的 `continue_decision.should_continue=false`，orchestrator 会直接结束，不再请求反思。
+12. 如果 `continue_decision.should_continue=true`，orchestrator 会把环境信息、步骤结果、skill 返回摘要和失败信息整理成脱敏 observation，请 AI 用 `work_reflect` 判断下一步。
+13. `work_reflect` 返回 `answer` 时结束；返回 `work_plan` 时执行这份续写计划，续写计划自己的 `continue_decision.should_continue` 决定执行后是否继续反思。
+14. 循环轮次达到 `agent_loop.checkpoint_turns`（或默认 `context_turns`）时，会先请求用户允许继续。
+15. 步骤失败时仍会生成修复建议；迭代模式还会把失败 observation 交给 AI 判断是否需要安全的下一轮诊断。
+
+AI 的 work/reflection 响应必须包含显式继续判断：
+
+```json
+{
+  "continue_decision": {
+    "should_continue": false,
+    "reason": "当前计划执行后为什么继续或停止"
+  }
+}
+```
+
+开启 `agent_loop.thinking_trace_enabled` 后，模型可额外返回简短 `thinking_summary`。程序会把它脱敏后写入 `/tmp/<session-id>/thinking/iteration-<n>.txt`，但不会把内容加入下一轮上下文、会话历史或审计 JSONL。
 
 支持的步骤执行器：
 
@@ -235,13 +255,13 @@ observer 可用时，会话开始安装带唯一 `audit_key` 的临时 auditd sy
 - `lib/sense.sh`: 根据主题采集最小必要环境信息，包括磁盘、资源、进程、网络、服务、日志和权限。
 - `lib/skills.sh`: 解析 skill 引用、定位脚本、校验登记状态、执行 skill 脚本、校验 skill 目录。
 - `lib/doctor.sh`: 检查必需命令、可选命令、配置 JSON 和 skill 目录。
-- `lib/ai.sh`: 构造系统提示、记录 AI 文件清单、调用 OpenAI-compatible API、校验和 mock 模型响应。
+- `lib/ai.sh`: 构造系统提示、记录 AI 文件清单、调用 OpenAI-compatible API、校验 work/reflection schema 和 mock 模型响应。
 - `lib/policy.sh`: 读取风险规则，对命令、脚本、远程脚本和步骤做审查。
 - `lib/observer.sh`: auditd observer 预检、规则安装/清理、`ausearch` 汇总和执行 marker。
-- `lib/executor.sh`: 工作计划执行状态机；审批、远程脚本下载审查、步骤执行、失败修复、计划修改。
+- `lib/executor.sh`: 工作计划执行状态机；低风险自动审批、人工审批、远程脚本下载审查、步骤执行、失败修复、计划修改。
 - `lib/editor.sh`: skill 编辑模式；打开编辑器、记录用户 diff、staging、校验和提交 skill。
 - `lib/interactive.sh`: REPL 输入、斜杠菜单和模式选择菜单。
-- `lib/orchestrator.sh`: 四种业务模式的高层编排。
+- `lib/orchestrator.sh`: 四种业务模式的高层编排；work 模式的观察、反思、checkpoint 和续写循环。
 
 ### `skills/`
 
@@ -259,9 +279,9 @@ observer 可用时，会话开始安装带唯一 `audit_key` 的临时 auditd sy
 
 ### `tests/`
 
-- `tests/smoke.sh`: 覆盖主要 CLI 入口、mock 工作流、JSON 输出和 AI 文件清单。
+- `tests/smoke.sh`: 覆盖主要 CLI 入口、mock 工作流、JSON 输出、AI 文件清单、checkpoint 和 thinking trace。
 - `tests/security.sh`: 覆盖脱敏、审计摘要、上下文边界、远程脚本审查和临时目录清理。
-- `tests/workflow.sh`: 覆盖失败中断、拒绝、跳过、修改需求、终止和输出渲染。
+- `tests/workflow.sh`: 覆盖失败中断、自动低风险执行、反思续写、拒绝、跳过、修改需求、终止和输出渲染。
 - `tests/policy.sh`: 覆盖风险规则、保护路径、远程脚本阻断和风险合并。
 - `tests/tools.sh`: 覆盖本地工具、skill 登记、日志清理边界和 doctor。
 - `tests/observer.sh`: 覆盖 observer 禁用、mock auditd、事件汇总和失败降级。
@@ -271,7 +291,7 @@ observer 可用时，会话开始安装带唯一 `audit_key` 的临时 auditd sy
 
 - `logs/`: JSONL 审计日志。
 - `tmp/`: 会话级临时目录根；每次 `bin/agent` 运行使用 `tmp/<session-id>/`。
-- `sessions/`: 旧版 Markdown 摘要目录；新会话不再生成。
+- `/tmp/<session-id>/thinking/`: 开启 thinking trace 后保存每轮简短推理摘要，不进入审计或上下文。
 
 ## 测试
 
