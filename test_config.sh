@@ -41,7 +41,7 @@ require_command() {
 
 json_get() {
     local query="$1"
-    jq -r "${query} // empty" "${CONFIG_FILE}"
+    jq -r "${query} | if . == null then empty else . end" "${CONFIG_FILE}"
 }
 
 validate_non_empty() {

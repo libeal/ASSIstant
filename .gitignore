@@ -2,3 +2,4 @@ config/config.json
 logs/
 sessions/
 tmp/
+AGENTS.md

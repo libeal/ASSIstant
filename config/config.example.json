@@ -1,4 +1,5 @@
 {
+  "provider": "OpenAI-Compatible",
   "api_url": "https://api.openai.com/v1/chat/completions",
   "api_key": "please-set-your-api-key",
   "model": "gpt-4.1-mini",
