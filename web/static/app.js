@@ -15,7 +15,18 @@ const state = {
   skillFiles: { markdown: [], scripts: [] },
   activeWorkJobId: "",
   activeScriptJobId: "",
+  selectedStepIndex: -1,
+  approvalDrawerOpen: false,
+  pendingApproval: null,
+  lastExecution: null,
+  lastThinkingSummary: "",
   workSuspended: false,
+  auditSessions: [],
+  auditEvents: [],
+  currentAuditSession: "",
+  configSnapshot: null,
+  configOriginal: {},
+  configDraft: {},
   auditPaused: false,
   draggedPanelId: "",
   webRunId: "",
@@ -67,6 +78,11 @@ const outputLabelMap = {
   thinking_summary: "thinking_summary",
   config_updated: "配置已更新",
   value: "值",
+  execution_proxy: "执行代理",
+  auto_approved: "自动批准",
+  risk_level: "风险",
+  executor_type: "执行器",
+  skill_script: "Skill",
 };
 
 const hiddenOutputKeys = new Set([
@@ -75,7 +91,73 @@ const hiddenOutputKeys = new Set([
   "agent_exit_code",
   "job_id",
   "response_type",
+  "execution_proxy",
+  "observer",
+  "auto_approved",
+  "root_pid",
+  "session_status",
+  "backend",
+  "lifecycle",
+  "scope",
+  "subject",
+  "step",
 ]);
+
+const CONFIG_GROUPS = [
+  {
+    title: "模型与 API",
+    note: "控制 LLM 供应商、接口、模型和请求超时。api_key 只显示是否配置，不在前端回显。",
+    fields: [
+      { key: "provider", label: "provider", type: "text", comment: "供应商名称，用于提示当前适配的 OpenAI-compatible 后端。" },
+      { key: "api_url", label: "api_url", type: "text", comment: "模型接口地址，通常是 chat/completions 兼容端点。" },
+      { key: "model", label: "model", type: "text", comment: "work/edit 等请求调用的模型名。" },
+      { key: "request_timeout_sec", label: "request_timeout_sec", type: "number", min: 1, comment: "单次模型请求最长等待秒数。" },
+      { key: "context_turns", label: "context_turns", type: "number", min: 1, comment: "保留的上下文轮数，过大可能增加 token 消耗。" },
+    ],
+  },
+  {
+    title: "工作流",
+    note: "控制自然语言 work、低风险自动执行和模型思考摘要。",
+    fields: [
+      { key: "agent_loop.enabled_for_work", label: "work_agent_loop", type: "boolean", comment: "执行后带 observation 继续反思，适合多步排障。" },
+      { key: "agent_loop.auto_execute_low_risk", label: "auto_execute_low_risk_skill", type: "boolean", comment: "低风险且策略干净的 skill 步骤可自动执行。" },
+      { key: "agent_loop.auto_execute_shell_low_risk", label: "auto_execute_low_risk_shell", type: "boolean", comment: "shell 命令即使低风险也建议保持谨慎。" },
+      { key: "agent_loop.observation_text_limit", label: "observation_text_limit", type: "number", min: 200, comment: "回传给模型的命令输出摘要上限。" },
+      { key: "agent_loop.checkpoint_turns", label: "checkpoint_turns", type: "number", min: 0, comment: "每隔多少轮强制 checkpoint；0 表示使用 context_turns。" },
+      { key: "agent_loop.thinking_trace_enabled", label: "thinking_summary", type: "boolean", comment: "开启后会话摘要栏展示模型返回的简短 thinking_summary。" },
+    ],
+  },
+  {
+    title: "审计与 Observer",
+    note: "控制审计脱敏、observer 后端和事件数量。",
+    fields: [
+      { key: "audit_mode", label: "audit_mode", type: "select", options: ["safe_summary", "redacted_verbose"], comment: "safe_summary 更克制；redacted_verbose 保留更多脱敏上下文。" },
+      { key: "audit_text_limit", label: "audit_text_limit", type: "number", min: 40, comment: "写入审计报告的文本截断长度。" },
+      { key: "observer.enabled", label: "observer_backend", type: "select", options: ["auto", "auditd", "disabled"], comment: "auto 会优先尝试 auditd，失败时降级记录诊断。" },
+      { key: "observer.privilege", label: "observer_privilege", type: "text", comment: "observer 提权策略，例如 sudo_interactive。" },
+      { key: "observer.max_events", label: "observer_max_events", type: "number", min: 0, comment: "单会话 observer 事件上限，避免报告过大。" },
+    ],
+  },
+  {
+    title: "执行策略与 Skill",
+    note: "控制最小权限代理、远程脚本策略和 skill 根目录。",
+    fields: [
+      { key: "execution.min_privilege_proxy", label: "min_privilege_proxy", type: "boolean", comment: "尽量使用低权限用户执行命令，降低误操作影响面。" },
+      { key: "execution.least_privilege_user", label: "least_privilege_user", type: "text", comment: "低权限代理使用的系统用户。" },
+      { key: "remote_script_policy", label: "remote_script_policy", type: "select", options: ["download_review", "disabled"], comment: "远程脚本默认先下载审查；disabled 直接禁用。" },
+      { key: "skills_dir", label: "skills_dir", type: "text", comment: "自定义 skill 根目录；空值表示使用项目默认 skills。" },
+    ],
+  },
+];
+
+const CONFIG_READONLY_FIELDS = [
+  { key: "api_key_configured", label: "api_key", comment: "只显示是否已配置，避免在浏览器中暴露密钥。" },
+  { key: "web.enabled", label: "web.enabled", comment: "web 服务开关，当前进程已启动时仅作状态展示。" },
+  { key: "web.host", label: "web.host", comment: "当前配置文件中的监听地址，改动需重启生效。" },
+  { key: "web.port", label: "web.port", comment: "当前配置文件中的监听端口，改动需重启生效。" },
+  { key: "web.token_configured", label: "web.token", comment: "只显示 token 是否已配置，不回显 token 明文。" },
+  { key: "web.job_retention_hours", label: "web.job_retention_hours", comment: "后端保留 job 文件的小时数，当前进程可能需重启才完全生效。" },
+];
 
 function escapeHtml(value) {
   return String(value ?? "")
@@ -124,8 +206,207 @@ function setThinkingSwitches(enabled) {
   setSwitch("thinkingTraceSwitchConfig", enabled);
 }
 
+function thinkingTraceEnabled() {
+  return Boolean($("thinkingTraceSwitch")?.classList.contains("on"));
+}
+
+function renderThinkingSummary(summary = state.lastThinkingSummary) {
+  const el = $("workOutput");
+  if (!el) return;
+  if (!thinkingTraceEnabled()) {
+    el.textContent = "thinking_summary 未开启。开启开关后，新请求会在这里显示模型返回的简短思考摘要。";
+    return;
+  }
+  const text = String(summary || "").trim();
+  el.textContent = text || "已开启 thinking_summary；本轮尚未返回模型思考摘要。";
+}
+
 function firstLine(value) {
   return String(value || "").split("\n").find((line) => line.trim()) || "--";
+}
+
+function compactText(value, max = 220) {
+  const text = String(value ?? "").replace(/\s+/g, " ").trim();
+  if (!text) return "";
+  return text.length > max ? `${text.slice(0, max)}...` : text;
+}
+
+function getNestedValue(source, path) {
+  return String(path || "").split(".").reduce((current, key) => {
+    if (!current || typeof current !== "object") return undefined;
+    return current[key];
+  }, source);
+}
+
+function setNestedValue(target, path, value) {
+  const parts = String(path || "").split(".");
+  let current = target;
+  for (const part of parts.slice(0, -1)) {
+    if (!isPlainObject(current[part])) current[part] = {};
+    current = current[part];
+  }
+  current[parts[parts.length - 1]] = value;
+}
+
+function configInputId(key) {
+  return `config-${String(key).replace(/[^A-Za-z0-9_-]/g, "-")}`;
+}
+
+function statusKind(value) {
+  const text = String(value || "").toLowerCase();
+  if (["ok", "executed", "succeeded", "success", "approved", "auto_approved"].includes(text)) return "low";
+  if (["running", "queued", "approval_required", "pending", "skipped", "review"].includes(text)) return "medium";
+  if (["failed", "blocked", "rejected", "terminated", "critical", "high"].includes(text)) return "high";
+  return pillKind(text);
+}
+
+function executionRoot(result) {
+  return result?.execution || result?.result || result || {};
+}
+
+function normalizeExecutionEntries(title, result) {
+  const root = executionRoot(result);
+  const results = Array.isArray(root.results) ? root.results : [];
+  if (results.length) {
+    return results.map((entry, index) => {
+      const step = entry.step || {};
+      const output = entry.result || entry.output || entry;
+      return {
+        index,
+        number: index + 1,
+        title: step.title || entry.title || entry.step_title || output.status || "步骤输出",
+        status: output.status || entry.status || (output.ok ? "executed" : "failed"),
+        step,
+        output,
+      };
+    });
+  }
+  return [{
+    index: 0,
+    number: 1,
+    title,
+    status: root.status || result?.status || (root.ok ? "executed" : "完成"),
+    step: {},
+    output: root,
+  }];
+}
+
+function completedExecutionCount(result) {
+  const root = executionRoot(result);
+  return Array.isArray(root.results) ? root.results.length : 0;
+}
+
+function primaryOutputObject(output) {
+  if (isPlainObject(output?.output)) return output.output;
+  if (isPlainObject(output?.result?.output)) return output.result.output;
+  return isPlainObject(output) ? output : {};
+}
+
+function outputSummaryText(output) {
+  const payload = primaryOutputObject(output);
+  for (const key of ["summary", "message", "action", "error", "stdout_preview", "stderr_preview", "raw"]) {
+    if (typeof payload[key] === "string" && payload[key].trim()) return compactText(payload[key], 260);
+    if (typeof output?.[key] === "string" && output[key].trim()) return compactText(output[key], 260);
+  }
+  const raw = extractRawOutput(output);
+  if (raw) return compactText(raw, 260);
+  const text = renderUserOutputText(payload);
+  return compactText(text, 260) || "无摘要输出";
+}
+
+function tableFromText(text) {
+  const lines = String(text || "").split("\n").filter((line) => line.trim());
+  if (lines.length < 2) return "";
+  const rows = lines.slice(0, 12).map((line) => line.trim().split(/\s{2,}|\t/).filter(Boolean));
+  const width = Math.max(...rows.map((row) => row.length));
+  if (width < 2) return "";
+  const body = rows.map((row, index) => {
+    const cells = [...row, ...Array(Math.max(0, width - row.length)).fill("")];
+    const tag = index === 0 ? "th" : "td";
+    return `<tr>${cells.map((cell) => `<${tag}>${escapeHtml(cell)}</${tag}>`).join("")}</tr>`;
+  }).join("");
+  return `<div class="data-table-wrap"><table class="data-table">${body}</table></div>`;
+}
+
+function renderPrimaryOutputHtml(output) {
+  const payload = primaryOutputObject(output);
+  const chunks = [];
+  const preferred = [
+    "summary", "message", "error", "command", "stdout", "stderr", "load", "memory", "disk_usage", "df_summary",
+    "top_processes", "processes", "journal", "journal_sample", "matches",
+    "stdout_preview", "stderr_preview", "raw",
+  ];
+  for (const key of preferred) {
+    const value = payload[key] ?? output?.[key];
+    if (isEmptyOutputValue(value)) continue;
+    const label = outputLabel(key);
+    const text = renderUserOutputText(value);
+    const table = tableFromText(text);
+    chunks.push(`
+      <section class="output-section">
+        <h5>${escapeHtml(label)}</h5>
+        ${table || `<pre class="inline-code">${escapeHtml(text)}</pre>`}
+      </section>
+    `);
+  }
+  if (chunks.length) return chunks.join("");
+  return `<p class="muted">${escapeHtml(outputSummaryText(output))}</p>`;
+}
+
+function terminalReturnPayload(output) {
+  const payload = primaryOutputObject(output);
+  const merged = {};
+  for (const key of ["command", "stdout", "stderr", "stdout_preview", "stderr_preview", "raw", "summary", "message", "error"]) {
+    const value = payload[key] ?? output?.[key];
+    if (!isEmptyOutputValue(value)) merged[key] = value;
+  }
+  if (!Object.keys(merged).length && isPlainObject(payload)) return payload;
+  return merged;
+}
+
+function renderTerminalReturnHtml(output) {
+  const payload = terminalReturnPayload(output);
+  if (isEmptyOutputValue(payload)) {
+    return `<p class="muted">本步骤没有返回 stdout/stderr；可展开原始调试数据确认执行元信息。</p>`;
+  }
+  return renderPrimaryOutputHtml(payload);
+}
+
+function compactMetaValue(value) {
+  if (value === true) return "true";
+  if (value === false) return "false";
+  if (value === undefined || value === null) return "";
+  if (typeof value === "object") return compactText(renderUserOutputText(value), 160);
+  return value;
+}
+
+function renderMetaRows(rows) {
+  return rows
+    .filter(([, value]) => !isEmptyOutputValue(value))
+    .map(([label, value]) => `<div class="meta-row"><span>${escapeHtml(label)}</span><strong>${escapeHtml(value)}</strong></div>`)
+    .join("");
+}
+
+function renderJsonDetails(title, value, open = false) {
+  if (isEmptyOutputValue(value)) return "";
+  return `
+    <details class="detail-block"${open ? " open" : ""}>
+      <summary>${escapeHtml(title)}</summary>
+      <pre class="code">${escapeHtml(pretty(value))}</pre>
+    </details>
+  `;
+}
+
+function updateSelectedStepStatus(entry) {
+  const status = $("selectedStepStatus");
+  if (!status) return;
+  if (!entry) {
+    status.textContent = "none";
+    status.className = "pill";
+    return;
+  }
+  status.textContent = entry.status || "selected";
+  status.className = `pill risk ${statusKind(entry.status)}`;
 }
 
 function currentLayoutStorageKey() {
@@ -560,9 +841,143 @@ function stepDefaultDecision(step) {
 function updateWorkActionLabel() {
   const button = $("workRunBtn");
   if (!button) return;
-  button.textContent = state.awaitingWorkApproval ? "提交审批选择" : (state.workSuspended ? "继续" : "发送");
+  button.textContent = state.awaitingWorkApproval ? "等待审批选择" : (state.workSuspended ? "继续" : "发送");
+  button.disabled = state.awaitingWorkApproval;
   if ($("workCancelBtn")) $("workCancelBtn").disabled = !state.activeWorkJobId;
   if ($("workSuspendBtn")) $("workSuspendBtn").disabled = !state.activeWorkJobId || state.workSuspended;
+}
+
+function closeApprovalDrawer() {
+  state.approvalDrawerOpen = false;
+  state.pendingApproval = null;
+  state.awaitingWorkApproval = false;
+  document.body.classList.remove("terminal-approval");
+  const drawer = $("approvalDrawer");
+  if (drawer) drawer.hidden = true;
+  updateWorkActionLabel();
+}
+
+function openApprovalDrawer(result, input) {
+  const response = result.response || state.workPlan || {};
+  const execution = result.execution || {};
+  const completedCount = Array.isArray(execution.results) ? execution.results.length : 0;
+  const steps = response.steps || [];
+  const step = steps[completedCount] || steps.find((candidate) => candidate.risk_level !== "low") || steps[0] || {};
+  state.pendingApproval = {
+    type: "work",
+    input,
+    response,
+    context: result.context || state.workContext || {},
+    step,
+    index: Math.max(0, steps.indexOf(step)),
+    review: execution.review || result.review || null,
+  };
+  state.approvalDrawerOpen = true;
+  state.awaitingWorkApproval = true;
+
+  setText("approvalTitle", step.title || step.id || "待审批步骤");
+  setStatus("approvalRisk", step.risk_level || "approval_required", riskKind(step.risk_level || "medium"));
+  const body = $("approvalBody");
+  if (body) {
+    body.innerHTML = `
+      <div class="approval-meta">
+        ${renderMetaRows([
+          ["执行器", step.executor_type || "--"],
+          ["Skill", step.skill_script || ""],
+          ["命令", step.command || ""],
+          ["预期效果", step.expected_effect || ""],
+          ["原因", step.reason || ""],
+        ])}
+      </div>
+      ${renderJsonDetails("策略审查 findings", state.pendingApproval.review?.findings || [], false)}
+      ${renderJsonDetails("步骤 JSON", step, false)}
+    `;
+  }
+  const revision = $("approvalRevision");
+  if (revision) revision.value = "";
+  const drawer = $("approvalDrawer");
+  if (drawer) drawer.hidden = false;
+  updateWorkActionLabel();
+}
+
+function openTerminalApprovalDrawer(command, review) {
+  state.pendingApproval = { type: "terminal", command, review };
+  state.approvalDrawerOpen = true;
+  setText("approvalTitle", "终端命令需要审批");
+  setStatus("approvalRisk", review.risk_level || "approval_required", riskKind(review.risk_level || "medium"));
+  const body = $("approvalBody");
+  if (body) {
+    body.innerHTML = `
+      <div class="approval-meta">
+        ${renderMetaRows([
+          ["执行器", "terminal"],
+          ["命令", command],
+          ["风险", review.risk_level || ""],
+        ])}
+      </div>
+      ${renderJsonDetails("策略审查 findings", review.findings || [], true)}
+    `;
+  }
+  const revision = $("approvalRevision");
+  if (revision) revision.value = "";
+  document.body.classList.add("terminal-approval");
+  const drawer = $("approvalDrawer");
+  if (drawer) drawer.hidden = false;
+}
+
+async function submitApprovalDecision(decision) {
+  if (!state.pendingApproval) return showToast("No pending approval");
+  if (state.pendingApproval.type === "terminal") {
+    const command = state.pendingApproval.command;
+    if (decision !== "y") {
+      const review = state.pendingApproval.review || {};
+      closeApprovalDrawer();
+      setStatus("terminalJobStatus", "rejected", "medium");
+      printOutput("terminalOutput", { ok: false, status: "rejected", review });
+      return;
+    }
+    closeApprovalDrawer();
+    const job = await createJob("terminal", "run", { command, approve: true });
+    const completed = await pollJob(job.job_id, "terminalJobStatus", "terminalOutput");
+    renderSharedExecution("终端输出", completed.result || completed, "terminalOutput");
+    return;
+  }
+
+  const payload = {
+    input: state.pendingApproval.input,
+    response: state.pendingApproval.response,
+    context: state.pendingApproval.context,
+    decisions: [decision],
+  };
+  if (decision === "s") payload.decisions.push($("approvalRevision")?.value || "");
+  closeApprovalDrawer();
+  const job = await createJob("work", "run", payload);
+  state.activeWorkJobId = job.job_id;
+  state.workSuspended = false;
+  updateWorkActionLabel();
+  const completed = await pollJob(job.job_id, "workJobStatus", null, { suspendFlag: "workSuspended" });
+  handleCompletedWork(completed, payload.input);
+}
+
+function renderPlanStep(step, index, awaitingApproval = false, pendingIndex = -1) {
+  const item = document.createElement("article");
+  const isPending = awaitingApproval && index === pendingIndex;
+  item.className = `timeline-card plan-step${isPending ? " needs-decision" : ""}`;
+  item.innerHTML = `
+    <button class="timeline-step-button" type="button">
+      <span class="step-index">${index + 1}</span>
+      <span class="timeline-main">
+        <span class="timeline-title">${escapeHtml(step.title || step.id || "step")}</span>
+        <span class="timeline-copy">${escapeHtml([step.executor_type, step.skill_script || step.command, step.expected_effect].filter(Boolean).join(" · "))}</span>
+      </span>
+      <span class="pill risk ${riskKind(step.risk_level)}">${escapeHtml(isPending ? "待审批" : (step.risk_level || "unknown"))}</span>
+    </button>
+  `;
+  item.querySelector("button").addEventListener("click", () => {
+    state.selectedStepIndex = index;
+    renderPendingStepDetail(step, index, isPending);
+  });
+  return item;
 }
 
 function renderWorkPlan(response, input = "", context = null, awaitingApproval = false) {
@@ -578,16 +993,20 @@ function renderWorkPlan(response, input = "", context = null, awaitingApproval =
 
   if (response.response_type === "answer") {
     const item = document.createElement("article");
-    item.className = "item step-card";
+    item.className = "timeline-card answer-card";
     item.innerHTML = `
-      <div class="step-index">A</div>
-      <div>
-        <div class="item-head"><h4>answer_received</h4><span class="pill risk low">answer</span></div>
-        <p></p>
+      <div class="timeline-step-button static">
+        <span class="step-index">A</span>
+        <span class="timeline-main">
+          <span class="timeline-title">answer_received</span>
+          <span class="timeline-copy"></span>
+        </span>
+        <span class="pill risk low">answer</span>
       </div>
     `;
-    item.querySelector("p").textContent = response.answer || "";
+    item.querySelector(".timeline-copy").textContent = response.answer || "";
     container.appendChild(item);
+    renderStepDetail({ index: 0, number: "A", title: "answer_received", status: "answer", step: {}, output: { summary: response.answer || "" } });
     return;
   }
 
@@ -596,78 +1015,138 @@ function renderWorkPlan(response, input = "", context = null, awaitingApproval =
     container.appendChild(emptyItem("暂无步骤"));
     return;
   }
-
-  steps.forEach((step, index) => {
-    const item = document.createElement("article");
-    item.className = "item step-card";
-    const decision = stepDefaultDecision(step);
-    const decisionHtml = awaitingApproval ? `
-        <div class="decision-row">
-          <select class="select decision-select">
-            <option value="y">approve</option>
-            <option value="n">reject</option>
-            <option value="s">skip</option>
-            <option value="t">terminate</option>
-          </select>
-          <input class="field revision-input" placeholder="skip revision request">
-        </div>
-    ` : "";
-    item.innerHTML = `
-      <div class="step-index">${index + 1}</div>
-      <div>
-        <div class="item-head">
-          <h4>${escapeHtml(step.title || step.id || "step")}</h4>
-          <span class="pill risk ${riskKind(step.risk_level)}">${escapeHtml(step.risk_level || "unknown")}</span>
-        </div>
-        <p></p>
-        ${decisionHtml}
-      </div>
-    `;
-    item.querySelector("p").textContent = [
-      step.executor_type,
-      step.skill_script,
-      step.command,
-      step.expected_effect,
-    ].filter(Boolean).join("\n");
-    if (awaitingApproval) item.querySelector(".decision-select").value = decision;
-    container.appendChild(item);
-  });
+  const pendingIndex = awaitingApproval ? completedExecutionCount(state.lastExecution) : -1;
+  steps.forEach((step, index) => container.appendChild(renderPlanStep(step, index, awaitingApproval, pendingIndex)));
+  renderPendingStepDetail(steps[0], 0, awaitingApproval && pendingIndex === 0);
 }
 
 function renderTerminalReturns(title, result) {
   const container = $("workPlan");
   container.innerHTML = "";
-  for (const entry of executionEntries(title, result)) {
-    appendReturnCard(container, entry.index, entry.title, entry.output, entry.status);
+  state.lastExecution = result;
+  const entries = normalizeExecutionEntries(title, result);
+  if (!entries.length) {
+    container.appendChild(emptyItem("暂无执行结果"));
+    return;
   }
+  for (const entry of entries) {
+    appendReturnCard(container, entry);
+  }
+  const selected = entries[Math.max(0, Math.min(state.selectedStepIndex, entries.length - 1))] || entries[0];
+  renderStepDetail(selected);
 }
 
-function appendReturnCard(container, index, title, output, status = "") {
-  const displayStatus = status || output?.status || (output?.ok ? "ok" : title);
+function renderSharedExecution(title, result, outputId = "terminalOutput") {
+  state.lastExecution = result;
+  const text = renderExecutionText(title, result);
+  if (outputId) printOutput(outputId, text);
+  renderTerminalReturns(title, result);
+}
+
+function appendReturnCard(container, entry) {
+  const output = entry.output || {};
+  const displayStatus = entry.status || output.status || (output.ok ? "ok" : "failed");
   const item = document.createElement("article");
-  item.className = "item step-card";
+  item.className = `timeline-card result-step ${statusKind(displayStatus)}`;
   item.innerHTML = `
-    <div class="step-index">${index}</div>
-    <div>
-      <div class="item-head"><h4>${escapeHtml(title)}</h4><span class="pill risk ${pillKind(displayStatus)}">${escapeHtml(displayStatus)}</span></div>
-      <pre class="output-text"></pre>
-    </div>
+    <button class="timeline-step-button" type="button">
+      <span class="step-index">${entry.number}</span>
+      <span class="timeline-main">
+        <span class="timeline-title">${escapeHtml(entry.title)}</span>
+        <span class="timeline-copy">${escapeHtml(outputSummaryText(output))}</span>
+      </span>
+      <span class="pill risk ${statusKind(displayStatus)}">${escapeHtml(displayStatus)}</span>
+    </button>
   `;
-  item.querySelector("pre").textContent = renderUserOutputText(output) || "无输出";
+  item.querySelector("button").addEventListener("click", () => {
+    state.selectedStepIndex = entry.index;
+    renderStepDetail(entry);
+  });
   container.appendChild(item);
 }
 
-function collectWorkDecisions() {
-  const lines = [];
-  document.querySelectorAll("#workPlan .item").forEach((item) => {
-    const select = item.querySelector(".decision-select");
-    if (!select) return;
-    lines.push(select.value);
-    if (select.value === "s") {
-      lines.push(item.querySelector(".revision-input").value || "");
-    }
+function renderStepDetail(entry) {
+  const container = $("workDetail");
+  if (!container) return;
+  if (!entry) {
+    container.className = "detail-empty";
+    container.textContent = "选择时间线中的步骤查看详情。";
+    updateSelectedStepStatus(null);
+    return;
+  }
+  updateSelectedStepStatus(entry);
+  const step = entry.step || {};
+  const output = entry.output || {};
+  const proxy = output.execution_proxy || {};
+  const observer = output.observer || {};
+  const commandLabel = step.skill_script || step.command || output.command || primaryOutputObject(output).command || "";
+  container.className = "step-detail";
+  container.innerHTML = `
+    <div class="detail-title-row">
+      <div>
+        <h4>${escapeHtml(entry.title || step.title || "步骤详情")}</h4>
+        <p>${escapeHtml(step.reason || outputSummaryText(output))}</p>
+      </div>
+      <span class="pill risk ${statusKind(entry.status)}">${escapeHtml(entry.status || "selected")}</span>
+    </div>
+    <section class="detail-section">
+      <h5>执行摘要</h5>
+      <div class="meta-grid">
+        ${renderMetaRows([
+          ["状态", entry.status || output.status || ""],
+          ["退出码", output.exit_code ?? ""],
+          ["自动批准", output.auto_approved === true ? "是" : (output.auto_approved === false ? "否" : "")],
+          ["执行器", step.executor_type || ""],
+          ["风险", step.risk_level || ""],
+          ["命令/Skill", commandLabel],
+        ])}
+      </div>
+    </section>
+    <section class="detail-section terminal-return-section">
+      <h5>终端返回</h5>
+      <div class="primary-output">
+        ${renderTerminalReturnHtml(output)}
+      </div>
+    </section>
+    <section class="detail-section">
+      <h5>执行代理</h5>
+      <div class="meta-grid">
+        ${renderMetaRows([
+          ["启用状态", proxy.enabled === true ? "启用" : (proxy.enabled === false ? "未启用" : "")],
+          ["请求权限", proxy.requested_privilege || ""],
+          ["执行用户", proxy.execution_user || proxy.user || ""],
+          ["准备目录", proxy.prepared_root || proxy.root || ""],
+        ]) || '<p class="muted">本步骤没有返回执行代理信息。</p>'}
+      </div>
+    </section>
+    <section class="detail-section">
+      <h5>Observer 摘要</h5>
+      <div class="meta-grid">
+        ${renderMetaRows([
+          ["状态", observer.status || ""],
+          ["后端", observer.backend || ""],
+          ["生命周期", observer.lifecycle || ""],
+          ["范围", observer.scope || ""],
+        ]) || '<p class="muted">本步骤没有返回 observer 信息。</p>'}
+      </div>
+    </section>
+    ${renderJsonDetails("策略审查", output.review || step.review || null)}
+    ${renderJsonDetails("原始调试数据", { step, output }, false)}
+  `;
+}
+
+function renderPendingStepDetail(step, index, awaitingApproval = false) {
+  renderStepDetail({
+    index,
+    number: index + 1,
+    title: step.title,
+    status: awaitingApproval ? "approval_required" : "planned",
+    step,
+    output: {
+      status: awaitingApproval ? "approval_required" : "planned",
+      summary: step.expected_effect || step.reason || "等待执行。",
+    },
   });
-  return lines;
 }
 
 async function createJob(resource, action, payload) {
@@ -724,8 +1203,14 @@ async function connect() {
 
 async function loadConfig() {
   const data = await api("/api/config");
-  const enabled = Boolean(data.config?.agent_loop?.thinking_trace_enabled);
+  state.configSnapshot = data.config || {};
+  state.configOriginal = collectEditableConfigValues(state.configSnapshot);
+  state.configDraft = { ...state.configOriginal };
+  renderConfigCenter(state.configSnapshot);
+  const enabled = Boolean(state.configSnapshot?.agent_loop?.thinking_trace_enabled);
   setThinkingSwitches(enabled);
+  renderThinkingSummary();
+  setConfigDirtyState(false);
 }
 
 async function updateThinkingTrace() {
@@ -738,11 +1223,185 @@ async function updateThinkingTrace() {
     showToast(data.error || data.status || "config update failed");
     return;
   }
-  setThinkingSwitches(Boolean(data.config?.agent_loop?.thinking_trace_enabled));
-  printOutput("workOutput", {
-    config_updated: "agent_loop.thinking_trace_enabled",
-    value: data.config?.agent_loop?.thinking_trace_enabled,
-  });
+  state.configSnapshot = data.config || state.configSnapshot || {};
+  state.configOriginal = collectEditableConfigValues(state.configSnapshot);
+  state.configDraft = { ...state.configOriginal };
+  const enabled = Boolean(state.configSnapshot?.agent_loop?.thinking_trace_enabled);
+  setThinkingSwitches(enabled);
+  renderThinkingSummary();
+  renderConfigCenter(state.configSnapshot);
+  setConfigDirtyState(false);
+  showToast(`thinking_summary ${enabled ? "已开启" : "已关闭"}`);
+}
+
+function collectEditableConfigValues(config) {
+  const values = {};
+  for (const group of CONFIG_GROUPS) {
+    for (const field of group.fields) {
+      values[field.key] = normalizeConfigFieldValue(field, getNestedValue(config, field.key));
+    }
+  }
+  return values;
+}
+
+function normalizeConfigFieldValue(field, value) {
+  if (field.type === "boolean") return Boolean(value);
+  if (field.type === "number") {
+    const next = Number(value);
+    return Number.isFinite(next) ? next : 0;
+  }
+  return String(value ?? "");
+}
+
+function renderConfigCenter(config) {
+  renderConfigRuntimeSummary(config);
+  renderConfigEditor(config);
+}
+
+function renderConfigRuntimeSummary(config) {
+  const container = $("configRuntimeSummary");
+  if (!container) return;
+  const web = config.web || {};
+  const rows = [
+    ["model", config.model || "--", config.provider || "provider"],
+    ["api_key", config.api_key_configured ? "configured" : "missing", "只显示状态"],
+    ["audit", config.audit_mode || "--", `limit ${config.audit_text_limit ?? "--"}`],
+    ["observer", config.observer?.enabled || "--", config.observer?.privilege || "privilege"],
+    ["web", `${web.host || "--"}:${web.port || "--"}`, web.enabled === false ? "disabled" : "enabled"],
+    ["token", web.token_configured ? "configured" : "runtime only", "不回显明文"],
+  ];
+  container.innerHTML = rows.map(([label, value, hint]) => `
+    <div class="metric">
+      <div class="label">${escapeHtml(label)}</div>
+      <div class="value compact-value">${escapeHtml(value)}</div>
+      <div class="hint">${escapeHtml(hint)}</div>
+    </div>
+  `).join("");
+}
+
+function renderConfigEditor(config) {
+  const root = $("configEditorRoot");
+  if (!root) return;
+  const sections = CONFIG_GROUPS.map((group) => `
+    <div class="config-section">
+      <div><h4>${escapeHtml(group.title)}</h4><p class="small">${escapeHtml(group.note)}</p></div>
+      <div class="config-field-list">
+        ${group.fields.map((field) => renderConfigField(field, getNestedValue(config, field.key))).join("")}
+      </div>
+    </div>
+  `);
+  sections.push(`
+    <div class="config-section">
+      <div><h4>只读与敏感项</h4><p class="small">这些值用于确认后端状态，不允许在浏览器里直接修改。</p></div>
+      <div class="config-field-list">
+        ${CONFIG_READONLY_FIELDS.map((field) => renderReadonlyConfigField(field, getNestedValue(config, field.key))).join("")}
+      </div>
+    </div>
+  `);
+  root.innerHTML = sections.join("");
+}
+
+function renderConfigField(field, rawValue) {
+  const value = normalizeConfigFieldValue(field, rawValue);
+  if (field.type === "boolean") {
+    return `
+      <div class="toggle-row config-field-row">
+        <div>
+          <strong class="white">${escapeHtml(field.label)}</strong>
+          <div class="small">${escapeHtml(field.comment)}</div>
+        </div>
+        <button class="switch config-switch${value ? " on" : ""}" id="${escapeHtml(configInputId(field.key))}" type="button" data-config-key="${escapeHtml(field.key)}" aria-pressed="${value ? "true" : "false"}"><span></span></button>
+      </div>
+    `;
+  }
+  if (field.type === "select") {
+    return `
+      <label class="small config-field-label" for="${escapeHtml(configInputId(field.key))}">
+        <span>${escapeHtml(field.label)}</span>
+        <select class="select" id="${escapeHtml(configInputId(field.key))}" data-config-key="${escapeHtml(field.key)}">
+          ${field.options.map((option) => `<option value="${escapeHtml(option)}"${option === value ? " selected" : ""}>${escapeHtml(option)}</option>`).join("")}
+        </select>
+        <span class="config-comment">${escapeHtml(field.comment)}</span>
+      </label>
+    `;
+  }
+  return `
+    <label class="small config-field-label" for="${escapeHtml(configInputId(field.key))}">
+      <span>${escapeHtml(field.label)}</span>
+      <input class="field" id="${escapeHtml(configInputId(field.key))}" data-config-key="${escapeHtml(field.key)}" type="${field.type === "number" ? "number" : "text"}" ${field.min !== undefined ? `min="${escapeHtml(field.min)}"` : ""} value="${escapeHtml(value)}">
+      <span class="config-comment">${escapeHtml(field.comment)}</span>
+    </label>
+  `;
+}
+
+function renderReadonlyConfigField(field, value) {
+  const display = typeof value === "boolean" ? (value ? "true" : "false") : String(value ?? "--");
+  return `
+    <div class="readonly-config-row">
+      <div>
+        <strong class="white">${escapeHtml(field.label)}</strong>
+        <div class="small">${escapeHtml(field.comment)}</div>
+      </div>
+      <span class="pill">${escapeHtml(display)}</span>
+    </div>
+  `;
+}
+
+function updateConfigDraftFromControl(control) {
+  const key = control.dataset.configKey;
+  if (!key) return;
+  const field = findConfigField(key);
+  if (!field) return;
+  if (field.type === "boolean") {
+    const next = !control.classList.contains("on");
+    control.classList.toggle("on", next);
+    control.setAttribute("aria-pressed", next ? "true" : "false");
+    state.configDraft[key] = next;
+  } else if (field.type === "number") {
+    state.configDraft[key] = Number(control.value);
+  } else {
+    state.configDraft[key] = control.value;
+  }
+  setConfigDirtyState(hasConfigChanges());
+}
+
+function findConfigField(key) {
+  for (const group of CONFIG_GROUPS) {
+    const field = group.fields.find((candidate) => candidate.key === key);
+    if (field) return field;
+  }
+  return null;
+}
+
+function hasConfigChanges() {
+  return Object.keys(state.configDraft).some((key) => state.configDraft[key] !== state.configOriginal[key]);
+}
+
+function setConfigDirtyState(dirty) {
+  const button = $("configSaveBtn");
+  if (button) button.disabled = !dirty;
+  setText("configDirtyState", dirty ? "modified" : "synced");
+}
+
+async function saveConfigChanges() {
+  const changes = Object.entries(state.configDraft).filter(([key, value]) => value !== state.configOriginal[key]);
+  if (!changes.length) {
+    showToast("没有配置变更");
+    setConfigDirtyState(false);
+    return;
+  }
+  for (const [key, value] of changes) {
+    const data = await api("/api/config/update", {
+      method: "POST",
+      body: { key, value },
+    });
+    if (!data.ok) {
+      showToast(data.error || data.status || `保存 ${key} 失败`);
+      return;
+    }
+  }
+  await loadConfig();
+  showToast("配置已保存");
 }
 
 async function loadSense() {
@@ -937,53 +1596,57 @@ async function runWork() {
   if (state.activeWorkJobId && state.workSuspended) {
     state.workSuspended = false;
     updateWorkActionLabel();
-    const completed = await pollJob(state.activeWorkJobId, "workJobStatus", "workOutput", { suspendFlag: "workSuspended" });
+    const completed = await pollJob(state.activeWorkJobId, "workJobStatus", null, { suspendFlag: "workSuspended" });
     handleCompletedWork(completed, state.workPlanInput);
     return;
   }
   const input = $("workInput").value.trim();
   if (!input) return showToast("Work input required");
+  closeApprovalDrawer();
   const payload = { input };
-  if (state.awaitingWorkApproval && state.workPlanInput === input && state.workPlan?.response_type === "work_plan") {
-    payload.response = state.workPlan;
-    payload.context = state.workContext || {};
-    payload.decisions = collectWorkDecisions();
-  }
   const job = await createJob("work", "run", payload);
   state.activeWorkJobId = job.job_id;
   state.workSuspended = false;
   updateWorkActionLabel();
-  const completed = await pollJob(job.job_id, "workJobStatus", "workOutput", { suspendFlag: "workSuspended" });
+  const completed = await pollJob(job.job_id, "workJobStatus", null, { suspendFlag: "workSuspended" });
   handleCompletedWork(completed, input);
 }
 
 function handleCompletedWork(completed, input) {
   if (completed.status === "suspended") return;
   state.activeWorkJobId = "";
-  updateWorkActionLabel();
   const result = completed.result || {};
+  state.lastExecution = result;
+  state.lastThinkingSummary = result.response?.thinking_summary || state.lastThinkingSummary || "";
+  renderThinkingSummary();
+  updateWorkActionLabel();
   if (result.response) {
     renderWorkPlan(result.response, input, result.context || null, result.status === "approval_required");
   } else if (result.status !== "approval_required") {
     state.awaitingWorkApproval = false;
+    closeApprovalDrawer();
     updateWorkActionLabel();
   }
-  if (result.execution || result.result || result.status === "executed" || result.status === "failed" || result.status === "cancelled") {
+  if (result.status !== "approval_required" && (result.execution || result.result || result.status === "executed" || result.status === "failed" || result.status === "cancelled")) {
     renderTerminalReturns(result.status || "work_return", result);
+    printOutput("terminalOutput", renderExecutionText(result.status || "work_return", result));
   }
-  if (result.response?.thinking_summary) {
-    printOutput("workOutput", { thinking_summary: result.response.thinking_summary });
+  if (result.status === "approval_required") {
+    openApprovalDrawer(result, input);
+    showToast("需要审批后继续");
+  } else {
+    closeApprovalDrawer();
   }
-  if (result.status === "approval_required") showToast("Approval required");
 }
 
 async function cancelWork() {
   if (!state.activeWorkJobId) return;
   const data = await cancelJob(state.activeWorkJobId);
-  printOutput("workOutput", data);
+  printOutput("terminalOutput", data);
   state.activeWorkJobId = "";
   state.workSuspended = false;
   state.awaitingWorkApproval = false;
+  closeApprovalDrawer();
   updateWorkActionLabel();
   setStatus("workJobStatus", data.status, data.ok ? "high" : "medium");
   renderTerminalReturns("cancelled", data.job || data);
@@ -1023,9 +1686,21 @@ async function runScript() {
 async function runTerminal() {
   const command = $("terminalCommand").value.trim();
   if (!command) return showToast("Command required");
-  const job = await createJob("terminal", "run", { command });
+  const review = await api("/api/terminal/review", { method: "POST", body: { command } });
+  if (review.status === "blocked") {
+    setStatus("terminalJobStatus", "blocked", "high");
+    printOutput("terminalOutput", review);
+    return;
+  }
+  if (review.status === "approval_required") {
+    setStatus("terminalJobStatus", "approval_required", "medium");
+    printOutput("terminalOutput", review);
+    openTerminalApprovalDrawer(command, review.review || review);
+    return;
+  }
+  const job = await createJob("terminal", "run", { command, approve: false });
   const completed = await pollJob(job.job_id, "terminalJobStatus", "terminalOutput");
-  printOutput("terminalOutput", renderExecutionText("终端输出", completed.result || completed));
+  renderSharedExecution("终端输出", completed.result || completed, "terminalOutput");
 }
 
 async function cancelScript() {
@@ -1120,9 +1795,18 @@ async function loadAuditList() {
     return;
   }
   const data = await api("/api/audit/list");
+  state.auditSessions = data.sessions || [];
+  state.auditEvents = [];
+  state.currentAuditSession = "";
+  renderAuditSessionList();
+  resetAuditSummary();
+}
+
+function renderAuditSessionList() {
   const container = $("auditList");
+  if (!container) return;
   container.innerHTML = "";
-  const sessions = data.sessions || [];
+  const sessions = filteredAuditSessions();
   if (!sessions.length) {
     container.appendChild(emptyEvent("暂无审计会话"));
     return;
@@ -1132,10 +1816,10 @@ async function loadAuditList() {
     item.type = "button";
     item.className = "event";
     item.innerHTML = `
-      <time>${escapeHtml(session.started_at || "--")}</time>
+      <time>${escapeHtml(compactAuditTime(session.started_at || session.updated_at || ""))}</time>
       <div class="body">
-        <strong>${escapeHtml(session.session_id)}</strong>
-        <span>status=${escapeHtml(session.status || "unknown")}</span>
+        <strong>${escapeHtml(session.session_id || session.path || "session")}</strong>
+        <span>status=${escapeHtml(session.status || "unknown")} · file=${escapeHtml(session.path || session.file || "logs/session")}</span>
       </div>
     `;
     item.addEventListener("click", () => readAudit(session.session_id));
@@ -1143,9 +1827,141 @@ async function loadAuditList() {
   }
 }
 
+function filteredAuditSessions() {
+  const text = String($("auditSessionFilter")?.value || "").trim().toLowerCase();
+  const status = String($("auditStatusFilter")?.value || "");
+  const limit = Math.max(1, Math.min(200, Number($("auditLimitInput")?.value || 40)));
+  return (state.auditSessions || [])
+    .filter((session) => {
+      const haystack = [session.session_id, session.status, session.started_at, session.updated_at, session.path, session.file].join(" ").toLowerCase();
+      if (text && !haystack.includes(text)) return false;
+      if (status && String(session.status || "") !== status) return false;
+      return true;
+    })
+    .slice(0, limit);
+}
+
 async function readAudit(sessionId) {
   const data = await api("/api/audit/read", { method: "POST", body: { session_id: sessionId } });
+  state.currentAuditSession = sessionId;
+  state.auditEvents = Array.isArray(data.events) ? data.events : [];
+  renderAuditEventTimeline();
+  renderAuditObserverSummary();
+  updateAuditMetrics();
   $("auditOutput").textContent = data.report || pretty(data);
+}
+
+function renderAuditEventTimeline() {
+  const container = $("auditList");
+  if (!container) return;
+  const events = filteredAuditEvents();
+  container.innerHTML = "";
+  if (!events.length) {
+    container.appendChild(emptyEvent(state.currentAuditSession ? "当前筛选下没有事件" : "尚未选择 session"));
+    return;
+  }
+  for (const event of events) {
+    const item = document.createElement("div");
+    item.className = "event";
+    const name = auditEventName(event);
+    item.innerHTML = `
+      <time>${escapeHtml(compactAuditTime(auditEventTime(event)))}</time>
+      <div class="body">
+        <strong>${escapeHtml(name)}</strong>
+        <span>${escapeHtml(auditEventSummary(event))}</span>
+      </div>
+    `;
+    container.appendChild(item);
+  }
+}
+
+function filteredAuditEvents() {
+  const category = String($("auditEventFilter")?.value || "");
+  const limit = Math.max(1, Math.min(200, Number($("auditLimitInput")?.value || 40)));
+  return (state.auditEvents || [])
+    .filter((event) => !category || auditEventMatchesCategory(event, category))
+    .slice(0, limit);
+}
+
+function auditEventMatchesCategory(event, category) {
+  const text = `${auditEventName(event)} ${pretty(event)}`.toLowerCase();
+  if (category === "observer") return text.includes("observer") || text.includes("auditd");
+  if (category === "policy") return text.includes("policy") || text.includes("review") || text.includes("risk");
+  if (category === "execution") return text.includes("execution") || text.includes("command") || text.includes("terminal") || text.includes("script");
+  if (category === "decision") return text.includes("decision") || text.includes("approve") || text.includes("reject") || text.includes("skip") || text.includes("terminate");
+  return true;
+}
+
+function auditEventName(event) {
+  return event.event || event.type || event.name || event.status || event.kind || "event";
+}
+
+function auditEventTime(event) {
+  return event.timestamp || event.time || event.started_at || event.created_at || "";
+}
+
+function compactAuditTime(value) {
+  const text = String(value || "");
+  if (!text) return "--";
+  return text.includes("T") ? text.split("T").pop().replace(/Z$/, "") : text;
+}
+
+function auditEventSummary(event) {
+  const payload = event.payload || event.data || event;
+  const rows = [
+    payload.status ? `status=${payload.status}` : "",
+    payload.mode ? `mode=${payload.mode}` : "",
+    payload.command ? `command=${payload.command}` : "",
+    payload.skill_script ? `skill=${payload.skill_script}` : "",
+    payload.risk_level ? `risk=${payload.risk_level}` : "",
+    payload.decision ? `decision=${payload.decision}` : "",
+    payload.error ? `error=${payload.error}` : "",
+  ].filter(Boolean);
+  return rows.join(" · ") || compactText(renderUserOutputText(payload), 180) || "无摘要字段，完整内容见右侧报告。";
+}
+
+function renderAuditObserverSummary() {
+  const container = $("auditObserverSummary");
+  if (!container) return;
+  const observerEvents = (state.auditEvents || []).filter((event) => auditEventMatchesCategory(event, "observer"));
+  container.innerHTML = "";
+  if (!observerEvents.length) {
+    container.innerHTML = '<tr><td colspan="3">当前 session 没有 observer 事件。</td></tr>';
+    return;
+  }
+  for (const event of observerEvents.slice(0, 12)) {
+    const payload = event.payload || event.data || event;
+    const status = payload.status || payload.lifecycle || auditEventName(event);
+    const row = document.createElement("tr");
+    row.innerHTML = `
+      <td><span class="pill risk ${statusKind(status)}">${escapeHtml(status)}</span></td>
+      <td class="mono">${escapeHtml(auditEventName(event))}</td>
+      <td>${escapeHtml(auditEventSummary(event))}</td>
+    `;
+    container.appendChild(row);
+  }
+}
+
+function updateAuditMetrics() {
+  const events = state.auditEvents || [];
+  const textFor = (event) => `${auditEventName(event)} ${pretty(event)}`.toLowerCase();
+  const decisions = events.filter((event) => /decision|approve|reject|skip|terminate/.test(textFor(event))).length;
+  const commands = events.filter((event) => /command|terminal|script|execution/.test(textFor(event))).length;
+  const observer = events.filter((event) => auditEventMatchesCategory(event, "observer")).length;
+  setText("auditMetricEvents", String(events.length));
+  setText("auditMetricDecisions", String(decisions));
+  setText("auditMetricCommands", String(commands));
+  setText("auditMetricObserver", String(observer));
+}
+
+function resetAuditSummary() {
+  setText("auditMetricEvents", "--");
+  setText("auditMetricDecisions", "--");
+  setText("auditMetricCommands", "--");
+  setText("auditMetricObserver", "--");
+  const observer = $("auditObserverSummary");
+  if (observer) observer.innerHTML = '<tr><td colspan="3">尚未选择 session。</td></tr>';
+  setText("auditOutput", "等待选择审计 session。");
 }
 
 function exportAuditReport() {
@@ -1365,7 +2181,7 @@ function renderAuditBoundaries(json) {
   state.auditBoundaries = json;
   const list = $("policyBoundaryList");
   const options = $("policyBoundaryOptionsList");
-  const observer = $("auditBoundarySummary");
+  const observer = $("policyAuditBoundarySummary");
   if (list) list.innerHTML = "";
   if (options) options.innerHTML = "";
   if (observer) observer.innerHTML = "";
@@ -1485,6 +2301,10 @@ function bindActions() {
   on("workRunBtn", "click", () => safeAction(runWork));
   on("workCancelBtn", "click", () => safeAction(cancelWork));
   on("workSuspendBtn", "click", suspendWork);
+  on("approvalApproveBtn", "click", () => safeAction(() => submitApprovalDecision("y")));
+  on("approvalRejectBtn", "click", () => safeAction(() => submitApprovalDecision("n")));
+  on("approvalSkipBtn", "click", () => safeAction(() => submitApprovalDecision("s")));
+  on("approvalTerminateBtn", "click", () => safeAction(() => submitApprovalDecision("t")));
   on("terminalRunBtn", "click", () => safeAction(runTerminal));
   on("scriptReviewBtn", "click", () => safeAction(reviewScript));
   on("scriptRunBtn", "click", () => safeAction(runScript));
@@ -1494,6 +2314,18 @@ function bindActions() {
   on("editReviewBtn", "click", () => safeAction(reviewEdit));
   on("editApplyBtn", "click", () => safeAction(applyEdit));
   on("auditRefreshBtn", "click", () => safeAction(loadAuditList));
+  on("auditSessionFilter", "input", renderAuditSessionList);
+  on("auditStatusFilter", "change", renderAuditSessionList);
+  on("auditEventFilter", "change", () => state.currentAuditSession ? renderAuditEventTimeline() : renderAuditSessionList());
+  on("auditLimitInput", "input", () => state.currentAuditSession ? renderAuditEventTimeline() : renderAuditSessionList());
+  on("configReloadBtn", "click", () => safeAction(loadConfig));
+  on("configSaveBtn", "click", () => safeAction(saveConfigChanges));
+  on("configEditorRoot", "input", (event) => updateConfigDraftFromControl(event.target));
+  on("configEditorRoot", "change", (event) => updateConfigDraftFromControl(event.target));
+  on("configEditorRoot", "click", (event) => {
+    const button = event.target.closest(".config-switch");
+    if (button) updateConfigDraftFromControl(button);
+  });
   on("doctorRunBtn", "click", () => safeAction(runDoctor));
   on("policyUnlockBtn", "click", () => safeAction(unlockPolicy));
   on("policyLockBtn", "click", lockPolicy);

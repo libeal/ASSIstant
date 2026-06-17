@@ -54,13 +54,13 @@
 
         <div class="content">
           <section class="screen active" id="screen-workbench">
-            <div class="split-wide">
-              <div class="stack">
-                <div class="panel">
+            <div class="workbench-grid">
+              <div class="stack workbench-main">
+                <div class="panel command-panel">
                   <div class="panel-header">
                     <div>
                       <h2>工作台</h2>
-                      <p>合并 work 与 terminal：上半部分处理自然语言运维任务，下半部分保留可审计终端直达能力。</p>
+                      <p>自然语言任务与终端命令共用同一条可审计执行线。</p>
                     </div>
                     <span class="pill risk low">work + terminal</span>
                   </div>
@@ -70,7 +70,7 @@
                   </div>
                   <div id="workModePanel">
                     <label class="small" for="workInput">当前请求</label>
-                    <textarea class="textarea" id="workInput" placeholder="例如：检查磁盘空间、定位服务异常、生成安全清理计划">帮我检查磁盘空间是否异常，并在需要时生成清理候选，不要直接删除文件。</textarea>
+                    <textarea class="textarea" id="workInput" placeholder="例如：检查磁盘空间、定位服务异常、生成安全清理计划">帮我检查磁盘热点</textarea>
                     <div class="toolbar action-gap" id="workActions">
                       <button class="btn" id="workRunBtn" type="button">发送</button>
                       <button class="btn danger" id="workCancelBtn" type="button" disabled>终止</button>
@@ -83,34 +83,23 @@
                     <div class="toolbar action-gap">
                       <button class="btn" id="terminalRunBtn" type="button">执行</button>
                     </div>
-                  </div>
+                  </div>查看磁盘热点
                 </div>
 
-                <div class="panel">
+                <div class="panel timeline-panel">
                   <div class="panel-header">
                     <div>
-                      <h3>运行会话与相关决策</h3>
-                      <p>把 plan、审批、执行、反思续写合并为同一条会话链，方便用户看到每次关键决策。</p>
+                      <h3>执行时间线</h3>
+                      <p>先看计划、审批状态与执行结论；点击步骤查看详情和原始数据。</p>
                     </div>
                     <span class="pill risk low" id="workJobStatus">idle</span>
                   </div>
-                  <div class="list" id="workPlan"></div>
+                  <div class="timeline-list" id="workPlan"></div>
                 </div>
               </div>
 
-              <aside class="stack">
-                <div class="panel tight">
-                  <div class="panel-header">
-                    <div><h3>会话摘要</h3><p>只展示可读摘要，审计与 AI 上下文继续使用脱敏内容。</p></div>
-                  </div>
-                  <div class="toggle-row">
-                    <div><strong class="white">随会话返回 thinking_summary</strong><div class="small">写入审计时仅保存简短摘要。</div></div>
-                    <button class="switch" id="thinkingTraceSwitch" type="button" aria-label="toggle thinking summary" aria-pressed="false"><span></span></button>
-                  </div>
-                  <pre class="code" id="workOutput">等待会话摘要。</pre>
-                </div>
-
-                <div class="panel tight">
+              <aside class="stack workbench-side">
+                <div class="panel tight status-panel">
                   <div class="panel-header"><div><h3>服务器运行状态</h3><p>作为 work 与 terminal 的常驻上下文。</p></div></div>
                   <div class="grid-2">
                     <div class="metric"><div class="label">load</div><div class="value" id="metricLoad">--</div><div class="hint">1m average</div></div>
@@ -119,21 +108,57 @@
                     <div class="metric"><div class="label">services</div><div class="value" id="metricServices">--</div><div class="hint">failed units</div></div>
                   </div>
                   <div class="divider"></div>
-                  <div class="kv"><div class="k">observer</div><div class="v"><span class="status-dot ok"></span> auto，auditd 可用</div></div>
-                  <div class="kv"><div class="k">payload</div><div class="v">下方内容来自 `/api/sense`，也会进入 work 请求上下文。</div></div>
-                  <pre class="code" id="environmentPayload">等待环境信息。</pre>
+                  <details class="detail-block">
+                    <summary>查看完整环境 payload</summary>
+                    <pre class="code" id="environmentPayload">等待环境信息。</pre>
+                  </details>
                 </div>
 
-                <div class="terminal">
-                  <div class="terminal-head"><span class="status-dot ok"></span><span>终端输出</span><span class="pill risk low" id="terminalJobStatus">idle</span></div>
-                  <pre id="terminalOutput">$ df -h /var
-Filesystem      Size  Used Avail Use% Mounted on
-/dev/vda1        80G   58G   18G  72% /
+                <div class="panel tight detail-panel">
+                  <div class="panel-header">
+                    <div><h3>选中步骤详情</h3><p>终端返回优先展示；observer、review 和 raw JSON 仅作为调试信息折叠查看。</p></div>
+                    <span class="pill" id="selectedStepStatus">none</span>
+                  </div>
+                  <div id="workDetail" class="detail-empty">选择时间线中的步骤查看详情。</div>
+                </div>
 
-审计: terminal_started → execution_finished → terminal_finished</pre>
+                <div class="panel tight summary-panel">
+                  <div class="panel-header">
+                    <div><h3>思考过程</h3><p>开启开关后，只展示模型返回的 thinking_summary。</p></div>
+                  </div>
+                  <div class="toggle-row">
+                    <div><strong class="white">显示模型思考摘要</strong><div class="small">仅用于简短摘要，不承载命令输出或配置回显。</div></div>
+                    <button class="switch" id="thinkingTraceSwitch" type="button" aria-label="toggle thinking summary" aria-pressed="false"><span></span></button>
+                  </div>
+                  <div class="summary-output" id="workOutput">thinking_summary 未开启。开启开关后，新请求会在这里显示模型返回的简短思考摘要。</div>
+                </div>
+
+                <div class="terminal shared-output">
+                  <div class="terminal-head"><span class="status-dot ok"></span><span>共享执行输出</span><span class="pill risk low" id="terminalJobStatus">idle</span></div>
+                  <pre id="terminalOutput">等待 work、terminal 或 skill 输出。</pre>
                 </div>
               </aside>
             </div>
+
+            <aside class="approval-drawer" id="approvalDrawer" hidden aria-live="polite" aria-label="待审批决策">
+              <div class="approval-drawer-head">
+                <div>
+                  <div class="small">当前执行已暂停</div>
+                  <h3 id="approvalTitle">等待审批</h3>
+                </div>
+                <span class="pill risk medium" id="approvalRisk">approval_required</span>
+              </div>
+              <div id="approvalBody" class="approval-body"></div>
+              <label class="small approval-revision" for="approvalRevision">跳过并继续时的修改需求
+                <textarea class="textarea" id="approvalRevision" placeholder="例如：跳过清理，改为只列出候选文件。"></textarea>
+              </label>
+              <div class="approval-actions">
+                <button class="btn" id="approvalApproveBtn" type="button">批准执行</button>
+                <button class="btn secondary" id="approvalSkipBtn" type="button">跳过并继续</button>
+                <button class="btn secondary" id="approvalRejectBtn" type="button">拒绝</button>
+                <button class="btn danger" id="approvalTerminateBtn" type="button">终止流程</button>
+              </div>
+            </aside>
           </section>
 
           <section class="screen" id="screen-skills">
@@ -298,59 +323,47 @@ Filesystem      Size  Used Avail Use% Mounted on
               <div class="stack">
                 <div class="panel">
                   <div class="panel-header">
-                    <div><h2>审计与回放</h2><p>从 logs/session 提取 observer 状态与会话审计，按时间线重放。</p></div>
+                    <div><h2>审计与回放</h2><p>从真实 session 文件读取审计报告，前端筛选只影响当前列表显示，不改写日志。</p></div>
                     <button class="btn" id="auditExportBtn" type="button">导出回放报告</button>
                   </div>
                   <div class="form-grid">
-                    <label class="small">session 文件<select class="select"><option>logs/session/sess-20260616-ops.jsonl</option><option>logs/session/sess-20260616-disk.jsonl</option></select></label>
-                    <label class="small">事件过滤<select class="select"><option>全部事件</option><option>observer 状态</option><option>策略审查</option><option>执行输出</option><option>用户决策</option></select></label>
+                    <label class="small">session 筛选<input class="field" id="auditSessionFilter" placeholder="按 session_id / 状态 / 日期过滤"></label>
+                    <label class="small">状态筛选<select class="select" id="auditStatusFilter"><option value="">全部状态</option><option value="executed">executed</option><option value="failed">failed</option><option value="blocked">blocked</option><option value="approval_required">approval_required</option><option value="rejected">rejected</option><option value="terminated">terminated</option></select></label>
+                    <label class="small">事件筛选<select class="select" id="auditEventFilter"><option value="">全部事件</option><option value="observer">observer 状态</option><option value="policy">策略审查</option><option value="execution">执行输出</option><option value="decision">用户决策</option></select></label>
+                    <label class="small">显示数量<input class="field" id="auditLimitInput" type="number" min="1" max="200" value="40"></label>
                   </div>
-                  <div class="toolbar action-gap"><button class="btn" id="auditRefreshBtn" type="button">播放</button><button class="btn secondary" id="auditPauseBtn" type="button">暂停</button><button class="btn secondary" id="auditFindFailureBtn" type="button">定位到失败事件</button></div>
+                  <div class="small">中文注释：列表来自 <span class="mono">/api/audit/list</span>，点击某个 session 后再通过 <span class="mono">/api/audit/read</span> 读取完整报告和事件。</div>
+                  <div class="toolbar action-gap"><button class="btn" id="auditRefreshBtn" type="button">刷新会话</button><button class="btn secondary" id="auditPauseBtn" type="button">暂停</button><button class="btn secondary" id="auditFindFailureBtn" type="button">定位失败</button></div>
                 </div>
 
                 <div class="panel">
-                  <div class="panel-header"><div><h3>会话审计时间线</h3><p>每个节点对应 JSONL 中的一行或聚合后的结构化事件。</p></div></div>
+                  <div class="panel-header"><div><h3>会话审计时间线</h3><p>上方筛选控制 session 列表；读取后这里会切换为该 session 的事件时间线。</p></div></div>
                   <div class="timeline" id="auditList">
-                    <div class="event"><time>13:41:02.004</time><div class="body"><strong>session_started</strong><span>session_id=sess-20260616-ops，mode=work，cwd=/opt/assistant。</span></div></div>
-                    <div class="event"><time>13:41:02.188</time><div class="body"><strong>observer_session_started</strong><span>backend=auditd，audit_key=linux-agent-sess-20260616-ops。</span></div></div>
-                    <div class="event"><time>13:41:03.031</time><div class="body"><strong>request_context_built</strong><span>current_request、environment_context、skill_index_snapshot 已写入 AI payload。</span></div></div>
-                    <div class="event"><time>13:41:05.812</time><div class="body"><strong>ai_response_received</strong><span>response_type=work_plan，steps=3，thinking_summary=enabled。</span></div></div>
-                    <div class="event"><time>13:41:06.102</time><div class="body"><strong>policy_reviewed</strong><span>risk=medium，approval_required=true，reasons=[WARN_PATTERN, PROTECTED_PATH_CHECK]。</span></div></div>
-                    <div class="event"><time>13:41:09.430</time><div class="body"><strong>user_decision</strong><span>decision=modify，enforce_dry_run=true，comment=不要真实删除。</span></div></div>
-                    <div class="event"><time>13:41:12.918</time><div class="body"><strong>execution_finished</strong><span>script=ops-basic/log-cleanup-plan，exit_code=0，stdout_preview 已脱敏。</span></div></div>
-                    <div class="event"><time>13:41:13.640</time><div class="body"><strong>observer_session_finished</strong><span>file_event_count=5，session_status=executed。</span></div></div>
+                    <div class="event"><time>--</time><div class="body"><strong>等待连接</strong><span>连接 token 后加载真实审计会话。</span></div></div>
                   </div>
                 </div>
               </div>
 
               <aside class="stack">
                 <div class="panel tight">
-                  <div class="panel-header"><div><h3>Observer 状态提取</h3><p>展示从 session 日志聚合出的所有 observer 片段。</p></div></div>
+                  <div class="panel-header"><div><h3>Observer 状态提取</h3><p>只提取 observer 相关事件，方便确认审计后端是否记录成功。</p></div></div>
                   <table class="table">
                     <thead><tr><th>状态</th><th>来源</th><th>说明</th></tr></thead>
-                    <tbody id="auditBoundarySummary">
-                      <tr><td><span class="pill risk low">started</span></td><td class="mono">observer_session_started</td><td>auditd 规则安装成功。</td></tr>
-                      <tr><td><span class="pill risk low">recorded</span></td><td class="mono">observer_file_event</td><td>记录 /tmp/session/work_plan.json。</td></tr>
-                      <tr><td><span class="pill risk medium">degraded</span></td><td class="mono">observer_diagnostic</td><td>权限不足时不影响主命令退出码。</td></tr>
-                      <tr><td><span class="pill risk low">finished</span></td><td class="mono">observer_session_finished</td><td>清理临时 audit 规则。</td></tr>
+                    <tbody id="auditObserverSummary">
+                      <tr><td colspan="3">尚未选择 session。</td></tr>
                     </tbody>
                   </table>
                 </div>
                 <div class="panel tight">
                   <div class="panel-header"><div><h3>回放摘要</h3><p>用于快速还原这次会话到底做了什么。</p></div></div>
                   <div class="grid-2">
-                    <div class="metric"><div class="label">events</div><div class="value">42</div><div class="hint">JSONL rows</div></div>
-                    <div class="metric"><div class="label">decisions</div><div class="value">3</div><div class="hint">approve/modify</div></div>
-                    <div class="metric"><div class="label">commands</div><div class="value">2</div><div class="hint">script + terminal</div></div>
-                    <div class="metric"><div class="label">files</div><div class="value">5</div><div class="hint">observer hits</div></div>
+                    <div class="metric"><div class="label">events</div><div class="value" id="auditMetricEvents">--</div><div class="hint">JSONL rows</div></div>
+                    <div class="metric"><div class="label">decisions</div><div class="value" id="auditMetricDecisions">--</div><div class="hint">approve/reject/skip</div></div>
+                    <div class="metric"><div class="label">commands</div><div class="value" id="auditMetricCommands">--</div><div class="hint">work + terminal + script</div></div>
+                    <div class="metric"><div class="label">observer</div><div class="value" id="auditMetricObserver">--</div><div class="hint">observer events</div></div>
                   </div>
                   <div class="divider"></div>
-                  <pre class="code" id="auditOutput">replay_view: {
-  source: "logs/session/sess-20260616-ops.jsonl",
-  include_observer: true,
-  include_session_audit: true,
-  redact_secrets: true
-}</pre>
+                  <pre class="code" id="auditOutput">等待选择审计 session。</pre>
                 </div>
               </aside>
             </div>
@@ -358,61 +371,17 @@ Filesystem      Size  Used Avail Use% Mounted on
 
           <section class="screen" id="screen-config">
             <div class="panel">
-              <div class="panel-header"><div><h2>配置中心</h2><p>覆盖所有可配置项：模型、API、执行策略、审计、observer、remote script、skill 路径与环境变量。</p></div><button class="btn" id="doctorRunBtn" type="button">运行 Doctor</button></div>
+              <div class="panel-header"><div><h2>配置中心</h2><p>连接 token 后读取后端真实配置；敏感值只显示是否已配置，不在前端回显。</p></div><div class="toolbar action-gap"><button class="btn secondary" id="configReloadBtn" type="button">重新读取</button><button class="btn" id="configSaveBtn" type="button" disabled>保存配置</button><button class="btn secondary" id="doctorRunBtn" type="button">运行 Doctor</button></div></div>
               <div id="doctorSummary" class="grid-3 doctor-summary"></div>
               <div class="config-section">
-                <div><h4>模型与 API</h4><p class="small">LLM 接口、模型与超时。</p></div>
-                <div class="form-grid">
-                  <label class="small">api_url<input class="field" value="https://api.openai.com/v1/chat/completions"></label>
-                  <label class="small">model<input class="field" value="gpt-4.1-mini"></label>
-                  <label class="small">api_key_env<input class="field" value="OPENAI_API_KEY"></label>
-                  <label class="small">request_timeout_sec<input class="field" value="90"></label>
-                  <label class="small">temperature<input class="field" value="0.2"></label>
-                  <label class="small">max_output_tokens<input class="field" value="4096"></label>
-                </div>
+                <div><h4>运行时快照</h4><p class="small">这些值来自后端当前配置和 web 进程；web host/port/token 改动通常需要重启进程生效。</p></div>
+                <div class="grid-3" id="configRuntimeSummary"></div>
               </div>
-              <div class="config-section">
-                <div><h4>工作流</h4><p class="small">work、terminal、script、edit 的默认行为。</p></div>
-                <div class="list">
-                  <div class="toggle-row"><div><strong class="white">work_agent_loop</strong><div class="small">执行后带 observation 继续反思。</div></div><span class="pill">config/config.json</span></div>
-                  <div class="toggle-row"><div><strong class="white">auto_execute_low_risk_skill</strong><div class="small">仅对已登记、低风险、策略干净的 skill 生效。</div></div><span class="pill">config/config.json</span></div>
-                  <div class="toggle-row"><div><strong class="white">auto_execute_low_risk_shell</strong><div class="small">默认关闭，shell 类命令需审批。</div></div><span class="pill">config/config.json</span></div>
-                  <div class="toggle-row"><div><strong class="white">thinking_summary</strong><div class="small">开启后仅返回简短摘要。</div></div><button class="switch" id="thinkingTraceSwitchConfig" type="button" aria-label="toggle thinking summary in config" aria-pressed="false"><span></span></button></div>
-                </div>
-              </div>
-              <div class="config-section">
-                <div><h4>审计与 Observer</h4><p class="small">JSONL、脱敏、observer backend。</p></div>
-                <div class="form-grid">
-                  <label class="small">audit_mode<select class="select"><option>safe_summary</option><option>redacted_verbose</option></select></label>
-                  <label class="small">logs_dir<input class="field" value="logs/session"></label>
-                  <label class="small">observer_backend<select class="select"><option>auto</option><option>auditd</option><option>disabled</option></select></label>
-                  <label class="small">stdout_preview_bytes<input class="field" value="4096"></label>
-                  <label class="small">redact_secrets<select class="select"><option>true</option><option>false</option></select></label>
-                  <label class="small">ai_files_manifest<select class="select"><option>true</option><option>false</option></select></label>
-                </div>
-              </div>
-              <div class="config-section">
-                <div><h4>策略与远程脚本</h4><p class="small">风险规则、受保护路径、远程脚本下载审查。</p></div>
-                <div class="form-grid">
-                  <label class="small">risk_rules_file<input class="field" value="policies/risk-rules.json"></label>
-                  <label class="small">remote_script_policy<select class="select"><option>download_review</option><option>disabled</option></select></label>
-                  <label class="small">remote_script_max_bytes<input class="field" value="262144"></label>
-                  <label class="small">protected_paths<input class="field" value="/etc,/boot,/usr,/var/lib,/root"></label>
-                </div>
-              </div>
-              <div class="config-section">
-                <div><h4>Skill 与环境变量</h4><p class="small">自定义 skill 根目录与启动参数。</p></div>
-                <div class="form-grid">
-                  <label class="small">skills_dir<input class="field" value="skills"></label>
-                  <label class="small">EDITOR<input class="field" value="vi"></label>
-                  <label class="small">LINUX_AGENT_OUTPUT_JSON<select class="select"><option>false</option><option>true</option></select></label>
-                  <label class="small">LINUX_AGENT_MOCK<select class="select"><option>false</option><option>true</option></select></label>
-                  <label class="small">context_turns<input class="field" value="6"></label>
-                  <label class="small">session_tmp_dir<input class="field" value="/tmp/assistant-session"></label>
-                </div>
-              </div>
+              <div id="configEditorRoot"></div>
+              <div class="locked-note small">中文注释：前端只写入白名单配置项；api_key、web.token 等敏感值不展示、不编辑。保存后会重新读取 <span class="mono">/api/config</span> 并刷新页面状态。</div>
+              <div class="divider"></div>
               <div class="terminal">
-                <div class="terminal-head"><span class="status-dot ok"></span><span>Doctor 输出</span></div>
+                <div class="terminal-head"><span class="status-dot ok"></span><span>Doctor 输出</span><span class="pill" id="configDirtyState">synced</span></div>
                 <pre id="doctorOutput">等待 Doctor 检查。</pre>
               </div>
             </div>

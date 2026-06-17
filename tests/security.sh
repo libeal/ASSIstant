@@ -149,6 +149,10 @@ grep -q 'printf ok' <<<"${prepared_step}"
 review="$(linux_agent_policy_review_step "${prepared_step}" "$(linux_agent_step_review_material "${prepared_step}")" remote)"
 grep -q '"approval_required":true' <<<"${review}"
 grep -q '"risk_level":"high"' <<<"${review}"
+[[ "$(linux_agent_execution_privilege_from_review "${review}")" == "least" ]]
+
+sudo_review="$(linux_agent_policy_review_text "terminal" "sudo systemctl restart nginx")"
+[[ "$(linux_agent_execution_privilege_from_review "${sudo_review}")" == "current" ]]
 
 linux_agent_download_remote_script() {
     printf '\000\001' > "$2"

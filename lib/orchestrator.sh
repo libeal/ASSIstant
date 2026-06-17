@@ -117,6 +117,7 @@ linux_agent_build_agent_observation() {
             tool:($r.output.tool // null),
             action:($r.output.action // null),
             auto_approved:($r.auto_approved // false),
+            execution_proxy:($r.execution_proxy // null),
             output_keys:(if ($r.output? | type) == "object" then ($r.output | keys) else [] end),
             output_preview:output_preview($r.output)
         };
@@ -449,7 +450,10 @@ linux_agent_process_script_request() {
     local script_path subject
     script_path="$(linux_agent_skill_script_path "${ref}")"
     subject="$(jq -cn --arg ref "${ref}" --argjson arguments "${arguments_json}" '{kind:"script_command", ref:$ref, arguments:$arguments}')"
-    result="$(linux_agent_execute_observed_command_output "script" "${subject}" -- bash "${script_path}" "${arguments_json}")"
+    result="$(
+        LINUX_AGENT_EXECUTION_PRIVILEGE="$(linux_agent_execution_privilege_from_review "${review}")" \
+            linux_agent_execute_observed_command_output "script" "${subject}" -- bash "${script_path}" "${arguments_json}"
+    )"
     linux_agent_log_event "script_executed" "${result}"
     if linux_agent_output_json_enabled; then
         printf '%s\n' "$(jq . <<<"${result}")"
@@ -467,15 +471,82 @@ linux_agent_process_script_request() {
 
 linux_agent_process_terminal_request() {
     local command_text="$1"
+    local approve="${2:-false}"
     local stdout_file stderr_file stdout_preview stderr_preview exit_code final_status result run_meta observer subject
+    local review step_decision proxy_meta proxy_error
+    local -a command_args prepared_command
 
     linux_agent_log_event "received" "$(jq -cn --arg command "${command_text}" '{mode:"terminal", command:$command}')"
+    review="$(linux_agent_terminal_review "${command_text}")"
+    linux_agent_log_event "terminal_policy_checked" "${review}"
+
+    if [[ "$(jq -r '.approved' <<<"${review}")" != "true" ]]; then
+        result="$(jq -cn --arg command "${command_text}" --argjson review "${review}" \
+            '{ok:false, status:"blocked", command:$command, review:$review}')"
+        linux_agent_log_event "terminal_blocked" "${result}"
+        if linux_agent_output_json_enabled; then
+            printf '%s\n' "$(jq . <<<"${result}")"
+        else
+            linux_agent_print_terminal_result "$(jq -c '. + {exit_code:126, stdout_preview:"", stderr_preview:(.review.findings | tostring)}' <<<"${result}")"
+        fi
+        linux_agent_log_event "finished" "$(jq -cn '{status:"blocked"}')"
+        return 0
+    fi
+
+    if [[ "$(jq -r '.approval_required' <<<"${review}")" == "true" && "${approve}" != "true" ]]; then
+        printf '终端命令审查风险: %s，发现项: %s\n' "$(jq -r '.risk_level' <<<"${review}")" "$(jq '.findings | length' <<<"${review}")" >&2
+        if [[ "${LINUX_AGENT_API_MODE:-0}" == "1" ]]; then
+            result="$(jq -cn --arg command "${command_text}" --argjson review "${review}" \
+                '{ok:false, status:"approval_required", command:$command, review:$review}')"
+            linux_agent_log_event "terminal_approval_required" "${result}"
+            printf '%s\n' "$(jq . <<<"${result}")"
+            linux_agent_log_event "finished" "$(jq -cn '{status:"approval_required"}')"
+            return 0
+        fi
+        if ! linux_agent_confirm_execution "批准执行该终端命令？"; then
+            result="$(jq -cn --arg command "${command_text}" --argjson review "${review}" \
+                '{ok:false, status:"rejected", command:$command, review:$review}')"
+            linux_agent_log_event "terminal_rejected" "${result}"
+            if linux_agent_output_json_enabled; then
+                printf '%s\n' "$(jq . <<<"${result}")"
+            else
+                linux_agent_print_terminal_result "$(jq -c '. + {exit_code:null, stdout_preview:"", stderr_preview:"用户拒绝执行。"}' <<<"${result}")"
+            fi
+            linux_agent_log_event "finished" "$(jq -cn '{status:"rejected"}')"
+            return 0
+        fi
+    fi
 
     stdout_file="$(mktemp "${LINUX_AGENT_TMP_DIR}/terminal.stdout.XXXXXX")"
     stderr_file="$(mktemp "${LINUX_AGENT_TMP_DIR}/terminal.stderr.XXXXXX")"
 
     subject="$(jq -cn --arg command "${command_text}" '{kind:"terminal_command", command:$command}')"
-    run_meta="$(linux_agent_run_observed_process "terminal" "${subject}" "${stdout_file}" "${stderr_file}" -- bash -lc "${command_text}")"
+    command_args=(bash -lc "${command_text}")
+    if ! linux_agent_prepare_execution_command "$(linux_agent_execution_privilege_from_review "${review}")" prepared_command "${command_args[@]}"; then
+        proxy_error="least privilege proxy is unavailable; refusing to run as root without an explicit privileged path"
+        proxy_meta="$(linux_agent_execution_proxy_metadata "$(linux_agent_execution_privilege_from_review "${review}")" "false" "${proxy_error}")"
+        result="$(jq -cn \
+            --arg command "${command_text}" \
+            --arg status "failed" \
+            --arg stderr_preview "${proxy_error}" \
+            --argjson proxy "${proxy_meta}" \
+            '{ok:false, status:$status, command:$command, exit_code:126, stdout_preview:"", stderr_preview:$stderr_preview, execution_proxy:$proxy}')"
+        linux_agent_log_event "terminal_executed" "${result}"
+        if linux_agent_output_json_enabled; then
+            printf '%s\n' "$(jq . <<<"${result}")"
+        else
+            linux_agent_print_terminal_result "${result}"
+        fi
+        linux_agent_log_event "finished" "$(jq -cn '{status:"failed"}')"
+        rm -f "${stdout_file}" "${stderr_file}"
+        return 0
+    fi
+    if [[ "$(linux_agent_execution_privilege_from_review "${review}")" == "least" && "$(id -u)" -eq 0 ]]; then
+        proxy_meta="$(linux_agent_execution_proxy_metadata "least" "true")"
+    else
+        proxy_meta="$(linux_agent_execution_proxy_metadata "$(linux_agent_execution_privilege_from_review "${review}")" "false")"
+    fi
+    run_meta="$(linux_agent_run_observed_process "terminal" "${subject}" "${stdout_file}" "${stderr_file}" -- "${prepared_command[@]}")"
     exit_code="$(jq -r '.exit_code' <<<"${run_meta}")"
     observer="$(jq -c '.observer' <<<"${run_meta}")"
 
@@ -494,7 +565,9 @@ linux_agent_process_terminal_request() {
         --arg status "${final_status}" \
         --argjson exit_code "${exit_code}" \
         --argjson observer "${observer}" \
-        '{ok:($exit_code == 0), status:$status, command:$command, exit_code:$exit_code, stdout_preview:$stdout_preview, stderr_preview:$stderr_preview, observer:$observer}')"
+        --argjson review "${review}" \
+        --argjson proxy "${proxy_meta}" \
+        '{ok:($exit_code == 0), status:$status, command:$command, exit_code:$exit_code, stdout_preview:$stdout_preview, stderr_preview:$stderr_preview, review:$review, observer:$observer, execution_proxy:$proxy}')"
 
     linux_agent_log_event "terminal_executed" "${result}"
     if linux_agent_output_json_enabled; then

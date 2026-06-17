@@ -63,7 +63,7 @@ health="$(curl --noproxy '*' -sS -H "Authorization: Bearer ${token}" "${base_url
 jq -e '.ok == true and .root != "" and .web_server.run_id != "" and .web_server.started_at != ""' <<<"${health}" >/dev/null
 
 config_state="$(curl --noproxy '*' -sS -H "Authorization: Bearer ${token}" "${base_url}/api/config")"
-jq -e '.ok == true and (.config.agent_loop.thinking_trace_enabled | type == "boolean") and .config.api_key_configured == true' <<<"${config_state}" >/dev/null
+jq -e '.ok == true and (.config.agent_loop.thinking_trace_enabled | type == "boolean") and .config.api_key_configured == true and .config.web.token_configured == true' <<<"${config_state}" >/dev/null
 
 config_update_payload="$(jq -cn '{key:"agent_loop.thinking_trace_enabled", value:true}')"
 config_update="$(curl --noproxy '*' -sS \
@@ -72,6 +72,14 @@ config_update="$(curl --noproxy '*' -sS \
     -d "${config_update_payload}" \
     "${base_url}/api/config/update")"
 jq -e '.ok == true and .status == "updated" and .config.agent_loop.thinking_trace_enabled == true' <<<"${config_update}" >/dev/null
+
+audit_limit_payload="$(jq -cn '{key:"audit_text_limit", value:1234}')"
+audit_limit_update="$(curl --noproxy '*' -sS \
+    -H "Authorization: Bearer ${token}" \
+    -H "Content-Type: application/json" \
+    -d "${audit_limit_payload}" \
+    "${base_url}/api/config/update")"
+jq -e '.ok == true and .status == "updated" and .updated.audit_text_limit == 1234 and .config.audit_text_limit == 1234' <<<"${audit_limit_update}" >/dev/null
 
 skill_tree="$(curl --noproxy '*' -sS -H "Authorization: Bearer ${token}" "${base_url}/api/skills/tree")"
 jq -e '.ok == true and (.markdown_files | index("INDEX.md")) and (.script_files | index("ops-basic/scripts/resource-inspect.sh"))' <<<"${skill_tree}" >/dev/null

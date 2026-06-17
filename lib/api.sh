@@ -316,7 +316,10 @@ linux_agent_api_script_run() {
 
     script_path="$(linux_agent_skill_script_path "${ref}")"
     subject="$(jq -cn --arg ref "${ref}" --argjson arguments "${args}" '{kind:"script_command", ref:$ref, arguments:$arguments}')"
-    result="$(linux_agent_execute_observed_command_output "script" "${subject}" -- bash "${script_path}" "${args}")"
+    result="$(
+        LINUX_AGENT_EXECUTION_PRIVILEGE="$(linux_agent_execution_privilege_from_review "$(jq -c '.review // {}' <<<"${review_json}")")" \
+            linux_agent_execute_observed_command_output "script" "${subject}" -- bash "${script_path}" "${args}"
+    )"
     linux_agent_log_event "script_executed" "${result}"
     if [[ "$(jq -r '.ok // false' <<<"${result}")" == "true" ]]; then
         final_status="executed"
@@ -328,6 +331,19 @@ linux_agent_api_script_run() {
         '{ok:($status == "executed"), status:$status, review:$review, result:$result}'
 }
 
+linux_agent_api_terminal_review() {
+    local payload="$1"
+    local command_text review
+    command_text="$(jq -r '.command // empty' <<<"${payload}")"
+    if [[ -z "${command_text}" ]]; then
+        linux_agent_api_error "missing_command" "command is required."
+        return 0
+    fi
+    review="$(linux_agent_terminal_review "${command_text}")"
+    jq -cn --arg command "${command_text}" --argjson review "${review}" \
+        '{ok:(($review.approved // false) == true), status:(if (($review.approved // false) == true) then (if (($review.approval_required // false) == true) then "approval_required" else "approved" end) else "blocked" end), command:$command, review:$review}'
+}
+
 linux_agent_api_terminal_run() {
     local payload="$1"
     local command_text stdout
@@ -337,7 +353,8 @@ linux_agent_api_terminal_run() {
         return 0
     fi
     LINUX_AGENT_OUTPUT_JSON=1
-    stdout="$(linux_agent_process_terminal_request "${command_text}")"
+    LINUX_AGENT_API_MODE=1
+    stdout="$(linux_agent_process_terminal_request "${command_text}" "$(jq -r '.approve // false' <<<"${payload}")")"
     if jq -e . >/dev/null 2>&1 <<<"${stdout}"; then
         jq -cn --argjson result "${stdout}" '{ok:($result.ok // false), status:($result.status // "unknown"), result:$result}'
     else
@@ -469,6 +486,9 @@ linux_agent_api_dispatch() {
             ;;
         script:run)
             linux_agent_api_script_run "${payload}"
+            ;;
+        terminal:review)
+            linux_agent_api_terminal_review "${payload}"
             ;;
         terminal:run)
             linux_agent_api_terminal_run "${payload}"

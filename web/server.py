@@ -49,10 +49,19 @@ def write_config(config):
     tmp_path.replace(CONFIG_PATH)
 
 
+def safe_int(value, default):
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return int(default)
+
+
 def config_public_state():
     config = read_config()
     agent_loop = config.get("agent_loop") if isinstance(config.get("agent_loop"), dict) else {}
     observer = config.get("observer") if isinstance(config.get("observer"), dict) else {}
+    execution = config.get("execution") if isinstance(config.get("execution"), dict) else {}
+    web = config.get("web") if isinstance(config.get("web"), dict) else {}
     return {
         "ok": True,
         "status": "read",
@@ -78,27 +87,99 @@ def config_public_state():
                 "privilege": observer.get("privilege", ""),
                 "max_events": observer.get("max_events", 200),
             },
+            "execution": {
+                "min_privilege_proxy": bool(execution.get("min_privilege_proxy", True)),
+                "least_privilege_user": execution.get("least_privilege_user", "nobody"),
+            },
             "skills_dir": config.get("skills_dir", ""),
             "remote_script_policy": config.get("remote_script_policy", "download_review"),
+            "web": {
+                "enabled": bool(web.get("enabled", True)),
+                "host": web.get("host", HOST),
+                "port": safe_int(web.get("port", PORT) or PORT, PORT),
+                "token_configured": bool(web.get("token") or TOKEN),
+                "job_retention_hours": safe_int(web.get("job_retention_hours", JOB_RETENTION_HOURS) or JOB_RETENTION_HOURS, JOB_RETENTION_HOURS),
+            },
         },
     }
 
 
+CONFIG_WRITABLE_FIELDS = {
+    "provider": {"type": "str", "min": 1},
+    "api_url": {"type": "str", "min": 1},
+    "model": {"type": "str", "min": 1},
+    "request_timeout_sec": {"type": "int", "min": 1, "max": 600},
+    "context_turns": {"type": "int", "min": 1, "max": 50},
+    "agent_loop.enabled_for_work": {"type": "bool"},
+    "agent_loop.auto_execute_low_risk": {"type": "bool"},
+    "agent_loop.auto_execute_shell_low_risk": {"type": "bool"},
+    "agent_loop.observation_text_limit": {"type": "int", "min": 200, "max": 200000},
+    "agent_loop.thinking_trace_enabled": {"type": "bool"},
+    "agent_loop.checkpoint_turns": {"type": "int", "min": 0, "max": 100},
+    "audit_mode": {"type": "enum", "values": {"safe_summary", "redacted_verbose"}},
+    "audit_text_limit": {"type": "int", "min": 40, "max": 200000},
+    "observer.enabled": {"type": "enum", "values": {"auto", "auditd", "disabled"}},
+    "observer.privilege": {"type": "str", "min": 0},
+    "observer.max_events": {"type": "int", "min": 0, "max": 100000},
+    "execution.min_privilege_proxy": {"type": "bool"},
+    "execution.least_privilege_user": {"type": "str", "min": 1},
+    "skills_dir": {"type": "str", "min": 0},
+    "remote_script_policy": {"type": "enum", "values": {"download_review", "disabled"}},
+}
+
+
+def normalize_config_value(key, value):
+    spec = CONFIG_WRITABLE_FIELDS.get(key)
+    if not spec:
+        return None, f"Unsupported writable config key: {key}"
+    value_type = spec["type"]
+    if value_type == "bool":
+        if not isinstance(value, bool):
+            return None, f"{key} must be boolean."
+        return value, ""
+    if value_type == "int":
+        if isinstance(value, bool):
+            return None, f"{key} must be integer."
+        try:
+            normalized = int(value)
+        except (TypeError, ValueError):
+            return None, f"{key} must be integer."
+        if normalized < spec.get("min", normalized) or normalized > spec.get("max", normalized):
+            return None, f"{key} is outside allowed range."
+        return normalized, ""
+    if value_type == "enum":
+        normalized = str(value)
+        if normalized not in spec["values"]:
+            return None, f"{key} must be one of: {', '.join(sorted(spec['values']))}."
+        return normalized, ""
+    normalized = str(value)
+    if len(normalized) < spec.get("min", 0):
+        return None, f"{key} must not be empty."
+    return normalized, ""
+
+
+def write_nested_config_value(config, key, value):
+    parts = key.split(".")
+    target = config
+    for part in parts[:-1]:
+        child = target.get(part)
+        if not isinstance(child, dict):
+            child = {}
+            target[part] = child
+        target = child
+    target[parts[-1]] = value
+
+
 def update_config_value(key, value):
-    if key != "agent_loop.thinking_trace_enabled":
-        return {"ok": False, "status": "unsupported_config_key", "error": "Only agent_loop.thinking_trace_enabled is writable from this view."}
-    if not isinstance(value, bool):
-        return {"ok": False, "status": "invalid_config_value", "error": "thinking_trace_enabled must be boolean."}
+    normalized, error = normalize_config_value(key, value)
+    if error:
+        return {"ok": False, "status": "invalid_config_value", "error": error}
     config = read_config()
-    agent_loop = config.get("agent_loop")
-    if not isinstance(agent_loop, dict):
-        agent_loop = {}
-        config["agent_loop"] = agent_loop
-    agent_loop["thinking_trace_enabled"] = value
+    write_nested_config_value(config, key, normalized)
     write_config(config)
     result = config_public_state()
     result["status"] = "updated"
-    result["updated"] = {key: value}
+    result["updated"] = {key: normalized}
     return result
 
 
@@ -659,6 +740,7 @@ class Handler(SimpleHTTPRequestHandler):
         sync_routes = {
             "/api/sense": ("sense", "get"),
             "/api/script/review": ("script", "review"),
+            "/api/terminal/review": ("terminal", "review"),
             "/api/terminal/run": ("terminal", "run"),
             "/api/edit/plan": ("edit", "plan"),
             "/api/edit/review": ("edit", "review"),

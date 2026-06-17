@@ -38,7 +38,7 @@ jq -e '.ok == true and ([.scripts[].ref] | index("ops-basic/resource-inspect"))'
 project_work="${tmp_root}/project-work-api"
 copy_project "${project_work}"
 work_run="$(cd "${project_work}" && bash bin/agent api work run '{"input":"查看cpu占用"}' 2>/dev/null)"
-jq -e '.ok == true and .status == "executed" and .execution.auto_executed_count == 1' <<<"${work_run}" >/dev/null
+jq -e '.ok == true and .status == "executed" and .execution.auto_executed_count == 1 and .execution.results[0].result.execution_proxy.requested_privilege == "least"' <<<"${work_run}" >/dev/null
 
 approval_first="$(cd "${project_work}" && bash bin/agent api work run '{"input":"帮我检查磁盘空间是否异常"}' 2>/dev/null)"
 jq -e '.ok == false and .status == "approval_required" and .response.response_type == "work_plan"' <<<"${approval_first}" >/dev/null
@@ -64,10 +64,16 @@ script_review="$(bash "${ROOT_DIR}/bin/agent" api script review '{"ref":"ops-bas
 jq -e '.ok == true and .review.risk_level == "low"' <<<"${script_review}" >/dev/null
 
 script_run="$(bash "${ROOT_DIR}/bin/agent" api script run '{"ref":"ops-basic/resource-inspect","arguments":{"top_n":1},"approve":true}' 2>/dev/null)"
-jq -e '.ok == true and .status == "executed" and .result.output.tool == "system.resource.inspect"' <<<"${script_run}" >/dev/null
+jq -e '.ok == true and .status == "executed" and .result.output.tool == "system.resource.inspect" and .result.execution_proxy.requested_privilege == "least"' <<<"${script_run}" >/dev/null
 
 terminal_run="$(bash "${ROOT_DIR}/bin/agent" api terminal run '{"command":"printf api-ok"}' 2>/dev/null)"
-jq -e '.ok == true and .result.stdout_preview == "api-ok"' <<<"${terminal_run}" >/dev/null
+jq -e '.ok == true and .result.stdout_preview == "api-ok" and .result.execution_proxy.requested_privilege == "least"' <<<"${terminal_run}" >/dev/null
+
+terminal_review="$(bash "${ROOT_DIR}/bin/agent" api terminal review '{"command":"sudo systemctl restart nginx"}')"
+jq -e '.ok == true and .status == "approval_required" and .review.risk_level == "high"' <<<"${terminal_review}" >/dev/null
+
+terminal_approval_required="$(bash "${ROOT_DIR}/bin/agent" api terminal run '{"command":"sudo systemctl restart nginx"}' 2>/dev/null)"
+jq -e '.ok == false and .status == "approval_required"' <<<"${terminal_approval_required}" >/dev/null
 
 project_edit="${tmp_root}/project-edit-api"
 copy_project "${project_edit}"

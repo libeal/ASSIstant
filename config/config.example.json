@@ -20,6 +20,10 @@
     "privilege": "sudo_interactive",
     "max_events": 200
   },
+  "execution": {
+    "min_privilege_proxy": true,
+    "least_privilege_user": "nobody"
+  },
   "skills_dir": "",
   "remote_script_policy": "download_review",
   "web": {

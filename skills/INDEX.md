@@ -14,4 +14,10 @@
 - `ops-basic/safe-log-cleanup`: 对允许范围内的非关键日志执行安全截断。
 - `ops-basic/service-restart-plan`: 生成服务重启前的只读预检计划。
 
+## os-deep-inspect
+
+- `os-deep-inspect/os-snapshot`: 深度采集主机、负载、磁盘、网络、失败服务、近期告警日志和进程摘要。
+- `os-deep-inspect/net-inspect`: 通过 `ss` 或 `netstat` 查看监听端口、连接状态和可选进程信息。
+- `os-deep-inspect/fd-inspect`: 通过 `lsof` 或 `/proc/<pid>/fd` 检查打开文件、socket 和文件句柄占用。
+- `os-deep-inspect/journal-inspect`: 通过 `journalctl` 按 unit、priority、时间窗口和关键词读取系统日志样本。
 

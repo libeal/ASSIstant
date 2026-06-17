@@ -1,0 +1,4 @@
+interface:
+  display_name: "OS Deep Inspect"
+  short_description: "Deep read-only OS diagnostics"
+  default_prompt: "Use $os-deep-inspect to collect a read-only OS diagnostic snapshot."

@@ -188,6 +188,7 @@ bash bin/agent api script review '{"ref":"ops-basic/resource-inspect","arguments
 
 1. `lib/orchestrator.sh` 记录 `received`。
 2. `lib/sense.sh` 根据用户输入识别主题，采集最小必要环境信息。
+2. `lib/sense.sh` 根据用户输入识别主题，采集最小必要环境信息。
 3. `lib/context.sh` 构造动态请求上下文。
 4. `lib/ai.sh` 调用 AI，要求返回 `answer` 或 `work_plan`；配置缺失、请求失败或响应不合法时直接失败，不生成测试兜底计划。
 5. 如果返回 `answer`，直接展示回答并记录本轮历史。

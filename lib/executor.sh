@@ -26,6 +26,102 @@ linux_agent_probe_sudo() {
     fi
 }
 
+linux_agent_min_privilege_proxy_enabled() {
+    linux_agent_config_bool_default '.execution.min_privilege_proxy' 'true'
+}
+
+linux_agent_least_privilege_user() {
+    local configured candidate
+    configured="$(linux_agent_config_get_default '.execution.least_privilege_user' 'nobody' 2>/dev/null || printf 'nobody')"
+    for candidate in "${configured}" nobody nfsnobody daemon; do
+        [[ -n "${candidate}" && "${candidate}" =~ ^[A-Za-z_][A-Za-z0-9_.-]*[$]?$ ]] || continue
+        if id -u "${candidate}" >/dev/null 2>&1; then
+            printf '%s\n' "${candidate}"
+            return 0
+        fi
+    done
+    return 1
+}
+
+linux_agent_execution_privilege_from_review() {
+    local review_json="$1"
+    local privileged_finding
+
+    privileged_finding="$(jq -r '
+        [(.findings // [])[] | select((.severity == "high" or .severity == "critical") and
+            ((.code == "REGEX_WARN") or (.code == "PROTECTED_SERVICE") or (.code == "PROTECTED_PATH")))]
+        | length > 0
+    ' <<<"${review_json}" 2>/dev/null || printf 'false')"
+    if [[ "${privileged_finding}" == "true" ]]; then
+        printf 'current\n'
+    else
+        printf 'least\n'
+    fi
+}
+
+linux_agent_prepare_execution_command() {
+    local requested_privilege="$1"
+    local output_var="$2"
+    shift 2
+    local -n output_command_ref="${output_var}"
+    output_command_ref=()
+
+    if [[ "${requested_privilege}" != "least" ]] || [[ "$(linux_agent_min_privilege_proxy_enabled)" != "true" ]]; then
+        output_command_ref=("$@")
+        return 0
+    fi
+
+    if [[ "$(id -u)" -ne 0 ]]; then
+        output_command_ref=("$@")
+        return 0
+    fi
+
+    local target_user target_uid target_gid
+    if ! target_user="$(linux_agent_least_privilege_user)"; then
+        return 1
+    fi
+
+    if command -v runuser >/dev/null 2>&1; then
+        output_command_ref=(runuser -u "${target_user}" -- "$@")
+        return 0
+    fi
+
+    if command -v setpriv >/dev/null 2>&1; then
+        target_uid="$(id -u "${target_user}")"
+        target_gid="$(id -g "${target_user}")"
+        output_command_ref=(setpriv --reuid "${target_uid}" --regid "${target_gid}" --init-groups "$@")
+        return 0
+    fi
+
+    return 1
+}
+
+linux_agent_execution_proxy_metadata() {
+    local requested_privilege="$1"
+    local prepared_root="$2"
+    local error_message="${3:-}"
+    local target_user=""
+    if [[ "${requested_privilege}" == "least" && "$(id -u)" -eq 0 ]]; then
+        target_user="$(linux_agent_least_privilege_user 2>/dev/null || true)"
+    fi
+
+    jq -cn \
+        --arg requested_privilege "${requested_privilege}" \
+        --arg execution_user "$(id -un 2>/dev/null || printf 'unknown')" \
+        --arg target_user "${target_user}" \
+        --arg prepared_root "${prepared_root}" \
+        --arg error "${error_message}" \
+        --argjson enabled "$(linux_agent_min_privilege_proxy_enabled)" \
+        '{
+            enabled:$enabled,
+            requested_privilege:$requested_privilege,
+            execution_user:$execution_user,
+            target_user:(if $target_user == "" then null else $target_user end),
+            prepared_root:($prepared_root == "true"),
+            error:(if $error == "" then null else $error end)
+        }'
+}
+
 linux_agent_confirm_execution() {
     local prompt="$1"
     local api_answer=""
@@ -365,6 +461,11 @@ linux_agent_print_terminal_result() {
     linux_agent_print_terminal_stream "终端错误" "${stderr_preview}"
 }
 
+linux_agent_terminal_review() {
+    local command_text="$1"
+    linux_agent_policy_review_text "terminal" "${command_text}"
+}
+
 linux_agent_print_work_execution_status() {
     local execution_json="$1"
     jq -r '
@@ -402,6 +503,7 @@ linux_agent_compact_execution_result() {
                         tool:(.result.output.tool // null),
                         action:(.result.output.action // null),
                         auto_approved:(.result.auto_approved // false),
+                        execution_proxy:(.result.execution_proxy // null),
                         observer:(.result.observer // null)
                     }
                 }
@@ -521,10 +623,29 @@ linux_agent_execute_observed_command_output() {
     [[ "${1:-}" == "--" ]] && shift
 
     local stdout_file stderr_file run_meta exit_code observer stdout_text stderr_text combined
+    local requested_privilege proxy_meta proxy_error
+    local -a prepared_command
+
+    requested_privilege="${LINUX_AGENT_EXECUTION_PRIVILEGE:-least}"
+    if ! linux_agent_prepare_execution_command "${requested_privilege}" prepared_command "$@"; then
+        proxy_error="least privilege proxy is unavailable; refusing to run as root without an explicit privileged path"
+        proxy_meta="$(linux_agent_execution_proxy_metadata "${requested_privilege}" "false" "${proxy_error}")"
+        jq -cn \
+            --arg output "${proxy_error}" \
+            --argjson proxy "${proxy_meta}" \
+            '{ok:false, exit_code:126, output:{raw:$output}, execution_proxy:$proxy}'
+        return 0
+    fi
+    if [[ "${requested_privilege}" == "least" && "$(id -u)" -eq 0 ]]; then
+        proxy_meta="$(linux_agent_execution_proxy_metadata "${requested_privilege}" "true")"
+    else
+        proxy_meta="$(linux_agent_execution_proxy_metadata "${requested_privilege}" "false")"
+    fi
+
     stdout_file="$(mktemp "${LINUX_AGENT_TMP_DIR}/observer.stdout.XXXXXX")"
     stderr_file="$(mktemp "${LINUX_AGENT_TMP_DIR}/observer.stderr.XXXXXX")"
 
-    run_meta="$(linux_agent_run_observed_process "${scope}" "${subject_json}" "${stdout_file}" "${stderr_file}" -- "$@")"
+    run_meta="$(linux_agent_run_observed_process "${scope}" "${subject_json}" "${stdout_file}" "${stderr_file}" -- "${prepared_command[@]}")"
     exit_code="$(jq -r '.exit_code' <<<"${run_meta}")"
     observer="$(jq -c '.observer' <<<"${run_meta}")"
     stdout_text="$(cat "${stdout_file}" 2>/dev/null || true)"
@@ -545,18 +666,21 @@ linux_agent_execute_observed_command_output() {
             --argjson output "$(printf '%s' "${combined}" | jq -c .)" \
             --argjson exit_code "${exit_code}" \
             --argjson observer "${observer}" \
-            '{ok:($exit_code == 0), exit_code:$exit_code, output:$output, observer:$observer}'
+            --argjson proxy "${proxy_meta}" \
+            '{ok:($exit_code == 0), exit_code:$exit_code, output:$output, observer:$observer, execution_proxy:$proxy}'
     else
         jq -cn \
             --arg output "${combined}" \
             --argjson exit_code "${exit_code}" \
             --argjson observer "${observer}" \
-            '{ok:($exit_code == 0), exit_code:$exit_code, output:{raw:$output}, observer:$observer}'
+            --argjson proxy "${proxy_meta}" \
+            '{ok:($exit_code == 0), exit_code:$exit_code, output:{raw:$output}, observer:$observer, execution_proxy:$proxy}'
     fi
 }
 
 linux_agent_execute_step_command() {
     local step_json="$1"
+    local review_json="${2:-}"
     local executor_type subject
     local -a command_args
     executor_type="$(jq -r '.executor_type' <<<"${step_json}")"
@@ -583,7 +707,8 @@ linux_agent_execute_step_command() {
     esac
 
     subject="$(jq -cn --argjson step "${step_json}" '{kind:"work_step", step:$step}')"
-    linux_agent_execute_observed_command_output "step_${executor_type}" "${subject}" -- "${command_args[@]}"
+    LINUX_AGENT_EXECUTION_PRIVILEGE="$(linux_agent_execution_privilege_from_review "${review_json:-{}}")" \
+        linux_agent_execute_observed_command_output "step_${executor_type}" "${subject}" -- "${command_args[@]}"
 }
 
 linux_agent_skipped_steps_after() {
@@ -860,7 +985,7 @@ linux_agent_execute_work_plan() {
 
         linux_agent_log_step_status "${step}" "approved"
         linux_agent_log_step_status "${step}" "running"
-        result="$(linux_agent_execute_step_command "${step}")"
+        result="$(linux_agent_execute_step_command "${step}" "${review}")"
         if [[ "${auto_approved}" -eq 1 ]]; then
             result="$(jq -c '. + {auto_approved:true}' <<<"${result}")"
         fi
