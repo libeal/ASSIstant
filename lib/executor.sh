@@ -493,6 +493,7 @@ linux_agent_compact_execution_result() {
                         id:.step.id,
                         title:.step.title,
                         executor_type:.step.executor_type,
+                        risk_level:(.step.risk_level // null),
                         skill_script:(.step.skill_script // null),
                         command:(.step.command // null)
                     },
@@ -502,6 +503,7 @@ linux_agent_compact_execution_result() {
                         exit_code:(.result.exit_code // null),
                         tool:(.result.output.tool // null),
                         action:(.result.output.action // null),
+                        output:(.result.output // null),
                         auto_approved:(.result.auto_approved // false),
                         execution_proxy:(.result.execution_proxy // null),
                         observer:(.result.observer // null)

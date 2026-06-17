@@ -39,9 +39,11 @@ project_work="${tmp_root}/project-work-api"
 copy_project "${project_work}"
 work_run="$(cd "${project_work}" && bash bin/agent api work run '{"input":"查看cpu占用"}' 2>/dev/null)"
 jq -e '.ok == true and .status == "executed" and .execution.auto_executed_count == 1 and .execution.results[0].result.execution_proxy.requested_privilege == "least"' <<<"${work_run}" >/dev/null
+jq -e '.execution.results[0].result.output.tool == "system.resource.inspect" and (.execution.results[0].result.output.top_processes | length > 0)' <<<"${work_run}" >/dev/null
 
 approval_first="$(cd "${project_work}" && bash bin/agent api work run '{"input":"帮我检查磁盘空间是否异常"}' 2>/dev/null)"
 jq -e '.ok == false and .status == "approval_required" and .response.response_type == "work_plan"' <<<"${approval_first}" >/dev/null
+jq -e '.execution.results[0].result.output.tool == "system.disk.hotspots" and (.execution.results[0].result.output.top_dirs | length > 0) and (.execution.results[0].result.output.top_files | length > 0)' <<<"${approval_first}" >/dev/null
 approval_payload="$(
     jq -cn \
         --arg input "帮我检查磁盘空间是否异常" \

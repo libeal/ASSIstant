@@ -328,26 +328,38 @@ function tableFromText(text) {
   return `<div class="data-table-wrap"><table class="data-table">${body}</table></div>`;
 }
 
+function renderOutputSection(key, value) {
+  const label = outputLabel(key);
+  const text = renderUserOutputText(value);
+  const table = tableFromText(text);
+  return `
+    <section class="output-section">
+      <h5>${escapeHtml(label)}</h5>
+      ${table || `<pre class="inline-code">${escapeHtml(text)}</pre>`}
+    </section>
+  `;
+}
+
 function renderPrimaryOutputHtml(output) {
   const payload = primaryOutputObject(output);
   const chunks = [];
+  const renderedKeys = new Set();
   const preferred = [
     "summary", "message", "error", "command", "stdout", "stderr", "load", "memory", "disk_usage", "df_summary",
-    "top_processes", "processes", "journal", "journal_sample", "matches",
+    "top_dirs", "top_files", "top_processes", "processes", "journal", "journal_sample", "matches",
     "stdout_preview", "stderr_preview", "raw",
   ];
   for (const key of preferred) {
     const value = payload[key] ?? output?.[key];
     if (isEmptyOutputValue(value)) continue;
-    const label = outputLabel(key);
-    const text = renderUserOutputText(value);
-    const table = tableFromText(text);
-    chunks.push(`
-      <section class="output-section">
-        <h5>${escapeHtml(label)}</h5>
-        ${table || `<pre class="inline-code">${escapeHtml(text)}</pre>`}
-      </section>
-    `);
+    chunks.push(renderOutputSection(key, value));
+    renderedKeys.add(key);
+  }
+  if (isPlainObject(payload)) {
+    for (const [key, value] of Object.entries(payload)) {
+      if (renderedKeys.has(key) || hiddenOutputKeys.has(key) || isEmptyOutputValue(value)) continue;
+      chunks.push(renderOutputSection(key, value));
+    }
   }
   if (chunks.length) return chunks.join("");
   return `<p class="muted">${escapeHtml(outputSummaryText(output))}</p>`;
