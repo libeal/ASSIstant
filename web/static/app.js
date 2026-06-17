@@ -20,7 +20,7 @@ const state = {
   draggedPanelId: "",
   webRunId: "",
   layoutStorageKey: "",
-  defaultLayout: { containers: {} },
+  defaultLayout: { containers: {}, children: {} },
 };
 
 const $ = (id) => document.getElementById(id);
@@ -134,12 +134,17 @@ function currentLayoutStorageKey() {
 
 function readCurrentLayout() {
   const containers = {};
+  const children = {};
   document.querySelectorAll("[data-layout-container]").forEach((container) => {
-    containers[container.dataset.layoutContainer] = [...container.children]
+    const containerId = container.dataset.layoutContainer;
+    containers[containerId] = [...container.children]
       .filter((child) => child.dataset?.layoutPanel)
       .map((child) => child.dataset.layoutPanel);
+    children[containerId] = [...container.children]
+      .map(layoutChildToken)
+      .filter(Boolean);
   });
-  return { containers };
+  return { containers, children };
 }
 
 function loadSavedLayout() {
@@ -167,6 +172,7 @@ function initPanelLayout() {
     containers.forEach((container, index) => {
       container.dataset.layoutContainer = `${screen.id}:container-${index}`;
       container.classList.add("layout-container");
+      let staticIndex = 0;
       getDirectLayoutPanels(container).forEach((panel) => {
         if (!panel.dataset.layoutPanel) {
           panel.dataset.layoutPanel = `${screen.id}:panel-${panelIndex}`;
@@ -174,6 +180,11 @@ function initPanelLayout() {
         }
         panel.classList.add("layout-panel");
         addDragHandle(panel);
+      });
+      [...container.children].forEach((child) => {
+        if (child.dataset.layoutPanel || child.dataset.layoutStatic) return;
+        child.dataset.layoutStatic = `${container.dataset.layoutContainer}:static-${staticIndex}`;
+        staticIndex += 1;
       });
     });
   });
@@ -202,30 +213,66 @@ function addDragHandle(panel) {
   header.appendChild(handle);
 }
 
-function applyPanelLayout(containers) {
+function layoutChildToken(child) {
+  if (child.dataset?.layoutPanel) return `panel:${child.dataset.layoutPanel}`;
+  if (child.dataset?.layoutStatic) return `static:${child.dataset.layoutStatic}`;
+  return "";
+}
+
+function applyPanelLayout(layout) {
+  const containers = layout.containers || layout;
+  const children = layout.children || {};
+  for (const [containerId, childTokens] of Object.entries(children)) {
+    const container = findLayoutContainer(containerId);
+    if (!container || !Array.isArray(childTokens)) continue;
+    applyContainerChildLayout(container, childTokens);
+  }
   for (const [containerId, panelIds] of Object.entries(containers)) {
+    if (children[containerId]) continue;
     const container = findLayoutContainer(containerId);
     if (!container || !Array.isArray(panelIds)) continue;
-    for (const panelId of panelIds) {
-      const panel = findLayoutPanel(panelId);
-      if (panel && panel.closest(".screen") === container.closest(".screen")) {
-        container.appendChild(panel);
-      }
+    applyContainerPanelLayout(container, panelIds);
+  }
+}
+
+function applyContainerChildLayout(container, childTokens) {
+  for (const token of childTokens) {
+    const child = findLayoutChild(token);
+    if (child && child.closest(".screen") === container.closest(".screen")) {
+      container.appendChild(child);
     }
   }
 }
 
+function applyContainerPanelLayout(container, panelIds) {
+  const anchor = findPanelBlockAnchor(container);
+  for (const panelId of panelIds) {
+    const panel = findLayoutPanel(panelId);
+    if (panel && panel.closest(".screen") === container.closest(".screen")) {
+      if (anchor && anchor.parentElement === container) container.insertBefore(panel, anchor);
+      else container.appendChild(panel);
+    }
+  }
+}
+
+function findPanelBlockAnchor(container) {
+  const children = [...container.children];
+  const firstPanelIndex = children.findIndex((child) => child.dataset?.layoutPanel);
+  if (firstPanelIndex < 0) return null;
+  return children.slice(firstPanelIndex).find((child) => !child.dataset?.layoutPanel) || null;
+}
+
 function applySavedLayout() {
   const saved = loadSavedLayout();
-  applyPanelLayout(state.defaultLayout.containers || {});
-  if (saved.containers) applyPanelLayout(saved.containers);
+  applyPanelLayout(state.defaultLayout);
+  if (saved.containers) applyPanelLayout(saved);
 }
 
 function setLayoutRunId(runId) {
   if (!runId) {
     state.webRunId = "";
     state.layoutStorageKey = "";
-    applyPanelLayout(state.defaultLayout.containers || {});
+    applyPanelLayout(state.defaultLayout);
     return;
   }
   const nextRunId = String(runId);
@@ -296,6 +343,20 @@ function findLayoutContainer(id) {
 
 function findLayoutPanel(id) {
   return [...document.querySelectorAll("[data-layout-panel]")].find((panel) => panel.dataset.layoutPanel === id) || null;
+}
+
+function findLayoutStatic(id) {
+  return [...document.querySelectorAll("[data-layout-static]")].find((child) => child.dataset.layoutStatic === id) || null;
+}
+
+function findLayoutChild(token) {
+  if (!token.includes(":")) return null;
+  const separator = token.indexOf(":");
+  const type = token.slice(0, separator);
+  const id = token.slice(separator + 1);
+  if (type === "panel") return findLayoutPanel(id);
+  if (type === "static") return findLayoutStatic(id);
+  return null;
 }
 
 function getDragAfterElement(container, y) {
