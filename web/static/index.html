@@ -10,7 +10,12 @@
   <body>
     <div class="app">
       <aside class="sidebar" aria-label="ASSIstant navigation">
-        <div class="traffic" aria-hidden="true"><span class="traffic-dot close"></span><span class="traffic-dot minimize"></span><span class="traffic-dot zoom"></span></div>
+        <div class="window-control">
+          <button class="shutdown-button" id="shutdownServerBtn" type="button" title="结束 agent-web 进程并关闭界面">
+            <span class="shutdown-dot"></span>
+            <span>结束进程</span>
+          </button>
+        </div>
         <div class="brand">
           <h1>ASSIstant</h1>
           <p>CLI 项目的桌面前端外壳</p>
@@ -26,7 +31,6 @@
           <strong>运行会话</strong>
           <p class="mono" id="rootPath">未连接</p>
           <div class="divider"></div>
-          <p>侧边栏仅保留 5 个一级模块，所有 CLI 能力按业务归并。</p>
         </div>
       </aside>
 
@@ -67,19 +71,17 @@
                   <div id="workModePanel">
                     <label class="small" for="workInput">当前请求</label>
                     <textarea class="textarea" id="workInput" placeholder="例如：检查磁盘空间、定位服务异常、生成安全清理计划">帮我检查磁盘空间是否异常，并在需要时生成清理候选，不要直接删除文件。</textarea>
-                    <div class="toolbar action-gap">
-                      <button class="btn" id="workRunBtn" type="button">生成 work_plan</button>
-                      <button class="btn secondary" type="button">只返回 answer</button>
-                      <button class="btn secondary" type="button">预览 AI payload</button>
+                    <div class="toolbar action-gap" id="workActions">
+                      <button class="btn" id="workRunBtn" type="button">发送</button>
+                      <button class="btn danger" id="workCancelBtn" type="button" disabled>终止</button>
+                      <button class="btn secondary" id="workSuspendBtn" type="button" disabled>挂起</button>
                     </div>
                   </div>
                   <div id="terminalModePanel" hidden>
                     <label class="small" for="terminalCommand">bash -lc 命令</label>
                     <input class="field mono" id="terminalCommand" value="df -h && du -sh /var/log 2>/dev/null">
                     <div class="toolbar action-gap">
-                      <button class="btn" id="terminalRunBtn" type="button">执行并写入审计</button>
-                      <button class="btn secondary" type="button">以 JSON 输出</button>
-                      <button class="btn danger" type="button">停止命令</button>
+                      <button class="btn" id="terminalRunBtn" type="button">执行</button>
                     </div>
                   </div>
                 </div>
@@ -92,60 +94,38 @@
                     </div>
                     <span class="pill risk low" id="workJobStatus">idle</span>
                   </div>
-                  <div class="list" id="workPlan">
-                    <article class="item step-card">
-                      <div class="step-index">1</div>
-                      <div>
-                        <div class="item-head"><h4>work_plan_created</h4><span class="pill risk low">accepted</span></div>
-                        <p>AI 返回 3 步计划：磁盘热点采集、日志清理候选、人工确认后的安全清理。</p>
-                      </div>
-                    </article>
-                    <article class="item step-card">
-                      <div class="step-index">2</div>
-                      <div>
-                        <div class="item-head"><h4>policy_reviewed</h4><span class="pill risk medium">approval required</span></div>
-                        <p>检测到清理候选涉及 /var/log，允许只读分析；真实清理需备份并人工确认。</p>
-                      </div>
-                    </article>
-                    <article class="item step-card">
-                      <div class="step-index">3</div>
-                      <div>
-                        <div class="item-head"><h4>user_decision</h4><span class="pill risk medium">modify</span></div>
-                        <p>用户将清理范围修改为 dry_run，仅生成建议，不执行删除、截断或权限变更。</p>
-                      </div>
-                    </article>
-                  </div>
+                  <div class="list" id="workPlan"></div>
                 </div>
               </div>
 
               <aside class="stack">
                 <div class="panel tight">
                   <div class="panel-header">
-                    <div><h3>简短 thinking_summary</h3><p>选择开启后仅返回可读摘要，不暴露长推理链。</p></div>
+                    <div><h3>会话摘要</h3><p>只展示可读摘要，审计与 AI 上下文继续使用脱敏内容。</p></div>
                   </div>
                   <div class="toggle-row">
                     <div><strong class="white">随会话返回 thinking_summary</strong><div class="small">写入审计时仅保存简短摘要。</div></div>
-                    <button class="switch on" type="button" aria-label="toggle thinking summary"><span></span></button>
+                    <button class="switch" id="thinkingTraceSwitch" type="button" aria-label="toggle thinking summary" aria-pressed="false"><span></span></button>
                   </div>
-                  <pre class="code" id="workOutput">thinking_summary: "用户要求先检查磁盘异常，再生成清理候选；真实清理被策略要求转为 dry_run 与人工审批。"</pre>
+                  <pre class="code" id="workOutput">等待会话摘要。</pre>
                 </div>
 
                 <div class="panel tight">
                   <div class="panel-header"><div><h3>服务器运行状态</h3><p>作为 work 与 terminal 的常驻上下文。</p></div></div>
                   <div class="grid-2">
-                    <div class="metric"><div class="label">load</div><div class="value">0.42</div><div class="hint">1m average</div></div>
-                    <div class="metric"><div class="label">disk</div><div class="value">72%</div><div class="hint">/var 占用较高</div></div>
-                    <div class="metric"><div class="label">memory</div><div class="value">61%</div><div class="hint">可用 3.1 GiB</div></div>
-                    <div class="metric"><div class="label">services</div><div class="value">2</div><div class="hint">failed units</div></div>
+                    <div class="metric"><div class="label">load</div><div class="value" id="metricLoad">--</div><div class="hint">1m average</div></div>
+                    <div class="metric"><div class="label">disk</div><div class="value" id="metricDisk">--</div><div class="hint">df 摘要</div></div>
+                    <div class="metric"><div class="label">memory</div><div class="value" id="metricMemory">--</div><div class="hint">free 摘要</div></div>
+                    <div class="metric"><div class="label">services</div><div class="value" id="metricServices">--</div><div class="hint">failed units</div></div>
                   </div>
                   <div class="divider"></div>
                   <div class="kv"><div class="k">observer</div><div class="v"><span class="status-dot ok"></span> auto，auditd 可用</div></div>
-                  <div class="kv"><div class="k">session</div><div class="v mono">sess-20260616-ops</div></div>
-                  <div class="kv"><div class="k">last_update</div><div class="v">2026-06-16 13:44:09 +08</div></div>
+                  <div class="kv"><div class="k">payload</div><div class="v">下方内容来自 `/api/sense`，也会进入 work 请求上下文。</div></div>
+                  <pre class="code" id="environmentPayload">等待环境信息。</pre>
                 </div>
 
                 <div class="terminal">
-                  <div class="terminal-head"><span class="status-dot ok"></span><span>terminal output preview</span><span class="pill risk low" id="terminalJobStatus">idle</span></div>
+                  <div class="terminal-head"><span class="status-dot ok"></span><span>终端输出</span><span class="pill risk low" id="terminalJobStatus">idle</span></div>
                   <pre id="terminalOutput">$ df -h /var
 Filesystem      Size  Used Avail Use% Mounted on
 /dev/vda1        80G   58G   18G  72% /
@@ -162,7 +142,7 @@ Filesystem      Size  Used Avail Use% Mounted on
                 <div class="panel">
                   <div class="panel-header">
                     <div><h2>Skill 库</h2><p>合并 edit 与 script：左侧编辑或运行，右侧呈现已有 skill、分类文件夹与索引文件。</p></div>
-                    <button class="btn" type="button">新建 Skill</button>
+                    <button class="btn" id="newSkillBtn" type="button">新建 Skill</button>
                   </div>
                   <div class="tabs" id="skillTabs">
                     <button class="btn active" data-skill-mode="script">script 运行</button>
@@ -174,31 +154,29 @@ Filesystem      Size  Used Avail Use% Mounted on
                       <label class="small" for="scriptArgs">JSON 参数<input class="field mono" id="scriptArgs" value='{"top_n": 5}'></label>
                     </div>
                     <div class="toolbar action-gap">
-                      <button class="btn" id="scriptRunBtn" type="button">策略审查并运行</button>
-                      <button class="btn secondary" id="scriptReviewBtn" type="button">只做策略审查</button>
-                      <button class="btn secondary" type="button">查看 SKILL.md</button>
+                      <button class="btn" id="scriptRunBtn" type="button">运行</button>
+                      <button class="btn danger" id="scriptCancelBtn" type="button" disabled>中止</button>
                       <span class="pill risk low" id="scriptJobStatus">idle</span>
                     </div>
                     <div class="terminal action-gap">
-                      <div class="terminal-head"><span class="status-dot ok"></span><span>script output preview</span></div>
+                      <div class="terminal-head"><span class="status-dot ok"></span><span>Skill 输出</span></div>
                       <pre id="scriptOutput">等待执行 skill。</pre>
                     </div>
                   </div>
                   <div id="editPanel" hidden>
                     <div class="form-grid">
-                      <label class="small">目标 Skill<input class="field" value="ops-basic/log-search"></label>
-                      <label class="small">编辑入口<select class="select"><option>SKILL.md</option><option>scripts/log-search.sh</option><option>README snippet</option></select></label>
+                      <label class="small" for="editFolderSelect">编辑入口<select class="select" id="editFolderSelect"><option value="skills">skills</option></select></label>
+                      <label class="small">未保存状态<input class="field" id="editDirtyState" value="clean" disabled></label>
                     </div>
-                    <label class="small edit-request-label" for="editInput">修改说明<textarea class="textarea" id="editInput">为 log-search 增加 include_journal=false 的显式默认值，并补充参数校验说明。</textarea></label>
+                    <label class="small edit-request-label" for="editInput">需求<textarea class="textarea" id="editInput" placeholder="描述要新增或修改的 skill 能力。已有未保存编辑时，可输入新的修改需求并重新生成。">为 log-search 增加 include_journal=false 的显式默认值，并补充参数校验说明。</textarea></label>
                     <div class="toolbar action-gap">
-                      <button class="btn" id="editPlanBtn" type="button">生成 skill_edit</button>
-                      <button class="btn secondary" id="editReviewBtn" type="button">审查当前编辑</button>
-                      <button class="btn secondary" id="editApplyBtn" type="button">保存编辑</button>
+                      <button class="btn" id="editPlanBtn" type="button">发送</button>
+                      <button class="btn secondary" id="editApplyBtn" type="button" disabled>保存</button>
                       <span class="pill risk low" id="editJobStatus">idle</span>
                     </div>
                     <div class="list action-gap" id="editScripts"></div>
                     <div class="terminal action-gap">
-                      <div class="terminal-head"><span class="status-dot ok"></span><span>edit review preview</span></div>
+                      <div class="terminal-head"><span class="status-dot ok"></span><span>编辑输出</span></div>
                       <pre id="editOutput">等待生成编辑包。</pre>
                     </div>
                   </div>
@@ -220,43 +198,22 @@ Filesystem      Size  Used Avail Use% Mounted on
                       <tr><td class="mono">config-backup</td><td>ops-basic / backup</td><td class="mono">scripts/config-backup.sh</td><td><span class="pill risk high">high</span></td><td>已登记</td></tr>
                     </tbody>
                   </table>
+                  <div class="terminal action-gap">
+                    <div class="terminal-head"><span class="status-dot ok"></span><span id="skillCodeTitle">skill script detail</span></div>
+                    <pre id="skillCodeOutput">点击已有 Skill 列表中的脚本查看 .sh 代码。</pre>
+                  </div>
                 </div>
               </div>
 
               <aside class="stack">
                 <div class="panel tight">
                   <div class="panel-header"><div><h3>分类文件夹</h3><p>按 skill 根目录、分类和脚本关系呈现。</p></div></div>
-                  <div class="tree" aria-label="skills folder tree">
-                    <div class="folder">skills/</div>
-                    <div class="indent-1">INDEX.md</div>
-                    <div class="indent-1 folder">ops-basic/</div>
-                    <div class="indent-2">SKILL.md</div>
-                    <div class="indent-2 folder">scripts/</div>
-                    <div class="indent-2">disk-hotspots.sh</div>
-                    <div class="indent-2">resource-inspect.sh</div>
-                    <div class="indent-2">process-inspect.sh</div>
-                    <div class="indent-2">service-inspect.sh</div>
-                    <div class="indent-2">service-restart-plan.sh</div>
-                    <div class="indent-2">log-search.sh</div>
-                    <div class="indent-2">log-cleanup-plan.sh</div>
-                    <div class="indent-2">safe-log-cleanup.sh</div>
-                    <div class="indent-2">config-backup.sh</div>
-                  </div>
+                  <div class="tree collapsible-tree" id="skillTree" aria-label="skills folder tree"></div>
                 </div>
                 <div class="panel tight">
                   <div class="panel-header"><div><h3>Skill 索引文件</h3><p>INDEX.md 是可执行入口白名单，前端编辑时应同步校验。</p></div></div>
-                  <pre class="code"># skills/INDEX.md
-- ops-basic
-  - disk-hotspots
-  - resource-inspect
-  - process-inspect
-  - service-inspect
-  - service-restart-plan
-  - log-search
-  - log-cleanup-plan
-  - safe-log-cleanup
-  - config-backup</pre>
-                  <div class="toolbar"><button class="btn secondary" type="button">验证索引一致性</button><button class="btn secondary" type="button">查看差异</button></div>
+                  <div class="list" id="skillMarkdownFiles"></div>
+                  <div class="markdown-preview action-gap" id="skillMarkdownPreview">选择一个 Markdown 文件查看细节。</div>
                 </div>
               </aside>
             </div>
@@ -293,7 +250,7 @@ Filesystem      Size  Used Avail Use% Mounted on
 
               <div class="split-wide">
                 <div class="panel">
-                  <div class="panel-header"><div><h3>正则审查表</h3><p>阻断规则、警告规则和原因一屏可查；解锁后可编辑。</p></div><button class="btn secondary policy-edit" type="button" disabled>新增规则</button></div>
+                  <div class="panel-header"><div><h3>正则审查表</h3><p>阻断规则、警告规则和原因一屏可查；解锁后可编辑。</p></div><button class="btn secondary policy-edit" id="policyAddRuleBtn" type="button" disabled>新增规则</button></div>
                   <table class="table">
                     <thead><tr><th>级别</th><th>正则 / 关键词</th><th>动作</th><th>原因</th></tr></thead>
                     <tbody id="riskRulesSummary">
@@ -308,7 +265,7 @@ Filesystem      Size  Used Avail Use% Mounted on
                 </div>
 
                 <div class="panel">
-                  <div class="panel-header"><div><h3>audit 边界策略</h3><p>定义 observer 可以记录什么、如何降级，以及哪些路径必须保护。</p></div><button class="btn secondary policy-edit" type="button" disabled>编辑边界</button></div>
+                  <div class="panel-header"><div><h3>audit 边界策略</h3><p>定义 observer 可以记录什么、如何降级，以及哪些路径必须保护。</p></div><button class="btn secondary policy-edit" id="policyEditBoundaryBtn" type="button" disabled>编辑边界</button></div>
                   <div id="policyBoundaryList">
                     <div class="kv"><div class="k">audit_backend</div><div class="v">auto：优先 auditd，失败则 degraded observer event。</div></div>
                     <div class="kv"><div class="k">session_source</div><div class="v mono">logs/session/*.jsonl</div></div>
@@ -317,6 +274,11 @@ Filesystem      Size  Used Avail Use% Mounted on
                     <div class="kv"><div class="k">remote_script</div><div class="v">HTTPS、文本类型、大小限制、SHA256、预览、强制高风险审批。</div></div>
                   </div>
                   <div class="divider"></div>
+                  <div id="policyBoundaryOptions" hidden>
+                    <div class="panel-header"><div><h3>可选检测边界</h3><p>服务器密码核对后才展示可选观察范围。</p></div></div>
+                    <div class="list" id="policyBoundaryOptionsList"></div>
+                    <div class="divider"></div>
+                  </div>
                   <textarea class="textarea policy-edit mono" id="policyEditor" disabled>{
   "audit_boundary": {
     "observer": "auto",
@@ -337,13 +299,13 @@ Filesystem      Size  Used Avail Use% Mounted on
                 <div class="panel">
                   <div class="panel-header">
                     <div><h2>审计与回放</h2><p>从 logs/session 提取 observer 状态与会话审计，按时间线重放。</p></div>
-                    <button class="btn" type="button">导出回放报告</button>
+                    <button class="btn" id="auditExportBtn" type="button">导出回放报告</button>
                   </div>
                   <div class="form-grid">
                     <label class="small">session 文件<select class="select"><option>logs/session/sess-20260616-ops.jsonl</option><option>logs/session/sess-20260616-disk.jsonl</option></select></label>
                     <label class="small">事件过滤<select class="select"><option>全部事件</option><option>observer 状态</option><option>策略审查</option><option>执行输出</option><option>用户决策</option></select></label>
                   </div>
-                  <div class="toolbar action-gap"><button class="btn" id="auditRefreshBtn" type="button">播放</button><button class="btn secondary" type="button">暂停</button><button class="btn secondary" type="button">定位到失败事件</button></div>
+                  <div class="toolbar action-gap"><button class="btn" id="auditRefreshBtn" type="button">播放</button><button class="btn secondary" id="auditPauseBtn" type="button">暂停</button><button class="btn secondary" id="auditFindFailureBtn" type="button">定位到失败事件</button></div>
                 </div>
 
                 <div class="panel">
@@ -412,10 +374,10 @@ Filesystem      Size  Used Avail Use% Mounted on
               <div class="config-section">
                 <div><h4>工作流</h4><p class="small">work、terminal、script、edit 的默认行为。</p></div>
                 <div class="list">
-                  <div class="toggle-row"><div><strong class="white">work_agent_loop</strong><div class="small">执行后带 observation 继续反思。</div></div><button class="switch on" type="button"><span></span></button></div>
-                  <div class="toggle-row"><div><strong class="white">auto_execute_low_risk_skill</strong><div class="small">仅对已登记、低风险、策略干净的 skill 生效。</div></div><button class="switch on" type="button"><span></span></button></div>
-                  <div class="toggle-row"><div><strong class="white">auto_execute_low_risk_shell</strong><div class="small">默认关闭，shell 类命令需审批。</div></div><button class="switch" type="button"><span></span></button></div>
-                  <div class="toggle-row"><div><strong class="white">thinking_summary</strong><div class="small">开启后仅返回简短摘要。</div></div><button class="switch on" type="button"><span></span></button></div>
+                  <div class="toggle-row"><div><strong class="white">work_agent_loop</strong><div class="small">执行后带 observation 继续反思。</div></div><span class="pill">config/config.json</span></div>
+                  <div class="toggle-row"><div><strong class="white">auto_execute_low_risk_skill</strong><div class="small">仅对已登记、低风险、策略干净的 skill 生效。</div></div><span class="pill">config/config.json</span></div>
+                  <div class="toggle-row"><div><strong class="white">auto_execute_low_risk_shell</strong><div class="small">默认关闭，shell 类命令需审批。</div></div><span class="pill">config/config.json</span></div>
+                  <div class="toggle-row"><div><strong class="white">thinking_summary</strong><div class="small">开启后仅返回简短摘要。</div></div><button class="switch" id="thinkingTraceSwitchConfig" type="button" aria-label="toggle thinking summary in config" aria-pressed="false"><span></span></button></div>
                 </div>
               </div>
               <div class="config-section">
@@ -450,7 +412,7 @@ Filesystem      Size  Used Avail Use% Mounted on
                 </div>
               </div>
               <div class="terminal">
-                <div class="terminal-head"><span class="status-dot ok"></span><span>doctor output preview</span></div>
+                <div class="terminal-head"><span class="status-dot ok"></span><span>Doctor 输出</span></div>
                 <pre id="doctorOutput">等待 Doctor 检查。</pre>
               </div>
             </div>

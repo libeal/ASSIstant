@@ -52,6 +52,7 @@ done
 
 index_html="$(curl --noproxy '*' -sS "${base_url}/")"
 grep -q 'ASSIstant 前端外壳' <<<"${index_html}"
+grep -q '结束进程' <<<"${index_html}"
 
 unauth_body="${tmp_root}/unauth.json"
 unauth_code="$(curl --noproxy '*' -sS -o "${unauth_body}" -w '%{http_code}' "${base_url}/api/health" || true)"
@@ -59,7 +60,29 @@ unauth_code="$(curl --noproxy '*' -sS -o "${unauth_body}" -w '%{http_code}' "${b
 grep -q 'unauthorized' "${unauth_body}"
 
 health="$(curl --noproxy '*' -sS -H "Authorization: Bearer ${token}" "${base_url}/api/health")"
-jq -e '.ok == true and .root != ""' <<<"${health}" >/dev/null
+jq -e '.ok == true and .root != "" and .web_server.run_id != "" and .web_server.started_at != ""' <<<"${health}" >/dev/null
+
+config_state="$(curl --noproxy '*' -sS -H "Authorization: Bearer ${token}" "${base_url}/api/config")"
+jq -e '.ok == true and (.config.agent_loop.thinking_trace_enabled | type == "boolean") and .config.api_key_configured == true' <<<"${config_state}" >/dev/null
+
+config_update_payload="$(jq -cn '{key:"agent_loop.thinking_trace_enabled", value:true}')"
+config_update="$(curl --noproxy '*' -sS \
+    -H "Authorization: Bearer ${token}" \
+    -H "Content-Type: application/json" \
+    -d "${config_update_payload}" \
+    "${base_url}/api/config/update")"
+jq -e '.ok == true and .status == "updated" and .config.agent_loop.thinking_trace_enabled == true' <<<"${config_update}" >/dev/null
+
+skill_tree="$(curl --noproxy '*' -sS -H "Authorization: Bearer ${token}" "${base_url}/api/skills/tree")"
+jq -e '.ok == true and (.markdown_files | index("INDEX.md")) and (.script_files | index("ops-basic/scripts/resource-inspect.sh"))' <<<"${skill_tree}" >/dev/null
+
+skill_read_payload="$(jq -cn '{path:"ops-basic/scripts/resource-inspect.sh"}')"
+skill_read="$(curl --noproxy '*' -sS \
+    -H "Authorization: Bearer ${token}" \
+    -H "Content-Type: application/json" \
+    -d "${skill_read_payload}" \
+    "${base_url}/api/skills/read")"
+jq -e '.ok == true and .kind == "script" and (.content | contains("system.resource.inspect"))' <<<"${skill_read}" >/dev/null
 
 conflict_err="${tmp_root}/conflict.err"
 conflict_out="${tmp_root}/conflict.out"
@@ -113,5 +136,34 @@ done
 
 [[ "${job_status}" == "succeeded" ]]
 jq -e '.result.result.stdout_preview == "web-job-ok"' <<<"${job_result}" >/dev/null
+
+cancel_payload="$(jq -cn '{resource:"terminal", action:"run", payload:{command:"sleep 5"}}')"
+cancel_job="$(curl --noproxy '*' -sS \
+    -H "Authorization: Bearer ${token}" \
+    -H "Content-Type: application/json" \
+    -d "${cancel_payload}" \
+    "${base_url}/api/jobs")"
+cancel_job_id="$(jq -r '.job_id' <<<"${cancel_job}")"
+[[ "${cancel_job_id}" =~ ^[0-9a-f]+$ ]]
+sleep 0.3
+cancel_result="$(curl --noproxy '*' -sS \
+    -H "Authorization: Bearer ${token}" \
+    -H "Content-Type: application/json" \
+    -d '{}' \
+    "${base_url}/api/jobs/${cancel_job_id}/cancel")"
+jq -e '.ok == true and .status == "cancelled"' <<<"${cancel_result}" >/dev/null
+
+shutdown_result="$(curl --noproxy '*' -sS \
+    -H "Authorization: Bearer ${token}" \
+    -H "Content-Type: application/json" \
+    -d '{}' \
+    "${base_url}/api/server/shutdown")"
+jq -e '.ok == true and .status == "shutting_down"' <<<"${shutdown_result}" >/dev/null
+timeout 5 tail --pid="${server_pid}" -f /dev/null >/dev/null 2>&1 || {
+    printf 'agent-web did not stop after shutdown request\n' >&2
+    exit 1
+}
+wait "${server_pid}" 2>/dev/null || true
+server_pid=""
 
 printf 'web_server: ok\n'

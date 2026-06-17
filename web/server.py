@@ -3,6 +3,7 @@
 import json
 import os
 import errno
+import signal
 import subprocess
 import sys
 import threading
@@ -18,20 +19,87 @@ ROOT = Path(os.environ.get("LINUX_AGENT_ROOT", Path(__file__).resolve().parents[
 STATIC_ROOT = ROOT / "web" / "static"
 JOBS_ROOT = ROOT / "tmp" / "web" / "jobs"
 POLICIES_ROOT = ROOT / "policies"
+SKILLS_ROOT = ROOT / "skills"
+CONFIG_PATH = ROOT / "config" / "config.json"
 AGENT = ROOT / "bin" / "agent"
 HOST = os.environ.get("LINUX_AGENT_WEB_HOST", "127.0.0.1")
 PORT = int(os.environ.get("LINUX_AGENT_WEB_PORT", "8765"))
 TOKEN = os.environ.get("LINUX_AGENT_WEB_TOKEN", "")
 JOB_RETENTION_HOURS = int(os.environ.get("LINUX_AGENT_WEB_JOB_RETENTION_HOURS", "24"))
+JOB_PROCESSES = {}
+JOB_PROCESSES_LOCK = threading.Lock()
+SERVER_RUN_ID = uuid.uuid4().hex
+SERVER_STARTED_AT = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
 
 def read_config():
-    path = ROOT / "config" / "config.json"
     try:
-        with path.open("r", encoding="utf-8") as handle:
+        with CONFIG_PATH.open("r", encoding="utf-8") as handle:
             return json.load(handle)
     except FileNotFoundError:
         return {}
+
+
+def write_config(config):
+    CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = CONFIG_PATH.with_suffix(".json.tmp")
+    with tmp_path.open("w", encoding="utf-8") as handle:
+        json.dump(config, handle, ensure_ascii=False, indent=2)
+        handle.write("\n")
+    tmp_path.replace(CONFIG_PATH)
+
+
+def config_public_state():
+    config = read_config()
+    agent_loop = config.get("agent_loop") if isinstance(config.get("agent_loop"), dict) else {}
+    observer = config.get("observer") if isinstance(config.get("observer"), dict) else {}
+    return {
+        "ok": True,
+        "status": "read",
+        "config": {
+            "provider": config.get("provider", ""),
+            "api_url": config.get("api_url", ""),
+            "api_key_configured": bool(config.get("api_key")),
+            "model": config.get("model", ""),
+            "request_timeout_sec": config.get("request_timeout_sec", 90),
+            "context_turns": config.get("context_turns", 6),
+            "agent_loop": {
+                "enabled_for_work": bool(agent_loop.get("enabled_for_work", True)),
+                "auto_execute_low_risk": bool(agent_loop.get("auto_execute_low_risk", True)),
+                "auto_execute_shell_low_risk": bool(agent_loop.get("auto_execute_shell_low_risk", False)),
+                "observation_text_limit": int(agent_loop.get("observation_text_limit", 4000) or 4000),
+                "thinking_trace_enabled": bool(agent_loop.get("thinking_trace_enabled", False)),
+                "checkpoint_turns": int(agent_loop.get("checkpoint_turns", 0) or 0),
+            },
+            "audit_mode": config.get("audit_mode", "safe_summary"),
+            "audit_text_limit": config.get("audit_text_limit", 1000),
+            "observer": {
+                "enabled": observer.get("enabled", "auto"),
+                "privilege": observer.get("privilege", ""),
+                "max_events": observer.get("max_events", 200),
+            },
+            "skills_dir": config.get("skills_dir", ""),
+            "remote_script_policy": config.get("remote_script_policy", "download_review"),
+        },
+    }
+
+
+def update_config_value(key, value):
+    if key != "agent_loop.thinking_trace_enabled":
+        return {"ok": False, "status": "unsupported_config_key", "error": "Only agent_loop.thinking_trace_enabled is writable from this view."}
+    if not isinstance(value, bool):
+        return {"ok": False, "status": "invalid_config_value", "error": "thinking_trace_enabled must be boolean."}
+    config = read_config()
+    agent_loop = config.get("agent_loop")
+    if not isinstance(agent_loop, dict):
+        agent_loop = {}
+        config["agent_loop"] = agent_loop
+    agent_loop["thinking_trace_enabled"] = value
+    write_config(config)
+    result = config_public_state()
+    result["status"] = "updated"
+    result["updated"] = {key: value}
+    return result
 
 
 def configured_token():
@@ -238,7 +306,83 @@ def write_policy_file(relative_path, content, password):
     return {"ok": True, "status": "saved", "path": target.relative_to(POLICIES_ROOT).as_posix(), "method": "sudo"}
 
 
-def run_agent_api(resource, action="", payload=None, timeout=None):
+def safe_skills_path(relative_path):
+    if not isinstance(relative_path, str) or not relative_path:
+        raise ValueError("skill path is required")
+    candidate = Path(relative_path)
+    if candidate.is_absolute() or ".." in candidate.parts:
+        raise ValueError("skill path must be relative to skills/")
+    target = (SKILLS_ROOT / candidate).resolve()
+    target.relative_to(SKILLS_ROOT.resolve())
+    if target.suffix not in (".md", ".sh"):
+        raise ValueError("only Markdown and shell skill files are readable from the web console")
+    return target
+
+
+def build_skill_tree(path):
+    children = []
+    try:
+        entries = sorted(path.iterdir(), key=lambda item: (not item.is_dir(), item.name.lower()))
+    except FileNotFoundError:
+        entries = []
+    for child in entries:
+        if child.name.startswith("."):
+            continue
+        relative = child.relative_to(SKILLS_ROOT).as_posix()
+        if child.is_dir():
+            children.append({"type": "dir", "name": child.name, "path": relative, "children": build_skill_tree(child)})
+        elif child.suffix in (".md", ".sh"):
+            stat = child.stat()
+            children.append(
+                {
+                    "type": "file",
+                    "name": child.name,
+                    "path": relative,
+                    "kind": "markdown" if child.suffix == ".md" else "script",
+                    "size_bytes": stat.st_size,
+                    "mtime": int(stat.st_mtime),
+                }
+            )
+    return children
+
+
+def list_skill_files():
+    SKILLS_ROOT.mkdir(parents=True, exist_ok=True)
+    markdown = []
+    scripts = []
+    for path in sorted(SKILLS_ROOT.rglob("*")):
+        if not path.is_file() or path.name.startswith("."):
+            continue
+        relative = path.relative_to(SKILLS_ROOT).as_posix()
+        if path.suffix == ".md":
+            markdown.append(relative)
+        elif path.suffix == ".sh":
+            scripts.append(relative)
+    return {
+        "ok": True,
+        "status": "listed",
+        "root": "skills",
+        "tree": build_skill_tree(SKILLS_ROOT),
+        "markdown_files": markdown,
+        "script_files": scripts,
+    }
+
+
+def read_skill_file(relative_path):
+    target = safe_skills_path(relative_path)
+    if not target.exists() or not target.is_file():
+        return {"ok": False, "status": "not_found", "error": "Skill file not found."}
+    content = target.read_text(encoding="utf-8")
+    return {
+        "ok": True,
+        "status": "read",
+        "path": target.relative_to(SKILLS_ROOT).as_posix(),
+        "kind": "markdown" if target.suffix == ".md" else "script",
+        "content": content,
+    }
+
+
+def run_agent_api(resource, action="", payload=None, timeout=None, job_id=None):
     payload = payload or {}
     command = ["bash", str(AGENT), "api", resource]
     if action:
@@ -246,17 +390,42 @@ def run_agent_api(resource, action="", payload=None, timeout=None):
     command.append(json.dumps(payload, ensure_ascii=False, separators=(",", ":")))
     env = os.environ.copy()
     env.setdefault("LINUX_AGENT_WEB", "1")
-    process = subprocess.run(
-        command,
-        cwd=str(ROOT),
-        env=env,
-        text=True,
-        capture_output=True,
-        timeout=timeout,
-        check=False,
-    )
-    stdout = process.stdout.strip()
-    stderr = process.stderr.strip()
+    if job_id is None:
+        process = subprocess.run(
+            command,
+            cwd=str(ROOT),
+            env=env,
+            text=True,
+            capture_output=True,
+            timeout=timeout,
+            check=False,
+        )
+        stdout = process.stdout.strip()
+        stderr = process.stderr.strip()
+        returncode = process.returncode
+    else:
+        process = subprocess.Popen(
+            command,
+            cwd=str(ROOT),
+            env=env,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            start_new_session=True,
+        )
+        with JOB_PROCESSES_LOCK:
+            JOB_PROCESSES[job_id] = process
+        try:
+            stdout, stderr = process.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            stdout, stderr = process.communicate()
+        finally:
+            with JOB_PROCESSES_LOCK:
+                JOB_PROCESSES.pop(job_id, None)
+        stdout = stdout.strip()
+        stderr = stderr.strip()
+        returncode = process.returncode
     try:
         result = json.loads(stdout) if stdout else {}
     except json.JSONDecodeError:
@@ -266,9 +435,13 @@ def run_agent_api(resource, action="", payload=None, timeout=None):
             "stdout_preview": stdout[:4000],
         }
     if isinstance(result, dict):
-        result.setdefault("ok", process.returncode == 0 and result.get("ok", False))
-        result.setdefault("status", "completed" if process.returncode == 0 else "failed")
-        result["agent_exit_code"] = process.returncode
+        if returncode is not None and returncode < 0:
+            result["ok"] = False
+            result["status"] = "cancelled"
+            result.setdefault("error", "Job process was terminated.")
+        result.setdefault("ok", returncode == 0 and result.get("ok", False))
+        result.setdefault("status", "completed" if returncode == 0 else "failed")
+        result["agent_exit_code"] = returncode
         if stderr:
             result["stderr_preview"] = stderr[:4000]
     return result
@@ -297,9 +470,12 @@ def start_job(resource, action, payload):
         job["updated_at"] = started_at
         write_job(job_id, job)
         try:
-            result = run_agent_api(resource, action, payload, timeout=None)
+            result = run_agent_api(resource, action, payload, timeout=None, job_id=job_id)
             finished_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-            job["status"] = "succeeded" if result.get("ok") or result.get("status") == "approval_required" else "failed"
+            if result.get("status") == "cancelled":
+                job["status"] = "cancelled"
+            else:
+                job["status"] = "succeeded" if result.get("ok") or result.get("status") == "approval_required" else "failed"
             job["result"] = result
             job["finished_at"] = finished_at
             job["updated_at"] = finished_at
@@ -314,6 +490,54 @@ def start_job(resource, action, payload):
 
     threading.Thread(target=worker, daemon=True).start()
     return job
+
+
+def cancel_job(job_id):
+    job = read_job(job_id)
+    if job is None:
+        return {"ok": False, "status": "not_found"}
+    if job.get("status") not in ("queued", "running"):
+        return {"ok": False, "status": "not_running", "job": job}
+    with JOB_PROCESSES_LOCK:
+        process = JOB_PROCESSES.get(job_id)
+    if process is None:
+        return {"ok": False, "status": "process_not_found", "job": job}
+    try:
+        os.killpg(process.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+    except OSError:
+        process.terminate()
+    now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    job["status"] = "cancelled"
+    job["updated_at"] = now
+    job["finished_at"] = now
+    job["result"] = {"ok": False, "status": "cancelled", "error": "Job cancellation requested."}
+    write_job(job_id, job)
+    return {"ok": True, "status": "cancelled", "job": job}
+
+
+def terminate_running_jobs():
+    with JOB_PROCESSES_LOCK:
+        processes = list(JOB_PROCESSES.values())
+    for process in processes:
+        try:
+            os.killpg(process.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            continue
+        except OSError:
+            process.terminate()
+
+
+def request_server_shutdown(server):
+    terminate_running_jobs()
+
+    def worker():
+        time.sleep(0.1)
+        server.shutdown()
+
+    threading.Thread(target=worker, daemon=True).start()
+    return {"ok": True, "status": "shutting_down"}
 
 
 class Handler(SimpleHTTPRequestHandler):
@@ -402,6 +626,12 @@ class Handler(SimpleHTTPRequestHandler):
         if path == "/api/policies":
             json_response(self, HTTPStatus.OK, {"ok": True, "status": "listed", "files": list_policy_files(), "requires_sudo_to_edit": True})
             return
+        if path == "/api/config":
+            json_response(self, HTTPStatus.OK, config_public_state())
+            return
+        if path == "/api/skills/tree":
+            json_response(self, HTTPStatus.OK, list_skill_files())
+            return
         if path.startswith("/api/jobs/"):
             job_id = path.rsplit("/", 1)[-1]
             if not job_id or not all(ch in "0123456789abcdef" for ch in job_id):
@@ -418,6 +648,11 @@ class Handler(SimpleHTTPRequestHandler):
             json_response(self, HTTPStatus.NOT_FOUND, {"ok": False, "status": "not_found"})
             return
         result = run_agent_api(route[0], route[1], {}, timeout=120)
+        if path == "/api/health" and isinstance(result, dict):
+            result["web_server"] = {
+                "run_id": SERVER_RUN_ID,
+                "started_at": SERVER_STARTED_AT,
+            }
         json_response(self, HTTPStatus.OK, result)
 
     def handle_api_post(self, path, body):
@@ -450,6 +685,29 @@ class Handler(SimpleHTTPRequestHandler):
             except ValueError as exc:
                 result = {"ok": False, "status": "invalid_path", "error": str(exc)}
             json_response(self, HTTPStatus.OK, result)
+            return
+        if path == "/api/config/update":
+            result = update_config_value(str(body.get("key") or ""), body.get("value"))
+            json_response(self, HTTPStatus.OK, result)
+            return
+        if path == "/api/skills/read":
+            try:
+                result = read_skill_file(str(body.get("path") or ""))
+            except ValueError as exc:
+                result = {"ok": False, "status": "invalid_path", "error": str(exc)}
+            json_response(self, HTTPStatus.OK, result)
+            return
+        if path == "/api/server/shutdown":
+            result = request_server_shutdown(self.server)
+            json_response(self, HTTPStatus.OK, result)
+            return
+        if path.startswith("/api/jobs/") and path.endswith("/cancel"):
+            parts = path.split("/")
+            job_id = parts[-2] if len(parts) >= 4 else ""
+            if not job_id or not all(ch in "0123456789abcdef" for ch in job_id):
+                json_response(self, HTTPStatus.BAD_REQUEST, {"ok": False, "status": "invalid_job_id"})
+                return
+            json_response(self, HTTPStatus.OK, cancel_job(job_id))
             return
         if path == "/api/jobs":
             resource = str(body.get("resource") or "")
