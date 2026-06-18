@@ -75,6 +75,20 @@ config_update="$(curl --noproxy '*' -sS \
     "${base_url}/api/config/update")"
 jq -e '.ok == true and .status == "updated" and .config.agent_loop.thinking_trace_enabled == true' <<<"${config_update}" >/dev/null
 
+api_key_value="test-web-updated-key-12345"
+api_key_payload="$(jq -cn --arg value "${api_key_value}" '{key:"api_key", value:$value}')"
+api_key_update="$(curl --noproxy '*' -sS \
+    -H "Authorization: Bearer ${token}" \
+    -H "Content-Type: application/json" \
+    -d "${api_key_payload}" \
+    "${base_url}/api/config/update")"
+jq -e '.ok == true and .status == "updated" and .updated.api_key == "configured" and .config.api_key_configured == true and (.config | has("api_key") | not)' <<<"${api_key_update}" >/dev/null
+if grep -q "${api_key_value}" <<<"${api_key_update}"; then
+    printf 'api_key update response leaked the secret value\n' >&2
+    exit 1
+fi
+jq -e --arg value "${api_key_value}" '.api_key == $value' "${project}/config/config.json" >/dev/null
+
 audit_limit_payload="$(jq -cn '{key:"audit_text_limit", value:1234}')"
 audit_limit_update="$(curl --noproxy '*' -sS \
     -H "Authorization: Bearer ${token}" \

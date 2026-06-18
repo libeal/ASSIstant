@@ -36,6 +36,7 @@ const state = {
 
 const $ = (id) => document.getElementById(id);
 const LAYOUT_STORAGE_PREFIX = "assistant.panelLayout.v1";
+const THINKING_TRACE_KEY = "agent_loop.thinking_trace_enabled";
 
 const titles = {
   workbench: "工作台",
@@ -106,10 +107,11 @@ const hiddenOutputKeys = new Set([
 const CONFIG_GROUPS = [
   {
     title: "模型与 API",
-    note: "控制 LLM 供应商、接口、模型和请求超时。api_key 只显示是否配置，不在前端回显。",
+    note: "控制 LLM 供应商、接口、密钥、模型和请求超时。api_key 输入框为空表示保持当前密钥，不在前端回显。",
     fields: [
       { key: "provider", label: "provider", type: "text", comment: "供应商名称，用于提示当前适配的 OpenAI-compatible 后端。" },
       { key: "api_url", label: "api_url", type: "text", comment: "模型接口地址，通常是 chat/completions 兼容端点。" },
+      { key: "api_key", label: "api_key", type: "secret", writeOnly: true, placeholder: "留空保持当前密钥", comment: "只写入新密钥，不读取或回显已有密钥。" },
       { key: "model", label: "model", type: "text", comment: "work/edit 等请求调用的模型名。" },
       { key: "request_timeout_sec", label: "request_timeout_sec", type: "number", min: 1, comment: "单次模型请求最长等待秒数。" },
       { key: "context_turns", label: "context_turns", type: "number", min: 1, comment: "保留的上下文轮数，过大可能增加 token 消耗。" },
@@ -124,7 +126,7 @@ const CONFIG_GROUPS = [
       { key: "agent_loop.auto_execute_shell_low_risk", label: "auto_execute_low_risk_shell", type: "boolean", comment: "shell 命令即使低风险也建议保持谨慎。" },
       { key: "agent_loop.observation_text_limit", label: "observation_text_limit", type: "number", min: 200, comment: "回传给模型的命令输出摘要上限。" },
       { key: "agent_loop.checkpoint_turns", label: "checkpoint_turns", type: "number", min: 0, comment: "每隔多少轮强制 checkpoint；0 表示使用 context_turns。" },
-      { key: "agent_loop.thinking_trace_enabled", label: "thinking_summary", type: "boolean", comment: "开启后会话摘要栏展示模型返回的简短 thinking_summary。" },
+      { key: THINKING_TRACE_KEY, label: "thinking_summary", type: "boolean", comment: "开启后会话摘要栏展示模型返回的简短 thinking_summary。" },
     ],
   },
   {
@@ -151,7 +153,7 @@ const CONFIG_GROUPS = [
 ];
 
 const CONFIG_READONLY_FIELDS = [
-  { key: "api_key_configured", label: "api_key", comment: "只显示是否已配置，避免在浏览器中暴露密钥。" },
+  { key: "api_key_configured", label: "api_key_configured", comment: "只显示是否已配置，避免在浏览器中暴露已有密钥。" },
   { key: "web.enabled", label: "web.enabled", comment: "web 服务开关，当前进程已启动时仅作状态展示。" },
   { key: "web.host", label: "web.host", comment: "当前配置文件中的监听地址，改动需重启生效。" },
   { key: "web.port", label: "web.port", comment: "当前配置文件中的监听端口，改动需重启生效。" },
@@ -203,7 +205,7 @@ function setSwitch(id, enabled) {
 
 function setThinkingSwitches(enabled) {
   setSwitch("thinkingTraceSwitch", enabled);
-  setSwitch(configInputId("agent_loop.thinking_trace_enabled"), enabled);
+  setSwitch(configInputId(THINKING_TRACE_KEY), enabled);
 }
 
 function thinkingTraceEnabled() {
@@ -1196,17 +1198,21 @@ async function loadConfig() {
   state.configOriginal = collectEditableConfigValues(state.configSnapshot);
   state.configDraft = { ...state.configOriginal };
   renderConfigCenter(state.configSnapshot);
-  const enabled = Boolean(state.configSnapshot?.agent_loop?.thinking_trace_enabled);
-  setThinkingSwitches(enabled);
+  syncThinkingTraceFromConfig();
   renderThinkingSummary();
   setConfigDirtyState(false);
 }
 
-async function updateThinkingTrace() {
-  const next = !$("thinkingTraceSwitch").classList.contains("on");
+function syncThinkingTraceFromConfig() {
+  const enabled = Boolean(state.configSnapshot?.agent_loop?.thinking_trace_enabled);
+  setThinkingSwitches(enabled);
+}
+
+async function updateThinkingTrace(next) {
+  const preservedChanges = pendingConfigChanges(new Set([THINKING_TRACE_KEY]));
   const data = await api("/api/config/update", {
     method: "POST",
-    body: { key: "agent_loop.thinking_trace_enabled", value: next },
+    body: { key: THINKING_TRACE_KEY, value: next },
   });
   if (!data.ok) {
     showToast(data.error || data.status || "config update failed");
@@ -1215,18 +1221,31 @@ async function updateThinkingTrace() {
   state.configSnapshot = data.config || state.configSnapshot || {};
   state.configOriginal = collectEditableConfigValues(state.configSnapshot);
   state.configDraft = { ...state.configOriginal };
-  const enabled = Boolean(state.configSnapshot?.agent_loop?.thinking_trace_enabled);
-  setThinkingSwitches(enabled);
-  renderThinkingSummary();
   renderConfigCenter(state.configSnapshot);
-  setConfigDirtyState(false);
+  syncThinkingTraceFromConfig();
+  restoreConfigDraftChanges(preservedChanges);
+  renderThinkingSummary();
+  setConfigDirtyState(hasConfigChanges());
+  const enabled = Boolean(state.configSnapshot?.agent_loop?.thinking_trace_enabled);
   showToast(`thinking_summary ${enabled ? "已开启" : "已关闭"}`);
+}
+
+async function toggleThinkingTraceFromWorkbench() {
+  await updateThinkingTrace(!thinkingTraceEnabled());
+}
+
+async function toggleThinkingTraceFromConfig(button) {
+  await updateThinkingTrace(!button.classList.contains("on"));
 }
 
 function collectEditableConfigValues(config) {
   const values = {};
   for (const group of CONFIG_GROUPS) {
     for (const field of group.fields) {
+      if (field.writeOnly) {
+        values[field.key] = "";
+        continue;
+      }
       values[field.key] = normalizeConfigFieldValue(field, getNestedValue(config, field.key));
     }
   }
@@ -1239,6 +1258,7 @@ function normalizeConfigFieldValue(field, value) {
     const next = Number(value);
     return Number.isFinite(next) ? next : 0;
   }
+  if (field.writeOnly) return "";
   return String(value ?? "");
 }
 
@@ -1317,7 +1337,7 @@ function renderConfigField(field, rawValue) {
   return `
     <label class="small config-field-label" for="${escapeHtml(configInputId(field.key))}">
       <span>${escapeHtml(field.label)}</span>
-      <input class="field" id="${escapeHtml(configInputId(field.key))}" data-config-key="${escapeHtml(field.key)}" type="${field.type === "number" ? "number" : "text"}" ${field.min !== undefined ? `min="${escapeHtml(field.min)}"` : ""} value="${escapeHtml(value)}">
+      <input class="field" id="${escapeHtml(configInputId(field.key))}" data-config-key="${escapeHtml(field.key)}" type="${field.type === "number" ? "number" : field.type === "secret" ? "password" : "text"}" ${field.min !== undefined ? `min="${escapeHtml(field.min)}"` : ""} ${field.writeOnly ? 'autocomplete="new-password"' : ""} ${field.placeholder ? `placeholder="${escapeHtml(field.placeholder)}"` : ""} value="${escapeHtml(value)}">
       <span class="config-comment">${escapeHtml(field.comment)}</span>
     </label>
   `;
@@ -1366,6 +1386,25 @@ function hasConfigChanges() {
   return Object.keys(state.configDraft).some((key) => state.configDraft[key] !== state.configOriginal[key]);
 }
 
+function pendingConfigChanges(excludeKeys = new Set()) {
+  return Object.entries(state.configDraft).filter(([key, value]) => !excludeKeys.has(key) && value !== state.configOriginal[key]);
+}
+
+function restoreConfigDraftChanges(changes) {
+  for (const [key, value] of changes) {
+    const field = findConfigField(key);
+    if (!field) continue;
+    state.configDraft[key] = value;
+    const control = $(configInputId(key));
+    if (!control) continue;
+    if (field.type === "boolean") {
+      setSwitch(configInputId(key), value);
+    } else {
+      control.value = value;
+    }
+  }
+}
+
 function setConfigDirtyState(dirty) {
   const button = $("configSaveBtn");
   if (button) button.disabled = !dirty;
@@ -1373,7 +1412,7 @@ function setConfigDirtyState(dirty) {
 }
 
 async function saveConfigChanges() {
-  const changes = Object.entries(state.configDraft).filter(([key, value]) => value !== state.configOriginal[key]);
+  const changes = pendingConfigChanges();
   if (!changes.length) {
     showToast("没有配置变更");
     setConfigDirtyState(false);
@@ -2278,7 +2317,7 @@ function bindModeTabs() {
 
 function bindSwitches() {
   document.querySelectorAll(".switch").forEach((button) => {
-    if (button.id === "thinkingTraceSwitch" || button.id === configInputId("agent_loop.thinking_trace_enabled")) return;
+    if (button.id === "thinkingTraceSwitch" || button.id === configInputId(THINKING_TRACE_KEY)) return;
     button.addEventListener("click", () => button.classList.toggle("on"));
   });
 }
@@ -2323,7 +2362,12 @@ function bindActions() {
   on("configEditorRoot", "change", (event) => updateConfigDraftFromControl(event.target));
   on("configEditorRoot", "click", (event) => {
     const button = event.target.closest(".config-switch");
-    if (button) updateConfigDraftFromControl(button);
+    if (!button) return;
+    if (button.dataset.configKey === THINKING_TRACE_KEY) {
+      safeAction(() => toggleThinkingTraceFromConfig(button));
+      return;
+    }
+    updateConfigDraftFromControl(button);
   });
   on("doctorRunBtn", "click", () => safeAction(runDoctor));
   on("policyUnlockBtn", "click", () => safeAction(unlockPolicy));
@@ -2333,7 +2377,7 @@ function bindActions() {
   on("policyFileSelect", "change", (event) => safeAction(() => readPolicy(event.target.value)));
   on("policyAddRuleBtn", "click", () => safeAction(() => openPolicyFile("risk-rules.json")));
   on("policyEditBoundaryBtn", "click", () => safeAction(() => openPolicyFile("audit-boundaries.json")));
-  on("thinkingTraceSwitch", "click", () => safeAction(updateThinkingTrace));
+  on("thinkingTraceSwitch", "click", () => safeAction(toggleThinkingTraceFromWorkbench));
   on("auditExportBtn", "click", exportAuditReport);
   on("auditPauseBtn", "click", toggleAuditPause);
   on("auditFindFailureBtn", "click", findAuditFailure);

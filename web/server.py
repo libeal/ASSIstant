@@ -107,6 +107,7 @@ def config_public_state():
 CONFIG_WRITABLE_FIELDS = {
     "provider": {"type": "str", "min": 1},
     "api_url": {"type": "str", "min": 1},
+    "api_key": {"type": "str", "min": 1},
     "model": {"type": "str", "min": 1},
     "request_timeout_sec": {"type": "int", "min": 1, "max": 600},
     "context_turns": {"type": "int", "min": 1, "max": 50},
@@ -126,6 +127,7 @@ CONFIG_WRITABLE_FIELDS = {
     "skills_dir": {"type": "str", "min": 0},
     "remote_script_policy": {"type": "enum", "values": {"download_review", "disabled"}},
 }
+CONFIG_SECRET_FIELDS = {"api_key"}
 
 
 def normalize_config_value(key, value):
@@ -179,7 +181,7 @@ def update_config_value(key, value):
     write_config(config)
     result = config_public_state()
     result["status"] = "updated"
-    result["updated"] = {key: normalized}
+    result["updated"] = {key: "configured" if key in CONFIG_SECRET_FIELDS else normalized}
     return result
 
 

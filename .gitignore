@@ -1,6 +1,5 @@
 config/config.json
 logs/
-sessions/
 tmp/
 __pycache__/
 *.pyc
