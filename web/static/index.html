@@ -100,7 +100,24 @@
 
               <aside class="stack workbench-side">
                 <div class="panel tight status-panel">
-                  <div class="panel-header"><div><h3>服务器运行状态</h3><p>作为 work 与 terminal 的常驻上下文。</p></div></div>
+                  <div class="panel-header">
+                    <div><h3>服务器运行状态</h3><p>作为 work 与 terminal 的常驻上下文。</p></div>
+                    <div class="toolbar">
+                      <select class="select compact-select" id="senseTopicSelect" aria-label="环境采集主题">
+                        <option value="all">all</option>
+                        <option value="disk">disk</option>
+                        <option value="resource">resource</option>
+                        <option value="process">process</option>
+                        <option value="network">network</option>
+                        <option value="service">service</option>
+                        <option value="logs">logs</option>
+                        <option value="privilege">privilege</option>
+                        <option value="minimal">minimal</option>
+                      </select>
+                      <button class="btn secondary" id="senseRefreshBtn" type="button">刷新</button>
+                      <span class="pill" id="senseStatus">idle</span>
+                    </div>
+                  </div>
                   <div class="grid-2">
                     <div class="metric"><div class="label">load</div><div class="value" id="metricLoad">--</div><div class="hint">1m average</div></div>
                     <div class="metric"><div class="label">disk</div><div class="value" id="metricDisk">--</div><div class="hint">df 摘要</div></div>
@@ -210,7 +227,10 @@
                 </div>
 
                 <div class="panel">
-                  <div class="panel-header"><div><h3>已有 Skill 列表</h3><p>表格同时展示分类、脚本入口、风险等级与索引状态。</p></div></div>
+                  <div class="panel-header">
+                    <div><h3>已有 Skill 列表</h3><p>表格同时展示分类、脚本入口、风险等级与索引状态。</p></div>
+                    <button class="btn secondary" id="skillsValidateBtn" type="button">校验 Skill</button>
+                  </div>
                   <table class="table">
                     <thead><tr><th>Skill</th><th>分类</th><th>脚本</th><th>风险</th><th>INDEX</th></tr></thead>
                     <tbody id="skillsCatalog">

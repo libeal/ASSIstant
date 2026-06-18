@@ -53,6 +53,8 @@ done
 index_html="$(curl --noproxy '*' -sS "${base_url}/")"
 grep -q 'ASSIstant 前端外壳' <<<"${index_html}"
 grep -q '结束进程' <<<"${index_html}"
+grep -q 'id="senseTopicSelect"' <<<"${index_html}"
+grep -q 'id="skillsValidateBtn"' <<<"${index_html}"
 
 unauth_body="${tmp_root}/unauth.json"
 unauth_code="$(curl --noproxy '*' -sS -o "${unauth_body}" -w '%{http_code}' "${base_url}/api/health" || true)"
@@ -84,6 +86,9 @@ jq -e '.ok == true and .status == "updated" and .updated.audit_text_limit == 123
 skill_tree="$(curl --noproxy '*' -sS -H "Authorization: Bearer ${token}" "${base_url}/api/skills/tree")"
 jq -e '.ok == true and (.markdown_files | index("INDEX.md")) and (.script_files | index("ops-basic/scripts/resource-inspect.sh"))' <<<"${skill_tree}" >/dev/null
 
+skills_validate="$(curl --noproxy '*' -sS -H "Authorization: Bearer ${token}" "${base_url}/api/skills/validate")"
+jq -e '.ok == true and .status == "validated" and .validation.ok == true' <<<"${skills_validate}" >/dev/null
+
 skill_read_payload="$(jq -cn '{path:"ops-basic/scripts/resource-inspect.sh"}')"
 skill_read="$(curl --noproxy '*' -sS \
     -H "Authorization: Bearer ${token}" \
@@ -102,6 +107,14 @@ grep -q '端口已被占用' "${conflict_err}"
 
 doctor="$(curl --noproxy '*' -sS -H "Authorization: Bearer ${token}" "${base_url}/api/doctor")"
 jq -e '.status == "checked"' <<<"${doctor}" >/dev/null
+
+sense_payload="$(jq -cn '{topic:"resource"}')"
+sense_resource="$(curl --noproxy '*' -sS \
+    -H "Authorization: Bearer ${token}" \
+    -H "Content-Type: application/json" \
+    -d "${sense_payload}" \
+    "${base_url}/api/sense")"
+jq -e '.ok == true and .topic == "resource" and .sense.topic == "resource"' <<<"${sense_resource}" >/dev/null
 
 policies="$(curl --noproxy '*' -sS -H "Authorization: Bearer ${token}" "${base_url}/api/policies")"
 jq -e '.ok == true and .requires_sudo_to_edit == true and any(.files[]?.path; . == "audit-boundaries.json")' <<<"${policies}" >/dev/null

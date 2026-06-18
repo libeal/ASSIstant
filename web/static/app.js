@@ -1393,19 +1393,25 @@ async function saveConfigChanges() {
   showToast("配置已保存");
 }
 
-async function loadSense() {
-  const data = await api("/api/sense", { method: "POST", body: { topic: "all" } });
+async function loadSense(topic = $("senseTopicSelect")?.value || "all") {
+  setStatus("senseStatus", "loading", "medium");
+  const data = await api("/api/sense", { method: "POST", body: { topic } });
   const sense = data.sense || {};
   renderSense(sense);
+  setStatus("senseStatus", data.topic || topic, data.ok ? "ok" : "failed");
 }
 
 function renderSense(sense) {
-  const load = firstLine(sense.resource?.load_summary).match(/load average[s]?:\s*([^,]+)/i)?.[1] || "--";
-  const diskLine = String(sense.disk?.df_summary || "").split("\n").find((line) => /\s[0-9]+%\s/.test(line)) || "";
+  const grouped = sense.topic ? { [sense.topic]: sense } : sense;
+  const resource = grouped.resource || {};
+  const disk = grouped.disk || {};
+  const service = grouped.service || {};
+  const load = firstLine(resource.load_summary).match(/load average[s]?:\s*([^,]+)/i)?.[1] || "--";
+  const diskLine = String(disk.df_summary || "").split("\n").find((line) => /\s[0-9]+%\s/.test(line)) || "";
   const diskUse = diskLine.match(/\s([0-9]+%)\s/)?.[1] || "--";
-  const memoryLine = String(sense.resource?.memory_summary || "").split("\n").find((line) => line.toLowerCase().startsWith("mem:")) || "";
+  const memoryLine = String(resource.memory_summary || "").split("\n").find((line) => line.toLowerCase().startsWith("mem:")) || "";
   const memory = memoryLine ? memoryLine.trim().replace(/\s+/g, " ") : "--";
-  const failedServices = String(sense.service?.failed_summary || "").split("\n").filter((line) => /^\s*●/.test(line) || /\bfailed\b/i.test(line)).length;
+  const failedServices = String(service.failed_summary || "").split("\n").filter((line) => /^\s*●/.test(line) || /\bfailed\b/i.test(line)).length;
   setText("metricLoad", load);
   setText("metricDisk", diskUse);
   setText("metricMemory", memory === "--" ? "--" : memory.split(" ").slice(2, 4).join("/"));
@@ -1438,6 +1444,14 @@ async function loadSkillTree() {
   if (state.skillFiles.markdown.includes("INDEX.md")) {
     await readSkillFile("INDEX.md", "markdown");
   }
+}
+
+async function validateSkills() {
+  setText("skillCodeTitle", "skills validate");
+  $("skillCodeOutput").textContent = "正在校验 skills...";
+  const data = await api("/api/skills/validate");
+  $("skillCodeOutput").textContent = pretty(data);
+  showToast(data.ok ? "Skill 校验通过" : "Skill 校验发现问题");
 }
 
 function renderToolCatalog() {
@@ -2284,6 +2298,7 @@ function bindActions() {
   on("workRunBtn", "click", () => safeAction(runWork));
   on("workCancelBtn", "click", () => safeAction(cancelWork));
   on("workSuspendBtn", "click", suspendWork);
+  on("senseRefreshBtn", "click", () => safeAction(() => loadSense()));
   on("approvalApproveBtn", "click", () => safeAction(() => submitApprovalDecision("y")));
   on("approvalRejectBtn", "click", () => safeAction(() => submitApprovalDecision("n")));
   on("approvalSkipBtn", "click", () => safeAction(() => submitApprovalDecision("s")));
@@ -2292,6 +2307,7 @@ function bindActions() {
   on("scriptReviewBtn", "click", () => safeAction(reviewScript));
   on("scriptRunBtn", "click", () => safeAction(runScript));
   on("scriptCancelBtn", "click", () => safeAction(cancelScript));
+  on("skillsValidateBtn", "click", () => safeAction(validateSkills));
   on("newSkillBtn", "click", startNewSkill);
   on("editPlanBtn", "click", () => safeAction(planEdit));
   on("editReviewBtn", "click", () => safeAction(reviewEdit));
