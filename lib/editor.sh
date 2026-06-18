@@ -54,15 +54,6 @@ linux_agent_write_skill_index() {
     mv "${tmp_path}" "${index_path}"
 }
 
-linux_agent_update_skill_index() {
-    local skill_name="$1"
-    local description="$2"
-    local scripts_json="$3"
-    local index_path
-    index_path="$(linux_agent_skill_index_path)"
-    linux_agent_write_skill_index "${index_path}" "${skill_name}" "${description}" "${scripts_json}"
-}
-
 linux_agent_select_script_editor() {
     local candidate
     if [[ -n "${EDITOR:-}" ]]; then

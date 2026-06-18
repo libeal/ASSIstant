@@ -6,8 +6,8 @@
 
 - `work`: 根据自然语言请求生成 `answer` 或 `work_plan`，并可在执行后基于观察结果受控迭代；低风险已登记 skill 可自动执行。
 - `edit`: 生成或修改 skill，打开编辑器让用户确认脚本内容，再保存到 `skills/`。
-- `script`: 直接执行已登记的 skill 脚本。
-- `terminal`: 直接执行本机 shell 命令，输出原样给用户，并写入审计。
+- `script`: 审查并在确认后执行已登记的 skill 脚本。
+- `terminal`: 对本机 shell 命令做策略审查，低风险直接执行，高风险或需权限命令请求确认，并写入审计。
 
 ## 快速开始
 
@@ -135,6 +135,21 @@ Web 覆盖的主要视图：
 - Audit: 查看 JSONL 审计会话和报告。
 - Doctor: 检查依赖、配置和 skill 目录。
 
+### CLI、API 与 Web 功能对照
+
+CLI 是项目核心；Web 通过 `bash bin/agent api ...` 调用同一套 Bash 能力，只额外提供浏览器中的状态展示、异步 job、筛选和编辑体验。
+
+| 功能 | CLI 入口 | API 入口 | Web 对应 | 关系 |
+| --- | --- | --- | --- | --- |
+| work 自然语言任务 | `agent work` / REPL `/work` | `api work run` | Work 工作台 | 同一套计划、审批、执行、反思循环；Web 增加时间线、审批抽屉、挂起轮询和 thinking 摘要展示。 |
+| script 执行 | `agent script` / REPL `/script` | `api script review/run` | Skill 库 > script 运行 | 同一套 skill 登记校验、参数 JSON 校验、策略审查和 observer 执行；Web 增加脚本选择器、单独审查按钮和异步中止。 |
+| terminal 命令 | `agent terminal` / REPL `/terminal` | `api terminal review/run` | Work 工作台 > terminal 直接命令 | 同一套 `risk-rules.json` 审查、阻断和人工确认规则；Web 增加预审结果展示和审批抽屉。 |
+| edit 生成 skill | `agent edit` / REPL `/edit` | `api edit plan/review/apply` | Skill 库 > edit 编辑 | CLI 使用 `$EDITOR` 或 `vi` 人工确认脚本；Web 使用浏览器内联编辑器，但保存前仍走同一套策略审查、staging 和 skill 校验。 |
+| tools / skills | `agent tools list`、`agent skills validate` | `api tools list`、`api skills validate` | Skill 目录、脚本详情、Markdown 预览 | Web 只做浏览和可视化，不改变 CLI 的登记依据。 |
+| audit | `agent audit <session-id>` | `api audit list/read` | 审计与回放 | 同读 `logs/*.jsonl`；Web 增加筛选、指标和报告导出。 |
+| doctor / sense | `agent doctor`、`agent sense` | `api doctor run`、`api sense get` | 配置中心、环境概览 | Web 调用 CLI 诊断能力并展示摘要。 |
+| config / policy | `test_config.sh`、手工编辑配置/策略 | Web 后端专用 API | 配置中心、策略编辑器 | Web 独立提供浏览器编辑体验；写策略前需 sudo 校验，CLI 运行不依赖 Web。 |
+
 Web 的策略编辑器默认只读。它只允许访问 `policies/` 下的 JSON 文件，写入时后端会先校验 sudo 权限，sudo 密码只保存在当前浏览器页面内存中，不写入 `localStorage`、配置文件或日志。
 
 机器可读 API 也可直接调用：
@@ -187,7 +202,6 @@ bash bin/agent api script review '{"ref":"ops-basic/resource-inspect","arguments
 ## Work 模式
 
 1. `lib/orchestrator.sh` 记录 `received`。
-2. `lib/sense.sh` 根据用户输入识别主题，采集最小必要环境信息。
 2. `lib/sense.sh` 根据用户输入识别主题，采集最小必要环境信息。
 3. `lib/context.sh` 构造动态请求上下文。
 4. `lib/ai.sh` 调用 AI，要求返回 `answer` 或 `work_plan`；配置缺失、请求失败或响应不合法时直接失败，不生成测试兜底计划。
@@ -243,9 +257,9 @@ AI 的 work/reflection 响应必须包含显式继续判断：
 ## Terminal 模式
 
 1. 用户输入会交给 `bash -lc`。
-2. 终端模式不走正则阻断或审批。
-3. stdout/stderr 原样展示给用户。
-4. 审计日志只保存命令文本、退出码和脱敏后的输出预览。
+2. 执行前先走 `linux_agent_terminal_review`，用 `policies/risk-rules.json` 做阻断、警告、保护路径和保护服务审查。
+3. clean low-risk 命令直接执行；阻断命令不会执行；需要人工确认的命令在 CLI 中请求确认，在 API/Web 中返回 `approval_required` 后由用户继续批准。
+4. 执行通过 observer 封装运行，stdout/stderr 展示给用户；审计日志保存命令文本、退出码和脱敏后的输出预览。
 
 ## 安全边界
 

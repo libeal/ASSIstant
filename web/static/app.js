@@ -203,7 +203,7 @@ function setSwitch(id, enabled) {
 
 function setThinkingSwitches(enabled) {
   setSwitch("thinkingTraceSwitch", enabled);
-  setSwitch("thinkingTraceSwitchConfig", enabled);
+  setSwitch(configInputId("agent_loop.thinking_trace_enabled"), enabled);
 }
 
 function thinkingTraceEnabled() {
@@ -236,16 +236,6 @@ function getNestedValue(source, path) {
     if (!current || typeof current !== "object") return undefined;
     return current[key];
   }, source);
-}
-
-function setNestedValue(target, path, value) {
-  const parts = String(path || "").split(".");
-  let current = target;
-  for (const part of parts.slice(0, -1)) {
-    if (!isPlainObject(current[part])) current[part] = {};
-    current = current[part];
-  }
-  current[parts[parts.length - 1]] = value;
 }
 
 function configInputId(key) {
@@ -382,14 +372,6 @@ function renderTerminalReturnHtml(output) {
     return `<p class="muted">本步骤没有返回 stdout/stderr；可展开原始调试数据确认执行元信息。</p>`;
   }
   return renderPrimaryOutputHtml(payload);
-}
-
-function compactMetaValue(value) {
-  if (value === true) return "true";
-  if (value === false) return "false";
-  if (value === undefined || value === null) return "";
-  if (typeof value === "object") return compactText(renderUserOutputText(value), 160);
-  return value;
 }
 
 function renderMetaRows(rows) {
@@ -843,11 +825,6 @@ function emptyEvent(text) {
   event.className = "event";
   event.innerHTML = `<time>--</time><div class="body"><strong>${escapeHtml(text)}</strong><span>等待数据。</span></div>`;
   return event;
-}
-
-function stepDefaultDecision(step) {
-  if (step.executor_type === "skill_script" && step.risk_level === "low") return "y";
-  return "n";
 }
 
 function updateWorkActionLabel() {
@@ -1729,8 +1706,13 @@ function renderEditPackage(editPackage) {
   const container = $("editScripts");
   container.innerHTML = "";
   const scripts = editPackage?.scripts || [];
+  const reviewButton = $("editReviewBtn");
+  const applyButton = $("editApplyBtn");
   if (!scripts.length) {
     container.appendChild(emptyItem("暂无生成脚本"));
+    if (reviewButton) reviewButton.disabled = true;
+    if (applyButton) applyButton.disabled = true;
+    markEditDirty();
     return;
   }
   for (const script of scripts) {
@@ -1748,7 +1730,8 @@ function renderEditPackage(editPackage) {
     container.appendChild(wrapper);
   }
   markEditDirty();
-  $("editApplyBtn").disabled = false;
+  if (reviewButton) reviewButton.disabled = false;
+  if (applyButton) applyButton.disabled = false;
 }
 
 function gatherEditPackage() {
@@ -1791,6 +1774,7 @@ async function applyEdit() {
   printOutput("editOutput", completed.result || completed);
   if (completed.status === "succeeded") {
     setText("editDirtyState", "clean");
+    $("editReviewBtn").disabled = true;
     $("editApplyBtn").disabled = true;
     await loadSkillTree();
     await loadTools();
@@ -2193,10 +2177,8 @@ function renderAuditBoundaries(json) {
   state.auditBoundaries = json;
   const list = $("policyBoundaryList");
   const options = $("policyBoundaryOptionsList");
-  const observer = $("policyAuditBoundarySummary");
   if (list) list.innerHTML = "";
   if (options) options.innerHTML = "";
-  if (observer) observer.innerHTML = "";
   if (!json) {
     setText("activeBoundary", "safe_summary");
     if (list) list.innerHTML = '<div class="kv"><div class="k">audit_backend</div><div class="v">未加载 audit-boundaries.json</div></div>';
@@ -2238,17 +2220,6 @@ function renderAuditBoundaries(json) {
         <p>${escapeHtml(boundary.description || boundary.name || "")}</p>
       `;
       options.appendChild(item);
-    }
-  }
-  if (observer) {
-    for (const eventName of running.application_events || running.event_sources || []) {
-      const row = document.createElement("tr");
-      row.innerHTML = `
-        <td><span class="pill risk low">recording</span></td>
-        <td class="mono">${escapeHtml(eventName)}</td>
-        <td>observer 正在记录的应用事件。</td>
-      `;
-      observer.appendChild(row);
     }
   }
 }
@@ -2293,7 +2264,7 @@ function bindModeTabs() {
 
 function bindSwitches() {
   document.querySelectorAll(".switch").forEach((button) => {
-    if (button.id === "thinkingTraceSwitch" || button.id === "thinkingTraceSwitchConfig") return;
+    if (button.id === "thinkingTraceSwitch" || button.id === configInputId("agent_loop.thinking_trace_enabled")) return;
     button.addEventListener("click", () => button.classList.toggle("on"));
   });
 }
@@ -2347,7 +2318,6 @@ function bindActions() {
   on("policyAddRuleBtn", "click", () => safeAction(() => openPolicyFile("risk-rules.json")));
   on("policyEditBoundaryBtn", "click", () => safeAction(() => openPolicyFile("audit-boundaries.json")));
   on("thinkingTraceSwitch", "click", () => safeAction(updateThinkingTrace));
-  on("thinkingTraceSwitchConfig", "click", () => safeAction(updateThinkingTrace));
   on("auditExportBtn", "click", exportAuditReport);
   on("auditPauseBtn", "click", toggleAuditPause);
   on("auditFindFailureBtn", "click", findAuditFailure);

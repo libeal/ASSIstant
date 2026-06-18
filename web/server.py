@@ -206,15 +206,6 @@ def json_response(handler, status, payload):
     handler.wfile.write(body)
 
 
-def text_response(handler, status, text, content_type="text/plain; charset=utf-8"):
-    body = text.encode("utf-8")
-    handler.send_response(status)
-    handler.send_header("Content-Type", content_type)
-    handler.send_header("Content-Length", str(len(body)))
-    handler.end_headers()
-    handler.wfile.write(body)
-
-
 def read_json_body(handler):
     length = int(handler.headers.get("Content-Length", "0") or "0")
     if length <= 0:
@@ -528,6 +519,32 @@ def run_agent_api(resource, action="", payload=None, timeout=None, job_id=None):
     return result
 
 
+def run_job(job_id, job, resource, action, payload):
+    started_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    job["status"] = "running"
+    job["started_at"] = started_at
+    job["updated_at"] = started_at
+    write_job(job_id, job)
+    try:
+        result = run_agent_api(resource, action, payload, timeout=None, job_id=job_id)
+        finished_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        if result.get("status") == "cancelled":
+            job["status"] = "cancelled"
+        else:
+            job["status"] = "succeeded" if result.get("ok") or result.get("status") == "approval_required" else "failed"
+        job["result"] = result
+        job["finished_at"] = finished_at
+        job["updated_at"] = finished_at
+        write_job(job_id, job)
+    except Exception as exc:  # noqa: BLE001 - surfaced as a job failure.
+        finished_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        job["status"] = "failed"
+        job["result"] = {"ok": False, "status": "job_exception", "error": str(exc)}
+        job["finished_at"] = finished_at
+        job["updated_at"] = finished_at
+        write_job(job_id, job)
+
+
 def start_job(resource, action, payload):
     cleanup_jobs()
     job_id = uuid.uuid4().hex
@@ -544,32 +561,7 @@ def start_job(resource, action, payload):
     }
     write_job(job_id, job)
 
-    def worker():
-        started_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-        job["status"] = "running"
-        job["started_at"] = started_at
-        job["updated_at"] = started_at
-        write_job(job_id, job)
-        try:
-            result = run_agent_api(resource, action, payload, timeout=None, job_id=job_id)
-            finished_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-            if result.get("status") == "cancelled":
-                job["status"] = "cancelled"
-            else:
-                job["status"] = "succeeded" if result.get("ok") or result.get("status") == "approval_required" else "failed"
-            job["result"] = result
-            job["finished_at"] = finished_at
-            job["updated_at"] = finished_at
-            write_job(job_id, job)
-        except Exception as exc:  # noqa: BLE001 - surfaced as a job failure.
-            finished_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-            job["status"] = "failed"
-            job["result"] = {"ok": False, "status": "job_exception", "error": str(exc)}
-            job["finished_at"] = finished_at
-            job["updated_at"] = finished_at
-            write_job(job_id, job)
-
-    threading.Thread(target=worker, daemon=True).start()
+    threading.Thread(target=run_job, args=(job_id, job, resource, action, payload), daemon=True).start()
     return job
 
 
@@ -610,14 +602,14 @@ def terminate_running_jobs():
             process.terminate()
 
 
+def shutdown_server_later(server):
+    time.sleep(0.1)
+    server.shutdown()
+
+
 def request_server_shutdown(server):
     terminate_running_jobs()
-
-    def worker():
-        time.sleep(0.1)
-        server.shutdown()
-
-    threading.Thread(target=worker, daemon=True).start()
+    threading.Thread(target=shutdown_server_later, args=(server,), daemon=True).start()
     return {"ok": True, "status": "shutting_down"}
 
 

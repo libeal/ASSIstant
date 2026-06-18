@@ -179,6 +179,7 @@
                       <label class="small" for="scriptArgs">JSON 参数<input class="field mono" id="scriptArgs" value='{"top_n": 5}'></label>
                     </div>
                     <div class="toolbar action-gap">
+                      <button class="btn secondary" id="scriptReviewBtn" type="button">审查</button>
                       <button class="btn" id="scriptRunBtn" type="button">运行</button>
                       <button class="btn danger" id="scriptCancelBtn" type="button" disabled>中止</button>
                       <span class="pill risk low" id="scriptJobStatus">idle</span>
@@ -196,6 +197,7 @@
                     <label class="small edit-request-label" for="editInput">需求<textarea class="textarea" id="editInput" placeholder="描述要新增或修改的 skill 能力。已有未保存编辑时，可输入新的修改需求并重新生成。">为 log-search 增加 include_journal=false 的显式默认值，并补充参数校验说明。</textarea></label>
                     <div class="toolbar action-gap">
                       <button class="btn" id="editPlanBtn" type="button">发送</button>
+                      <button class="btn secondary" id="editReviewBtn" type="button" disabled>审查</button>
                       <button class="btn secondary" id="editApplyBtn" type="button" disabled>保存</button>
                       <span class="pill risk low" id="editJobStatus">idle</span>
                     </div>
