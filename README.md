@@ -50,13 +50,11 @@ bash bin/agent
 
 配置最少需要修改：
 
-```json
-{
-  "api_url": "https://api.openai.com/v1/chat/completions",
-  "api_key": "你的密钥",
-  "model": "gpt-4.1-mini"
-}
+```bash
+export LINUX_AGENT_API_KEY="你的密钥"
 ```
+
+`config/config.json` 中仍需配置 `api_url` 和 `model`。如果不想使用环境变量，也可以把密钥写入本机 secret 文件，并在 `config.json` 中设置 `api_key_file`，不建议把真实密钥直接写入 `.api_key` 明文字段。
 
 启动 Web：
 
@@ -86,11 +84,21 @@ bash bin/agent api tools list
 bash bin/agent api sense get '{"topic":"resource"}'
 bash bin/agent api script review '{"ref":"ops-basic/resource-inspect","arguments":{"top_n":1}}'
 bash bin/agent api terminal run '{"command":"printf api-ok"}'
+bash bin/agent api terminal run '{"command":"printf api-ok"}' | jq '.timeline, .approval_card, .output_blocks'
 ```
 
 ## 项目架构
 
 项目按“入口层 -> 核心 Bash 层 -> Web 外壳层 -> 策略与提示层 -> Skill 能力层 -> 配置层 -> 测试层 -> 运行时产物层”组织。CLI 是项目核心，Web 通过同一套 CLI/API 能力提供浏览器体验，测试层使用 fake AI 和脚本验证主流程，不参与项目主体运行。
+
+从演进角度看，项目应始终保持“核心引擎 + 多入口适配器 + 可扩展能力系统”的边界：
+
+- 入口层：`bin/agent`、`bin/agent-web`、Web API，以及未来可能出现的官方 remote bootstrap。
+- 编排层：任务解析、上下文采集、AI 调用、响应校验、work/edit/script/terminal 调度。
+- 执行层：shell、skill_script、remote_script、文件编辑等执行器，以及 policy、approval、observer、audit。
+- 能力层：skills、policies、prompts、config、audit、context 等可替换或可扩展资源。
+
+这个边界借鉴 rssh 的思路：不同入口共享同一套核心能力，AI 只提出计划，执行层独立审查、确认、执行和审计。更详细的架构记录见 [`docs/architecture.md`](docs/architecture.md)，CLI/Web 机器协议见 [`docs/api-protocol.md`](docs/api-protocol.md)。
 
 ```text
 Linux 运维 Agent
@@ -112,6 +120,8 @@ Linux 运维 Agent
 │  │  ├─ ai.sh               模型请求、响应规范化和 schema 校验
 │  │  ├─ orchestrator.sh     work/edit/script/terminal 高层编排和反思循环
 │  │  ├─ executor.sh         work plan 执行状态机
+│  │  ├─ command_guard.py    Python 标准库 AST/Token 命令风险守卫
+│  │  ├─ protocol.sh         timeline、approval_card、output_blocks 协议构造器
 │  │  ├─ editor.sh           skill edit/staging/提交
 │  │  ├─ observer.sh         auditd observer 和降级记录
 │  │  ├─ api.sh              机器可读 API
@@ -120,13 +130,15 @@ Linux 运维 Agent
 │  ├─ server.py              标准库 HTTP 后端，认证、静态文件、job、策略/配置/skill API
 │  └─ static/
 │     ├─ index.html          Web 页面结构
-│     ├─ app.js              前端状态、轮询、审批、配置、审计和 skill 交互
+│     ├─ app.js              前端工作台入口
+│     ├─ modules/            无构建 ES modules：api、state、timeline、approval、output-blocks、audit、policy/config
 │     ├─ styles.css          页面样式
 │     └─ mark.svg            Web 图标
 ├─ 策略与提示层
 │  ├─ prompts/system.txt     模型系统提示和输出约束
 │  └─ policies/
 │     ├─ risk-rules.json     阻断、警告、保护路径和保护服务规则
+│     ├─ redaction-rules.json 脱敏规则集中配置
 │     └─ audit-boundaries.json audit/observer 允许观察边界
 ├─ Skill 能力层 skills/
 │  ├─ INDEX.md               可执行 skill 白名单
@@ -155,6 +167,12 @@ Linux 运维 Agent
 - 配置层保存模板和本地运行配置，本地敏感配置不进入版本库。
 - 测试层包含 fake AI 和回归脚本，只服务验证流程，不应被主流程依赖。
 - 运行时产物层保存日志、临时状态和缓存，均为本地生成内容。
+
+### Skill Registry 边界
+
+当前 skill registry 是本地目录实现，`skills/INDEX.md`、`skills/<name>/SKILL.md` 和 `skills/<name>/scripts/*.sh` 必须互相一致。调用方应通过 `lib/skills.sh` 提供的函数列出、检查、读取和执行 skill，而不是绕过 registry 直接拼路径。
+
+未来如果引入远程 skill 索引或按需加载，仍应保持相同语义：首次只加载索引摘要，执行前 materialize 目标脚本，校验来源和摘要后再交给现有 policy、approval、observer 和 audit 流程。
 
 ### 核心调用关系
 
@@ -224,7 +242,7 @@ Web 版 edit 使用浏览器内联编辑器，但保存前仍调用同一套 `ed
 2. 校验引用格式、`skills/INDEX.md` 登记、对应 `SKILL.md` 声明和脚本文件存在。
 3. 对脚本文本和参数做策略审查。
 4. 用户确认后执行脚本。
-5. 返回脚本 JSON 输出、退出码、observer 摘要和审计事件。
+5. 返回 `timeline`、`approval_card`、`output_blocks`，其中脚本 JSON 输出、observer 摘要和执行元数据都放在分块结果中。
 
 ### Terminal 模式
 
@@ -232,7 +250,7 @@ Web 版 edit 使用浏览器内联编辑器，但保存前仍调用同一套 `ed
 2. 执行前调用 `linux_agent_terminal_review`。
 3. 阻断命令不会执行。
 4. 需要审批的命令在 CLI 中请求确认，在 API/Web 中返回 `approval_required`。
-5. 执行结果展示 stdout/stderr，并写入脱敏后的审计预览。
+5. 执行结果通过 `output_blocks` 展示 stdout/stderr，并写入脱敏后的审计摘要。
 
 ### Remote Script
 
@@ -244,6 +262,20 @@ Web 版 edit 使用浏览器内联编辑器，但保存前仍调用同一套 `ed
 4. 风险等级提升为 high 或 critical。
 5. 用户审批后才执行下载后的脚本。
 
+### 未来远程运行设想（未实现）
+
+项目未来可以增加 remote bootstrap，使其他服务器通过受控入口临时加载 Agent。该能力当前尚未实现，README 中的这一段只记录架构方向，不代表现在可以使用 `curl | bash` 运行本项目。
+
+预留设计原则：
+
+- 官方 bootstrap 是新的入口适配器，必须复用现有 core、policy、executor 和 audit。
+- 首次加载只包含最小核心模块、manifest、策略和 skill 索引摘要，不完整下载全部 skill。
+- 远程模块和 skill 由 manifest 描述，并用 SHA256 校验后再加载。
+- skill 按需下载、校验、审查和执行。
+- 运行期默认使用临时目录保存已校验内容，退出后清理。
+- API key、token、私钥和本地密钥不写入 bootstrap、manifest 或 skill 包。
+- 任意第三方远程脚本仍然只能走当前 `remote_script` 的下载审查流程。
+
 ## 配置
 
 `config/config.example.json` 是模板，`config/config.json` 是本地配置文件并被 `.gitignore` 忽略。
@@ -254,7 +286,8 @@ Web 版 edit 使用浏览器内联编辑器，但保存前仍调用同一套 `ed
 | --- | --- |
 | `provider` | 供应商展示名。 |
 | `api_url` | Chat Completions 兼容接口地址。 |
-| `api_key` | 模型 API 密钥，本地保存，不提交。 |
+| `api_key_file` | 可选的本机 API key 文件路径；相对路径按项目根目录解析。 |
+| `api_key` | 旧版兼容字段，不推荐继续写入真实密钥；优先使用 `LINUX_AGENT_API_KEY` 或 `api_key_file`。 |
 | `model` | 模型名称。 |
 | `request_timeout_sec` | AI 请求超时时间。 |
 | `context_turns` | 会话历史窗口大小。 |
@@ -284,6 +317,7 @@ Web 版 edit 使用浏览器内联编辑器，但保存前仍调用同一套 `ed
 | 变量 | 作用 |
 | --- | --- |
 | `EDITOR` | Edit 模式打开脚本确认文件的编辑器，未设置时使用 `vi`。 |
+| `LINUX_AGENT_API_KEY` | 推荐的模型 API 密钥来源，优先级高于 `api_key_file` 和旧版 `config.api_key`。 |
 | `LINUX_AGENT_OUTPUT_JSON=1` | 将 CLI 业务输出切换为机器可读 JSON。 |
 
 内部变量如 `LINUX_AGENT_TMP_DIR`、`LINUX_AGENT_SESSION_ID`、`LINUX_AGENT_AUDIT_LOG` 由程序设置，不建议外部手工使用。
@@ -354,6 +388,13 @@ done
 | `README.md` | 项目说明文档。 |
 | `test_config.sh` | 本地配置校验脚本，默认不访问网络，`--live` 才发送最小模型请求。 |
 
+### `docs/`
+
+| 文件 | 功能 |
+| --- | --- |
+| `docs/architecture.md` | 架构边界说明，记录 rssh 借鉴点、core/adapter 分层、skill registry 契约、安全执行模型和未来远程运行方向。 |
+| `docs/api-protocol.md` | CLI/Web API 机器协议，定义通用响应、timeline、approval_card、output_blocks、review、job 和 secret 配置状态。 |
+
 ### `bin/`
 
 | 文件 | 功能 |
@@ -380,7 +421,9 @@ done
 | `lib/skills.sh` | 解析 skill 引用、定位脚本、读取索引、校验登记状态、执行 skill 脚本、校验 skill 目录。 |
 | `lib/doctor.sh` | 检查必需命令、可选命令、配置和 skill 目录。 |
 | `lib/ai.sh` | 构造系统提示，记录 AI 输入文件清单，调用 Chat Completions 兼容接口，规范化和校验模型响应。 |
-| `lib/policy.sh` | 加载风险规则，对命令、脚本、参数、远程脚本、保护路径和保护服务做审查。 |
+| `lib/command_guard.py` | 标准库命令守卫，识别 pipeline、redirect、wrapper、substitution、remote pipe、保护路径写入和交互命令等风险形态。 |
+| `lib/policy.sh` | 聚合 AST 守卫和项目风险规则，对命令、脚本、参数、远程脚本、保护路径和保护服务做审查。 |
+| `lib/protocol.sh` | 为 API/CLI 构造 `timeline`、`approval_card`、`output_blocks` 工作台协议。 |
 | `lib/observer.sh` | auditd observer 预检、规则安装和清理、`ausearch` 解析、执行过程 marker 和降级记录。 |
 | `lib/executor.sh` | Work 计划执行状态机，包含自动审批、人工审批、跳过/修改/终止、远程脚本下载审查、步骤执行、失败修复建议和输出渲染。 |
 | `lib/editor.sh` | Edit 模式实现，生成 `SKILL.md`，打开编辑器，记录人工修改 diff，staging 校验并提交 skill。 |
@@ -394,7 +437,8 @@ done
 | --- | --- |
 | `web/server.py` | Python 标准库 Web 后端，提供静态文件、认证、配置 API、策略 API、skill 文件 API、job API，并转发 CLI API。 |
 | `web/static/index.html` | Web 控制台 HTML 页面，包含 Work、Skill、Policy、Audit、Config 五个主视图。 |
-| `web/static/app.js` | Web 前端交互逻辑，包含认证、API 调用、job 轮询、审批抽屉、输出渲染、配置编辑、策略编辑、审计筛选、skill 校验和环境刷新。 |
+| `web/static/app.js` | Web 前端入口，组合无构建 ES modules 并驱动工作台交互。 |
+| `web/static/modules/` | 前端 API、state、timeline、approval、output-blocks、audit、policy/config 模块。 |
 | `web/static/styles.css` | Web 控制台样式。 |
 | `web/static/mark.svg` | Web 控制台图标资源。 |
 
@@ -409,7 +453,8 @@ done
 | 文件 | 功能 |
 | --- | --- |
 | `policies/risk-rules.json` | 风险规则文件，包含阻断模式、警告模式、远程脚本阻断模式、保护路径和保护服务。 |
-| `policies/audit-boundaries.json` | audit 和 observer 边界文件，定义当前观察项、允许观察项、payload 模式、文本限制、observer syscall 和结果字段。 |
+| `policies/redaction-rules.json` | 脱敏规则文件，集中覆盖 Bearer、sk、AKIA、JWT、长 hex、私钥、敏感 key/value 和内网 IP。 |
+| `policies/audit-boundaries.json` | audit 和 observer 边界文件，定义审计事件范围、payload 模式、文本限制、observer syscall、observer 字段和事件上限。 |
 
 ### `skills/`
 
@@ -462,7 +507,7 @@ done
 ## 故障排查
 
 - `config/config.json` 缺失：运行 `cp config/config.example.json config/config.json`。
-- `api_key` 仍是占位值：`work` 和 `edit` 会返回明确的 AI 配置错误。
+- API key 未配置：设置 `LINUX_AGENT_API_KEY`，或配置 `api_key_file` 指向本机 secret 文件；旧版 `.api_key` 仍兼容但会提示迁移。
 - Web 端口被占用：停止旧进程或修改 `web.port`。
 - Web 认证失败：确认页面右上角 token 与 `agent-web` 启动日志一致。
 - `skills validate` 失败：检查 `skills/INDEX.md`、对应 `SKILL.md` 和 `scripts/*.sh` 是否一致。

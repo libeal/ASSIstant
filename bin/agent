@@ -5,6 +5,8 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
+# 本地 CLI adapter：这里只做环境加载和命令分发，核心业务保持在 lib/ 中，
+# 以便 Web 和未来 remote bootstrap 复用同一套执行链路。
 # shellcheck source=../lib/common.sh
 source "${ROOT_DIR}/lib/common.sh"
 # shellcheck source=../lib/config.sh
@@ -23,6 +25,8 @@ source "${ROOT_DIR}/lib/doctor.sh"
 source "${ROOT_DIR}/lib/ai.sh"
 # shellcheck source=../lib/policy.sh
 source "${ROOT_DIR}/lib/policy.sh"
+# shellcheck source=../lib/protocol.sh
+source "${ROOT_DIR}/lib/protocol.sh"
 # shellcheck source=../lib/observer.sh
 source "${ROOT_DIR}/lib/observer.sh"
 # shellcheck source=../lib/executor.sh

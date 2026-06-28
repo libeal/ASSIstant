@@ -217,7 +217,7 @@ linux_agent_run_agent_loop() {
     local environment_context="$3"
     local initial_plan="$4"
     local current_plan execution_json all_results iteration status final_status final_answer stopped_reason
-    local observation_json reflection_json checkpoint_turns auto_executed_count checkpoint_required
+    local observation_json reflection_json checkpoint_turns auto_executed_count checkpoint_required final_review final_approval_step
     local execution_user sudo_probe
 
     current_plan="${initial_plan}"
@@ -227,6 +227,8 @@ linux_agent_run_agent_loop() {
     final_answer=""
     stopped_reason=""
     checkpoint_required=false
+    final_review='null'
+    final_approval_step='null'
     auto_executed_count=0
     execution_user=""
     sudo_probe=""
@@ -251,6 +253,8 @@ linux_agent_run_agent_loop() {
         all_results="$(jq -cn --argjson prior "${all_results}" --argjson next "$(jq '.results // []' <<<"${execution_json}")" '$prior + $next')"
         status="$(jq -r '.status // "unknown"' <<<"${execution_json}")"
         final_status="${status}"
+        final_review="$(jq -c '.review // null' <<<"${execution_json}")"
+        final_approval_step="$(jq -c '.approval_step // null' <<<"${execution_json}")"
         auto_executed_count="$(jq '[.[] | select(.result.auto_approved == true)] | length' <<<"${all_results}")"
 
         if [[ "${status}" != "executed" && "${status}" != "failed" ]]; then
@@ -319,8 +323,10 @@ linux_agent_run_agent_loop() {
         --argjson iterations "${iteration}" \
         --argjson auto_executed_count "${auto_executed_count}" \
         --argjson checkpoint_required "${checkpoint_required}" \
+        --argjson review "${final_review}" \
+        --argjson approval_step "${final_approval_step}" \
         --argjson results "${all_results}" \
-        '{status:$status, execution_user:$execution_user, sudo_probe:$sudo_probe, iterations:$iterations, auto_executed_count:$auto_executed_count, final_answer:$final_answer, checkpoint_required:$checkpoint_required, stopped_reason:$stopped_reason, results:$results}'
+        '{status:$status, execution_user:$execution_user, sudo_probe:$sudo_probe, review:$review, approval_step:$approval_step, iterations:$iterations, auto_executed_count:$auto_executed_count, final_answer:$final_answer, checkpoint_required:$checkpoint_required, stopped_reason:$stopped_reason, results:$results}'
 }
 
 linux_agent_process_work_request() {
@@ -387,6 +393,29 @@ linux_agent_process_work_request() {
     linux_agent_record_turn "assistant" "$(jq -c '{status:.status, results:(.results | length)}' <<<"${execution_json}")" "${final_status}"
 }
 
+linux_agent_print_execution_protocol_json() {
+    local title="$1"
+    local result_json="$2"
+    local approval_card="${3:-null}"
+    local protocol
+
+    if [[ "${LINUX_AGENT_API_MODE:-0}" == "1" ]]; then
+        printf '%s\n' "$(jq . <<<"${result_json}")"
+        return 0
+    fi
+
+    protocol="$(linux_agent_protocol_for_single_execution "${title}" "${result_json}")"
+    jq --argjson protocol "${protocol}" --argjson approval_card "${approval_card}" '
+        {
+            ok:(.ok // false),
+            status:(.status // $protocol.timeline[0].status // (if (.ok // false) then "executed" else "failed" end)),
+            timeline:$protocol.timeline,
+            approval_card:$approval_card,
+            output_blocks:$protocol.output_blocks
+        }
+    ' <<<"${result_json}"
+}
+
 linux_agent_process_script_request() {
     local ref="$1"
     local arguments_json="${2:-}"
@@ -397,7 +426,7 @@ linux_agent_process_script_request() {
         result="$(jq -cn --arg ref "${ref}" '{ok:false, status:"blocked", error:"脚本参数必须是 JSON 对象。", ref:$ref}')"
         linux_agent_log_event "script_blocked" "${result}"
         if linux_agent_output_json_enabled; then
-            printf '%s\n' "$(jq . <<<"${result}")"
+            linux_agent_print_execution_protocol_json "Skill 输出" "${result}"
         else
             linux_agent_print_script_result "${result}"
         fi
@@ -411,7 +440,7 @@ linux_agent_process_script_request() {
         result="$(jq -cn --arg ref "${ref}" '{ok:false, status:"blocked", error:"脚本未登记或不在 skills 目录中。", ref:$ref}')"
         linux_agent_log_event "script_blocked" "${result}"
         if linux_agent_output_json_enabled; then
-            printf '%s\n' "$(jq . <<<"${result}")"
+            linux_agent_print_execution_protocol_json "Skill 输出" "${result}"
         else
             linux_agent_print_script_result "${result}"
         fi
@@ -422,12 +451,14 @@ linux_agent_process_script_request() {
     material="$(printf 'skill_script=%s\narguments=%s\n%s\n' "${ref}" "${arguments_json}" "$(linux_agent_skill_script_content "${ref}")")"
     review="$(linux_agent_policy_review_text "script:${ref}" "${material}")"
     linux_agent_log_event "script_policy_checked" "${review}"
-    printf '脚本: %s\n参数: %s\n审查: %s\n' "${ref}" "${arguments_json}" "$(jq -c '.risk_level' <<<"${review}")"
+    if ! linux_agent_output_json_enabled; then
+        printf '脚本: %s\n参数: %s\n审查: %s\n' "${ref}" "${arguments_json}" "$(jq -c '.risk_level' <<<"${review}")"
+    fi
     if [[ "$(jq -r '.approved' <<<"${review}")" != "true" ]]; then
         result="$(jq -cn --arg ref "${ref}" --argjson review "${review}" '{ok:false, status:"blocked", ref:$ref, review:$review}')"
         linux_agent_log_event "script_blocked" "${result}"
         if linux_agent_output_json_enabled; then
-            printf '%s\n' "$(jq . <<<"${result}")"
+            linux_agent_print_execution_protocol_json "Skill 输出" "${result}"
         else
             linux_agent_print_script_result "${result}"
         fi
@@ -439,7 +470,7 @@ linux_agent_process_script_request() {
         result="$(jq -cn --arg ref "${ref}" '{ok:false, status:"rejected", ref:$ref}')"
         linux_agent_log_event "script_rejected" "${result}"
         if linux_agent_output_json_enabled; then
-            printf '%s\n' "$(jq . <<<"${result}")"
+            linux_agent_print_execution_protocol_json "Skill 输出" "${result}"
         else
             linux_agent_print_script_result "${result}"
         fi
@@ -456,7 +487,7 @@ linux_agent_process_script_request() {
     )"
     linux_agent_log_event "script_executed" "${result}"
     if linux_agent_output_json_enabled; then
-        printf '%s\n' "$(jq . <<<"${result}")"
+        linux_agent_print_execution_protocol_json "Skill 输出" "${result}"
     else
         linux_agent_print_script_result "${result}"
     fi
@@ -472,8 +503,8 @@ linux_agent_process_script_request() {
 linux_agent_process_terminal_request() {
     local command_text="$1"
     local approve="${2:-false}"
-    local stdout_file stderr_file stdout_preview stderr_preview exit_code final_status result run_meta observer subject
-    local review step_decision proxy_meta proxy_error
+    local stdout_file stderr_file stdout_text stderr_text exit_code final_status result run_meta observer subject
+    local review proxy_meta proxy_error
     local -a command_args prepared_command
 
     linux_agent_log_event "received" "$(jq -cn --arg command "${command_text}" '{mode:"terminal", command:$command}')"
@@ -485,9 +516,9 @@ linux_agent_process_terminal_request() {
             '{ok:false, status:"blocked", command:$command, review:$review}')"
         linux_agent_log_event "terminal_blocked" "${result}"
         if linux_agent_output_json_enabled; then
-            printf '%s\n' "$(jq . <<<"${result}")"
+            linux_agent_print_execution_protocol_json "终端输出" "${result}"
         else
-            linux_agent_print_terminal_result "$(jq -c '. + {exit_code:126, stdout_preview:"", stderr_preview:(.review.findings | tostring)}' <<<"${result}")"
+            linux_agent_print_terminal_result "$(jq -c '. + {exit_code:126, stdout:"", stderr:(.review.findings | tostring)}' <<<"${result}")"
         fi
         linux_agent_log_event "finished" "$(jq -cn '{status:"blocked"}')"
         return 0
@@ -508,9 +539,9 @@ linux_agent_process_terminal_request() {
                 '{ok:false, status:"rejected", command:$command, review:$review}')"
             linux_agent_log_event "terminal_rejected" "${result}"
             if linux_agent_output_json_enabled; then
-                printf '%s\n' "$(jq . <<<"${result}")"
+                linux_agent_print_execution_protocol_json "终端输出" "${result}"
             else
-                linux_agent_print_terminal_result "$(jq -c '. + {exit_code:null, stdout_preview:"", stderr_preview:"用户拒绝执行。"}' <<<"${result}")"
+                linux_agent_print_terminal_result "$(jq -c '. + {exit_code:null, stdout:"", stderr:"用户拒绝执行。"}' <<<"${result}")"
             fi
             linux_agent_log_event "finished" "$(jq -cn '{status:"rejected"}')"
             return 0
@@ -528,12 +559,12 @@ linux_agent_process_terminal_request() {
         result="$(jq -cn \
             --arg command "${command_text}" \
             --arg status "failed" \
-            --arg stderr_preview "${proxy_error}" \
+            --arg stderr_text "${proxy_error}" \
             --argjson proxy "${proxy_meta}" \
-            '{ok:false, status:$status, command:$command, exit_code:126, stdout_preview:"", stderr_preview:$stderr_preview, execution_proxy:$proxy}')"
+            '{ok:false, status:$status, command:$command, exit_code:126, stdout:"", stderr:$stderr_text, execution_proxy:$proxy}')"
         linux_agent_log_event "terminal_executed" "${result}"
         if linux_agent_output_json_enabled; then
-            printf '%s\n' "$(jq . <<<"${result}")"
+            linux_agent_print_execution_protocol_json "终端输出" "${result}"
         else
             linux_agent_print_terminal_result "${result}"
         fi
@@ -550,8 +581,8 @@ linux_agent_process_terminal_request() {
     exit_code="$(jq -r '.exit_code' <<<"${run_meta}")"
     observer="$(jq -c '.observer' <<<"${run_meta}")"
 
-    stdout_preview="$(head -c 4000 "${stdout_file}" || true)"
-    stderr_preview="$(head -c 4000 "${stderr_file}" || true)"
+    stdout_text="$(head -c 4000 "${stdout_file}" || true)"
+    stderr_text="$(head -c 4000 "${stderr_file}" || true)"
     if [[ "${exit_code}" -eq 0 ]]; then
         final_status="executed"
     else
@@ -560,18 +591,18 @@ linux_agent_process_terminal_request() {
 
     result="$(jq -cn \
         --arg command "${command_text}" \
-        --arg stdout_preview "${stdout_preview}" \
-        --arg stderr_preview "${stderr_preview}" \
+        --arg stdout_text "${stdout_text}" \
+        --arg stderr_text "${stderr_text}" \
         --arg status "${final_status}" \
         --argjson exit_code "${exit_code}" \
         --argjson observer "${observer}" \
         --argjson review "${review}" \
         --argjson proxy "${proxy_meta}" \
-        '{ok:($exit_code == 0), status:$status, command:$command, exit_code:$exit_code, stdout_preview:$stdout_preview, stderr_preview:$stderr_preview, review:$review, observer:$observer, execution_proxy:$proxy}')"
+        '{ok:($exit_code == 0), status:$status, command:$command, exit_code:$exit_code, stdout:$stdout_text, stderr:$stderr_text, review:$review, observer:$observer, execution_proxy:$proxy}')"
 
     linux_agent_log_event "terminal_executed" "${result}"
     if linux_agent_output_json_enabled; then
-        printf '%s\n' "$(jq . <<<"${result}")"
+        linux_agent_print_execution_protocol_json "终端输出" "${result}"
     else
         linux_agent_print_terminal_result "${result}"
     fi

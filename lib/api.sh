@@ -251,8 +251,16 @@ linux_agent_api_work_run() {
         linux_agent_log_event "finished" "$(jq -cn '{status:"answered"}')"
         linux_agent_record_turn "user" "${user_input}" "work"
         linux_agent_record_turn "assistant" "${answer}" "answered"
-        jq -cn --arg answer "${answer}" --argjson context "${context_json}" --argjson response "${response_json}" \
-            '{ok:true, status:"answered", answer:$answer, context:$context, response:$response}'
+        jq -cn --arg answer "${answer}" --argjson context "${context_json}" --argjson response "${response_json}" --argjson timeline "$(linux_agent_timeline_plan_items "${response_json}")" \
+            '{
+                ok:true,
+                status:"answered",
+                context:$context,
+                response:$response,
+                timeline:$timeline,
+                approval_card:null,
+                output_blocks:[{kind:"markdown", title:"回答", text:$answer, truncated_bytes:0}]
+            }'
         return 0
     fi
 
@@ -263,12 +271,19 @@ linux_agent_api_work_run() {
     fi
     linux_agent_log_event "executed" "${execution_json}"
     final_status="$(jq -r '.status // "unknown"' <<<"${execution_json}")"
-    compact="$(linux_agent_compact_execution_result "${execution_json}")"
     linux_agent_log_event "finished" "$(jq -cn --arg status "${final_status}" '{status:$status}')"
     linux_agent_record_turn "user" "${user_input}" "work"
     linux_agent_record_turn "assistant" "$(jq -c '{status:.status, results:(.results | length)}' <<<"${execution_json}")" "${final_status}"
-    jq -cn --arg status "${final_status}" --argjson context "${context_json}" --argjson response "${response_json}" --argjson execution "${compact}" \
-        '{ok:($status == "executed" or $status == "answered"), status:$status, context:$context, response:$response, execution:$execution}'
+    jq -cn --arg status "${final_status}" --argjson context "${context_json}" --argjson response "${response_json}" --argjson protocol "$(linux_agent_protocol_for_work "${final_status}" "${response_json}" "${execution_json}")" \
+        '{
+            ok:($status == "executed" or $status == "answered"),
+            status:$status,
+            context:$context,
+            response:$response,
+            timeline:$protocol.timeline,
+            approval_card:$protocol.approval_card,
+            output_blocks:$protocol.output_blocks
+        }'
 }
 
 linux_agent_api_script_review() {
@@ -286,8 +301,16 @@ linux_agent_api_script_review() {
     fi
     material="$(printf 'skill_script=%s\narguments=%s\n%s\n' "${ref}" "${args}" "$(linux_agent_skill_script_content "${ref}")")"
     review="$(linux_agent_policy_review_text "script:${ref}" "${material}")"
-    jq -cn --arg ref "${ref}" --argjson arguments "${args}" --argjson review "${review}" \
-        '{ok:(($review.approved // false) == true), status:(if (($review.approved // false) == true) then "approved" else "blocked" end), ref:$ref, arguments:$arguments, review:$review}'
+    jq -cn --arg ref "${ref}" --argjson arguments "${args}" --argjson review "${review}" --argjson output_blocks "$(linux_agent_output_blocks_from_review "${review}")" \
+        '{
+            ok:(($review.approved // false) == true),
+            status:(if (($review.approved // false) == true) then (if (($review.approval_required // false) == true) then "approval_required" else "approved" end) else "blocked" end),
+            ref:$ref,
+            arguments:$arguments,
+            review:$review,
+            output_blocks:$output_blocks,
+            timeline:[{id:"script-review", kind:"review", status:(if (($review.approved // false) != true) then "blocked" elif (($review.approval_required // false) == true) then "approval_required" else "approved" end), title:"Skill 审查", summary:($review.risk_level // "low"), review:$review, output_blocks:$output_blocks}]
+        }'
 }
 
 linux_agent_api_script_run() {
@@ -302,15 +325,21 @@ linux_agent_api_script_run() {
     if [[ "$(jq -r '.ok // false' <<<"${review_json}")" != "true" ]]; then
         linux_agent_log_event "script_blocked" "${review_json}"
         linux_agent_log_event "finished" "$(jq -cn '{status:"blocked"}')"
-        printf '%s\n' "${review_json}"
+        jq -cn --argjson review_response "${review_json}" '{
+            ok:false,
+            status:"blocked",
+            timeline:($review_response.timeline // []),
+            approval_card:null,
+            output_blocks:($review_response.output_blocks // [])
+        }'
         return 0
     fi
     if [[ "$(jq -r '.approve // false' <<<"${payload}")" != "true" ]]; then
         result="$(jq -cn --arg ref "${ref}" '{ok:false, status:"rejected", ref:$ref}')"
         linux_agent_log_event "script_rejected" "${result}"
         linux_agent_log_event "finished" "$(jq -cn '{status:"rejected"}')"
-        jq -cn --argjson review "${review_json}" --argjson result "${result}" \
-            '{ok:false, status:"rejected", review:$review, result:$result}'
+        jq -cn --argjson review_response "${review_json}" --argjson blocks "$(linux_agent_output_blocks_from_result "${result}")" \
+            '{ok:false, status:"rejected", timeline:($review_response.timeline // []), approval_card:null, output_blocks:$blocks}'
         return 0
     fi
 
@@ -327,8 +356,14 @@ linux_agent_api_script_run() {
         final_status="failed"
     fi
     linux_agent_log_event "finished" "$(jq -cn --arg status "${final_status}" '{status:$status}')"
-    jq -cn --arg status "${final_status}" --argjson review "${review_json}" --argjson result "${result}" \
-        '{ok:($status == "executed"), status:$status, review:$review, result:$result}'
+    jq -cn --arg status "${final_status}" --argjson review_response "${review_json}" --argjson protocol "$(linux_agent_protocol_for_single_execution "Skill 输出" "${result}")" \
+        '{
+            ok:($status == "executed"),
+            status:$status,
+            timeline:(($review_response.timeline // []) + $protocol.timeline),
+            approval_card:null,
+            output_blocks:$protocol.output_blocks
+        }'
 }
 
 linux_agent_api_terminal_review() {
@@ -340,8 +375,16 @@ linux_agent_api_terminal_review() {
         return 0
     fi
     review="$(linux_agent_terminal_review "${command_text}")"
-    jq -cn --arg command "${command_text}" --argjson review "${review}" \
-        '{ok:(($review.approved // false) == true), status:(if (($review.approved // false) == true) then (if (($review.approval_required // false) == true) then "approval_required" else "approved" end) else "blocked" end), command:$command, review:$review}'
+    jq -cn --arg command "${command_text}" --argjson review "${review}" --argjson output_blocks "$(linux_agent_output_blocks_from_review "${review}")" --argjson approval_card "$(linux_agent_approval_card_for_terminal "${command_text}" "${review}")" \
+        '{
+            ok:(($review.approved // false) == true),
+            status:(if (($review.approved // false) == true) then (if (($review.approval_required // false) == true) then "approval_required" else "approved" end) else "blocked" end),
+            command:$command,
+            review:$review,
+            approval_card:$approval_card,
+            output_blocks:$output_blocks,
+            timeline:[{id:"terminal-review", kind:"review", status:(if (($review.approved // false) != true) then "blocked" elif (($review.approval_required // false) == true) then "approval_required" else "approved" end), title:"终端审查", summary:($review.risk_level // "low"), review:$review, output_blocks:$output_blocks}]
+        }'
 }
 
 linux_agent_api_terminal_run() {
@@ -356,9 +399,15 @@ linux_agent_api_terminal_run() {
     LINUX_AGENT_API_MODE=1
     stdout="$(linux_agent_process_terminal_request "${command_text}" "$(jq -r '.approve // false' <<<"${payload}")")"
     if jq -e . >/dev/null 2>&1 <<<"${stdout}"; then
-        jq -cn --argjson result "${stdout}" '{ok:($result.ok // false), status:($result.status // "unknown"), result:$result}'
+        jq -cn --argjson result "${stdout}" --argjson protocol "$(linux_agent_protocol_for_single_execution "终端输出" "${stdout}")" --argjson approval_card "$(linux_agent_approval_card_for_terminal "${command_text}" "$(jq -c '.review // {}' <<<"${stdout}")")" '{
+            ok:($result.ok // false),
+            status:($result.status // "unknown"),
+            timeline:$protocol.timeline,
+            approval_card:(if ($result.status // "") == "approval_required" then $approval_card else null end),
+            output_blocks:$protocol.output_blocks
+        }'
     else
-        jq -cn --arg raw "${stdout}" '{ok:false, status:"invalid_output", output:{raw:$raw}}'
+        jq -cn --arg raw "${stdout}" '{ok:false, status:"invalid_output", timeline:[], approval_card:null, output_blocks:[{kind:"stdout", title:"原始输出", text:$raw, truncated_bytes:0}]}'
     fi
 }
 

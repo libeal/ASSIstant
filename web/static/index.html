@@ -317,7 +317,7 @@
                     <div class="kv"><div class="k">audit_backend</div><div class="v">auto：优先 auditd，失败则 degraded observer event。</div></div>
                     <div class="kv"><div class="k">session_source</div><div class="v mono">logs/session/*.jsonl</div></div>
                     <div class="kv"><div class="k">protected_paths</div><div class="v mono">/etc, /boot, /usr, /var/lib, /root</div></div>
-                    <div class="kv"><div class="k">output_policy</div><div class="v">stdout/stderr 仅保存脱敏摘要与截断 preview。</div></div>
+                    <div class="kv"><div class="k">output_policy</div><div class="v">stdout/stderr 通过 output_blocks 保存脱敏分块与截断信息。</div></div>
                     <div class="kv"><div class="k">remote_script</div><div class="v">HTTPS、文本类型、大小限制、SHA256、预览、强制高风险审批。</div></div>
                   </div>
                   <div class="divider"></div>
@@ -330,8 +330,7 @@
   "audit_boundary": {
     "observer": "auto",
     "session_log_dir": "logs/session",
-    "redact_secrets": true,
-    "stdout_preview_bytes": 4096
+    "output_block_text_limit": 4096
   }
 }</textarea>
                   <pre class="code action-gap" id="policyOutput">policy editor: read-only</pre>
@@ -393,14 +392,14 @@
 
           <section class="screen" id="screen-config">
             <div class="panel">
-              <div class="panel-header"><div><h2>配置中心</h2><p>连接 token 后读取后端真实配置；api_key 只允许写入新值，不在前端回显。</p></div><div class="toolbar action-gap"><button class="btn secondary" id="configReloadBtn" type="button">重新读取</button><button class="btn" id="configSaveBtn" type="button" disabled>保存配置</button><button class="btn secondary" id="doctorRunBtn" type="button">运行 Doctor</button></div></div>
+              <div class="panel-header"><div><h2>配置中心</h2><p>连接 token 后读取后端真实配置；api_key 只允许写入本机 secret 文件，不在前端回显。</p></div><div class="toolbar action-gap"><button class="btn secondary" id="configReloadBtn" type="button">重新读取</button><button class="btn" id="configSaveBtn" type="button" disabled>保存配置</button><button class="btn secondary" id="doctorRunBtn" type="button">运行 Doctor</button></div></div>
               <div id="doctorSummary" class="grid-3 doctor-summary"></div>
               <div class="config-section">
                 <div><h4>运行时快照</h4><p class="small">这些值来自后端当前配置和 web 进程；web host/port/token 改动通常需要重启进程生效。</p></div>
                 <div class="grid-3" id="configRuntimeSummary"></div>
               </div>
               <div id="configEditorRoot"></div>
-              <div class="locked-note small">中文注释：前端只写入白名单配置项；api_key 可通过空白输入框写入新值但不回显，web.token 等敏感值仍不展示、不编辑。保存后会重新读取 <span class="mono">/api/config</span> 并刷新页面状态。</div>
+              <div class="locked-note small">中文注释：前端只写入白名单配置项；api_key 可通过空白输入框写入本机 secret 文件但不回显，web.token 等敏感值仍不展示、不编辑。保存后会重新读取 <span class="mono">/api/config</span> 并刷新页面状态。</div>
               <div class="divider"></div>
               <div class="terminal">
                 <div class="terminal-head"><span class="status-dot ok"></span><span>Doctor 输出</span><span class="pill" id="configDirtyState">synced</span></div>
@@ -413,6 +412,6 @@
     </div>
 
     <div id="toast" class="toast" role="status" aria-live="polite"></div>
-    <script src="/app.js"></script>
+    <script type="module" src="/app.js"></script>
   </body>
 </html>

@@ -33,9 +33,12 @@ source "${ROOT_DIR}/lib/executor.sh"
 
 linux_agent_init_env "${ROOT_DIR}"
 linux_agent_load_config
-LINUX_AGENT_CONFIG_JSON="$(jq --arg api_url "${FAKE_AI_URL}" '
+test_secret_file="${tmp_root}/test-api-key.secret"
+printf 'test-api-key\n' > "${test_secret_file}"
+LINUX_AGENT_CONFIG_JSON="$(jq --arg api_url "${FAKE_AI_URL}" --arg api_key_file "${test_secret_file}" '
     .api_url = $api_url
-    | .api_key = "test-api-key"
+    | .api_key_file = $api_key_file
+    | del(.api_key)
     | .model = "fake-chat-completions"
     | .request_timeout_sec = 10
 ' <<<"${LINUX_AGENT_CONFIG_JSON}")"
@@ -48,6 +51,22 @@ payload_context="$(linux_agent_build_ai_payload_context "${request_context}" '{"
 grep -q '"environment_context":{"topic":"disk"}' <<<"${payload_context}"
 repair_response="$(linux_agent_call_ai_with_context "repair" "${request_context}" "repair" '{"topic":"disk"}')"
 jq -e '(.failure_context | fromjson).environment_context.topic == "disk"' <<<"${repair_response}" >/dev/null
+
+file_key_state="$(linux_agent_api_key_state_json)"
+jq -e '.configured == true and .source == "file" and .file_configured == true' <<<"${file_key_state}" >/dev/null
+! grep -q 'test-api-key' <<<"${LINUX_AGENT_LAST_AI_PAYLOAD}"
+
+LINUX_AGENT_API_KEY="TEST_ENV_API_KEY_123456"
+env_config_json="$(jq 'del(.api_key) | .api_key_file = ""' <<<"${LINUX_AGENT_CONFIG_JSON}")"
+saved_config_json="${LINUX_AGENT_CONFIG_JSON}"
+LINUX_AGENT_CONFIG_JSON="${env_config_json}"
+env_response="$(linux_agent_call_ai_with_context "env secret" "${request_context}" "repair" '{"topic":"disk"}')"
+jq -e '(.failure_context | fromjson).environment_context.topic == "disk"' <<<"${env_response}" >/dev/null
+env_key_state="$(linux_agent_api_key_state_json)"
+jq -e '.configured == true and .source == "env"' <<<"${env_key_state}" >/dev/null
+! grep -q 'TEST_ENV_API_KEY' <<<"${LINUX_AGENT_LAST_AI_PAYLOAD}"
+unset LINUX_AGENT_API_KEY
+LINUX_AGENT_CONFIG_JSON="${saved_config_json}"
 
 string_args_response="$(jq -cn '{
     response_type:"work_plan",

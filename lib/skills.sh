@@ -2,6 +2,9 @@
 
 set -euo pipefail
 
+# Skill registry boundary: callers should use this file instead of reaching into
+# skills/ directly. A future manifest-backed resolver should preserve these
+# registration, content and execution semantics.
 linux_agent_skills_dir() {
     local configured
     configured="$(linux_agent_config_get '.skills_dir')"

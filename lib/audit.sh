@@ -549,8 +549,8 @@ linux_agent_audit_safe_summary() {
             + {
                 results:[.results[]? | {step:step_summary(.step), result:result_summary(.result)}],
                 command_present:(has("command")),
-                stdout_present:(has("stdout_preview")),
-                stderr_present:(has("stderr_preview"))
+                stdout_present:(has("stdout")),
+                stderr_present:(has("stderr"))
             }
         else
             fallback

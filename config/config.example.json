@@ -1,7 +1,7 @@
 {
   "provider": "OpenAI-Compatible",
   "api_url": "https://api.openai.com/v1/chat/completions",
-  "api_key": "please-set-your-api-key",
+  "api_key_file": "",
   "model": "gpt-4.1-mini",
   "request_timeout_sec": 90,
   "context_turns": 6,

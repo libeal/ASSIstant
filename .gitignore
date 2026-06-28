@@ -1,6 +1,9 @@
 config/config.json
+config/*.secret
 logs/
 tmp/
 __pycache__/
 *.pyc
 AGENTS.md
+rssh/
+docs/

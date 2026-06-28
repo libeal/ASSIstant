@@ -30,6 +30,8 @@ JOB_PROCESSES = {}
 JOB_PROCESSES_LOCK = threading.Lock()
 SERVER_RUN_ID = uuid.uuid4().hex
 SERVER_STARTED_AT = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+API_KEY_PLACEHOLDER = "please-set-your-api-key"
+DEFAULT_API_KEY_FILE = "config/api_key.secret"
 
 
 def read_config():
@@ -56,19 +58,68 @@ def safe_int(value, default):
         return int(default)
 
 
+def secret_value_configured(value):
+    return bool(value) and str(value) != API_KEY_PLACEHOLDER
+
+
+def resolve_config_path(path_value):
+    raw = str(path_value or "")
+    if not raw:
+        return None
+    path = Path(raw)
+    if path.is_absolute():
+        return path
+    return (ROOT / path).resolve()
+
+
+def api_key_state(config):
+    env_configured = secret_value_configured(os.environ.get("LINUX_AGENT_API_KEY", ""))
+    file_ref = str(config.get("api_key_file") or "")
+    legacy_configured = secret_value_configured(config.get("api_key", ""))
+    file_configured = False
+
+    if file_ref:
+        try:
+            file_path = resolve_config_path(file_ref)
+            file_configured = bool(file_path and file_path.is_file() and file_path.stat().st_size > 0)
+        except OSError:
+            file_configured = False
+
+    if env_configured:
+        source = "env"
+    elif file_configured:
+        source = "file"
+    elif legacy_configured:
+        source = "config_legacy"
+    else:
+        source = "missing"
+
+    return {
+        "configured": source != "missing",
+        "source": source,
+        "file_configured": file_configured,
+        "legacy_configured": legacy_configured,
+        "migration_recommended": legacy_configured,
+    }
+
+
 def config_public_state():
     config = read_config()
     agent_loop = config.get("agent_loop") if isinstance(config.get("agent_loop"), dict) else {}
     observer = config.get("observer") if isinstance(config.get("observer"), dict) else {}
     execution = config.get("execution") if isinstance(config.get("execution"), dict) else {}
     web = config.get("web") if isinstance(config.get("web"), dict) else {}
+    key_state = api_key_state(config)
     return {
         "ok": True,
         "status": "read",
         "config": {
             "provider": config.get("provider", ""),
             "api_url": config.get("api_url", ""),
-            "api_key_configured": bool(config.get("api_key")),
+            "api_key_configured": key_state["configured"],
+            "api_key_source": key_state["source"],
+            "api_key_file_configured": key_state["file_configured"],
+            "api_key_migration_recommended": key_state["migration_recommended"],
             "model": config.get("model", ""),
             "request_timeout_sec": config.get("request_timeout_sec", 90),
             "context_turns": config.get("context_turns", 6),
@@ -91,6 +142,7 @@ def config_public_state():
                 "min_privilege_proxy": bool(execution.get("min_privilege_proxy", True)),
                 "least_privilege_user": execution.get("least_privilege_user", "nobody"),
             },
+            "api_key_file": config.get("api_key_file", ""),
             "skills_dir": config.get("skills_dir", ""),
             "remote_script_policy": config.get("remote_script_policy", "download_review"),
             "web": {
@@ -107,7 +159,7 @@ def config_public_state():
 CONFIG_WRITABLE_FIELDS = {
     "provider": {"type": "str", "min": 1},
     "api_url": {"type": "str", "min": 1},
-    "api_key": {"type": "str", "min": 1},
+    "api_key_file": {"type": "str", "min": 0},
     "model": {"type": "str", "min": 1},
     "request_timeout_sec": {"type": "int", "min": 1, "max": 600},
     "context_turns": {"type": "int", "min": 1, "max": 50},
@@ -172,7 +224,56 @@ def write_nested_config_value(config, key, value):
     target[parts[-1]] = value
 
 
+def write_api_key_secret(value):
+    secret = str(value or "")
+    config = read_config()
+    target = resolve_config_path(config.get("api_key_file") or DEFAULT_API_KEY_FILE)
+    if target is None:
+        target = resolve_config_path(DEFAULT_API_KEY_FILE)
+
+    if not secret:
+        try:
+            if target and target.exists():
+                target.unlink()
+        except OSError:
+            return {"ok": False, "status": "secret_clear_failed", "error": "Failed to remove API key secret file."}
+        config.pop("api_key", None)
+        config["api_key_file"] = str(config.get("api_key_file") or DEFAULT_API_KEY_FILE)
+        write_config(config)
+        result = config_public_state()
+        result["status"] = "updated"
+        result["updated"] = {"api_key": "cleared"}
+        return result
+
+    if target is None:
+        return {"ok": False, "status": "invalid_config_value", "error": "api_key_file is invalid."}
+    target.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = target.with_suffix(target.suffix + f".{uuid.uuid4().hex}.tmp")
+    try:
+        with tmp_path.open("w", encoding="utf-8") as handle:
+            handle.write(secret)
+            handle.write("\n")
+        os.chmod(tmp_path, 0o600)
+        tmp_path.replace(target)
+    except OSError as exc:
+        try:
+            tmp_path.unlink()
+        except OSError:
+            pass
+        return {"ok": False, "status": "secret_write_failed", "error": str(exc)}
+
+    config.pop("api_key", None)
+    config["api_key_file"] = str(config.get("api_key_file") or DEFAULT_API_KEY_FILE)
+    write_config(config)
+    result = config_public_state()
+    result["status"] = "updated"
+    result["updated"] = {"api_key": "configured"}
+    return result
+
+
 def update_config_value(key, value):
+    if key == "api_key":
+        return write_api_key_secret(value)
     normalized, error = normalize_config_value(key, value)
     if error:
         return {"ok": False, "status": "invalid_config_value", "error": error}
@@ -506,7 +607,11 @@ def run_agent_api(resource, action="", payload=None, timeout=None, job_id=None):
         result = {
             "ok": False,
             "status": "invalid_agent_output",
-            "stdout_preview": stdout[:4000],
+            "timeline": [],
+            "approval_card": None,
+            "output_blocks": [
+                {"kind": "stdout", "title": "Agent stdout", "text": stdout[:4000], "truncated_bytes": max(0, len(stdout) - 4000)}
+            ],
         }
     if isinstance(result, dict):
         if returncode is not None and returncode < 0:
@@ -515,9 +620,15 @@ def run_agent_api(resource, action="", payload=None, timeout=None, job_id=None):
             result.setdefault("error", "Job process was terminated.")
         result.setdefault("ok", returncode == 0 and result.get("ok", False))
         result.setdefault("status", "completed" if returncode == 0 else "failed")
-        result["agent_exit_code"] = returncode
+        blocks = result.setdefault("output_blocks", [])
+        if not isinstance(blocks, list):
+            blocks = []
+            result["output_blocks"] = blocks
         if stderr:
-            result["stderr_preview"] = stderr[:4000]
+            blocks.append(
+                {"kind": "stderr", "title": "Agent stderr", "text": stderr[:4000], "truncated_bytes": max(0, len(stderr) - 4000)}
+            )
+        blocks.append({"kind": "meta", "title": "Agent runtime", "json": {"exit_code": returncode}})
     return result
 
 
@@ -535,6 +646,8 @@ def run_job(job_id, job, resource, action, payload):
         else:
             job["status"] = "succeeded" if result.get("ok") or result.get("status") == "approval_required" else "failed"
         job["result"] = result
+        job["result_ok"] = bool(result.get("ok"))
+        job["result_status"] = result.get("status", job["status"])
         job["finished_at"] = finished_at
         job["updated_at"] = finished_at
         write_job(job_id, job)
@@ -542,6 +655,8 @@ def run_job(job_id, job, resource, action, payload):
         finished_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
         job["status"] = "failed"
         job["result"] = {"ok": False, "status": "job_exception", "error": str(exc)}
+        job["result_ok"] = False
+        job["result_status"] = "job_exception"
         job["finished_at"] = finished_at
         job["updated_at"] = finished_at
         write_job(job_id, job)
@@ -560,6 +675,8 @@ def start_job(resource, action, payload):
         "created_at": now,
         "updated_at": now,
         "result": None,
+        "result_ok": None,
+        "result_status": None,
     }
     write_job(job_id, job)
 
@@ -588,6 +705,8 @@ def cancel_job(job_id):
     job["updated_at"] = now
     job["finished_at"] = now
     job["result"] = {"ok": False, "status": "cancelled", "error": "Job cancellation requested."}
+    job["result_ok"] = False
+    job["result_status"] = "cancelled"
     write_job(job_id, job)
     return {"ok": True, "status": "cancelled", "job": job}
 

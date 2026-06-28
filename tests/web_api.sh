@@ -38,12 +38,17 @@ jq -e '.ok == true and ([.scripts[].ref] | index("ops-basic/resource-inspect"))'
 project_work="${tmp_root}/project-work-api"
 copy_project "${project_work}"
 work_run="$(cd "${project_work}" && bash bin/agent api work run '{"input":"查看cpu占用"}' 2>/dev/null)"
-jq -e '.ok == true and .status == "executed" and .execution.auto_executed_count == 1 and .execution.results[0].result.execution_proxy.requested_privilege == "least"' <<<"${work_run}" >/dev/null
-jq -e '.execution.results[0].result.output.tool == "system.resource.inspect" and (.execution.results[0].result.output.top_processes | length > 0)' <<<"${work_run}" >/dev/null
+jq -e '.ok == true and .status == "executed"
+    and ([.output_blocks[]? | select(.kind == "meta" and .title == "工作流摘要") | .json.auto_executed_count] | first) == 1
+    and ([.timeline[]? | select(.kind == "execution") | .output_blocks[]? | select(.kind == "meta" and .title == "执行代理") | .json.requested_privilege] | first) == "least"' <<<"${work_run}" >/dev/null
+jq -e '([.timeline[]? | select(.kind == "execution") | .output_blocks[]? | select(.kind == "json") | .json
+    | select(.tool == "system.resource.inspect" and (.top_processes | length > 0))] | length) > 0' <<<"${work_run}" >/dev/null
 
 approval_first="$(cd "${project_work}" && bash bin/agent api work run '{"input":"帮我检查磁盘空间是否异常"}' 2>/dev/null)"
-jq -e '.ok == false and .status == "approval_required" and .response.response_type == "work_plan"' <<<"${approval_first}" >/dev/null
-jq -e '.execution.results[0].result.output.tool == "system.disk.hotspots" and (.execution.results[0].result.output.top_dirs | length > 0) and (.execution.results[0].result.output.top_files | length > 0)' <<<"${approval_first}" >/dev/null
+jq -e '.ok == false and .status == "approval_required" and .response.response_type == "work_plan"
+    and .approval_card.review.approval_required == true and .approval_card.step.id != ""' <<<"${approval_first}" >/dev/null
+jq -e '([.timeline[]? | select(.kind == "execution") | .output_blocks[]? | select(.kind == "json") | .json
+    | select(.tool == "system.disk.hotspots" and (.top_dirs | length > 0) and (.top_files | length > 0))] | length) > 0' <<<"${approval_first}" >/dev/null
 approval_payload="$(
     jq -cn \
         --arg input "帮我检查磁盘空间是否异常" \
@@ -57,25 +62,29 @@ jq -e '.ok == true and .status == "executed" and .response.response_type == "wor
 project_missing="${tmp_root}/project-missing-ai"
 copy_project "${project_missing}"
 tmp_config="$(mktemp)"
-jq '.api_key = "please-set-your-api-key"' "${project_missing}/config/config.json" > "${tmp_config}"
+jq 'del(.api_key) | .api_key_file = ""' "${project_missing}/config/config.json" > "${tmp_config}"
 mv "${tmp_config}" "${project_missing}/config/config.json"
 missing_ai="$(cd "${project_missing}" && bash bin/agent api work run '{"input":"查看cpu占用"}' 2>/dev/null)"
 jq -e '.ok == false and .status == "ai_config_missing"' <<<"${missing_ai}" >/dev/null
 
 script_review="$(bash "${ROOT_DIR}/bin/agent" api script review '{"ref":"ops-basic/resource-inspect","arguments":{"top_n":1}}')"
-jq -e '.ok == true and .review.risk_level == "low"' <<<"${script_review}" >/dev/null
+jq -e '.ok == true and .status == "approved" and .review.engine == "ast+rules" and .review.risk_level == "low" and (.output_blocks | length) > 0' <<<"${script_review}" >/dev/null
 
 script_run="$(bash "${ROOT_DIR}/bin/agent" api script run '{"ref":"ops-basic/resource-inspect","arguments":{"top_n":1},"approve":true}' 2>/dev/null)"
-jq -e '.ok == true and .status == "executed" and .result.output.tool == "system.resource.inspect" and .result.execution_proxy.requested_privilege == "least"' <<<"${script_run}" >/dev/null
+jq -e '.ok == true and .status == "executed"
+    and ([.output_blocks[]? | select(.kind == "json") | .json | select(.tool == "system.resource.inspect")] | length) > 0
+    and ([.output_blocks[]? | select(.kind == "meta" and .title == "执行代理") | .json.requested_privilege] | first) == "least"' <<<"${script_run}" >/dev/null
 
 terminal_run="$(bash "${ROOT_DIR}/bin/agent" api terminal run '{"command":"printf api-ok"}' 2>/dev/null)"
-jq -e '.ok == true and .result.stdout_preview == "api-ok" and .result.execution_proxy.requested_privilege == "least"' <<<"${terminal_run}" >/dev/null
+jq -e '.ok == true
+    and ([.output_blocks[]? | select(.kind == "stdout") | .text] | first) == "api-ok"
+    and ([.output_blocks[]? | select(.kind == "meta" and .title == "执行代理") | .json.requested_privilege] | first) == "least"' <<<"${terminal_run}" >/dev/null
 
 terminal_review="$(bash "${ROOT_DIR}/bin/agent" api terminal review '{"command":"sudo systemctl restart nginx"}')"
-jq -e '.ok == true and .status == "approval_required" and .review.risk_level == "high"' <<<"${terminal_review}" >/dev/null
+jq -e '.ok == true and .status == "approval_required" and .review.risk_level == "high" and .approval_card.type == "terminal"' <<<"${terminal_review}" >/dev/null
 
 terminal_approval_required="$(bash "${ROOT_DIR}/bin/agent" api terminal run '{"command":"sudo systemctl restart nginx"}' 2>/dev/null)"
-jq -e '.ok == false and .status == "approval_required"' <<<"${terminal_approval_required}" >/dev/null
+jq -e '.ok == false and .status == "approval_required" and .approval_card.type == "terminal"' <<<"${terminal_approval_required}" >/dev/null
 
 project_edit="${tmp_root}/project-edit-api"
 copy_project "${project_edit}"

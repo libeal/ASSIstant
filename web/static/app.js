@@ -1,38 +1,18 @@
-const state = {
-  token: localStorage.getItem("linuxAgentToken") || "",
-  tools: [],
-  workPlan: null,
-  workContext: null,
-  workPlanInput: "",
-  awaitingWorkApproval: false,
-  editPackage: null,
-  policyFiles: [],
-  currentPolicyPath: "",
-  policySudoPassword: "",
-  policySudoUnlocked: false,
-  auditBoundaries: null,
-  skillTree: null,
-  skillFiles: { markdown: [], scripts: [] },
-  activeWorkJobId: "",
-  activeScriptJobId: "",
-  selectedStepIndex: -1,
-  approvalDrawerOpen: false,
-  pendingApproval: null,
-  lastExecution: null,
-  lastThinkingSummary: "",
-  workSuspended: false,
-  auditSessions: [],
-  auditEvents: [],
-  currentAuditSession: "",
-  configSnapshot: null,
-  configOriginal: {},
-  configDraft: {},
-  auditPaused: false,
-  draggedPanelId: "",
-  webRunId: "",
-  layoutStorageKey: "",
-  defaultLayout: { containers: {}, children: {} },
-};
+import { createInitialState } from "./modules/state.js";
+import { requestJson } from "./modules/api.js";
+import { normalizeProtocolExecutionEntries, completedExecutionCount as completedProtocolExecutionCount } from "./modules/timeline.js";
+import {
+  findBlockJson,
+  outputBlocksFrom,
+  outputBlocksSummary,
+  outputBlocksText,
+  renderOutputBlocksHtml,
+} from "./modules/output-blocks.js";
+import { normalizeApprovalCard } from "./modules/approval.js";
+import * as auditProtocol from "./modules/audit.js";
+import { CONFIG_GROUPS, CONFIG_READONLY_FIELDS } from "./modules/policy-config.js";
+
+const state = createInitialState();
 
 const $ = (id) => document.getElementById(id);
 const LAYOUT_STORAGE_PREFIX = "assistant.panelLayout.v1";
@@ -62,9 +42,7 @@ const outputLabelMap = {
   zombies: "僵尸进程",
   error: "错误",
   stdout: "标准输出",
-  stdout_preview: "标准输出",
   stderr: "错误输出",
-  stderr_preview: "错误输出",
   exit_code: "退出码",
   command: "命令",
   result: "结果",
@@ -89,7 +67,6 @@ const outputLabelMap = {
 const hiddenOutputKeys = new Set([
   "ok",
   "tool",
-  "agent_exit_code",
   "job_id",
   "response_type",
   "execution_proxy",
@@ -103,63 +80,6 @@ const hiddenOutputKeys = new Set([
   "subject",
   "step",
 ]);
-
-const CONFIG_GROUPS = [
-  {
-    title: "模型与 API",
-    note: "控制 LLM 供应商、接口、密钥、模型和请求超时。api_key 输入框为空表示保持当前密钥，不在前端回显。",
-    fields: [
-      { key: "provider", label: "provider", type: "text", comment: "供应商名称，用于提示当前适配的 OpenAI-compatible 后端。" },
-      { key: "api_url", label: "api_url", type: "text", comment: "模型接口地址，通常是 chat/completions 兼容端点。" },
-      { key: "api_key", label: "api_key", type: "secret", writeOnly: true, placeholder: "留空保持当前密钥", comment: "只写入新密钥，不读取或回显已有密钥。" },
-      { key: "model", label: "model", type: "text", comment: "work/edit 等请求调用的模型名。" },
-      { key: "request_timeout_sec", label: "request_timeout_sec", type: "number", min: 1, comment: "单次模型请求最长等待秒数。" },
-      { key: "context_turns", label: "context_turns", type: "number", min: 1, comment: "保留的上下文轮数，过大可能增加 token 消耗。" },
-    ],
-  },
-  {
-    title: "工作流",
-    note: "控制自然语言 work、低风险自动执行和模型思考摘要。",
-    fields: [
-      { key: "agent_loop.enabled_for_work", label: "work_agent_loop", type: "boolean", comment: "执行后带 observation 继续反思，适合多步排障。" },
-      { key: "agent_loop.auto_execute_low_risk", label: "auto_execute_low_risk_skill", type: "boolean", comment: "低风险且策略干净的 skill 步骤可自动执行。" },
-      { key: "agent_loop.auto_execute_shell_low_risk", label: "auto_execute_low_risk_shell", type: "boolean", comment: "shell 命令即使低风险也建议保持谨慎。" },
-      { key: "agent_loop.observation_text_limit", label: "observation_text_limit", type: "number", min: 200, comment: "回传给模型的命令输出摘要上限。" },
-      { key: "agent_loop.checkpoint_turns", label: "checkpoint_turns", type: "number", min: 0, comment: "每隔多少轮强制 checkpoint；0 表示使用 context_turns。" },
-      { key: THINKING_TRACE_KEY, label: "thinking_summary", type: "boolean", comment: "开启后会话摘要栏展示模型返回的简短 thinking_summary。" },
-    ],
-  },
-  {
-    title: "审计与 Observer",
-    note: "控制审计脱敏、observer 后端和事件数量。",
-    fields: [
-      { key: "audit_mode", label: "audit_mode", type: "select", options: ["safe_summary", "redacted_verbose"], comment: "safe_summary 更克制；redacted_verbose 保留更多脱敏上下文。" },
-      { key: "audit_text_limit", label: "audit_text_limit", type: "number", min: 40, comment: "写入审计报告的文本截断长度。" },
-      { key: "observer.enabled", label: "observer_backend", type: "select", options: ["auto", "auditd", "disabled"], comment: "auto 会优先尝试 auditd，失败时降级记录诊断。" },
-      { key: "observer.privilege", label: "observer_privilege", type: "text", comment: "observer 提权策略，例如 sudo_interactive。" },
-      { key: "observer.max_events", label: "observer_max_events", type: "number", min: 0, comment: "单会话 observer 事件上限，避免报告过大。" },
-    ],
-  },
-  {
-    title: "执行策略与 Skill",
-    note: "控制最小权限代理、远程脚本策略和 skill 根目录。",
-    fields: [
-      { key: "execution.min_privilege_proxy", label: "min_privilege_proxy", type: "boolean", comment: "尽量使用低权限用户执行命令，降低误操作影响面。" },
-      { key: "execution.least_privilege_user", label: "least_privilege_user", type: "text", comment: "低权限代理使用的系统用户。" },
-      { key: "remote_script_policy", label: "remote_script_policy", type: "select", options: ["download_review", "disabled"], comment: "远程脚本默认先下载审查；disabled 直接禁用。" },
-      { key: "skills_dir", label: "skills_dir", type: "text", comment: "自定义 skill 根目录；空值表示使用项目默认 skills。" },
-    ],
-  },
-];
-
-const CONFIG_READONLY_FIELDS = [
-  { key: "api_key_configured", label: "api_key_configured", comment: "只显示是否已配置，避免在浏览器中暴露已有密钥。" },
-  { key: "web.enabled", label: "web.enabled", comment: "web 服务开关，当前进程已启动时仅作状态展示。" },
-  { key: "web.host", label: "web.host", comment: "当前配置文件中的监听地址，改动需重启生效。" },
-  { key: "web.port", label: "web.port", comment: "当前配置文件中的监听端口，改动需重启生效。" },
-  { key: "web.token_configured", label: "web.token", comment: "只显示 token 是否已配置，不回显 token 明文。" },
-  { key: "web.job_retention_hours", label: "web.job_retention_hours", comment: "后端保留 job 文件的小时数，当前进程可能需重启才完全生效。" },
-];
 
 function escapeHtml(value) {
   return String(value ?? "")
@@ -252,27 +172,10 @@ function statusKind(value) {
   return pillKind(text);
 }
 
-function executionRoot(result) {
-  return result?.execution || result?.result || result || {};
-}
-
 function normalizeExecutionEntries(title, result) {
-  const root = executionRoot(result);
-  const results = Array.isArray(root.results) ? root.results : [];
-  if (results.length) {
-    return results.map((entry, index) => {
-      const step = entry.step || {};
-      const output = entry.result || entry.output || entry;
-      return {
-        index,
-        number: index + 1,
-        title: step.title || entry.title || entry.step_title || output.status || "步骤输出",
-        status: output.status || entry.status || (output.ok ? "executed" : "failed"),
-        step,
-        output,
-      };
-    });
-  }
+  const protocolEntries = normalizeProtocolExecutionEntries(title, result);
+  if (protocolEntries.length) return protocolEntries;
+  const root = result || {};
   return [{
     index: 0,
     number: 1,
@@ -284,19 +187,22 @@ function normalizeExecutionEntries(title, result) {
 }
 
 function completedExecutionCount(result) {
-  const root = executionRoot(result);
-  return Array.isArray(root.results) ? root.results.length : 0;
+  return completedProtocolExecutionCount(result);
 }
 
 function primaryOutputObject(output) {
+  const blocks = outputBlocksFrom(output);
+  const blockJson = findBlockJson(blocks, "json");
+  if (Object.keys(blockJson).length) return blockJson;
   if (isPlainObject(output?.output)) return output.output;
-  if (isPlainObject(output?.result?.output)) return output.result.output;
   return isPlainObject(output) ? output : {};
 }
 
 function outputSummaryText(output) {
+  const blockSummary = outputBlocksSummary(output);
+  if (blockSummary) return blockSummary;
   const payload = primaryOutputObject(output);
-  for (const key of ["summary", "message", "action", "error", "stdout_preview", "stderr_preview", "raw"]) {
+  for (const key of ["summary", "message", "action", "error"]) {
     if (typeof payload[key] === "string" && payload[key].trim()) return compactText(payload[key], 260);
     if (typeof output?.[key] === "string" && output[key].trim()) return compactText(output[key], 260);
   }
@@ -333,13 +239,14 @@ function renderOutputSection(key, value) {
 }
 
 function renderPrimaryOutputHtml(output) {
+  const blocks = outputBlocksFrom(output);
+  if (blocks.length) return renderOutputBlocksHtml(blocks);
   const payload = primaryOutputObject(output);
   const chunks = [];
   const renderedKeys = new Set();
   const preferred = [
     "summary", "message", "error", "command", "stdout", "stderr", "load", "memory", "disk_usage", "df_summary",
     "top_dirs", "top_files", "top_processes", "processes", "journal", "journal_sample", "matches",
-    "stdout_preview", "stderr_preview", "raw",
   ];
   for (const key of preferred) {
     const value = payload[key] ?? output?.[key];
@@ -358,9 +265,11 @@ function renderPrimaryOutputHtml(output) {
 }
 
 function terminalReturnPayload(output) {
+  const blocks = outputBlocksFrom(output);
+  if (blocks.length) return { output_blocks: blocks };
   const payload = primaryOutputObject(output);
   const merged = {};
-  for (const key of ["command", "stdout", "stderr", "stdout_preview", "stderr_preview", "raw", "summary", "message", "error"]) {
+  for (const key of ["command", "stdout", "stderr", "summary", "message", "error"]) {
     const value = payload[key] ?? output?.[key];
     if (!isEmptyOutputValue(value)) merged[key] = value;
   }
@@ -656,7 +565,9 @@ function pretty(value) {
 
 function printOutput(id, value) {
   const el = $(id);
-  if (el) el.textContent = renderUserOutputText(value);
+  if (!el) return;
+  const blocks = outputBlocksFrom(value);
+  el.textContent = blocks.length ? outputBlocksText(blocks) : renderUserOutputText(value);
 }
 
 function outputLabel(key) {
@@ -676,11 +587,8 @@ function isEmptyOutputValue(value) {
 
 function extractRawOutput(value) {
   if (!isPlainObject(value)) return "";
-  if (typeof value.output?.raw === "string") return value.output.raw;
-  if (typeof value.raw === "string" && Object.keys(value).every((key) => key === "raw" || hiddenOutputKeys.has(key))) {
-    return value.raw;
-  }
-  for (const key of ["result", "output"]) {
+  if (outputBlocksFrom(value).length) return outputBlocksText(value);
+  for (const key of ["output"]) {
     if (isPlainObject(value[key])) {
       const raw = extractRawOutput(value[key]);
       if (raw) return raw;
@@ -723,57 +631,19 @@ function renderObjectOutputText(value) {
   return rows.join("\n\n");
 }
 
-function executionEntries(title, result) {
-  const execution = result?.execution || result?.result || result || {};
-  const results = Array.isArray(execution.results) ? execution.results : [];
-  if (results.length) {
-    return results.map((entry, index) => {
-      const output = entry.result || entry.output || entry;
-      return {
-        index: index + 1,
-        title: entry.title || entry.step_title || entry.status || output.status || "步骤输出",
-        status: entry.status || output.status || "完成",
-        output,
-      };
-    });
-  }
-  return [{
-    index: 1,
-    title,
-    status: execution.status || result?.status || "完成",
-    output: execution,
-  }];
-}
-
-function renderExecutionText(title, result) {
-  return executionEntries(title, result)
+function renderProtocolText(title, result) {
+  return normalizeExecutionEntries(title, result)
     .map((entry) => {
-      const body = renderUserOutputText(entry.output);
-      const header = `${entry.index}. ${entry.title}${entry.status ? ` (${entry.status})` : ""}`;
+      const body = outputBlocksFrom(entry.output).length ? outputBlocksText(entry.output) : renderUserOutputText(entry.output);
+      const number = entry.number ?? entry.index;
+      const header = `${number}. ${entry.title}${entry.status ? ` (${entry.status})` : ""}`;
       return body.trim() ? `${header}\n${body}` : header;
     })
     .join("\n\n");
 }
 
-function authHeaders() {
-  return {
-    "Authorization": `Bearer ${state.token}`,
-    "Content-Type": "application/json",
-  };
-}
-
 async function api(path, options = {}) {
-  const init = {
-    method: options.method || "GET",
-    headers: authHeaders(),
-  };
-  if (options.body !== undefined) init.body = JSON.stringify(options.body);
-  const response = await fetch(path, init);
-  const data = await response.json().catch(() => ({ ok: false, status: "invalid_json" }));
-  if (!response.ok) {
-    throw new Error(data.error || data.status || `HTTP ${response.status}`);
-  }
-  return data;
+  return requestJson(path, options, () => state.token);
 }
 
 async function shutdownServer() {
@@ -849,25 +719,25 @@ function closeApprovalDrawer() {
 }
 
 function openApprovalDrawer(result, input) {
+  const card = normalizeApprovalCard(result);
   const response = result.response || state.workPlan || {};
-  const execution = result.execution || {};
-  const completedCount = Array.isArray(execution.results) ? execution.results.length : 0;
   const steps = response.steps || [];
-  const step = steps[completedCount] || steps.find((candidate) => candidate.risk_level !== "low") || steps[0] || {};
+  const step = card?.step || steps[completedExecutionCount(result)] || steps.find((candidate) => candidate.risk_level !== "low") || steps[0] || {};
   state.pendingApproval = {
     type: "work",
     input,
     response,
     context: result.context || state.workContext || {},
+    card,
     step,
     index: Math.max(0, steps.indexOf(step)),
-    review: execution.review || result.review || null,
+    review: card?.review || null,
   };
   state.approvalDrawerOpen = true;
   state.awaitingWorkApproval = true;
 
-  setText("approvalTitle", step.title || step.id || "待审批步骤");
-  setStatus("approvalRisk", step.risk_level || "approval_required", riskKind(step.risk_level || "medium"));
+  setText("approvalTitle", card?.title || step.title || step.id || "待审批步骤");
+  setStatus("approvalRisk", card?.risk_level || step.risk_level || "approval_required", riskKind(card?.risk_level || step.risk_level || "medium"));
   const body = $("approvalBody");
   if (body) {
     body.innerHTML = `
@@ -892,21 +762,23 @@ function openApprovalDrawer(result, input) {
 }
 
 function openTerminalApprovalDrawer(command, review) {
-  state.pendingApproval = { type: "terminal", command, review };
+  const card = review?.review ? review : { command, review };
+  const policyReview = card.review || {};
+  state.pendingApproval = { type: "terminal", command: card.command || command, review: policyReview, card };
   state.approvalDrawerOpen = true;
-  setText("approvalTitle", "终端命令需要审批");
-  setStatus("approvalRisk", review.risk_level || "approval_required", riskKind(review.risk_level || "medium"));
+  setText("approvalTitle", card.title || "终端命令需要审批");
+  setStatus("approvalRisk", card.risk_level || policyReview.risk_level || "approval_required", riskKind(card.risk_level || policyReview.risk_level || "medium"));
   const body = $("approvalBody");
   if (body) {
     body.innerHTML = `
       <div class="approval-meta">
         ${renderMetaRows([
           ["执行器", "terminal"],
-          ["命令", command],
-          ["风险", review.risk_level || ""],
+          ["命令", card.command || command],
+          ["风险", card.risk_level || policyReview.risk_level || ""],
         ])}
       </div>
-      ${renderJsonDetails("策略审查 findings", review.findings || [], true)}
+      ${renderJsonDetails("策略审查 findings", policyReview.findings || [], true)}
     `;
   }
   const revision = $("approvalRevision");
@@ -930,7 +802,7 @@ async function submitApprovalDecision(decision) {
     closeApprovalDrawer();
     const job = await createJob("terminal", "run", { command, approve: true });
     const completed = await pollJob(job.job_id, "terminalJobStatus", "terminalOutput");
-    renderSharedExecution("终端输出", completed.result || completed, "terminalOutput");
+    renderSharedProtocolExecution("终端输出", completed.result || completed, "terminalOutput");
     return;
   }
 
@@ -1006,15 +878,15 @@ function renderWorkPlan(response, input = "", context = null, awaitingApproval =
     container.appendChild(emptyItem("暂无步骤"));
     return;
   }
-  const pendingIndex = awaitingApproval ? completedExecutionCount(state.lastExecution) : -1;
+  const pendingIndex = awaitingApproval ? completedExecutionCount(state.lastProtocolResult) : -1;
   steps.forEach((step, index) => container.appendChild(renderPlanStep(step, index, awaitingApproval, pendingIndex)));
   renderPendingStepDetail(steps[0], 0, awaitingApproval && pendingIndex === 0);
 }
 
-function renderTerminalReturns(title, result) {
+function renderTimelineReturns(title, result) {
   const container = $("workPlan");
   container.innerHTML = "";
-  state.lastExecution = result;
+  state.lastProtocolResult = result;
   const entries = normalizeExecutionEntries(title, result);
   if (!entries.length) {
     container.appendChild(emptyItem("暂无执行结果"));
@@ -1027,11 +899,11 @@ function renderTerminalReturns(title, result) {
   renderStepDetail(selected);
 }
 
-function renderSharedExecution(title, result, outputId = "terminalOutput") {
-  state.lastExecution = result;
-  const text = renderExecutionText(title, result);
+function renderSharedProtocolExecution(title, result, outputId = "terminalOutput") {
+  state.lastProtocolResult = result;
+  const text = renderProtocolText(title, result);
   if (outputId) printOutput(outputId, text);
-  renderTerminalReturns(title, result);
+  renderTimelineReturns(title, result);
 }
 
 function appendReturnCard(container, entry) {
@@ -1068,8 +940,10 @@ function renderStepDetail(entry) {
   updateSelectedStepStatus(entry);
   const step = entry.step || {};
   const output = entry.output || {};
-  const proxy = output.execution_proxy || {};
-  const observer = output.observer || {};
+  const blocks = outputBlocksFrom(output);
+  const proxy = findBlockJson(blocks, "meta", "执行代理");
+  const observer = findBlockJson(blocks, "observer");
+  const review = findBlockJson(blocks, "review");
   const commandLabel = step.skill_script || step.command || output.command || primaryOutputObject(output).command || "";
   container.className = "step-detail";
   container.innerHTML = `
@@ -1121,7 +995,7 @@ function renderStepDetail(entry) {
         ]) || '<p class="muted">本步骤没有返回 observer 信息。</p>'}
       </div>
     </section>
-    ${renderJsonDetails("策略审查", output.review || step.review || null)}
+    ${renderJsonDetails("策略审查", review || step.review || null)}
     ${renderJsonDetails("原始调试数据", { step, output }, false)}
   `;
 }
@@ -1271,14 +1145,18 @@ function renderConfigRuntimeSummary(config) {
   const container = $("configRuntimeSummary");
   if (!container) return;
   const web = config.web || {};
+  const apiKeySource = config.api_key_source || (config.api_key_configured ? "configured" : "missing");
   const rows = [
     ["model", config.model || "--", config.provider || "provider"],
-    ["api_key", config.api_key_configured ? "configured" : "missing", "只显示状态"],
+    ["api_key", config.api_key_configured ? "configured" : "missing", `source ${apiKeySource}`],
     ["audit", config.audit_mode || "--", `limit ${config.audit_text_limit ?? "--"}`],
     ["observer", config.observer?.enabled || "--", config.observer?.privilege || "privilege"],
     ["web", `${web.host || "--"}:${web.port || "--"}`, web.enabled === false ? "disabled" : "enabled"],
     ["token", web.token_configured ? "configured" : "runtime only", "不回显明文"],
   ];
+  if (config.api_key_migration_recommended) {
+    rows.splice(2, 0, ["api_key_migration", "recommended", "迁移到环境变量或 secret 文件"]);
+  }
   container.innerHTML = rows.map(([label, value, hint]) => `
     <div class="metric">
       <div class="label">${escapeHtml(label)}</div>
@@ -1658,7 +1536,7 @@ function handleCompletedWork(completed, input) {
   if (completed.status === "suspended") return;
   state.activeWorkJobId = "";
   const result = completed.result || {};
-  state.lastExecution = result;
+  state.lastProtocolResult = result;
   state.lastThinkingSummary = result.response?.thinking_summary || state.lastThinkingSummary || "";
   renderThinkingSummary();
   updateWorkActionLabel();
@@ -1669,9 +1547,9 @@ function handleCompletedWork(completed, input) {
     closeApprovalDrawer();
     updateWorkActionLabel();
   }
-  if (result.status !== "approval_required" && (result.execution || result.result || result.status === "executed" || result.status === "failed" || result.status === "cancelled")) {
-    renderTerminalReturns(result.status || "work_return", result);
-    printOutput("terminalOutput", renderExecutionText(result.status || "work_return", result));
+  if (result.status !== "approval_required" && (Array.isArray(result.timeline) || Array.isArray(result.output_blocks) || result.status === "executed" || result.status === "failed" || result.status === "cancelled")) {
+    renderTimelineReturns(result.status || "work_return", result);
+    printOutput("terminalOutput", renderProtocolText(result.status || "work_return", result));
   }
   if (result.status === "approval_required") {
     openApprovalDrawer(result, input);
@@ -1691,7 +1569,7 @@ async function cancelWork() {
   closeApprovalDrawer();
   updateWorkActionLabel();
   setStatus("workJobStatus", data.status, data.ok ? "high" : "medium");
-  renderTerminalReturns("cancelled", data.job || data);
+  renderTimelineReturns("cancelled", data.job || data);
 }
 
 function suspendWork() {
@@ -1722,7 +1600,7 @@ async function runScript() {
   const completed = await pollJob(job.job_id, "scriptJobStatus", "scriptOutput");
   state.activeScriptJobId = "";
   $("scriptCancelBtn").disabled = true;
-  printOutput("scriptOutput", renderExecutionText("Skill 输出", completed.result || completed));
+  printOutput("scriptOutput", completed.result || completed);
 }
 
 async function runTerminal() {
@@ -1737,12 +1615,12 @@ async function runTerminal() {
   if (review.status === "approval_required") {
     setStatus("terminalJobStatus", "approval_required", "medium");
     printOutput("terminalOutput", review);
-    openTerminalApprovalDrawer(command, review.review || review);
+    openTerminalApprovalDrawer(command, review.approval_card || review.review || review);
     return;
   }
   const job = await createJob("terminal", "run", { command, approve: false });
   const completed = await pollJob(job.job_id, "terminalJobStatus", "terminalOutput");
-  renderSharedExecution("终端输出", completed.result || completed, "terminalOutput");
+  renderSharedProtocolExecution("终端输出", completed.result || completed, "terminalOutput");
 }
 
 async function cancelScript() {
@@ -1933,40 +1811,23 @@ function filteredAuditEvents() {
 }
 
 function auditEventMatchesCategory(event, category) {
-  const text = `${auditEventName(event)} ${pretty(event)}`.toLowerCase();
-  if (category === "observer") return text.includes("observer") || text.includes("auditd");
-  if (category === "policy") return text.includes("policy") || text.includes("review") || text.includes("risk");
-  if (category === "execution") return text.includes("execution") || text.includes("command") || text.includes("terminal") || text.includes("script");
-  if (category === "decision") return text.includes("decision") || text.includes("approve") || text.includes("reject") || text.includes("skip") || text.includes("terminate");
-  return true;
+  return auditProtocol.auditEventMatchesCategory(event, category, pretty);
 }
 
 function auditEventName(event) {
-  return event.event || event.type || event.name || event.status || event.kind || "event";
+  return auditProtocol.auditEventName(event);
 }
 
 function auditEventTime(event) {
-  return event.timestamp || event.time || event.started_at || event.created_at || "";
+  return auditProtocol.auditEventTime(event);
 }
 
 function compactAuditTime(value) {
-  const text = String(value || "");
-  if (!text) return "--";
-  return text.includes("T") ? text.split("T").pop().replace(/Z$/, "") : text;
+  return auditProtocol.compactAuditTime(value);
 }
 
 function auditEventSummary(event) {
-  const payload = event.payload || event.data || event;
-  const rows = [
-    payload.status ? `status=${payload.status}` : "",
-    payload.mode ? `mode=${payload.mode}` : "",
-    payload.command ? `command=${payload.command}` : "",
-    payload.skill_script ? `skill=${payload.skill_script}` : "",
-    payload.risk_level ? `risk=${payload.risk_level}` : "",
-    payload.decision ? `decision=${payload.decision}` : "",
-    payload.error ? `error=${payload.error}` : "",
-  ].filter(Boolean);
-  return rows.join(" · ") || compactText(renderUserOutputText(payload), 180) || "无摘要字段，完整内容见右侧报告。";
+  return auditProtocol.auditEventSummary(event, pretty) || "无摘要字段，完整内容见右侧报告。";
 }
 
 function renderAuditObserverSummary() {

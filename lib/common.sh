@@ -121,25 +121,58 @@ linux_agent_audit_text_limit() {
     printf '%s\n' "${limit}"
 }
 
+linux_agent_redaction_rules_path() {
+    printf '%s/policies/redaction-rules.json\n' "${LINUX_AGENT_ROOT}"
+}
+
+linux_agent_redaction_rules_default_config() {
+    cat <<'JSON'
+{
+  "rules": [
+    {"id":"private_key","pattern":"-----BEGIN [^-]+ PRIVATE KEY-----[\\s\\S]*?-----END [^-]+ PRIVATE KEY-----","replacement":"[REDACTED_PRIVATE_KEY]"},
+    {"id":"bearer_token","pattern":"(?i)Bearer[[:space:]]+[A-Za-z0-9._~+/=:-]+","replacement":"Bearer [REDACTED]"},
+    {"id":"authorization_header","pattern":"(?i)(authorization|cookie)[[:space:]]*:[[:space:]]*[^\\n\\r;]+","replacement":"[REDACTED_SECRET]"},
+    {"id":"quoted_secret_double","pattern":"(?i)(api[_-]?key|token|password|passwd|secret|credential|private[_-]?key)[[:space:]]*[:=][[:space:]]*\"[^\"\\n\\r]*\"","replacement":"[REDACTED_SECRET]"},
+    {"id":"quoted_secret_single","pattern":"(?i)(api[_-]?key|token|password|passwd|secret|credential|private[_-]?key)[[:space:]]*[:=][[:space:]]*'[^'\\n\\r]*'","replacement":"[REDACTED_SECRET]"},
+    {"id":"unquoted_secret","pattern":"(?i)(api[_-]?key|token|password|passwd|secret|credential|private[_-]?key)[[:space:]]*[:=][[:space:]]*[^\\n\\r;,}]+","replacement":"[REDACTED_SECRET]"},
+    {"id":"known_token_prefixes","pattern":"(?i)((sk|tp)[_-][A-Za-z0-9_./+=:-]{12,}|(ghp|github_pat|xox[baprs]|akia)[A-Za-z0-9_./+=:-]{12,})","replacement":"[REDACTED_TOKEN]"},
+    {"id":"jwt","pattern":"eyJ[A-Za-z0-9_-]{20,}\\.[A-Za-z0-9_-]{20,}\\.[A-Za-z0-9_-]+","replacement":"[REDACTED_JWT]"},
+    {"id":"long_hex","pattern":"\\b[0-9a-fA-F]{32,}\\b","replacement":"[REDACTED_HEX]"},
+    {"id":"private_ip_10","pattern":"\\b10\\.\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}\\b","replacement":"[REDACTED_IP]"},
+    {"id":"private_ip_172","pattern":"\\b172\\.(1[6-9]|2\\d|3[01])\\.\\d{1,3}\\.\\d{1,3}\\b","replacement":"[REDACTED_IP]"},
+    {"id":"private_ip_192","pattern":"\\b192\\.168\\.\\d{1,3}\\.\\d{1,3}\\b","replacement":"[REDACTED_IP]"}
+  ],
+  "sensitive_key_pattern": "(?i)(api[_-]?key|token|password|passwd|secret|authorization|cookie|credential|private[_-]?key)"
+}
+JSON
+}
+
+linux_agent_redaction_rules_config() {
+    local path
+    path="$(linux_agent_redaction_rules_path)"
+    if [[ -f "${path}" ]] && jq -e 'type == "object" and (.rules | type == "array")' "${path}" >/dev/null 2>&1; then
+        jq -c . "${path}"
+        return 0
+    fi
+    linux_agent_redaction_rules_default_config | jq -c .
+}
+
 linux_agent_sanitize_text() {
     local input="$1"
     local limit="${2:-$(linux_agent_audit_text_limit)}"
+    local redaction
     [[ "${limit}" =~ ^[0-9]+$ && "${limit}" -gt 0 ]] || limit=1000
+    redaction="$(linux_agent_redaction_rules_config)"
 
-    printf '%s' "${input}" | jq -R -r -s --argjson limit "${limit}" '
+    printf '%s' "${input}" | jq -R -r -s --argjson limit "${limit}" --argjson redaction "${redaction}" '
         def trim:
             if length > $limit then .[0:$limit] + "[TRUNCATED]" else . end;
         def redact_string:
-            gsub("-----BEGIN [^-]+ PRIVATE KEY-----[\\s\\S]*?-----END [^-]+ PRIVATE KEY-----"; "[REDACTED_PRIVATE_KEY]")
-            | gsub("(?i)Bearer[[:space:]]+[A-Za-z0-9._~+/=:-]+"; "Bearer [REDACTED]")
-            | gsub("(?i)(authorization|cookie)[[:space:]]*:[[:space:]]*[^\\n\\r;]+"; "[REDACTED_SECRET]")
-            | gsub("(?i)(api[_-]?key|token|password|passwd|secret|credential|private[_-]?key)[[:space:]]*[:=][[:space:]]*\"[^\"\\n\\r]*\"";
-                   "[REDACTED_SECRET]")
-            | gsub("(?i)(api[_-]?key|token|password|passwd|secret|credential|private[_-]?key)[[:space:]]*[:=][[:space:]]*'\''[^'\''\\n\\r]*'\''";
-                   "[REDACTED_SECRET]")
-            | gsub("(?i)(api[_-]?key|token|password|passwd|secret|credential|private[_-]?key)[[:space:]]*[:=][[:space:]]*[^\\n\\r;,}]+";
-                   "[REDACTED_SECRET]")
-            | gsub("(?i)((sk|tp)[_-][A-Za-z0-9_./+=:-]{12,}|(ghp|github_pat|xox[baprs]|akia)[A-Za-z0-9_./+=:-]{12,})"; "[REDACTED_TOKEN]");
+            reduce ($redaction.rules // [])[] as $rule
+                (.;
+                 if (($rule.pattern // "") != "") then
+                    gsub($rule.pattern; ($rule.replacement // "[REDACTED]"))
+                 else . end);
         redact_string | trim
     '
 }
@@ -147,25 +180,22 @@ linux_agent_sanitize_text() {
 linux_agent_sanitize_json() {
     local input="$1"
     local limit="${2:-$(linux_agent_audit_text_limit)}"
+    local redaction
     [[ "${limit}" =~ ^[0-9]+$ && "${limit}" -gt 0 ]] || limit=1000
+    redaction="$(linux_agent_redaction_rules_config)"
 
     if printf '%s' "${input}" | jq -e . >/dev/null 2>&1; then
-        jq -c --argjson limit "${limit}" '
+        jq -c --argjson limit "${limit}" --argjson redaction "${redaction}" '
             def trim:
                 if length > $limit then .[0:$limit] + "[TRUNCATED]" else . end;
             def sensitive_key:
-                test("(?i)(api[_-]?key|token|password|passwd|secret|authorization|cookie|credential|private[_-]?key)");
+                test($redaction.sensitive_key_pattern // "(?i)(api[_-]?key|token|password|passwd|secret|authorization|cookie|credential|private[_-]?key)");
             def redact_string:
-                gsub("-----BEGIN [^-]+ PRIVATE KEY-----[\\s\\S]*?-----END [^-]+ PRIVATE KEY-----"; "[REDACTED_PRIVATE_KEY]")
-                | gsub("(?i)Bearer[[:space:]]+[A-Za-z0-9._~+/=:-]+"; "Bearer [REDACTED]")
-                | gsub("(?i)(authorization|cookie)[[:space:]]*:[[:space:]]*[^\\n\\r;]+"; "[REDACTED_SECRET]")
-                | gsub("(?i)(api[_-]?key|token|password|passwd|secret|credential|private[_-]?key)[[:space:]]*[:=][[:space:]]*\"[^\"\\n\\r]*\"";
-                       "[REDACTED_SECRET]")
-                | gsub("(?i)(api[_-]?key|token|password|passwd|secret|credential|private[_-]?key)[[:space:]]*[:=][[:space:]]*'\''[^'\''\\n\\r]*'\''";
-                       "[REDACTED_SECRET]")
-                | gsub("(?i)(api[_-]?key|token|password|passwd|secret|credential|private[_-]?key)[[:space:]]*[:=][[:space:]]*[^\\n\\r;,}]+";
-                       "[REDACTED_SECRET]")
-                | gsub("(?i)((sk|tp)[_-][A-Za-z0-9_./+=:-]{12,}|(ghp|github_pat|xox[baprs]|akia)[A-Za-z0-9_./+=:-]{12,})"; "[REDACTED_TOKEN]");
+                reduce ($redaction.rules // [])[] as $rule
+                    (.;
+                     if (($rule.pattern // "") != "") then
+                        gsub($rule.pattern; ($rule.replacement // "[REDACTED]"))
+                     else . end);
             def sanitize:
                 if type == "object" then
                     with_entries(

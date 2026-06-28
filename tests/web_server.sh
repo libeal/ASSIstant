@@ -33,9 +33,12 @@ project="${tmp_root}/project-web"
 copy_project "${project}"
 port="$((19000 + RANDOM % 1000))"
 token="test-web-token-12345"
+printf 'test-web-initial-key\n' > "${project}/config/test-api-key.secret"
 tmp_config="$(mktemp)"
 jq --arg token "${token}" --argjson port "${port}" \
-    '.web = {enabled:true, host:"127.0.0.1", port:$port, token:$token, job_retention_hours:1}' \
+    '.web = {enabled:true, host:"127.0.0.1", port:$port, token:$token, job_retention_hours:1}
+    | .api_key_file = "config/test-api-key.secret"
+    | del(.api_key)' \
     "${project}/config/config.json" > "${tmp_config}"
 mv "${tmp_config}" "${project}/config/config.json"
 
@@ -65,7 +68,7 @@ health="$(curl --noproxy '*' -sS -H "Authorization: Bearer ${token}" "${base_url
 jq -e '.ok == true and .root != "" and .web_server.run_id != "" and .web_server.started_at != ""' <<<"${health}" >/dev/null
 
 config_state="$(curl --noproxy '*' -sS -H "Authorization: Bearer ${token}" "${base_url}/api/config")"
-jq -e '.ok == true and (.config.agent_loop.thinking_trace_enabled | type == "boolean") and .config.api_key_configured == true and .config.web.token_configured == true' <<<"${config_state}" >/dev/null
+jq -e '.ok == true and (.config.agent_loop.thinking_trace_enabled | type == "boolean") and .config.api_key_configured == true and .config.api_key_source == "file" and .config.web.token_configured == true and (.config | has("api_key") | not)' <<<"${config_state}" >/dev/null
 
 config_update_payload="$(jq -cn '{key:"agent_loop.thinking_trace_enabled", value:true}')"
 config_update="$(curl --noproxy '*' -sS \
@@ -82,12 +85,14 @@ api_key_update="$(curl --noproxy '*' -sS \
     -H "Content-Type: application/json" \
     -d "${api_key_payload}" \
     "${base_url}/api/config/update")"
-jq -e '.ok == true and .status == "updated" and .updated.api_key == "configured" and .config.api_key_configured == true and (.config | has("api_key") | not)' <<<"${api_key_update}" >/dev/null
+jq -e '.ok == true and .status == "updated" and .updated.api_key == "configured" and .config.api_key_configured == true and .config.api_key_source == "file" and (.config | has("api_key") | not)' <<<"${api_key_update}" >/dev/null
 if grep -q "${api_key_value}" <<<"${api_key_update}"; then
     printf 'api_key update response leaked the secret value\n' >&2
     exit 1
 fi
-jq -e --arg value "${api_key_value}" '.api_key == $value' "${project}/config/config.json" >/dev/null
+jq -e '(.api_key_file | type == "string") and (.api_key | not)' "${project}/config/config.json" >/dev/null
+secret_path="$(jq -r '.api_key_file' "${project}/config/config.json")"
+grep -qx "${api_key_value}" "${project}/${secret_path}"
 
 audit_limit_payload="$(jq -cn '{key:"audit_text_limit", value:1234}')"
 audit_limit_update="$(curl --noproxy '*' -sS \
@@ -170,7 +175,9 @@ for _ in $(seq 1 80); do
 done
 
 [[ "${job_status}" == "succeeded" ]]
-jq -e '.result.result.stdout_preview == "web-job-ok"' <<<"${job_result}" >/dev/null
+jq -e '.result_status == "executed" and .result_ok == true
+    and ([.result.output_blocks[]? | select(.kind == "stdout") | .text] | first) == "web-job-ok"
+    and ([.result.output_blocks[]? | select(.kind == "meta" and .title == "Agent runtime") | .json.exit_code] | first) == 0' <<<"${job_result}" >/dev/null
 
 cancel_payload="$(jq -cn '{resource:"terminal", action:"run", payload:{command:"sleep 5"}}')"
 cancel_job="$(curl --noproxy '*' -sS \

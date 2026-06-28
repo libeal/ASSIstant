@@ -224,7 +224,7 @@ linux_agent_call_ai_with_context() {
 
     local api_url api_key model timeout_sec system_prompt payload response content
     api_url="$(linux_agent_config_get '.api_url')"
-    api_key="$(linux_agent_config_get '.api_key')"
+    api_key="$(linux_agent_config_api_key)"
     model="$(linux_agent_config_get '.model')"
     timeout_sec="$(linux_agent_config_get_default '.request_timeout_sec' '90')"
     system_prompt="$(linux_agent_build_system_prompt | jq -r '.')"

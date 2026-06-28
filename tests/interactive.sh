@@ -45,8 +45,7 @@ grep -q 'count: 2' <<<"${terminal_json_output}"
 ! grep -q '"tool"' <<<"${terminal_json_output}"
 
 terminal_machine_json="$(LINUX_AGENT_OUTPUT_JSON=1 bash "${ROOT_DIR}/bin/agent" terminal "printf terminal-json-mode" 2>/dev/null)"
-grep -q '"status": "executed"' <<<"${terminal_machine_json}"
-grep -q '"stdout_preview": "terminal-json-mode"' <<<"${terminal_machine_json}"
+jq -e '.status == "executed" and ([.output_blocks[]? | select(.kind == "stdout") | .text] | first) == "terminal-json-mode"' <<<"${terminal_machine_json}" >/dev/null
 
 tmp_root="$(mktemp -d)"
 cleanup() {

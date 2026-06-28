@@ -49,7 +49,12 @@ linux_agent_execution_privilege_from_review() {
 
     privileged_finding="$(jq -r '
         [(.findings // [])[] | select((.severity == "high" or .severity == "critical") and
-            ((.code == "REGEX_WARN") or (.code == "PROTECTED_SERVICE") or (.code == "PROTECTED_PATH")))]
+            ((.code == "REGEX_WARN")
+             or (.code == "PROTECTED_SERVICE")
+             or (.code == "PROTECTED_PATH")
+             or (.category == "privilege")
+             or (.category == "protected_path")
+             or (.category == "protected_service")))]
         | length > 0
     ' <<<"${review_json}" 2>/dev/null || printf 'false')"
     if [[ "${privileged_finding}" == "true" ]]; then
@@ -452,13 +457,13 @@ linux_agent_print_terminal_stream() {
 
 linux_agent_print_terminal_result() {
     local result_json="$1"
-    local stdout_preview stderr_preview
+    local stdout_text stderr_text
 
     linux_agent_print_execution_result_summary "${result_json}" "终端执行结果"
-    stdout_preview="$(jq -r '.stdout_preview // empty' <<<"${result_json}")"
-    stderr_preview="$(jq -r '.stderr_preview // empty' <<<"${result_json}")"
-    linux_agent_print_terminal_stream "终端输出" "${stdout_preview}"
-    linux_agent_print_terminal_stream "终端错误" "${stderr_preview}"
+    stdout_text="$(jq -r '.stdout // empty' <<<"${result_json}")"
+    stderr_text="$(jq -r '.stderr // empty' <<<"${result_json}")"
+    linux_agent_print_terminal_stream "终端输出" "${stdout_text}"
+    linux_agent_print_terminal_stream "终端错误" "${stderr_text}"
 }
 
 linux_agent_terminal_review() {
@@ -482,6 +487,8 @@ linux_agent_compact_execution_result() {
             execution_user,
             sudo_probe,
             findings,
+            review,
+            approval_step,
             iterations,
             auto_executed_count,
             final_answer,

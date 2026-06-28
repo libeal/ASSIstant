@@ -14,8 +14,9 @@ usage() {
   bash test_config.sh --live   本地校验通过后，发送一次最小 API 请求
 
 说明:
-  - 默认不会访问网络，也不会打印 api_key。
-  - --live 会调用 config.json 中的 api_url/model/api_key。
+  - 默认不会访问网络，也不会打印 API key。
+  - API key 读取顺序为 LINUX_AGENT_API_KEY、api_key_file、旧版 config.api_key。
+  - --live 会调用 config.json 中的 api_url/model 和解析后的 API key。
 EOF
 }
 
@@ -44,6 +45,77 @@ json_get() {
     jq -r "${query} | if . == null then empty else . end" "${CONFIG_FILE}"
 }
 
+config_path_value() {
+    local configured="$1"
+    if [[ -z "${configured}" ]]; then
+        return 1
+    fi
+    if [[ "${configured}" == /* ]]; then
+        printf '%s\n' "${configured}"
+    else
+        printf '%s/%s\n' "${ROOT_DIR}" "${configured}"
+    fi
+}
+
+api_key_placeholder() {
+    local value="$1"
+    [[ -z "${value}" || "${value}" == "please-set-your-api-key" ]]
+}
+
+api_key_value() {
+    local env_value file_config file_path file_value legacy_value
+    env_value="${LINUX_AGENT_API_KEY:-}"
+    if ! api_key_placeholder "${env_value}"; then
+        printf '%s\n' "${env_value}"
+        return 0
+    fi
+
+    file_config="$(json_get '.api_key_file')"
+    if [[ -n "${file_config}" ]]; then
+        file_path="$(config_path_value "${file_config}")"
+        if [[ -r "${file_path}" ]]; then
+            IFS= read -r file_value < "${file_path}" || file_value=""
+            if ! api_key_placeholder "${file_value}"; then
+                printf '%s\n' "${file_value}"
+                return 0
+            fi
+        fi
+    fi
+
+    legacy_value="$(json_get '.api_key')"
+    if ! api_key_placeholder "${legacy_value}"; then
+        printf '%s\n' "${legacy_value}"
+        return 0
+    fi
+    return 0
+}
+
+api_key_source() {
+    local env_value file_config file_path file_value legacy_value
+    env_value="${LINUX_AGENT_API_KEY:-}"
+    if ! api_key_placeholder "${env_value}"; then
+        printf 'env\n'
+        return 0
+    fi
+    file_config="$(json_get '.api_key_file')"
+    if [[ -n "${file_config}" ]]; then
+        file_path="$(config_path_value "${file_config}")"
+        if [[ -r "${file_path}" ]]; then
+            IFS= read -r file_value < "${file_path}" || file_value=""
+            if ! api_key_placeholder "${file_value}"; then
+                printf 'file\n'
+                return 0
+            fi
+        fi
+    fi
+    legacy_value="$(json_get '.api_key')"
+    if ! api_key_placeholder "${legacy_value}"; then
+        printf 'config_legacy\n'
+        return 0
+    fi
+    printf 'missing\n'
+}
+
 validate_non_empty() {
     local field="$1"
     local value="$2"
@@ -58,6 +130,7 @@ validate_config() {
     local failures=0
 
     require_command jq || failures=$((failures + 1))
+    require_command python3 || failures=$((failures + 1))
 
     if [[ ! -f "${CONFIG_FILE}" ]]; then
         print_error "未找到 ${CONFIG_FILE}"
@@ -74,11 +147,12 @@ validate_config() {
     fi
     print_ok "config/config.json JSON 格式合法"
 
-    local api_url api_key model timeout context_turns audit_mode audit_text_limit remote_policy skills_dir
+    local api_url api_key api_key_src model timeout context_turns audit_mode audit_text_limit remote_policy skills_dir
     local web_enabled web_host web_port web_token web_retention
     local loop_enabled auto_low auto_shell observation_limit thinking_trace checkpoint_turns
     api_url="$(json_get '.api_url')"
-    api_key="$(json_get '.api_key')"
+    api_key="$(api_key_value)"
+    api_key_src="$(api_key_source)"
     model="$(json_get '.model')"
     timeout="$(json_get '.request_timeout_sec')"
     context_turns="$(json_get '.context_turns')"
@@ -102,13 +176,16 @@ validate_config() {
     validate_non_empty "api_key" "${api_key}" || failures=$((failures + 1))
     validate_non_empty "model" "${model}" || failures=$((failures + 1))
 
-    if [[ "${api_key}" == "please-set-your-api-key" ]]; then
-        print_error "api_key 仍是示例占位值"
+    if [[ "${api_key_src}" == "missing" ]]; then
+        print_error "API key 未配置；请设置 LINUX_AGENT_API_KEY 或 config.api_key_file"
         failures=$((failures + 1))
     elif [[ ${#api_key} -lt 8 ]]; then
         print_warn "api_key 长度较短，请确认是否正确"
     else
-        print_ok "api_key 看起来已替换为真实值（未打印密钥）"
+        print_ok "api_key 已通过 ${api_key_src} 配置（未打印密钥）"
+        if [[ "${api_key_src}" == "config_legacy" ]]; then
+            print_warn "检测到旧版 config.api_key，建议迁移到 LINUX_AGENT_API_KEY 或 api_key_file"
+        fi
     fi
 
     if [[ ! "${api_url}" =~ ^https?:// ]]; then
@@ -281,7 +358,7 @@ live_check() {
 
     local api_url api_key model timeout payload response_file body_file http_code
     api_url="$(json_get '.api_url')"
-    api_key="$(json_get '.api_key')"
+    api_key="$(api_key_value)"
     model="$(json_get '.model')"
     timeout="$(json_get '.request_timeout_sec')"
     [[ -z "${timeout}" ]] && timeout=90
