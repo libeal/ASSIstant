@@ -24,6 +24,7 @@ export function createInitialState() {
     workSuspended: false,
     auditSessions: [],
     auditEvents: [],
+    auditWebTimeline: null,
     currentAuditSession: "",
     configSnapshot: null,
     configOriginal: {},

@@ -148,24 +148,127 @@ linux_agent_auto_execute_shell_low_risk_enabled() {
     linux_agent_config_bool_default '.agent_loop.auto_execute_shell_low_risk' 'false'
 }
 
+linux_agent_config_bool_with_legacy_default() {
+    local key="$1"
+    local legacy_key="$2"
+    local default_value="$3"
+    local value
+
+    value="$(jq -r "${key} // empty" <<<"${LINUX_AGENT_CONFIG_JSON:-{}}" 2>/dev/null || true)"
+    if [[ -n "${value}" ]]; then
+        case "${value,,}" in
+            true|1|yes|on) printf 'true\n' ;;
+            *) printf 'false\n' ;;
+        esac
+        return 0
+    fi
+
+    if [[ -n "${legacy_key}" ]]; then
+        linux_agent_config_bool_default "${legacy_key}" "${default_value}"
+    else
+        linux_agent_config_bool_default "${key}" "${default_value}"
+    fi
+}
+
+linux_agent_auto_approval_enabled() {
+    local capability="$1"
+    case "${capability}" in
+        skill_readonly)
+            linux_agent_config_bool_with_legacy_default '.approvals.auto.skill_readonly' '.agent_loop.auto_execute_low_risk' 'true'
+            ;;
+        shell_readonly)
+            linux_agent_config_bool_with_legacy_default '.approvals.auto.shell_readonly' '.agent_loop.auto_execute_shell_low_risk' 'false'
+            ;;
+        file_match)
+            linux_agent_config_bool_with_legacy_default '.approvals.auto.file_match' '' 'true'
+            ;;
+        file_patch)
+            linux_agent_config_bool_with_legacy_default '.approvals.auto.file_patch' '' 'false'
+            ;;
+        file_download)
+            linux_agent_config_bool_with_legacy_default '.approvals.auto.file_download' '' 'false'
+            ;;
+        local_analyze)
+            linux_agent_config_bool_with_legacy_default '.approvals.auto.local_analyze' '' 'true'
+            ;;
+        remote_script)
+            linux_agent_config_bool_with_legacy_default '.approvals.auto.remote_script' '' 'false'
+            ;;
+        *)
+            printf 'false\n'
+            ;;
+    esac
+}
+
+linux_agent_auto_approval_config_json() {
+    jq -cn \
+        --argjson skill_readonly "$(linux_agent_auto_approval_enabled skill_readonly)" \
+        --argjson shell_readonly "$(linux_agent_auto_approval_enabled shell_readonly)" \
+        --argjson file_match "$(linux_agent_auto_approval_enabled file_match)" \
+        --argjson file_patch "$(linux_agent_auto_approval_enabled file_patch)" \
+        --argjson file_download "$(linux_agent_auto_approval_enabled file_download)" \
+        --argjson local_analyze "$(linux_agent_auto_approval_enabled local_analyze)" \
+        --argjson remote_script "$(linux_agent_auto_approval_enabled remote_script)" \
+        '{
+            skill_readonly:$skill_readonly,
+            shell_readonly:$shell_readonly,
+            file_match:$file_match,
+            file_patch:$file_patch,
+            file_download:$file_download,
+            local_analyze:$local_analyze,
+            remote_script:$remote_script
+        }'
+}
+
+linux_agent_step_auto_approval_capability() {
+    local step_json="$1"
+    local executor_type ref
+    executor_type="$(jq -r '.executor_type' <<<"${step_json}")"
+    case "${executor_type}" in
+        skill_script)
+            ref="$(jq -r '.skill_script // empty' <<<"${step_json}")"
+            case "${ref}" in
+                controlled-tools/file-match) printf 'file_match\n' ;;
+                controlled-tools/file-patch) printf 'file_patch\n' ;;
+                controlled-tools/file-download) printf 'file_download\n' ;;
+                controlled-tools/local-analyze) printf 'local_analyze\n' ;;
+                *) printf 'skill_readonly\n' ;;
+            esac
+            ;;
+        shell)
+            printf 'shell_readonly\n'
+            ;;
+        remote_script)
+            printf 'remote_script\n'
+            ;;
+        *)
+            printf 'unknown\n'
+            ;;
+    esac
+}
+
 linux_agent_should_auto_execute_step() {
     local step_json="$1"
     local review_json="$2"
-    local executor_type ref
+    local executor_type ref capability
 
-    [[ "$(linux_agent_auto_execute_low_risk_enabled)" == "true" ]] || return 1
     [[ "$(jq -r '.approved // false' <<<"${review_json}")" == "true" ]] || return 1
     [[ "$(jq -r '.approval_required == false' <<<"${review_json}")" == "true" ]] || return 1
     [[ "$(jq -r '.risk_level // "unknown"' <<<"${review_json}")" == "low" ]] || return 1
 
     executor_type="$(jq -r '.executor_type' <<<"${step_json}")"
+    capability="$(linux_agent_step_auto_approval_capability "${step_json}")"
+    [[ "$(linux_agent_auto_approval_enabled "${capability}")" == "true" ]] || return 1
     case "${executor_type}" in
         skill_script)
             ref="$(jq -r '.skill_script // empty' <<<"${step_json}")"
             [[ -n "${ref}" ]] && linux_agent_skill_is_registered "${ref}"
             ;;
         shell)
-            [[ "$(linux_agent_auto_execute_shell_low_risk_enabled)" == "true" ]]
+            return 0
+            ;;
+        remote_script)
+            return 0
             ;;
         *)
             return 1

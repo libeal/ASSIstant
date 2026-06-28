@@ -13,14 +13,27 @@ export const CONFIG_GROUPS = [
   },
   {
     title: "工作流",
-    note: "控制自然语言 work、低风险自动执行和模型思考摘要。",
+    note: "控制自然语言 work、兼容自动执行开关和模型思考摘要。新自动批准规则优先使用下方能力级配置。",
     fields: [
       { key: "agent_loop.enabled_for_work", label: "work_agent_loop", type: "boolean", comment: "执行后带 observation 继续反思，适合多步排障。" },
-      { key: "agent_loop.auto_execute_low_risk", label: "auto_execute_low_risk_skill", type: "boolean", comment: "低风险且策略干净的 skill 步骤可自动执行。" },
-      { key: "agent_loop.auto_execute_shell_low_risk", label: "auto_execute_low_risk_shell", type: "boolean", comment: "shell 命令即使低风险也建议保持谨慎。" },
+      { key: "agent_loop.auto_execute_low_risk", label: "legacy_auto_skill", type: "boolean", comment: "兼容旧配置；当 approvals.auto.skill_readonly 未设置时作为默认值。" },
+      { key: "agent_loop.auto_execute_shell_low_risk", label: "legacy_auto_shell", type: "boolean", comment: "兼容旧配置；当 approvals.auto.shell_readonly 未设置时作为默认值。" },
       { key: "agent_loop.observation_text_limit", label: "observation_text_limit", type: "number", min: 200, comment: "回传给模型的命令输出摘要上限。" },
       { key: "agent_loop.checkpoint_turns", label: "checkpoint_turns", type: "number", min: 0, comment: "每隔多少轮强制 checkpoint；0 表示使用 context_turns。" },
       { key: "agent_loop.thinking_trace_enabled", label: "thinking_summary", type: "boolean", comment: "开启后会话摘要栏展示模型返回的简短 thinking_summary。" },
+    ],
+  },
+  {
+    title: "自动批准能力",
+    note: "按执行能力拆分低风险自动批准；所有 critical/high/medium 或命中审查项的步骤仍需审批。",
+    fields: [
+      { key: "approvals.auto.skill_readonly", label: "skill_readonly", type: "boolean", comment: "低风险且策略干净的普通只读 skill 可自动执行。" },
+      { key: "approvals.auto.shell_readonly", label: "shell_readonly", type: "boolean", comment: "低风险 shell 默认关闭；自由文件修改会被策略阻断。" },
+      { key: "approvals.auto.file_match", label: "file_match", type: "boolean", comment: "controlled-tools/file-match 只读匹配可自动执行。" },
+      { key: "approvals.auto.file_patch", label: "file_patch", type: "boolean", comment: "controlled-tools/file-patch 默认关闭，即使低风险也要求人工确认。" },
+      { key: "approvals.auto.file_download", label: "file_download", type: "boolean", comment: "controlled-tools/file-download 默认关闭，下载写入本地文件需确认。" },
+      { key: "approvals.auto.local_analyze", label: "local_analyze", type: "boolean", comment: "controlled-tools/local-analyze 只读分析可自动执行。" },
+      { key: "approvals.auto.remote_script", label: "remote_script", type: "boolean", comment: "远程脚本默认不能自动执行，下载审查后仍需审批。" },
     ],
   },
   {

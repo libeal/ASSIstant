@@ -4,6 +4,7 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SCRIPT_DIR="${ROOT_DIR}/skills/ops-basic/scripts"
+CONTROLLED_SCRIPT_DIR="${ROOT_DIR}/skills/controlled-tools/scripts"
 
 disk_result="$(bash "${SCRIPT_DIR}/disk-hotspots.sh" '{"path":"/var","top_n":3}')"
 resource_result="$(bash "${SCRIPT_DIR}/resource-inspect.sh" '{"top_n":3}')"
@@ -14,6 +15,23 @@ cleanup_plan_bad_number="$(bash "${SCRIPT_DIR}/log-cleanup-plan.sh" '{"root_path
 restart_plan_result="$(bash "${SCRIPT_DIR}/service-restart-plan.sh" '{"service":"sshd"}')"
 log_search_reject="$(bash "${SCRIPT_DIR}/log-search.sh" "{\"path\":\"${ROOT_DIR}/README.md\",\"keyword\":\"Linux\",\"lines\":1}")"
 log_search_no_journal="$(bash "${SCRIPT_DIR}/log-search.sh" '{"path":"/var/log","keyword":"__unlikely_linux_agent_test_keyword__","lines":1,"include_journal":false}')"
+
+controlled_file="$(mktemp /tmp/linux-agent-controlled-file.XXXXXX)"
+printf 'alpha\nneedle\nomega\n' > "${controlled_file}"
+controlled_link="${controlled_file}.link"
+ln -s "${controlled_file}" "${controlled_link}"
+match_result="$(bash "${CONTROLLED_SCRIPT_DIR}/file-match.sh" "$(jq -cn --arg path "${controlled_file}" '{path:$path, find:"needle", context_lines:1}')")"
+patch_preview="$(bash "${CONTROLLED_SCRIPT_DIR}/file-patch.sh" "$(jq -cn --arg path "${controlled_file}" '{path:$path, find:"needle", replacement:"patched", expected_count:1, apply:false}')")"
+patch_result="$(bash "${CONTROLLED_SCRIPT_DIR}/file-patch.sh" "$(jq -cn --arg path "${controlled_file}" '{path:$path, find:"needle", replacement:"patched", expected_count:1, backup:true}')")"
+patched_content="$(cat "${controlled_file}")"
+patch_mismatch="$(bash "${CONTROLLED_SCRIPT_DIR}/file-patch.sh" "$(jq -cn --arg path "${controlled_file}" '{path:$path, find:"patched", replacement:"again", expected_count:2}')")"
+after_mismatch_content="$(cat "${controlled_file}")"
+analyze_result="$(bash "${CONTROLLED_SCRIPT_DIR}/local-analyze.sh" '{"text":"ok\nfailed to start\nwarning: slow"}')"
+match_symlink="$(bash "${CONTROLLED_SCRIPT_DIR}/file-match.sh" "$(jq -cn --arg path "${controlled_link}" '{path:$path, find:"patched"}')")"
+patch_symlink="$(bash "${CONTROLLED_SCRIPT_DIR}/file-patch.sh" "$(jq -cn --arg path "${controlled_link}" '{path:$path, find:"patched", replacement:"again", expected_count:1}')")"
+analyze_symlink="$(bash "${CONTROLLED_SCRIPT_DIR}/local-analyze.sh" "$(jq -cn --arg path "${controlled_link}" '{path:$path}')")"
+download_unsafe="$(bash "${CONTROLLED_SCRIPT_DIR}/file-download.sh" '{"url":"http://example.com/file","output_path":"/tmp/linux-agent-download-test"}')"
+rm -f "${controlled_file}" "${controlled_link}" "${controlled_file}".bak.*
 
 cleanup_file="$(mktemp /tmp/linux-agent-tools-cleanup.XXXXXX)"
 printf '0123456789' > "${cleanup_file}"
@@ -60,6 +78,18 @@ grep -q '仅允许检索 /var/log' <<<"${log_search_reject}"
 grep -q '"ok": false' <<<"$(jq . <<<"${log_search_symlink}")"
 grep -q '"include_journal": false' <<<"$(jq . <<<"${log_search_no_journal}")"
 grep -q '"journal_sample": ""' <<<"$(jq . <<<"${log_search_no_journal}")"
+grep -q '"tool": "controlled.file.match"' <<<"$(jq . <<<"${match_result}")"
+jq -e '.ok == true and .match_count == 1 and .matches[0].line == 2' <<<"${match_result}" >/dev/null
+jq -e '.ok == true and .status == "previewed" and (.diff | contains("patched"))' <<<"${patch_preview}" >/dev/null
+jq -e '.ok == true and .status == "patched" and .backup_path != null' <<<"${patch_result}" >/dev/null
+grep -q 'patched' <<<"${patched_content}"
+jq -e '.ok == false and .status == "count_mismatch"' <<<"${patch_mismatch}" >/dev/null
+[[ "${after_mismatch_content}" == "${patched_content}" ]]
+jq -e '.ok == true and .tool == "controlled.local.analyze" and (.keyword_samples | length) == 2' <<<"${analyze_result}" >/dev/null
+jq -e '.ok == false and .status == "unsupported_path"' <<<"${match_symlink}" >/dev/null
+jq -e '.ok == false and .status == "unsupported_path"' <<<"${patch_symlink}" >/dev/null
+jq -e '.ok == false and .status == "unsupported_path"' <<<"${analyze_symlink}" >/dev/null
+jq -e '.ok == false and .status == "unsafe_url"' <<<"${download_unsafe}" >/dev/null
 
 source "${ROOT_DIR}/lib/common.sh"
 source "${ROOT_DIR}/lib/config.sh"
@@ -75,9 +105,11 @@ grep -q '"ok": true' <<<"$(jq . <<<"${skills_json}")"
 resource_skill_result="$(linux_agent_run_skill_script ops-basic/resource-inspect '{"top_n":3}')"
 resource_skill_string_arg_result="$(linux_agent_run_skill_script ops-basic/resource-inspect "$(jq -cn --arg args '{"top_n":2}' '$args')")"
 process_skill_result="$(linux_agent_run_skill_script ops-basic/process-inspect '{"pattern":"systemd"}')"
+controlled_skill_result="$(linux_agent_run_skill_script controlled-tools/file-match "$(jq -cn --arg path "${ROOT_DIR}/README.md" '{path:$path, find:"Linux", max_matches:1}')")"
 grep -q '"tool": "system.resource.inspect"' <<<"$(jq . <<<"${resource_skill_result}")"
 grep -q '"tool": "system.resource.inspect"' <<<"$(jq . <<<"${resource_skill_string_arg_result}")"
 grep -q '"tool": "system.process.inspect"' <<<"$(jq . <<<"${process_skill_result}")"
+grep -q '"tool":"controlled.file.match"' <<<"${controlled_skill_result}"
 
 broken_skills_root="$(mktemp -d)"
 cp -a "${ROOT_DIR}/skills" "${broken_skills_root}/skills"

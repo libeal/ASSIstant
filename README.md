@@ -18,6 +18,7 @@ Linux 运维 Agent 是一个以 Bash CLI 为核心的本机运维助手。它把
 | Sense | `bash bin/agent sense <topic>` | 按主题采集环境信息，支持 `all`、`disk`、`resource`、`process`、`network`、`service`、`logs`、`privilege`、`minimal`。 |
 | Tools | `bash bin/agent tools list` | 输出 `skills/INDEX.md` 中登记的可执行 skill 索引。 |
 | Skills | `bash bin/agent skills validate` | 校验 skill 目录、`SKILL.md`、脚本和索引登记一致性。 |
+| Policy | `bash bin/agent policy validate [file]` | 校验 `policies/` 下策略 JSON、正则和审计边界。 |
 | Audit | `bash bin/agent audit <session-id>` | 读取历史 JSONL 审计会话并生成摘要报告。 |
 | API | `bash bin/agent api <resource> <action> [json]` | 给 Web 后端调用的机器可读 JSON 接口。 |
 
@@ -31,14 +32,15 @@ Web 视图包括：
 
 - Work 工作台：自然语言任务、terminal 命令、执行时间线、审批抽屉、环境主题刷新。
 - Skill 库：script 运行、script 审查、edit 生成、edit 审查、保存、skill 树、Markdown 预览、`skills validate`。
-- Policy：查看和编辑 `policies/` 下的 JSON 策略文件，写入前需要 sudo 校验。
-- Audit：查看 JSONL 审计 session、事件筛选、指标统计和报告导出。
+- Policy：查看、校验和编辑 `policies/` 下的 JSON 策略文件，保存前会先运行策略校验，写入前需要 sudo 校验。
+- Audit：查看 JSONL 审计 session、事件筛选、指标统计、报告导出，并可把审计事件恢复为 Web 工作台时间线。
 - Config：读取和保存白名单配置项，运行 Doctor，展示运行时配置快照。
 
 ### 内置 Skill
 
 - `ops-basic`: 常用只读巡检、日志搜索、清理计划、备份和安全日志截断。
 - `os-deep-inspect`: 更深入的系统快照、网络、文件描述符和 journal 检查。
+- `controlled-tools`: 受控文件匹配、字面量补丁、安全下载和本地文本分析；自由 shell 文件修改会被审查拒绝，应使用这些脚本。
 
 ## 快速开始
 
@@ -73,6 +75,7 @@ bash bin/agent terminal "printf hello"
 bash bin/agent sense disk
 bash bin/agent tools list
 bash bin/agent skills validate
+bash bin/agent policy validate
 bash bin/agent audit <session-id>
 ```
 
@@ -83,6 +86,7 @@ bash bin/agent api health
 bash bin/agent api tools list
 bash bin/agent api sense get '{"topic":"resource"}'
 bash bin/agent api script review '{"ref":"ops-basic/resource-inspect","arguments":{"top_n":1}}'
+bash bin/agent api policy validate '{"path":"risk-rules.json"}'
 bash bin/agent api terminal run '{"command":"printf api-ok"}'
 bash bin/agent api terminal run '{"command":"printf api-ok"}' | jq '.timeline, .approval_card, .output_blocks'
 ```
@@ -143,7 +147,8 @@ Linux 运维 Agent
 ├─ Skill 能力层 skills/
 │  ├─ INDEX.md               可执行 skill 白名单
 │  ├─ ops-basic/             基础巡检、日志、备份和安全清理 skill
-│  └─ os-deep-inspect/       深度系统、网络、FD 和 journal 检查 skill
+│  ├─ os-deep-inspect/       深度系统、网络、FD 和 journal 检查 skill
+│  └─ controlled-tools/      受控文件匹配、补丁、下载和本地文本分析 skill
 ├─ 配置层
 │  ├─ config/config.example.json 模板配置
 │  └─ config/config.json     本地实际配置，忽略提交
@@ -207,8 +212,9 @@ Linux 运维 Agent
    - 校验 executor 类型。
    - 校验 skill 是否登记。
    - 对 shell、skill、remote script 做策略审查。
-   - clean low-risk 的已登记 skill 可自动执行。
-   - 默认 shell、remote script、medium/high/critical 或命中策略告警的步骤需要人工确认。
+   - 低风险且策略干净的步骤按 `approvals.auto.*` 能力开关决定是否自动执行。
+   - 自由 shell 文件写入、重定向写入、`sed -i`、`cp`、`mv`、`rm`、`curl -o` 和 `wget -O` 会被阻断，应改用 `controlled-tools`。
+   - 默认 shell、remote script、文件补丁、文件下载、medium/high/critical 或命中策略告警的步骤需要人工确认。
 6. 每步通过 observer 封装执行，结果写入审计。
 7. 失败时生成修复建议，但不会自动执行修复计划。
 8. 如果计划要求继续反思，执行结果会整理成脱敏 observation，再请求模型判断下一步。
@@ -292,11 +298,18 @@ Web 版 edit 使用浏览器内联编辑器，但保存前仍调用同一套 `ed
 | `request_timeout_sec` | AI 请求超时时间。 |
 | `context_turns` | 会话历史窗口大小。 |
 | `agent_loop.enabled_for_work` | 是否启用 work 反思续写循环。 |
-| `agent_loop.auto_execute_low_risk` | 是否自动执行 clean low-risk skill 步骤。 |
-| `agent_loop.auto_execute_shell_low_risk` | 是否允许自动执行 clean low-risk shell 步骤，默认关闭。 |
+| `agent_loop.auto_execute_low_risk` | 旧版兼容开关；当 `approvals.auto.skill_readonly` 未设置时作为默认值。 |
+| `agent_loop.auto_execute_shell_low_risk` | 旧版兼容开关；当 `approvals.auto.shell_readonly` 未设置时作为默认值。 |
 | `agent_loop.observation_text_limit` | observation 文本摘要上限。 |
 | `agent_loop.thinking_trace_enabled` | 是否保存并展示简短 `thinking_summary`。 |
 | `agent_loop.checkpoint_turns` | 强制 checkpoint 轮次，`0` 表示使用默认窗口。 |
+| `approvals.auto.skill_readonly` | 是否自动执行低风险且策略干净的普通只读 skill。 |
+| `approvals.auto.shell_readonly` | 是否自动执行低风险且策略干净的 shell，默认关闭。 |
+| `approvals.auto.file_match` | 是否自动执行 `controlled-tools/file-match`。 |
+| `approvals.auto.file_patch` | 是否自动执行 `controlled-tools/file-patch`，默认关闭。 |
+| `approvals.auto.file_download` | 是否自动执行 `controlled-tools/file-download`，默认关闭。 |
+| `approvals.auto.local_analyze` | 是否自动执行 `controlled-tools/local-analyze`。 |
+| `approvals.auto.remote_script` | 是否自动执行远程脚本，默认关闭。 |
 | `audit_mode` | 审计写入模式。 |
 | `audit_text_limit` | 审计和输出预览文本截断长度。 |
 | `observer.enabled` | observer 开关，默认 `auto`。 |
@@ -328,9 +341,10 @@ Web 版 edit 使用浏览器内联编辑器，但保存前仍调用同一套 `ed
 - Skill 脚本必须同时登记在 `skills/INDEX.md` 和对应 `SKILL.md`。
 - Work 和 Script 都经过 `policies/risk-rules.json`。
 - Terminal 也会执行策略审查，高风险命令需要确认。
+- 自由 shell 文件修改默认阻断；文件匹配、补丁、下载和本地文本分析应通过 `controlled-tools` 登记脚本执行。
 - Remote script 只能 HTTPS 下载后审查，不允许流式管道执行。
 - Web `/api/` 全部需要 Bearer token。
-- Web 策略编辑只允许 `policies/` 下 JSON 文件，写入前做 sudo 校验。
+- Web 策略编辑只允许 `policies/` 下 JSON 文件，保存前做策略校验，写入前做 sudo 校验。
 - 审计文本和上下文会脱敏并截断。
 - 当前 session 的临时目录只在当前进程结束时清理。
 
@@ -477,6 +491,11 @@ done
 | `skills/os-deep-inspect/scripts/net-inspect.sh` | 通过 `ss` 或 `netstat` 查看监听端口、连接状态和可选进程信息。 |
 | `skills/os-deep-inspect/scripts/fd-inspect.sh` | 通过 `lsof` 或 `/proc/<pid>/fd` 检查打开文件、socket 和文件句柄占用。 |
 | `skills/os-deep-inspect/scripts/journal-inspect.sh` | 通过 `journalctl` 按 unit、priority、时间窗口和关键词读取日志样本。 |
+| `skills/controlled-tools/SKILL.md` | `controlled-tools` skill 说明和受控工具工作流。 |
+| `skills/controlled-tools/scripts/file-match.sh` | 只读字面量匹配目标文件，返回出现次数和上下文。 |
+| `skills/controlled-tools/scripts/file-patch.sh` | 在匹配次数符合预期时生成 diff、可备份并原子替换文件。 |
+| `skills/controlled-tools/scripts/file-download.sh` | 仅允许 HTTPS 公网下载到本机路径，限制大小并可校验 sha256。 |
+| `skills/controlled-tools/scripts/local-analyze.sh` | 对文本或本地文件做只读关键词和错误样本分析。 |
 
 ### `tests/`
 

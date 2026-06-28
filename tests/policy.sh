@@ -34,6 +34,18 @@ redirect_result="$(linux_agent_policy_review_text "shell" "printf bad > /etc/hos
 grep -q '"approved": false' <<<"$(jq . <<<"${redirect_result}")"
 grep -q 'REGEX_BLOCKED\|PROTECTED_PATH' <<<"${redirect_result}"
 
+free_redirect_result="$(linux_agent_policy_review_text "shell" "printf bad > /tmp/agent-free-write-test")"
+grep -q '"approved": false' <<<"$(jq . <<<"${free_redirect_result}")"
+grep -q 'AST_FILE_MUTATION_REQUIRES_SKILL' <<<"${free_redirect_result}"
+
+free_cp_result="$(linux_agent_policy_review_text "shell" "cp /tmp/source /tmp/dest")"
+grep -q '"approved": false' <<<"$(jq . <<<"${free_cp_result}")"
+grep -q 'AST_FILE_MUTATION_REQUIRES_SKILL' <<<"${free_cp_result}"
+
+free_rm_result="$(linux_agent_policy_review_text "shell" "rm /tmp/agent-free-write-test")"
+grep -q '"approved": false' <<<"$(jq . <<<"${free_rm_result}")"
+grep -q 'AST_FILE_MUTATION_REQUIRES_SKILL' <<<"${free_rm_result}"
+
 substitution_result="$(linux_agent_policy_review_text "shell" 'echo $(cat /etc/passwd)')"
 grep -q '"approval_required": true' <<<"$(jq . <<<"${substitution_result}")"
 grep -q 'AST_COMMAND_SUBSTITUTION' <<<"${substitution_result}"
@@ -59,5 +71,20 @@ remote_result="$(linux_agent_policy_review_step "${remote_step}" "printf ok" "re
 grep -q '"approved": true' <<<"$(jq . <<<"${remote_result}")"
 grep -q '"approval_required": true' <<<"$(jq . <<<"${remote_result}")"
 grep -q '"risk_level": "high"' <<<"$(jq . <<<"${remote_result}")"
+
+policy_validation="$(linux_agent_validate_policy_file "")"
+jq -e '.ok == true and .status == "valid" and (.files | length) >= 3' <<<"${policy_validation}" >/dev/null
+
+policy_cli_validation="$(bash "${ROOT_DIR}/bin/agent" policy validate risk-rules.json)"
+jq -e '.ok == true and .status == "valid" and .path == "risk-rules.json"' <<<"${policy_cli_validation}" >/dev/null
+
+policy_api_validation="$(bash "${ROOT_DIR}/bin/agent" api policy validate '{"path":"risk-rules.json"}')"
+jq -e '.ok == true and .status == "valid" and .validation.path == "risk-rules.json"' <<<"${policy_api_validation}" >/dev/null
+
+invalid_risk_validation="$(linux_agent_validate_policy_content "risk-rules.json" '{"blocked_patterns":["("],"warn_patterns":[],"remote_script_blocked_patterns":[],"protected_paths":[],"protected_services":[]}')"
+jq -e '.ok == false and ([.findings[]?.code] | index("POLICY_REGEX_INVALID"))' <<<"${invalid_risk_validation}" >/dev/null
+
+zero_width_redaction="$(linux_agent_validate_policy_content "redaction-rules.json" '{"rules":[{"id":"bad","pattern":".*","replacement":"x"}],"sensitive_key_pattern":"(?i)token"}')"
+jq -e '.ok == false and ([.findings[]?.code] | index("POLICY_REGEX_ZERO_WIDTH"))' <<<"${zero_width_redaction}" >/dev/null
 
 printf 'policy: ok\n'

@@ -106,6 +106,8 @@ def api_key_state(config):
 def config_public_state():
     config = read_config()
     agent_loop = config.get("agent_loop") if isinstance(config.get("agent_loop"), dict) else {}
+    approvals = config.get("approvals") if isinstance(config.get("approvals"), dict) else {}
+    auto_approvals = approvals.get("auto") if isinstance(approvals.get("auto"), dict) else {}
     observer = config.get("observer") if isinstance(config.get("observer"), dict) else {}
     execution = config.get("execution") if isinstance(config.get("execution"), dict) else {}
     web = config.get("web") if isinstance(config.get("web"), dict) else {}
@@ -130,6 +132,17 @@ def config_public_state():
                 "observation_text_limit": int(agent_loop.get("observation_text_limit", 4000) or 4000),
                 "thinking_trace_enabled": bool(agent_loop.get("thinking_trace_enabled", False)),
                 "checkpoint_turns": int(agent_loop.get("checkpoint_turns", 0) or 0),
+            },
+            "approvals": {
+                "auto": {
+                    "skill_readonly": bool(auto_approvals.get("skill_readonly", agent_loop.get("auto_execute_low_risk", True))),
+                    "shell_readonly": bool(auto_approvals.get("shell_readonly", agent_loop.get("auto_execute_shell_low_risk", False))),
+                    "file_match": bool(auto_approvals.get("file_match", True)),
+                    "file_patch": bool(auto_approvals.get("file_patch", False)),
+                    "file_download": bool(auto_approvals.get("file_download", False)),
+                    "local_analyze": bool(auto_approvals.get("local_analyze", True)),
+                    "remote_script": bool(auto_approvals.get("remote_script", False)),
+                }
             },
             "audit_mode": config.get("audit_mode", "safe_summary"),
             "audit_text_limit": config.get("audit_text_limit", 1000),
@@ -169,6 +182,13 @@ CONFIG_WRITABLE_FIELDS = {
     "agent_loop.observation_text_limit": {"type": "int", "min": 200, "max": 200000},
     "agent_loop.thinking_trace_enabled": {"type": "bool"},
     "agent_loop.checkpoint_turns": {"type": "int", "min": 0, "max": 100},
+    "approvals.auto.skill_readonly": {"type": "bool"},
+    "approvals.auto.shell_readonly": {"type": "bool"},
+    "approvals.auto.file_match": {"type": "bool"},
+    "approvals.auto.file_patch": {"type": "bool"},
+    "approvals.auto.file_download": {"type": "bool"},
+    "approvals.auto.local_analyze": {"type": "bool"},
+    "approvals.auto.remote_script": {"type": "bool"},
     "audit_mode": {"type": "enum", "values": {"safe_summary", "redacted_verbose"}},
     "audit_text_limit": {"type": "int", "min": 40, "max": 200000},
     "observer.enabled": {"type": "enum", "values": {"auto", "auditd", "disabled"}},
@@ -426,6 +446,14 @@ def sudo_check(password):
     }
 
 
+def validate_policy_content(relative_path, content):
+    try:
+        safe_policy_path(relative_path)
+    except ValueError as exc:
+        return {"ok": False, "status": "invalid_path", "error": str(exc)}
+    return run_agent_api("policy", "validate", {"path": relative_path, "content": content}, timeout=60)
+
+
 def write_policy_file(relative_path, content, password):
     target = safe_policy_path(relative_path)
     if not isinstance(content, str) or not content.strip():
@@ -435,11 +463,21 @@ def write_policy_file(relative_path, content, password):
     except json.JSONDecodeError as exc:
         return {"ok": False, "status": "invalid_json", "error": str(exc)}
 
+    normalized_content = json.dumps(parsed, ensure_ascii=False, indent=2) + "\n"
+    validation = validate_policy_content(relative_path, normalized_content)
+    if not validation.get("ok"):
+        return {
+            "ok": False,
+            "status": "validation_failed",
+            "error": "Policy validation failed.",
+            "validation": validation.get("validation", validation),
+        }
+
     target.parent.mkdir(parents=True, exist_ok=True)
     tmp_dir = ROOT / "tmp" / "web" / "policy-edits"
     tmp_dir.mkdir(parents=True, exist_ok=True)
     tmp_path = tmp_dir / f"{target.name}.{uuid.uuid4().hex}.tmp"
-    tmp_path.write_text(json.dumps(parsed, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    tmp_path.write_text(normalized_content, encoding="utf-8")
 
     if os.geteuid() == 0:
         tmp_path.replace(target)
@@ -711,6 +749,152 @@ def cancel_job(job_id):
     return {"ok": True, "status": "cancelled", "job": job}
 
 
+def compact_summary(value, limit=220):
+    text = " ".join(str(value or "").split())
+    if len(text) > limit:
+        return text[:limit] + "..."
+    return text
+
+
+def audit_stage(event):
+    if not isinstance(event, dict):
+        return "event"
+    return str(event.get("stage") or event.get("event") or event.get("type") or event.get("status") or "event")
+
+
+def audit_payload(event):
+    if isinstance(event, dict) and isinstance(event.get("payload"), dict):
+        return event["payload"]
+    return event if isinstance(event, dict) else {}
+
+
+def build_web_timeline_from_audit(session_id, events):
+    steps_by_id = {}
+    planned_steps = []
+    timeline = []
+    summary = ""
+    input_preview = ""
+    final_status = "restored"
+    step_statuses = {
+        "step_auto_approved",
+        "step_approval_required",
+        "step_blocked",
+        "step_rejected",
+        "step_running",
+        "step_succeeded",
+        "step_failed",
+        "step_skipped_user",
+        "step_skipped_unexecuted",
+        "step_terminated",
+    }
+
+    for event in events if isinstance(events, list) else []:
+        stage = audit_stage(event)
+        payload = audit_payload(event)
+        if stage == "received" and not input_preview:
+            input_preview = str(payload.get("input_preview") or payload.get("command") or payload.get("ref") or "")
+        elif stage == "planned":
+            summary = str(payload.get("summary_preview") or summary)
+            for index, step in enumerate(payload.get("steps") or []):
+                if not isinstance(step, dict):
+                    continue
+                step_id = str(step.get("id") or f"step-{index + 1}")
+                normalized = {
+                    "id": step_id,
+                    "title": step.get("title") or step_id,
+                    "executor_type": step.get("executor_type"),
+                    "skill_script": step.get("skill_script"),
+                    "risk_level": step.get("risk_level") or "low",
+                    "expected_effect": step.get("expected_effect") or "",
+                    "reason": step.get("reason") or "",
+                }
+                steps_by_id[step_id] = normalized
+                planned_steps.append(normalized)
+        elif stage in {"finished", "session_finished", "command_finished"}:
+            final_status = str(payload.get("status") or final_status)
+
+        if stage in {"terminal_executed", "script_executed"}:
+            status = str(payload.get("status") or ("executed" if payload.get("ok") else "failed"))
+            timeline.append(
+                {
+                    "id": f"{stage}-{len(timeline) + 1}",
+                    "kind": "execution",
+                    "status": status,
+                    "step_id": stage,
+                    "title": "终端执行" if stage == "terminal_executed" else "Skill 执行",
+                    "summary": compact_summary(payload.get("action") or status),
+                    "risk_level": None,
+                    "step": {"id": stage, "title": "终端执行" if stage == "terminal_executed" else "Skill 执行", "executor_type": "terminal" if stage == "terminal_executed" else "skill_script"},
+                    "output_blocks": [{"kind": "meta", "title": "审计恢复摘要", "json": {"stage": stage, "status": status, "payload": payload}}],
+                }
+            )
+            continue
+
+        if stage not in step_statuses:
+            continue
+        step = payload.get("step") if isinstance(payload.get("step"), dict) else {}
+        step_id = str(step.get("id") or f"{stage}-{len(timeline) + 1}")
+        merged_step = {**steps_by_id.get(step_id, {}), **step}
+        status = str(payload.get("status") or stage.replace("step_", ""))
+        detail = payload.get("detail") if isinstance(payload.get("detail"), dict) else {}
+        findings = payload.get("findings") if isinstance(payload.get("findings"), list) else []
+        blocks = [
+            {
+                "kind": "meta",
+                "title": "审计恢复摘要",
+                "json": {
+                    "stage": stage,
+                    "status": status,
+                    "detail": detail,
+                    "finding_count": len(findings),
+                },
+            }
+        ]
+        if findings:
+            blocks.append({"kind": "review", "title": "策略审查 findings", "json": {"findings": findings}})
+        timeline.append(
+            {
+                "id": f"{stage}-{len(timeline) + 1}",
+                "kind": "execution",
+                "status": status,
+                "step_id": step_id,
+                "title": merged_step.get("title") or step_id,
+                "summary": compact_summary(detail.get("status") or detail.get("action") or status),
+                "risk_level": merged_step.get("risk_level"),
+                "step": merged_step,
+                "output_blocks": blocks,
+            }
+        )
+
+    return {
+        "ok": True,
+        "status": final_status,
+        "source": "audit",
+        "session_id": session_id,
+        "input": input_preview,
+        "response": {
+            "response_type": "work_plan" if planned_steps else "answer",
+            "summary": summary or f"审计恢复 {session_id}",
+            "steps": planned_steps,
+            "continue_decision": {"should_continue": False, "reason": "Restored from audit events for Web replay."},
+        },
+        "timeline": timeline,
+        "approval_card": None,
+        "output_blocks": [
+            {
+                "kind": "meta",
+                "title": "Web 时间线恢复",
+                "json": {
+                    "session_id": session_id,
+                    "event_count": len(events) if isinstance(events, list) else 0,
+                    "timeline_count": len(timeline),
+                    "planned_step_count": len(planned_steps),
+                },
+            }
+        ],
+    }
+
+
 def terminate_running_jobs():
     with JOB_PROCESSES_LOCK:
         processes = list(JOB_PROCESSES.values())
@@ -870,6 +1054,16 @@ class Handler(SimpleHTTPRequestHandler):
             result = sudo_check(str(body.get("password") or ""))
             json_response(self, HTTPStatus.OK, result)
             return
+        if path == "/api/policies/validate":
+            try:
+                result = validate_policy_content(
+                    str(body.get("path") or ""),
+                    str(body.get("content") or ""),
+                )
+            except ValueError as exc:
+                result = {"ok": False, "status": "invalid_path", "error": str(exc)}
+            json_response(self, HTTPStatus.OK, result)
+            return
         if path == "/api/policies/write":
             try:
                 result = write_policy_file(
@@ -879,6 +1073,12 @@ class Handler(SimpleHTTPRequestHandler):
                 )
             except ValueError as exc:
                 result = {"ok": False, "status": "invalid_path", "error": str(exc)}
+            json_response(self, HTTPStatus.OK, result)
+            return
+        if path == "/api/audit/read":
+            result = run_agent_api("audit", "read", body, timeout=180)
+            if isinstance(result, dict) and isinstance(result.get("events"), list):
+                result["web_timeline"] = build_web_timeline_from_audit(str(body.get("session_id") or result.get("session_id") or ""), result["events"])
             json_response(self, HTTPStatus.OK, result)
             return
         if path == "/api/config/update":

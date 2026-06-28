@@ -173,6 +173,21 @@ grep -q '"risk_level":"high"' <<<"${review}"
 sudo_review="$(linux_agent_policy_review_text "terminal" "sudo systemctl restart nginx")"
 [[ "$(linux_agent_execution_privilege_from_review "${sudo_review}")" == "current" ]]
 
+linux_agent_init_env "${ROOT_DIR}"
+linux_agent_load_config
+low_review='{"approved":true,"approval_required":false,"risk_level":"low","findings":[]}'
+readonly_skill_step='{"id":"auto-1","title":"resource","executor_type":"skill_script","skill_script":"ops-basic/resource-inspect","arguments":{},"reason":"test","expected_effect":"test","risk_level":"low","rollback_hint":"none"}'
+file_match_step='{"id":"auto-2","title":"match","executor_type":"skill_script","skill_script":"controlled-tools/file-match","arguments":{},"reason":"test","expected_effect":"test","risk_level":"low","rollback_hint":"none"}'
+file_patch_step='{"id":"auto-3","title":"patch","executor_type":"skill_script","skill_script":"controlled-tools/file-patch","arguments":{},"reason":"test","expected_effect":"test","risk_level":"low","rollback_hint":"none"}'
+legacy_auto_config="${LINUX_AGENT_CONFIG_JSON}"
+LINUX_AGENT_CONFIG_JSON="$(jq 'del(.approvals) | .agent_loop.auto_execute_low_risk=true | .agent_loop.auto_execute_shell_low_risk=false' <<<"${legacy_auto_config}")"
+linux_agent_should_auto_execute_step "${readonly_skill_step}" "${low_review}"
+LINUX_AGENT_CONFIG_JSON="$(jq '.approvals.auto.skill_readonly=false | .approvals.auto.file_match=true | .approvals.auto.file_patch=false' <<<"${legacy_auto_config}")"
+! linux_agent_should_auto_execute_step "${readonly_skill_step}" "${low_review}"
+linux_agent_should_auto_execute_step "${file_match_step}" "${low_review}"
+! linux_agent_should_auto_execute_step "${file_patch_step}" "${low_review}"
+LINUX_AGENT_CONFIG_JSON="${legacy_auto_config}"
+
 linux_agent_download_remote_script() {
     printf '\000\001' > "$2"
 }

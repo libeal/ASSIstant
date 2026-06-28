@@ -21,3 +21,9 @@
 - `os-deep-inspect/fd-inspect`: 通过 `lsof` 或 `/proc/<pid>/fd` 检查打开文件、socket 和文件句柄占用。
 - `os-deep-inspect/journal-inspect`: 通过 `journalctl` 按 unit、priority、时间窗口和关键词读取系统日志样本。
 
+## controlled-tools
+
+- `controlled-tools/file-match`: 只读匹配目标文件中的字面量文本，返回出现次数和上下文。
+- `controlled-tools/file-patch`: 在 `expected_count` 匹配时对目标文件做字面量替换、diff 预览、备份和原子写入。
+- `controlled-tools/file-download`: 安全下载 HTTPS 公网文件到本机路径，限制大小并可校验 sha256。
+- `controlled-tools/local-analyze`: 对文本或本地文件做只读关键词和错误样本分析。

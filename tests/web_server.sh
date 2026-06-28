@@ -58,6 +58,8 @@ grep -q 'ASSIstant 前端外壳' <<<"${index_html}"
 grep -q '结束进程' <<<"${index_html}"
 grep -q 'id="senseTopicSelect"' <<<"${index_html}"
 grep -q 'id="skillsValidateBtn"' <<<"${index_html}"
+grep -q 'id="policyValidateBtn"' <<<"${index_html}"
+grep -q 'id="auditRestoreTimelineBtn"' <<<"${index_html}"
 
 unauth_body="${tmp_root}/unauth.json"
 unauth_code="$(curl --noproxy '*' -sS -o "${unauth_body}" -w '%{http_code}' "${base_url}/api/health" || true)"
@@ -68,7 +70,9 @@ health="$(curl --noproxy '*' -sS -H "Authorization: Bearer ${token}" "${base_url
 jq -e '.ok == true and .root != "" and .web_server.run_id != "" and .web_server.started_at != ""' <<<"${health}" >/dev/null
 
 config_state="$(curl --noproxy '*' -sS -H "Authorization: Bearer ${token}" "${base_url}/api/config")"
-jq -e '.ok == true and (.config.agent_loop.thinking_trace_enabled | type == "boolean") and .config.api_key_configured == true and .config.api_key_source == "file" and .config.web.token_configured == true and (.config | has("api_key") | not)' <<<"${config_state}" >/dev/null
+jq -e '.ok == true and (.config.agent_loop.thinking_trace_enabled | type == "boolean") and .config.api_key_configured == true and .config.api_key_source == "file" and .config.web.token_configured == true and (.config | has("api_key") | not)
+    and .config.approvals.auto.skill_readonly == true
+    and .config.approvals.auto.file_patch == false' <<<"${config_state}" >/dev/null
 
 config_update_payload="$(jq -cn '{key:"agent_loop.thinking_trace_enabled", value:true}')"
 config_update="$(curl --noproxy '*' -sS \
@@ -101,6 +105,14 @@ audit_limit_update="$(curl --noproxy '*' -sS \
     -d "${audit_limit_payload}" \
     "${base_url}/api/config/update")"
 jq -e '.ok == true and .status == "updated" and .updated.audit_text_limit == 1234 and .config.audit_text_limit == 1234' <<<"${audit_limit_update}" >/dev/null
+
+approval_update_payload="$(jq -cn '{key:"approvals.auto.file_patch", value:true}')"
+approval_update="$(curl --noproxy '*' -sS \
+    -H "Authorization: Bearer ${token}" \
+    -H "Content-Type: application/json" \
+    -d "${approval_update_payload}" \
+    "${base_url}/api/config/update")"
+jq -e '.ok == true and .status == "updated" and .updated["approvals.auto.file_patch"] == true and .config.approvals.auto.file_patch == true' <<<"${approval_update}" >/dev/null
 
 skill_tree="$(curl --noproxy '*' -sS -H "Authorization: Bearer ${token}" "${base_url}/api/skills/tree")"
 jq -e '.ok == true and (.markdown_files | index("INDEX.md")) and (.script_files | index("ops-basic/scripts/resource-inspect.sh"))' <<<"${skill_tree}" >/dev/null
@@ -147,6 +159,21 @@ boundary="$(curl --noproxy '*' -sS \
 jq -e '.ok == true and .json.observing.audit_payload_mode == "safe_summary" and (.json.allowed_to_observe.observer_syscalls | index("openat"))' <<<"${boundary}" >/dev/null
 
 policy_write_payload="$(jq -cn --rawfile content "${project}/policies/audit-boundaries.json" '{path:"audit-boundaries.json", content:$content, password:""}')"
+policy_validate="$(curl --noproxy '*' -sS \
+    -H "Authorization: Bearer ${token}" \
+    -H "Content-Type: application/json" \
+    -d "${policy_write_payload}" \
+    "${base_url}/api/policies/validate")"
+jq -e '.ok == true and .status == "valid" and .validation.ok == true' <<<"${policy_validate}" >/dev/null
+
+invalid_policy_payload="$(jq -cn '{path:"redaction-rules.json", content:"{\"rules\":[{\"id\":\"bad\",\"pattern\":\".*\",\"replacement\":\"x\"}],\"sensitive_key_pattern\":\"(?i)token\"}"}')"
+invalid_policy_validate="$(curl --noproxy '*' -sS \
+    -H "Authorization: Bearer ${token}" \
+    -H "Content-Type: application/json" \
+    -d "${invalid_policy_payload}" \
+    "${base_url}/api/policies/validate")"
+jq -e '.ok == false and .validation.ok == false and ([.validation.findings[]?.code] | index("POLICY_REGEX_ZERO_WIDTH"))' <<<"${invalid_policy_validate}" >/dev/null
+
 policy_write="$(curl --noproxy '*' -sS \
     -H "Authorization: Bearer ${token}" \
     -H "Content-Type: application/json" \
@@ -178,6 +205,17 @@ done
 jq -e '.result_status == "executed" and .result_ok == true
     and ([.result.output_blocks[]? | select(.kind == "stdout") | .text] | first) == "web-job-ok"
     and ([.result.output_blocks[]? | select(.kind == "meta" and .title == "Agent runtime") | .json.exit_code] | first) == 0' <<<"${job_result}" >/dev/null
+
+audit_after_job="$(curl --noproxy '*' -sS -H "Authorization: Bearer ${token}" "${base_url}/api/audit/list")"
+job_session_id="$(jq -r '.sessions[0].session_id // empty' <<<"${audit_after_job}")"
+[[ -n "${job_session_id}" ]]
+audit_read_payload="$(jq -cn --arg session_id "${job_session_id}" '{session_id:$session_id}')"
+audit_read="$(curl --noproxy '*' -sS \
+    -H "Authorization: Bearer ${token}" \
+    -H "Content-Type: application/json" \
+    -d "${audit_read_payload}" \
+    "${base_url}/api/audit/read")"
+jq -e '.ok == true and .web_timeline.source == "audit" and (.web_timeline.timeline | length) >= 1 and ([.web_timeline.timeline[]?.kind] | index("execution"))' <<<"${audit_read}" >/dev/null
 
 cancel_payload="$(jq -cn '{resource:"terminal", action:"run", payload:{command:"sleep 5"}}')"
 cancel_job="$(curl --noproxy '*' -sS \

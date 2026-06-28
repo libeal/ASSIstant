@@ -290,7 +290,7 @@
                     <div class="kv"><div class="k">mode</div><div class="v" id="policyEditMode">read-only</div></div>
                     <div class="kv"><div class="k">scope</div><div class="v">risk-rules.json、audit boundary、remote script policy</div></div>
                     <div class="kv"><div class="k">file</div><div class="v"><select class="select" id="policyFileSelect"></select></div></div>
-                    <div class="toolbar"><button class="btn secondary" id="policyReloadBtn" type="button">刷新策略</button><button class="btn secondary policy-edit" id="policySaveBtn" type="button" disabled>保存当前文件</button></div>
+                    <div class="toolbar"><button class="btn secondary" id="policyReloadBtn" type="button">刷新策略</button><button class="btn secondary" id="policyValidateBtn" type="button">校验当前文件</button><button class="btn secondary policy-edit" id="policySaveBtn" type="button" disabled>保存当前文件</button></div>
                   </div>
                 </div>
               </div>
@@ -354,7 +354,7 @@
                     <label class="small">显示数量<input class="field" id="auditLimitInput" type="number" min="1" max="200" value="40"></label>
                   </div>
                   <div class="small">中文注释：列表来自 <span class="mono">/api/audit/list</span>，点击某个 session 后再通过 <span class="mono">/api/audit/read</span> 读取完整报告和事件。</div>
-                  <div class="toolbar action-gap"><button class="btn" id="auditRefreshBtn" type="button">刷新会话</button><button class="btn secondary" id="auditPauseBtn" type="button">暂停</button><button class="btn secondary" id="auditFindFailureBtn" type="button">定位失败</button></div>
+                  <div class="toolbar action-gap"><button class="btn" id="auditRefreshBtn" type="button">刷新会话</button><button class="btn secondary" id="auditRestoreTimelineBtn" type="button" disabled>恢复到工作台</button><button class="btn secondary" id="auditPauseBtn" type="button">暂停</button><button class="btn secondary" id="auditFindFailureBtn" type="button">定位失败</button></div>
                 </div>
 
                 <div class="panel">

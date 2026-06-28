@@ -475,6 +475,18 @@ linux_agent_api_edit_apply() {
         '{ok:($result.ok // false), status:$status, result:$result}'
 }
 
+linux_agent_api_policy_validate() {
+    local payload="$1"
+    local path content
+    path="$(jq -r '.path // empty' <<<"${payload}")"
+    if jq -e 'has("content")' <<<"${payload}" >/dev/null 2>&1; then
+        content="$(jq -r '.content // ""' <<<"${payload}")"
+        linux_agent_validate_policy_content "${path}" "${content}"
+        return 0
+    fi
+    linux_agent_validate_policy_file "${path}"
+}
+
 linux_agent_api_needs_session() {
     local resource="${1:-}"
     local action="${2:-}"
@@ -520,6 +532,9 @@ linux_agent_api_dispatch() {
             ;;
         skills:validate)
             jq -cn --argjson validation "$(linux_agent_validate_skills)" '{ok:($validation.ok // false), status:"validated", validation:$validation}'
+            ;;
+        policy:validate)
+            jq -cn --argjson validation "$(linux_agent_api_policy_validate "${payload}")" '{ok:($validation.ok // false), status:($validation.status // "invalid"), validation:$validation}'
             ;;
         audit:list)
             linux_agent_api_audit_list "${payload}"

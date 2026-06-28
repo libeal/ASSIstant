@@ -34,12 +34,10 @@ linux_agent_agent_checkpoint_turns() {
 linux_agent_agent_loop_context_json() {
     jq -cn \
         --argjson thinking_trace_enabled "$(linux_agent_thinking_trace_enabled)" \
-        --argjson auto_execute_low_risk "$(linux_agent_auto_execute_low_risk_enabled)" \
-        --argjson auto_execute_shell_low_risk "$(linux_agent_auto_execute_shell_low_risk_enabled)" \
+        --argjson auto_approval "$(linux_agent_auto_approval_config_json)" \
         '{
             thinking_trace_enabled:$thinking_trace_enabled,
-            auto_execute_low_risk:$auto_execute_low_risk,
-            auto_execute_shell_low_risk:$auto_execute_shell_low_risk
+            auto_approval:$auto_approval
         }'
 }
 

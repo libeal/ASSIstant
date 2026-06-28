@@ -93,6 +93,7 @@ WRITE_VERBS = {
     "rmdir",
     "touch",
 }
+FILE_MUTATION_COMMANDS = {"rm", "unlink", "dd", "mount", "umount"}
 ALIASES = {
     "gsed": "sed",
     "gcp": "cp",
@@ -167,6 +168,23 @@ def finding(
         **({"node": node} if node else {}),
         **({"text": text[:500]} if text else {}),
     }
+
+
+def file_mutation_requires_skill(
+    *,
+    command_head: str | None = None,
+    node: str | None = None,
+    text: str | None = None,
+) -> dict:
+    return finding(
+        "critical",
+        "AST_FILE_MUTATION_REQUIRES_SKILL",
+        "File modifications must use a registered controlled skill instead of free-form shell.",
+        category="controlled_file_modification",
+        command_head=command_head,
+        node=node,
+        text=text,
+    )
 
 
 def canonical(head: str) -> str:
@@ -373,16 +391,7 @@ def command_without_redirects(tokens: list[str], findings: list[dict]) -> list[s
                         )
                     )
                 else:
-                    findings.append(
-                        finding(
-                            "high",
-                            "AST_FILE_REDIRECT",
-                            "Command writes to a file via shell redirect.",
-                            category="write",
-                            node="redirect",
-                            text=dest,
-                        )
-                    )
+                    findings.append(file_mutation_requires_skill(node="redirect", text=dest))
             i += max(consumed, 1)
             continue
 
@@ -494,6 +503,21 @@ def has_protected_target(argv: Iterable[str]) -> bool:
     return any(protected_path(t) for t in target_paths(argv))
 
 
+def archive_command_is_readonly(head: str, argv: list[str]) -> bool:
+    if head == "tar":
+        for arg in argv:
+            if arg == "--list":
+                return True
+            if arg.startswith("-") and "t" in arg and not any(flag in arg for flag in "xcruA"):
+                return True
+        return False
+    if head == "unzip":
+        return any(arg in {"-l", "-Z"} or arg.startswith("-l") for arg in argv)
+    if head == "cpio":
+        return any(arg == "-t" or (arg.startswith("-") and "t" in arg and "i" not in arg and "o" not in arg) for arg in argv)
+    return False
+
+
 def check_command_rules(cmd: CommandNode, findings: list[dict]) -> None:
     head = cmd.head
     argv = cmd.argv
@@ -574,30 +598,46 @@ def check_command_rules(cmd: CommandNode, findings: list[dict]) -> None:
             )
         )
     elif head in DESTRUCTIVE:
-        severity = "critical" if has_protected_target(argv) or (head == "rm" and any(t in {"/", "--no-preserve-root"} for t in argv)) else "high"
+        severity = (
+            "critical"
+            if (
+                head in FILE_MUTATION_COMMANDS
+                or has_protected_target(argv)
+                or (head == "rm" and any(t in {"/", "--no-preserve-root"} for t in argv))
+            )
+            else "high"
+        )
         findings.append(
             finding(
                 severity,
-                "AST_DESTRUCTIVE_COMMAND",
-                "Command can mutate or disrupt system state.",
-                category="destructive" if severity == "high" else "protected_path",
+                "AST_FILE_MUTATION_REQUIRES_SKILL" if head in FILE_MUTATION_COMMANDS and not has_protected_target(argv) else "AST_DESTRUCTIVE_COMMAND",
+                "File modifications must use a registered controlled skill instead of free-form shell."
+                if head in FILE_MUTATION_COMMANDS and not has_protected_target(argv)
+                else "Command can mutate or disrupt system state.",
+                category="controlled_file_modification" if head in FILE_MUTATION_COMMANDS and not has_protected_target(argv) else ("destructive" if severity == "high" else "protected_path"),
                 command_head=head,
                 text=text,
             )
         )
 
     if head in WRITE_VERBS:
+        if archive_command_is_readonly(head, argv):
+            return
         severity = "critical" if has_protected_target(argv) else "high"
         if severity == "critical" and head == "tee":
             code = "AST_PROTECTED_REDIRECT"
+        elif severity == "high":
+            code = "AST_FILE_MUTATION_REQUIRES_SKILL"
         else:
-            code = "AST_PROTECTED_WRITE" if severity == "critical" else "AST_WRITE_COMMAND"
+            code = "AST_PROTECTED_WRITE"
         findings.append(
             finding(
-                severity,
+                "critical" if code == "AST_FILE_MUTATION_REQUIRES_SKILL" else severity,
                 code,
-                "Command writes filesystem state.",
-                category="protected_path" if severity == "critical" else "write",
+                "File modifications must use a registered controlled skill instead of free-form shell."
+                if code == "AST_FILE_MUTATION_REQUIRES_SKILL"
+                else "Command writes filesystem state.",
+                category="protected_path" if severity == "critical" and code != "AST_FILE_MUTATION_REQUIRES_SKILL" else "controlled_file_modification",
                 command_head=head,
                 text=text,
             )
@@ -607,10 +647,12 @@ def check_command_rules(cmd: CommandNode, findings: list[dict]) -> None:
         severity = "critical" if has_protected_target(argv) else "high"
         findings.append(
             finding(
-                severity,
-                "AST_RECURSIVE_PERMISSION_CHANGE",
-                "Recursive permission or ownership changes require review.",
-                category="protected_path" if severity == "critical" else "write",
+                "critical",
+                "AST_RECURSIVE_PERMISSION_CHANGE" if severity == "critical" else "AST_FILE_MUTATION_REQUIRES_SKILL",
+                "Recursive permission or ownership changes require review."
+                if severity == "critical"
+                else "File modifications must use a registered controlled skill instead of free-form shell.",
+                category="protected_path" if severity == "critical" else "controlled_file_modification",
                 command_head=head,
                 text=text,
             )
@@ -620,10 +662,12 @@ def check_command_rules(cmd: CommandNode, findings: list[dict]) -> None:
         severity = "critical" if has_protected_target(argv) else "high"
         findings.append(
             finding(
-                severity,
-                "AST_IN_PLACE_EDIT",
-                "sed in-place editing writes files.",
-                category="protected_path" if severity == "critical" else "write",
+                "critical",
+                "AST_IN_PLACE_EDIT" if severity == "critical" else "AST_FILE_MUTATION_REQUIRES_SKILL",
+                "sed in-place editing writes files."
+                if severity == "critical"
+                else "File modifications must use a registered controlled skill instead of free-form shell.",
+                category="protected_path" if severity == "critical" else "controlled_file_modification",
                 command_head=head,
                 text=text,
             )
@@ -633,23 +677,18 @@ def check_command_rules(cmd: CommandNode, findings: list[dict]) -> None:
         for idx, arg in enumerate(argv[:-1]):
             if arg == "-i" and argv[idx + 1] == "inplace":
                 findings.append(
-                    finding(
-                        "high",
-                        "AST_IN_PLACE_EDIT",
-                        "awk in-place editing writes files.",
-                        category="write",
-                        command_head=head,
-                        text=text,
-                    )
+                    file_mutation_requires_skill(command_head=head, text=text)
                 )
 
     if head == "find" and any(t in {"-exec", "-execdir", "-delete"} for t in argv):
         findings.append(
             finding(
-                "high",
-                "AST_FIND_EXEC",
-                "find executes or deletes through arguments.",
-                category="destructive",
+                "critical" if "-delete" in argv else "high",
+                "AST_FILE_MUTATION_REQUIRES_SKILL" if "-delete" in argv else "AST_FIND_EXEC",
+                "File modifications must use a registered controlled skill instead of free-form shell."
+                if "-delete" in argv
+                else "find executes through arguments.",
+                category="controlled_file_modification" if "-delete" in argv else "destructive",
                 command_head=head,
                 text=text,
             )
@@ -658,18 +697,18 @@ def check_command_rules(cmd: CommandNode, findings: list[dict]) -> None:
     if head == "curl":
         for idx, arg in enumerate(argv):
             if arg in {"-O", "--remote-name", "--remote-name-all"}:
-                findings.append(finding("high", "AST_DOWNLOAD_WRITE", "curl writes a remote file to disk.", category="write", command_head=head, text=text))
+                findings.append(file_mutation_requires_skill(command_head=head, text=text))
             if arg in {"-o", "--output"} and idx + 1 < len(argv) and argv[idx + 1] not in {"-", "/dev/null"}:
-                findings.append(finding("high", "AST_DOWNLOAD_WRITE", "curl writes output to a file.", category="write", command_head=head, text=argv[idx + 1]))
+                findings.append(file_mutation_requires_skill(command_head=head, text=argv[idx + 1]))
             if arg.startswith("--output=") and arg.split("=", 1)[1] not in {"-", "/dev/null"}:
-                findings.append(finding("high", "AST_DOWNLOAD_WRITE", "curl writes output to a file.", category="write", command_head=head, text=arg))
+                findings.append(file_mutation_requires_skill(command_head=head, text=arg))
 
     if head == "wget":
         for idx, arg in enumerate(argv):
             if arg in {"-O", "--output-document"} and idx + 1 < len(argv) and argv[idx + 1] not in {"-", "/dev/null"}:
-                findings.append(finding("high", "AST_DOWNLOAD_WRITE", "wget writes output to a file.", category="write", command_head=head, text=argv[idx + 1]))
+                findings.append(file_mutation_requires_skill(command_head=head, text=argv[idx + 1]))
             if arg.startswith("--output-document=") and arg.split("=", 1)[1] not in {"-", "/dev/null"}:
-                findings.append(finding("high", "AST_DOWNLOAD_WRITE", "wget writes output to a file.", category="write", command_head=head, text=arg))
+                findings.append(file_mutation_requires_skill(command_head=head, text=arg))
 
     if head in INTERACTIVE:
         findings.append(

@@ -1724,6 +1724,7 @@ async function loadAuditList() {
   const data = await api("/api/audit/list");
   state.auditSessions = data.sessions || [];
   state.auditEvents = [];
+  state.auditWebTimeline = null;
   state.currentAuditSession = "";
   renderAuditSessionList();
   resetAuditSummary();
@@ -1772,10 +1773,12 @@ async function readAudit(sessionId) {
   const data = await api("/api/audit/read", { method: "POST", body: { session_id: sessionId } });
   state.currentAuditSession = sessionId;
   state.auditEvents = Array.isArray(data.events) ? data.events : [];
+  state.auditWebTimeline = data.web_timeline || null;
   renderAuditEventTimeline();
   renderAuditObserverSummary();
   updateAuditMetrics();
   $("auditOutput").textContent = data.report || pretty(data);
+  if ($("auditRestoreTimelineBtn")) $("auditRestoreTimelineBtn").disabled = !state.auditWebTimeline?.timeline?.length;
 }
 
 function renderAuditEventTimeline() {
@@ -1872,6 +1875,8 @@ function resetAuditSummary() {
   const observer = $("auditObserverSummary");
   if (observer) observer.innerHTML = '<tr><td colspan="3">尚未选择 session。</td></tr>';
   setText("auditOutput", "等待选择审计 session。");
+  state.auditWebTimeline = null;
+  if ($("auditRestoreTimelineBtn")) $("auditRestoreTimelineBtn").disabled = true;
 }
 
 function exportAuditReport() {
@@ -1900,6 +1905,23 @@ function findAuditFailure() {
   target.scrollIntoView({ behavior: "smooth", block: "center" });
   target.classList.add("focused-event");
   window.setTimeout(() => target.classList.remove("focused-event"), 1800);
+}
+
+function restoreAuditTimelineToWorkbench() {
+  const restored = state.auditWebTimeline;
+  if (!restored?.timeline?.length) return showToast("当前审计 session 没有可恢复的工作时间线");
+  state.lastProtocolResult = restored;
+  state.workPlan = restored.response || null;
+  state.workContext = { restored_from_audit: restored.session_id };
+  state.workPlanInput = restored.input || "";
+  state.awaitingWorkApproval = false;
+  closeApprovalDrawer();
+  if ($("workInput") && restored.input) $("workInput").value = restored.input;
+  renderTimelineReturns(`审计恢复 ${restored.session_id || ""}`, restored);
+  printOutput("terminalOutput", renderProtocolText("审计恢复", restored));
+  setStatus("workJobStatus", restored.status || "restored", statusKind(restored.status || "restored"));
+  showScreen("workbench");
+  showToast("已从审计恢复工作时间线");
 }
 
 async function runDoctor() {
@@ -2014,6 +2036,23 @@ async function unlockPolicy() {
   showToast("Policy editing unlocked");
 }
 
+async function validatePolicy({ silent = false } = {}) {
+  const data = await api("/api/policies/validate", {
+    method: "POST",
+    body: {
+      path: state.currentPolicyPath,
+      content: $("policyEditor").value,
+    },
+  });
+  printOutput("policyOutput", data);
+  if (!data.ok) {
+    if (!silent) showToast(data.error || data.status || "策略校验失败");
+    return data;
+  }
+  if (!silent) showToast("策略校验通过");
+  return data;
+}
+
 function lockPolicy() {
   state.policySudoPassword = "";
   state.policySudoUnlocked = false;
@@ -2023,6 +2062,11 @@ function lockPolicy() {
 
 async function savePolicy() {
   if (!state.policySudoUnlocked) return showToast("sudo unlock required");
+  const validation = await validatePolicy({ silent: true });
+  if (!validation.ok) {
+    showToast(validation.error || validation.status || "策略校验失败，未保存");
+    return;
+  }
   const data = await api("/api/policies/write", {
     method: "POST",
     body: {
@@ -2034,10 +2078,10 @@ async function savePolicy() {
   printOutput("policyOutput", data);
   if (!data.ok) {
     if (String(data.status || "").startsWith("sudo_")) lockPolicy();
-    showToast(data.error || data.status || "save failed");
+    showToast(data.error || data.status || "保存失败");
     return;
   }
-  showToast("Policy saved");
+  showToast("策略已保存");
   await readPolicy(state.currentPolicyPath);
   await loadPolicySummaries(state.currentPolicyPath);
 }
@@ -2213,6 +2257,7 @@ function bindActions() {
   on("editReviewBtn", "click", () => safeAction(reviewEdit));
   on("editApplyBtn", "click", () => safeAction(applyEdit));
   on("auditRefreshBtn", "click", () => safeAction(loadAuditList));
+  on("auditRestoreTimelineBtn", "click", restoreAuditTimelineToWorkbench);
   on("auditSessionFilter", "input", renderAuditSessionList);
   on("auditStatusFilter", "change", renderAuditSessionList);
   on("auditEventFilter", "change", () => state.currentAuditSession ? renderAuditEventTimeline() : renderAuditSessionList());
@@ -2234,6 +2279,7 @@ function bindActions() {
   on("policyUnlockBtn", "click", () => safeAction(unlockPolicy));
   on("policyLockBtn", "click", lockPolicy);
   on("policyReloadBtn", "click", () => safeAction(loadPolicies));
+  on("policyValidateBtn", "click", () => safeAction(validatePolicy));
   on("policySaveBtn", "click", () => safeAction(savePolicy));
   on("policyFileSelect", "change", (event) => safeAction(() => readPolicy(event.target.value)));
   on("policyAddRuleBtn", "click", () => safeAction(() => openPolicyFile("risk-rules.json")));

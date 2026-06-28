@@ -13,6 +13,17 @@
     "thinking_trace_enabled": false,
     "checkpoint_turns": 0
   },
+  "approvals": {
+    "auto": {
+      "skill_readonly": true,
+      "shell_readonly": false,
+      "file_match": true,
+      "file_patch": false,
+      "file_download": false,
+      "local_analyze": true,
+      "remote_script": false
+    }
+  },
   "audit_mode": "safe_summary",
   "audit_text_limit": 1000,
   "observer": {
