@@ -53,7 +53,7 @@ export function outputBlocksSummary(blocks) {
   return "";
 }
 
-function tableFromText(text) {
+export function tableFromText(text) {
   const lines = String(text || "").split("\n").filter((line) => line.trim());
   if (lines.length < 2) return "";
   const rows = lines.slice(0, 12).map((line) => line.trim().split(/\s{2,}|\t/).filter(Boolean));

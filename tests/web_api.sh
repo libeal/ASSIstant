@@ -62,7 +62,7 @@ jq -e '.ok == true and .status == "executed" and .response.response_type == "wor
 project_missing="${tmp_root}/project-missing-ai"
 copy_project "${project_missing}"
 tmp_config="$(mktemp)"
-jq 'del(.api_key) | .api_key_file = ""' "${project_missing}/config/config.json" > "${tmp_config}"
+jq 'del(.api_key) | del(.api_key_file)' "${project_missing}/config/config.json" > "${tmp_config}"
 mv "${tmp_config}" "${project_missing}/config/config.json"
 missing_ai="$(cd "${project_missing}" && bash bin/agent api work run '{"input":"查看cpu占用"}' 2>/dev/null)"
 jq -e '.ok == false and .status == "ai_config_missing"' <<<"${missing_ai}" >/dev/null

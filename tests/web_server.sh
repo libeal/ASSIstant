@@ -33,12 +33,13 @@ project="${tmp_root}/project-web"
 copy_project "${project}"
 port="$((19000 + RANDOM % 1000))"
 token="test-web-token-12345"
-printf 'test-web-initial-key\n' > "${project}/config/test-api-key.secret"
 tmp_config="$(mktemp)"
 jq --arg token "${token}" --argjson port "${port}" \
     '.web = {enabled:true, host:"127.0.0.1", port:$port, token:$token, job_retention_hours:1}
-    | .api_key_file = "config/test-api-key.secret"
-    | del(.api_key)' \
+    | .api_key = "test-web-initial-config-key"
+    | del(.api_key_file)
+    | .agent_loop.auto_execute_low_risk = false
+    | .agent_loop.auto_execute_shell_low_risk = true' \
     "${project}/config/config.json" > "${tmp_config}"
 mv "${tmp_config}" "${project}/config/config.json"
 
@@ -60,6 +61,7 @@ grep -q 'id="senseTopicSelect"' <<<"${index_html}"
 grep -q 'id="skillsValidateBtn"' <<<"${index_html}"
 grep -q 'id="policyValidateBtn"' <<<"${index_html}"
 grep -q 'id="auditRestoreTimelineBtn"' <<<"${index_html}"
+grep -q 'id="observerAuditDialog"' <<<"${index_html}"
 
 unauth_body="${tmp_root}/unauth.json"
 unauth_code="$(curl --noproxy '*' -sS -o "${unauth_body}" -w '%{http_code}' "${base_url}/api/health" || true)"
@@ -69,9 +71,32 @@ grep -q 'unauthorized' "${unauth_body}"
 health="$(curl --noproxy '*' -sS -H "Authorization: Bearer ${token}" "${base_url}/api/health")"
 jq -e '.ok == true and .root != "" and .web_server.run_id != "" and .web_server.started_at != ""' <<<"${health}" >/dev/null
 
+observer_bootstrap="$(curl --noproxy '*' -sS -H "Authorization: Bearer ${token}" "${base_url}/api/observer/bootstrap")"
+jq -e '.ok == true and (.status | IN("pending","disabled","enabled","skipped","failed","unavailable")) and .requires_permission == true' <<<"${observer_bootstrap}" >/dev/null
+observer_skip="$(curl --noproxy '*' -sS \
+    -H "Authorization: Bearer ${token}" \
+    -H "Content-Type: application/json" \
+    -d '{"action":"skip"}' \
+    "${base_url}/api/observer/bootstrap")"
+jq -e '.ok == true and .status == "skipped" and .logged == true' <<<"${observer_skip}" >/dev/null
+grep -R -q '"stage":"observer_bootstrap_skipped"' "${project}/logs"
+if grep -R -q 'password\|test-web-token-12345' "${project}/logs"; then
+    printf 'observer bootstrap log leaked sensitive auth material\n' >&2
+    exit 1
+fi
+observer_enable_without_password="$(curl --noproxy '*' -sS \
+    -H "Authorization: Bearer ${token}" \
+    -H "Content-Type: application/json" \
+    -d '{"action":"enable","password":""}' \
+    "${base_url}/api/observer/bootstrap")"
+jq -e 'if .ok then .status == "enabled" else (.status | IN("sudo_required","auditctl_not_found","ausearch_not_found","auditctl_failed","auditctl_permission_denied","auditctl_timeout","observer_disabled","sudo_not_found","sudo_timeout","sudo_denied")) end' <<<"${observer_enable_without_password}" >/dev/null
+
 config_state="$(curl --noproxy '*' -sS -H "Authorization: Bearer ${token}" "${base_url}/api/config")"
-jq -e '.ok == true and (.config.agent_loop.thinking_trace_enabled | type == "boolean") and .config.api_key_configured == true and .config.api_key_source == "file" and .config.web.token_configured == true and (.config | has("api_key") | not)
+jq -e '.ok == true and (.config.agent_loop.thinking_trace_enabled | type == "boolean") and .config.api_key_configured == true and .config.api_key_source == "config" and .config.api_key_configured_in_config == true and .config.web.token_configured == true and (.config | has("api_key") | not) and (.config | has("api_key_file") | not) and (.config | has("api_key_file_configured") | not) and (.config | has("api_key_migration_recommended") | not)
+    and (.config.agent_loop | has("auto_execute_low_risk") | not)
+    and (.config.agent_loop | has("auto_execute_shell_low_risk") | not)
     and .config.approvals.auto.skill_readonly == true
+    and .config.approvals.auto.shell_readonly == false
     and .config.approvals.auto.file_patch == false' <<<"${config_state}" >/dev/null
 
 config_update_payload="$(jq -cn '{key:"agent_loop.thinking_trace_enabled", value:true}')"
@@ -89,14 +114,12 @@ api_key_update="$(curl --noproxy '*' -sS \
     -H "Content-Type: application/json" \
     -d "${api_key_payload}" \
     "${base_url}/api/config/update")"
-jq -e '.ok == true and .status == "updated" and .updated.api_key == "configured" and .config.api_key_configured == true and .config.api_key_source == "file" and (.config | has("api_key") | not)' <<<"${api_key_update}" >/dev/null
+jq -e '.ok == true and .status == "updated" and .updated.api_key == "configured" and .config.api_key_configured == true and .config.api_key_source == "config" and .config.api_key_configured_in_config == true and (.config | has("api_key") | not)' <<<"${api_key_update}" >/dev/null
 if grep -q "${api_key_value}" <<<"${api_key_update}"; then
     printf 'api_key update response leaked the secret value\n' >&2
     exit 1
 fi
-jq -e '(.api_key_file | type == "string") and (.api_key | not)' "${project}/config/config.json" >/dev/null
-secret_path="$(jq -r '.api_key_file' "${project}/config/config.json")"
-grep -qx "${api_key_value}" "${project}/${secret_path}"
+jq -e --arg api_key_value "${api_key_value}" '.api_key == $api_key_value' "${project}/config/config.json" >/dev/null
 
 audit_limit_payload="$(jq -cn '{key:"audit_text_limit", value:1234}')"
 audit_limit_update="$(curl --noproxy '*' -sS \

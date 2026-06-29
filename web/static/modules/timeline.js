@@ -18,6 +18,21 @@ export function normalizeProtocolExecutionEntries(title, result) {
   }));
 }
 
+export function normalizeExecutionEntries(title, result) {
+  const protocolEntries = normalizeProtocolExecutionEntries(title, result);
+  if (protocolEntries.length) return protocolEntries;
+
+  const root = result || {};
+  return [{
+    index: 0,
+    number: 1,
+    title,
+    status: root.status || (root.ok ? "executed" : "完成"),
+    step: {},
+    output: root,
+  }];
+}
+
 export function completedExecutionCount(result) {
   return (Array.isArray(result?.timeline) ? result.timeline : []).filter((item) => item.kind === "execution").length;
 }

@@ -2,25 +2,6 @@
 
 set -euo pipefail
 
-LINUX_AGENT_API_INPUT_JSON='[]'
-
-linux_agent_api_read_input_line() {
-    local result_var="$1"
-    local line remaining
-
-    [[ "${LINUX_AGENT_API_MODE:-0}" == "1" ]] || return 1
-    if ! jq -e 'type == "array" and length > 0' <<<"${LINUX_AGENT_API_INPUT_JSON:-[]}" >/dev/null 2>&1; then
-        printf -v "${result_var}" '%s' ""
-        return 0
-    fi
-
-    line="$(jq -r '.[0] // ""' <<<"${LINUX_AGENT_API_INPUT_JSON}")"
-    remaining="$(jq -c '.[1:]' <<<"${LINUX_AGENT_API_INPUT_JSON}")"
-    LINUX_AGENT_API_INPUT_JSON="${remaining}"
-    printf -v "${result_var}" '%s' "${line}"
-    return 0
-}
-
 linux_agent_api_payload() {
     local raw="${1:-}"
     if [[ -z "${raw}" && ! -t 0 ]]; then
@@ -38,17 +19,6 @@ linux_agent_api_error() {
     local status="$1"
     local message="$2"
     jq -cn --arg status "${status}" --arg error "${message}" '{ok:false, status:$status, error:$error}'
-}
-
-linux_agent_api_set_decision_lines() {
-    local payload="$1"
-    LINUX_AGENT_API_MODE=1
-    LINUX_AGENT_API_INPUT_JSON="$(jq -c '
-        if (.decisions | type) == "array" then .decisions
-        elif (.stdin | type) == "array" then .stdin
-        else [] end
-        | map(tostring)
-    ' <<<"${payload}")"
 }
 
 linux_agent_api_web_config_json() {

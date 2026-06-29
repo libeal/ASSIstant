@@ -4,6 +4,7 @@ import json
 import os
 import errno
 import signal
+import shutil
 import subprocess
 import sys
 import threading
@@ -31,7 +32,16 @@ JOB_PROCESSES_LOCK = threading.Lock()
 SERVER_RUN_ID = uuid.uuid4().hex
 SERVER_STARTED_AT = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 API_KEY_PLACEHOLDER = "please-set-your-api-key"
-DEFAULT_API_KEY_FILE = "config/api_key.secret"
+WEB_AUDIT_SESSION_ID = f"web_{SERVER_RUN_ID[:16]}"
+WEB_AUDIT_LOG = ROOT / "logs" / f"{WEB_AUDIT_SESSION_ID}.jsonl"
+OBSERVER_BOOTSTRAP_STATE = {
+    "status": "pending",
+    "ok": True,
+    "method": "",
+    "error": "",
+    "diagnostic": "",
+    "updated_at": SERVER_STARTED_AT,
+}
 
 
 def read_config():
@@ -58,48 +68,29 @@ def safe_int(value, default):
         return int(default)
 
 
+def now_iso():
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
 def secret_value_configured(value):
     return bool(value) and str(value) != API_KEY_PLACEHOLDER
 
 
-def resolve_config_path(path_value):
-    raw = str(path_value or "")
-    if not raw:
-        return None
-    path = Path(raw)
-    if path.is_absolute():
-        return path
-    return (ROOT / path).resolve()
-
-
 def api_key_state(config):
     env_configured = secret_value_configured(os.environ.get("LINUX_AGENT_API_KEY", ""))
-    file_ref = str(config.get("api_key_file") or "")
-    legacy_configured = secret_value_configured(config.get("api_key", ""))
-    file_configured = False
-
-    if file_ref:
-        try:
-            file_path = resolve_config_path(file_ref)
-            file_configured = bool(file_path and file_path.is_file() and file_path.stat().st_size > 0)
-        except OSError:
-            file_configured = False
+    config_configured = secret_value_configured(config.get("api_key", ""))
 
     if env_configured:
         source = "env"
-    elif file_configured:
-        source = "file"
-    elif legacy_configured:
-        source = "config_legacy"
+    elif config_configured:
+        source = "config"
     else:
         source = "missing"
 
     return {
         "configured": source != "missing",
         "source": source,
-        "file_configured": file_configured,
-        "legacy_configured": legacy_configured,
-        "migration_recommended": legacy_configured,
+        "config_configured": config_configured,
     }
 
 
@@ -120,23 +111,20 @@ def config_public_state():
             "api_url": config.get("api_url", ""),
             "api_key_configured": key_state["configured"],
             "api_key_source": key_state["source"],
-            "api_key_file_configured": key_state["file_configured"],
-            "api_key_migration_recommended": key_state["migration_recommended"],
+            "api_key_configured_in_config": key_state["config_configured"],
             "model": config.get("model", ""),
             "request_timeout_sec": config.get("request_timeout_sec", 90),
             "context_turns": config.get("context_turns", 6),
             "agent_loop": {
                 "enabled_for_work": bool(agent_loop.get("enabled_for_work", True)),
-                "auto_execute_low_risk": bool(agent_loop.get("auto_execute_low_risk", True)),
-                "auto_execute_shell_low_risk": bool(agent_loop.get("auto_execute_shell_low_risk", False)),
                 "observation_text_limit": int(agent_loop.get("observation_text_limit", 4000) or 4000),
                 "thinking_trace_enabled": bool(agent_loop.get("thinking_trace_enabled", False)),
                 "checkpoint_turns": int(agent_loop.get("checkpoint_turns", 0) or 0),
             },
             "approvals": {
                 "auto": {
-                    "skill_readonly": bool(auto_approvals.get("skill_readonly", agent_loop.get("auto_execute_low_risk", True))),
-                    "shell_readonly": bool(auto_approvals.get("shell_readonly", agent_loop.get("auto_execute_shell_low_risk", False))),
+                    "skill_readonly": bool(auto_approvals.get("skill_readonly", True)),
+                    "shell_readonly": bool(auto_approvals.get("shell_readonly", False)),
                     "file_match": bool(auto_approvals.get("file_match", True)),
                     "file_patch": bool(auto_approvals.get("file_patch", False)),
                     "file_download": bool(auto_approvals.get("file_download", False)),
@@ -155,7 +143,6 @@ def config_public_state():
                 "min_privilege_proxy": bool(execution.get("min_privilege_proxy", True)),
                 "least_privilege_user": execution.get("least_privilege_user", "nobody"),
             },
-            "api_key_file": config.get("api_key_file", ""),
             "skills_dir": config.get("skills_dir", ""),
             "remote_script_policy": config.get("remote_script_policy", "download_review"),
             "web": {
@@ -172,13 +159,10 @@ def config_public_state():
 CONFIG_WRITABLE_FIELDS = {
     "provider": {"type": "str", "min": 1},
     "api_url": {"type": "str", "min": 1},
-    "api_key_file": {"type": "str", "min": 0},
     "model": {"type": "str", "min": 1},
     "request_timeout_sec": {"type": "int", "min": 1, "max": 600},
     "context_turns": {"type": "int", "min": 1, "max": 50},
     "agent_loop.enabled_for_work": {"type": "bool"},
-    "agent_loop.auto_execute_low_risk": {"type": "bool"},
-    "agent_loop.auto_execute_shell_low_risk": {"type": "bool"},
     "agent_loop.observation_text_limit": {"type": "int", "min": 200, "max": 200000},
     "agent_loop.thinking_trace_enabled": {"type": "bool"},
     "agent_loop.checkpoint_turns": {"type": "int", "min": 0, "max": 100},
@@ -192,8 +176,8 @@ CONFIG_WRITABLE_FIELDS = {
     "audit_mode": {"type": "enum", "values": {"safe_summary", "redacted_verbose"}},
     "audit_text_limit": {"type": "int", "min": 40, "max": 200000},
     "observer.enabled": {"type": "enum", "values": {"auto", "auditd", "disabled"}},
-    "observer.privilege": {"type": "str", "min": 0},
-    "observer.max_events": {"type": "int", "min": 0, "max": 100000},
+    "observer.privilege": {"type": "enum", "values": {"sudo_interactive", "passwordless", "none"}},
+    "observer.max_events": {"type": "int", "min": 1, "max": 100000},
     "execution.min_privilege_proxy": {"type": "bool"},
     "execution.least_privilege_user": {"type": "str", "min": 1},
     "skills_dir": {"type": "str", "min": 0},
@@ -247,43 +231,16 @@ def write_nested_config_value(config, key, value):
 def write_api_key_secret(value):
     secret = str(value or "")
     config = read_config()
-    target = resolve_config_path(config.get("api_key_file") or DEFAULT_API_KEY_FILE)
-    if target is None:
-        target = resolve_config_path(DEFAULT_API_KEY_FILE)
 
     if not secret:
-        try:
-            if target and target.exists():
-                target.unlink()
-        except OSError:
-            return {"ok": False, "status": "secret_clear_failed", "error": "Failed to remove API key secret file."}
         config.pop("api_key", None)
-        config["api_key_file"] = str(config.get("api_key_file") or DEFAULT_API_KEY_FILE)
         write_config(config)
         result = config_public_state()
         result["status"] = "updated"
         result["updated"] = {"api_key": "cleared"}
         return result
 
-    if target is None:
-        return {"ok": False, "status": "invalid_config_value", "error": "api_key_file is invalid."}
-    target.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = target.with_suffix(target.suffix + f".{uuid.uuid4().hex}.tmp")
-    try:
-        with tmp_path.open("w", encoding="utf-8") as handle:
-            handle.write(secret)
-            handle.write("\n")
-        os.chmod(tmp_path, 0o600)
-        tmp_path.replace(target)
-    except OSError as exc:
-        try:
-            tmp_path.unlink()
-        except OSError:
-            pass
-        return {"ok": False, "status": "secret_write_failed", "error": str(exc)}
-
-    config.pop("api_key", None)
-    config["api_key_file"] = str(config.get("api_key_file") or DEFAULT_API_KEY_FILE)
+    config["api_key"] = secret
     write_config(config)
     result = config_public_state()
     result["status"] = "updated"
@@ -443,6 +400,246 @@ def sudo_check(password):
         "ok": False,
         "status": "sudo_denied",
         "error": (process.stderr or "sudo validation failed").strip()[:400],
+    }
+
+
+def record_web_audit_event(stage, payload=None):
+    payload = payload if isinstance(payload, dict) else {}
+    WEB_AUDIT_LOG.parent.mkdir(parents=True, exist_ok=True)
+    event = {
+        "timestamp": now_iso(),
+        "session_id": WEB_AUDIT_SESSION_ID,
+        "stage": stage,
+        "payload": payload,
+    }
+    with WEB_AUDIT_LOG.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(event, ensure_ascii=False, separators=(",", ":")))
+        handle.write("\n")
+
+
+def observer_runtime_config():
+    config = read_config()
+    observer = config.get("observer") if isinstance(config.get("observer"), dict) else {}
+    enabled = str(observer.get("enabled") or "auto")
+    if enabled not in {"auto", "auditd", "disabled"}:
+        enabled = "auto"
+    privilege = str(observer.get("privilege") or "sudo_interactive")
+    if privilege not in {"sudo_interactive", "passwordless", "none"}:
+        privilege = "sudo_interactive"
+    max_events = safe_int(observer.get("max_events", 200) or 200, 200)
+    if max_events <= 0:
+        max_events = 200
+    return {
+        "enabled": enabled,
+        "privilege": privilege,
+        "max_events": max_events,
+    }
+
+
+def observer_requires_permission(observer):
+    return observer.get("enabled") != "disabled" and observer.get("privilege") != "none"
+
+
+def observer_bootstrap_public_state(force_ok=None, extra=None):
+    observer = observer_runtime_config()
+    state = dict(OBSERVER_BOOTSTRAP_STATE)
+    if observer.get("enabled") == "disabled":
+        state.update(
+            {
+                "status": "disabled",
+                "ok": True,
+                "method": "config",
+                "diagnostic": "observer.enabled is disabled in config.",
+            }
+        )
+    state.update(extra or {})
+    ok = bool(state.get("ok", True)) if force_ok is None else bool(force_ok)
+    return {
+        "ok": ok,
+        "status": state.get("status", "pending"),
+        "method": state.get("method", ""),
+        "error": state.get("error", ""),
+        "diagnostic": state.get("diagnostic", ""),
+        "updated_at": state.get("updated_at", SERVER_STARTED_AT),
+        "requires_permission": observer_requires_permission(observer),
+        "observer": observer,
+    }
+
+
+def update_observer_bootstrap_state(status, ok, method="", error="", diagnostic=""):
+    OBSERVER_BOOTSTRAP_STATE.update(
+        {
+            "status": status,
+            "ok": bool(ok),
+            "method": method,
+            "error": str(error or "")[:400],
+            "diagnostic": str(diagnostic or "")[:600],
+            "updated_at": now_iso(),
+        }
+    )
+    return observer_bootstrap_public_state(force_ok=ok)
+
+
+def sudo_cached():
+    if not shutil.which("sudo"):
+        return False
+    try:
+        process = subprocess.run(
+            ["sudo", "-n", "true"],
+            text=True,
+            capture_output=True,
+            timeout=5,
+            check=False,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return False
+    return process.returncode == 0
+
+
+def auditctl_preflight_command():
+    if os.geteuid() == 0:
+        return ["auditctl", "-s"], "root"
+    return ["sudo", "-n", "auditctl", "-s"], "sudo"
+
+
+def observer_bootstrap_skip():
+    result = update_observer_bootstrap_state(
+        "skipped",
+        True,
+        method="user",
+        diagnostic="User skipped web observer bootstrap; later jobs will record observer_unavailable if sudo credentials are not available.",
+    )
+    record_web_audit_event(
+        "observer_bootstrap_skipped",
+        {
+            "status": result["status"],
+            "method": result["method"],
+            "diagnostic": result["diagnostic"],
+            "observer": result["observer"],
+        },
+    )
+    result["logged"] = True
+    return result
+
+
+def observer_bootstrap_enable(password):
+    observer = observer_runtime_config()
+    if observer.get("enabled") == "disabled":
+        result = update_observer_bootstrap_state(
+            "observer_disabled",
+            False,
+            method="config",
+            error="observer.enabled is disabled.",
+            diagnostic="Enable observer.enabled before starting auditd observer bootstrap.",
+        )
+        record_web_audit_event("observer_bootstrap_failed", public_observer_log_payload(result))
+        return result
+    if observer.get("privilege") == "none" and os.geteuid() != 0:
+        result = update_observer_bootstrap_state(
+            "sudo_required",
+            False,
+            method="none",
+            error="observer.privilege is set to none.",
+            diagnostic="Set observer.privilege to sudo_interactive or passwordless to enable auditd from web.",
+        )
+        record_web_audit_event("observer_bootstrap_failed", public_observer_log_payload(result))
+        return result
+    if not shutil.which("auditctl"):
+        result = update_observer_bootstrap_state(
+            "auditctl_not_found",
+            False,
+            method="auditd",
+            error="auditctl is not installed.",
+            diagnostic="Install auditd/auditctl or disable observer.",
+        )
+        record_web_audit_event("observer_bootstrap_failed", public_observer_log_payload(result))
+        return result
+    if not shutil.which("ausearch"):
+        result = update_observer_bootstrap_state(
+            "ausearch_not_found",
+            False,
+            method="auditd",
+            error="ausearch is not installed.",
+            diagnostic="Install auditd/ausearch or disable observer.",
+        )
+        record_web_audit_event("observer_bootstrap_failed", public_observer_log_payload(result))
+        return result
+
+    if os.geteuid() != 0 and not sudo_cached():
+        if not password:
+            result = update_observer_bootstrap_state(
+                "sudo_required",
+                False,
+                method="sudo",
+                error="sudo password is required.",
+                diagnostic="Web has no TTY, so sudo credentials must be validated from the browser once per sudo timeout window.",
+            )
+            record_web_audit_event("observer_bootstrap_failed", public_observer_log_payload(result))
+            return result
+        check = sudo_check(password)
+        if not check.get("ok"):
+            result = update_observer_bootstrap_state(
+                str(check.get("status") or "sudo_denied"),
+                False,
+                method=str(check.get("method") or "sudo"),
+                error=str(check.get("error") or check.get("status") or "sudo validation failed"),
+                diagnostic="sudo credential validation failed; auditd observer was not enabled for web jobs.",
+            )
+            record_web_audit_event("observer_bootstrap_failed", public_observer_log_payload(result))
+            return result
+
+    command, method = auditctl_preflight_command()
+    try:
+        process = subprocess.run(command, text=True, capture_output=True, timeout=10, check=False)
+    except subprocess.TimeoutExpired:
+        result = update_observer_bootstrap_state(
+            "auditctl_timeout",
+            False,
+            method=method,
+            error="auditctl validation timed out.",
+            diagnostic="auditctl -s did not return within 10 seconds.",
+        )
+        record_web_audit_event("observer_bootstrap_failed", public_observer_log_payload(result))
+        return result
+    except FileNotFoundError:
+        result = update_observer_bootstrap_state(
+            "auditctl_not_found",
+            False,
+            method=method,
+            error="auditctl is not installed.",
+            diagnostic="Install auditd/auditctl or disable observer.",
+        )
+        record_web_audit_event("observer_bootstrap_failed", public_observer_log_payload(result))
+        return result
+
+    if process.returncode == 0:
+        result = update_observer_bootstrap_state(
+            "enabled",
+            True,
+            method=method,
+            diagnostic="auditctl preflight succeeded; subsequent web jobs can start auditd observer while sudo credentials remain valid.",
+        )
+        record_web_audit_event("observer_bootstrap_enabled", public_observer_log_payload(result))
+        return result
+
+    stderr = (process.stderr or process.stdout or "auditctl validation failed").strip()[:400]
+    status = "auditctl_failed"
+    diagnostic = "auditctl -s failed; auditd may be unavailable or the kernel audit interface may be restricted."
+    if "operation not permitted" in stderr.lower():
+        status = "auditctl_permission_denied"
+        diagnostic = "auditctl was rejected by the kernel audit interface; this commonly happens in containers, WSL, or hosts without CAP_AUDIT_CONTROL/auditd support."
+    result = update_observer_bootstrap_state(status, False, method=method, error=stderr, diagnostic=diagnostic)
+    record_web_audit_event("observer_bootstrap_failed", public_observer_log_payload(result))
+    return result
+
+
+def public_observer_log_payload(result):
+    return {
+        "status": result.get("status", ""),
+        "method": result.get("method", ""),
+        "error": result.get("error", ""),
+        "diagnostic": result.get("diagnostic", ""),
+        "observer": result.get("observer", {}),
     }
 
 
@@ -1007,6 +1204,9 @@ class Handler(SimpleHTTPRequestHandler):
         if path == "/api/config":
             json_response(self, HTTPStatus.OK, config_public_state())
             return
+        if path == "/api/observer/bootstrap":
+            json_response(self, HTTPStatus.OK, observer_bootstrap_public_state(force_ok=True))
+            return
         if path == "/api/skills/tree":
             json_response(self, HTTPStatus.OK, list_skill_files())
             return
@@ -1085,6 +1285,16 @@ class Handler(SimpleHTTPRequestHandler):
             result = update_config_value(str(body.get("key") or ""), body.get("value"))
             json_response(self, HTTPStatus.OK, result)
             return
+        if path == "/api/observer/bootstrap":
+            action = str(body.get("action") or "")
+            if action == "skip":
+                result = observer_bootstrap_skip()
+            elif action == "enable":
+                result = observer_bootstrap_enable(str(body.get("password") or ""))
+            else:
+                result = {"ok": False, "status": "invalid_action", "error": "action must be enable or skip."}
+            json_response(self, HTTPStatus.OK, result)
+            return
         if path == "/api/skills/read":
             try:
                 result = read_skill_file(str(body.get("path") or ""))
@@ -1135,6 +1345,14 @@ def main():
     cleanup_jobs()
     STATIC_ROOT.mkdir(parents=True, exist_ok=True)
     JOBS_ROOT.mkdir(parents=True, exist_ok=True)
+    record_web_audit_event(
+        "session_started",
+        {
+            "request": "agent-web",
+            "run_id": SERVER_RUN_ID,
+            "started_at": SERVER_STARTED_AT,
+        },
+    )
     try:
         server = ThreadingHTTPServer((HOST, PORT), Handler)
     except OSError as exc:
@@ -1155,6 +1373,13 @@ def main():
     except KeyboardInterrupt:
         print("\n[信息] Web 控制台已停止。", file=sys.stderr, flush=True)
     finally:
+        record_web_audit_event(
+            "session_finished",
+            {
+                "status": "stopped",
+                "run_id": SERVER_RUN_ID,
+            },
+        )
         server.server_close()
 
 

@@ -15,7 +15,7 @@ usage() {
 
 说明:
   - 默认不会访问网络，也不会打印 API key。
-  - API key 读取顺序为 LINUX_AGENT_API_KEY、api_key_file、旧版 config.api_key。
+  - API key 读取顺序为 LINUX_AGENT_API_KEY、config.api_key。
   - --live 会调用 config.json 中的 api_url/model 和解析后的 API key。
 EOF
 }
@@ -45,72 +45,38 @@ json_get() {
     jq -r "${query} | if . == null then empty else . end" "${CONFIG_FILE}"
 }
 
-config_path_value() {
-    local configured="$1"
-    if [[ -z "${configured}" ]]; then
-        return 1
-    fi
-    if [[ "${configured}" == /* ]]; then
-        printf '%s\n' "${configured}"
-    else
-        printf '%s/%s\n' "${ROOT_DIR}" "${configured}"
-    fi
-}
-
 api_key_placeholder() {
     local value="$1"
     [[ -z "${value}" || "${value}" == "please-set-your-api-key" ]]
 }
 
 api_key_value() {
-    local env_value file_config file_path file_value legacy_value
+    local env_value config_value
     env_value="${LINUX_AGENT_API_KEY:-}"
     if ! api_key_placeholder "${env_value}"; then
         printf '%s\n' "${env_value}"
         return 0
     fi
 
-    file_config="$(json_get '.api_key_file')"
-    if [[ -n "${file_config}" ]]; then
-        file_path="$(config_path_value "${file_config}")"
-        if [[ -r "${file_path}" ]]; then
-            IFS= read -r file_value < "${file_path}" || file_value=""
-            if ! api_key_placeholder "${file_value}"; then
-                printf '%s\n' "${file_value}"
-                return 0
-            fi
-        fi
-    fi
-
-    legacy_value="$(json_get '.api_key')"
-    if ! api_key_placeholder "${legacy_value}"; then
-        printf '%s\n' "${legacy_value}"
+    config_value="$(json_get '.api_key')"
+    if ! api_key_placeholder "${config_value}"; then
+        printf '%s\n' "${config_value}"
         return 0
     fi
+
     return 0
 }
 
 api_key_source() {
-    local env_value file_config file_path file_value legacy_value
+    local env_value config_value
     env_value="${LINUX_AGENT_API_KEY:-}"
     if ! api_key_placeholder "${env_value}"; then
         printf 'env\n'
         return 0
     fi
-    file_config="$(json_get '.api_key_file')"
-    if [[ -n "${file_config}" ]]; then
-        file_path="$(config_path_value "${file_config}")"
-        if [[ -r "${file_path}" ]]; then
-            IFS= read -r file_value < "${file_path}" || file_value=""
-            if ! api_key_placeholder "${file_value}"; then
-                printf 'file\n'
-                return 0
-            fi
-        fi
-    fi
-    legacy_value="$(json_get '.api_key')"
-    if ! api_key_placeholder "${legacy_value}"; then
-        printf 'config_legacy\n'
+    config_value="$(json_get '.api_key')"
+    if ! api_key_placeholder "${config_value}"; then
+        printf 'config\n'
         return 0
     fi
     printf 'missing\n'
@@ -149,7 +115,8 @@ validate_config() {
 
     local api_url api_key api_key_src model timeout context_turns audit_mode audit_text_limit remote_policy skills_dir
     local web_enabled web_host web_port web_token web_retention
-    local loop_enabled auto_low auto_shell observation_limit thinking_trace checkpoint_turns
+    local loop_enabled observation_limit thinking_trace checkpoint_turns
+    local approval_skill approval_shell approval_file_match approval_file_patch approval_file_download approval_local_analyze approval_remote_script
     api_url="$(json_get '.api_url')"
     api_key="$(api_key_value)"
     api_key_src="$(api_key_source)"
@@ -166,26 +133,28 @@ validate_config() {
     web_token="$(json_get '.web.token')"
     web_retention="$(json_get '.web.job_retention_hours')"
     loop_enabled="$(json_get '.agent_loop.enabled_for_work')"
-    auto_low="$(json_get '.agent_loop.auto_execute_low_risk')"
-    auto_shell="$(json_get '.agent_loop.auto_execute_shell_low_risk')"
     observation_limit="$(json_get '.agent_loop.observation_text_limit')"
     thinking_trace="$(json_get '.agent_loop.thinking_trace_enabled')"
     checkpoint_turns="$(json_get '.agent_loop.checkpoint_turns')"
+    approval_skill="$(json_get '.approvals.auto.skill_readonly')"
+    approval_shell="$(json_get '.approvals.auto.shell_readonly')"
+    approval_file_match="$(json_get '.approvals.auto.file_match')"
+    approval_file_patch="$(json_get '.approvals.auto.file_patch')"
+    approval_file_download="$(json_get '.approvals.auto.file_download')"
+    approval_local_analyze="$(json_get '.approvals.auto.local_analyze')"
+    approval_remote_script="$(json_get '.approvals.auto.remote_script')"
 
     validate_non_empty "api_url" "${api_url}" || failures=$((failures + 1))
     validate_non_empty "api_key" "${api_key}" || failures=$((failures + 1))
     validate_non_empty "model" "${model}" || failures=$((failures + 1))
 
     if [[ "${api_key_src}" == "missing" ]]; then
-        print_error "API key 未配置；请设置 LINUX_AGENT_API_KEY 或 config.api_key_file"
+        print_error "API key 未配置；请设置 LINUX_AGENT_API_KEY 或 config.api_key"
         failures=$((failures + 1))
     elif [[ ${#api_key} -lt 8 ]]; then
         print_warn "api_key 长度较短，请确认是否正确"
     else
         print_ok "api_key 已通过 ${api_key_src} 配置（未打印密钥）"
-        if [[ "${api_key_src}" == "config_legacy" ]]; then
-            print_warn "检测到旧版 config.api_key，建议迁移到 LINUX_AGENT_API_KEY 或 api_key_file"
-        fi
     fi
 
     if [[ ! "${api_url}" =~ ^https?:// ]]; then
@@ -252,9 +221,14 @@ validate_config() {
 
     for bool_field in \
         "agent_loop.enabled_for_work:${loop_enabled}" \
-        "agent_loop.auto_execute_low_risk:${auto_low}" \
-        "agent_loop.auto_execute_shell_low_risk:${auto_shell}" \
-        "agent_loop.thinking_trace_enabled:${thinking_trace}"; do
+        "agent_loop.thinking_trace_enabled:${thinking_trace}" \
+        "approvals.auto.skill_readonly:${approval_skill}" \
+        "approvals.auto.shell_readonly:${approval_shell}" \
+        "approvals.auto.file_match:${approval_file_match}" \
+        "approvals.auto.file_patch:${approval_file_patch}" \
+        "approvals.auto.file_download:${approval_file_download}" \
+        "approvals.auto.local_analyze:${approval_local_analyze}" \
+        "approvals.auto.remote_script:${approval_remote_script}"; do
         local field_name field_value
         field_name="${bool_field%%:*}"
         field_value="${bool_field#*:}"

@@ -42,7 +42,7 @@
           </div>
           <div class="status">
             <span class="pill" id="connectionState">offline</span>
-            <span class="pill">observer: auto</span>
+            <button class="pill status-action" id="observerAuditBtn" type="button">observer: <span id="observerState">pending</span></button>
             <span class="pill">audit: <span id="activeBoundary">safe_summary</span></span>
             <span class="pill">thinking_summary: optional</span>
             <form id="tokenForm" class="token-form">
@@ -392,14 +392,14 @@
 
           <section class="screen" id="screen-config">
             <div class="panel">
-              <div class="panel-header"><div><h2>配置中心</h2><p>连接 token 后读取后端真实配置；api_key 只允许写入本机 secret 文件，不在前端回显。</p></div><div class="toolbar action-gap"><button class="btn secondary" id="configReloadBtn" type="button">重新读取</button><button class="btn" id="configSaveBtn" type="button" disabled>保存配置</button><button class="btn secondary" id="doctorRunBtn" type="button">运行 Doctor</button></div></div>
+              <div class="panel-header"><div><h2>配置中心</h2><p>连接 token 后读取后端真实配置；api_key 写入 config.api_key，但不会在前端回显明文。</p></div><div class="toolbar action-gap"><button class="btn secondary" id="configReloadBtn" type="button">重新读取</button><button class="btn" id="configSaveBtn" type="button" disabled>保存配置</button><button class="btn secondary" id="doctorRunBtn" type="button">运行 Doctor</button></div></div>
               <div id="doctorSummary" class="grid-3 doctor-summary"></div>
               <div class="config-section">
                 <div><h4>运行时快照</h4><p class="small">这些值来自后端当前配置和 web 进程；web host/port/token 改动通常需要重启进程生效。</p></div>
                 <div class="grid-3" id="configRuntimeSummary"></div>
               </div>
               <div id="configEditorRoot"></div>
-              <div class="locked-note small">中文注释：前端只写入白名单配置项；api_key 可通过空白输入框写入本机 secret 文件但不回显，web.token 等敏感值仍不展示、不编辑。保存后会重新读取 <span class="mono">/api/config</span> 并刷新页面状态。</div>
+              <div class="locked-note small">中文注释：前端只写入白名单配置项；api_key 可通过空白输入框更新 config.api_key 但不回显，web.token 等敏感值仍不展示、不编辑。保存后会重新读取 <span class="mono">/api/config</span> 并刷新页面状态。</div>
               <div class="divider"></div>
               <div class="terminal">
                 <div class="terminal-head"><span class="status-dot ok"></span><span>Doctor 输出</span><span class="pill" id="configDirtyState">synced</span></div>
@@ -411,6 +411,25 @@
       </main>
     </div>
 
+    <dialog class="observer-dialog" id="observerAuditDialog" aria-labelledby="observerAuditTitle">
+      <section class="observer-dialog-card">
+        <div class="panel-header">
+          <div>
+            <h2 id="observerAuditTitle">启用内核审计</h2>
+            <p>Web 进程没有终端交互权限，需要在浏览器中核对一次服务器密码来启用 auditd observer。</p>
+          </div>
+          <span class="pill risk medium" id="observerAuditStatus">pending</span>
+        </div>
+        <label class="small" for="observerAuditPassword">服务器密码
+          <input class="field" id="observerAuditPassword" type="password" autocomplete="current-password" placeholder="输入服务器密码">
+        </label>
+        <pre class="code observer-dialog-output" id="observerAuditOutput">等待授权。</pre>
+        <div class="approval-actions">
+          <button class="btn" id="observerAuditEnableBtn" type="button">启用审计</button>
+          <button class="btn secondary" id="observerAuditSkipBtn" type="button">跳过并记录</button>
+        </div>
+      </section>
+    </dialog>
     <div id="toast" class="toast" role="status" aria-live="polite"></div>
     <script type="module" src="/app.js"></script>
   </body>

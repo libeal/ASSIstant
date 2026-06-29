@@ -31,14 +31,12 @@ stop_fake_ai_server() {
 configure_fake_ai() {
     local project="$1"
     local tmp_config
-    local secret_file="${project}/config/test-api-key.secret"
 
-    printf 'test-api-key\n' > "${secret_file}"
     tmp_config="$(mktemp)"
     jq --arg api_url "${FAKE_AI_URL}" '
         .api_url = $api_url
-        | .api_key_file = "config/test-api-key.secret"
-        | del(.api_key)
+        | .api_key = "test-api-key"
+        | del(.api_key_file)
         | .model = "fake-chat-completions"
         | .request_timeout_sec = 10
     ' "${project}/config/config.json" > "${tmp_config}"

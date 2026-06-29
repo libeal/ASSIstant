@@ -10,7 +10,7 @@
     "(^|[;&|[:space:]])sed[[:space:]].*-i",
     "(^|[;&|[:space:]])perl[[:space:]].*-(p|i|pi|ip)",
     "(^|[;&|[:space:]])(python|python3|ruby|node|php|perl)[[:space:]]+-c[[:space:]]",
-    "[^<]>[>]?[^\\n]*(/(etc|boot|usr|var/lib|home/[^/]+/\\.ssh)(/|[[:space:]]|$))",
+    "[^<]>[>]?[^\\n]*(/(etc|boot|usr|var/lib|root|home/[^/]+/\\.ssh)(/|[[:space:]]|$))",
     "curl[[:space:]].*\\|[[:space:]]*(sudo[[:space:]]+)?(bash|sh)",
     "wget[[:space:]].*\\|[[:space:]]*(sudo[[:space:]]+)?(bash|sh)"
   ],
@@ -29,7 +29,7 @@
     "(^|[;&|[:space:]])sed[[:space:]].*-i",
     "(^|[;&|[:space:]])perl[[:space:]].*-(p|i|pi|ip)",
     "(^|[;&|[:space:]])(python|python3|ruby|node|php|perl)[[:space:]]+-c[[:space:]]",
-    "[^<]>[>]?[^\\n]*(/(etc|boot|usr|var/lib|home/[^/]+/\\.ssh)(/|[[:space:]]|$))",
+    "[^<]>[>]?[^\\n]*(/(etc|boot|usr|var/lib|root|home/[^/]+/\\.ssh)(/|[[:space:]]|$))",
     "curl[[:space:]].*\\|[[:space:]]*(bash|sh)",
     "wget[[:space:]].*\\|[[:space:]]*(bash|sh)"
   ],
@@ -39,8 +39,9 @@
     "(rm|mv|chmod|chown|truncate|tee|dd|install|ln|sed|perl)[^\\n]*/boot(/|[[:space:]]|$)",
     "(rm|mv|chmod|chown|truncate|tee|dd|install|ln|sed|perl)[^\\n]*/usr(/|[[:space:]]|$)",
     "(rm|mv|chmod|chown|truncate|tee|dd|install|ln|sed|perl)[^\\n]*/var/lib(/|[[:space:]]|$)",
+    "(rm|mv|chmod|chown|truncate|tee|dd|install|ln|sed|perl)[^\\n]*/root(/|[[:space:]]|$)",
     "(rm|mv|chmod|chown|truncate|tee|dd|install|ln|sed|perl)[^\\n]*/home/[^/]+/\\.ssh(/|[[:space:]]|$)",
-    "[^<]>[>]?[^\\n]*(/(etc|boot|usr|var/lib|home/[^/]+/\\.ssh)(/|[[:space:]]|$))"
+    "[^<]>[>]?[^\\n]*(/(etc|boot|usr|var/lib|root|home/[^/]+/\\.ssh)(/|[[:space:]]|$))"
   ],
   "protected_services": [
     "(^|[[:space:]])sshd([[:space:]]|$)",

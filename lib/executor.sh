@@ -2,13 +2,39 @@
 
 set -euo pipefail
 
+LINUX_AGENT_API_INPUT_JSON='[]'
+
 linux_agent_api_read_input_line() {
-    return 1
+    local result_var="$1"
+    local line remaining
+
+    [[ "${LINUX_AGENT_API_MODE:-0}" == "1" ]] || return 1
+    if ! jq -e 'type == "array" and length > 0' <<<"${LINUX_AGENT_API_INPUT_JSON:-[]}" >/dev/null 2>&1; then
+        printf -v "${result_var}" '%s' ""
+        return 0
+    fi
+
+    line="$(jq -r '.[0] // ""' <<<"${LINUX_AGENT_API_INPUT_JSON}")"
+    remaining="$(jq -c '.[1:]' <<<"${LINUX_AGENT_API_INPUT_JSON}")"
+    LINUX_AGENT_API_INPUT_JSON="${remaining}"
+    printf -v "${result_var}" '%s' "${line}"
+    return 0
 }
 
 linux_agent_api_has_pending_decision_lines() {
     [[ "${LINUX_AGENT_API_MODE:-0}" == "1" ]] || return 1
     jq -e 'type == "array" and length > 0' <<<"${LINUX_AGENT_API_INPUT_JSON:-[]}" >/dev/null 2>&1
+}
+
+linux_agent_api_set_decision_lines() {
+    local payload="$1"
+    LINUX_AGENT_API_MODE=1
+    LINUX_AGENT_API_INPUT_JSON="$(jq -c '
+        if (.decisions | type) == "array" then .decisions
+        elif (.stdin | type) == "array" then .stdin
+        else [] end
+        | map(tostring)
+    ' <<<"${payload}")"
 }
 
 linux_agent_probe_sudo() {
@@ -140,59 +166,29 @@ linux_agent_confirm_execution() {
     [[ "${answer}" =~ ^[Yy]$ ]]
 }
 
-linux_agent_auto_execute_low_risk_enabled() {
-    linux_agent_config_bool_default '.agent_loop.auto_execute_low_risk' 'true'
-}
-
-linux_agent_auto_execute_shell_low_risk_enabled() {
-    linux_agent_config_bool_default '.agent_loop.auto_execute_shell_low_risk' 'false'
-}
-
-linux_agent_config_bool_with_legacy_default() {
-    local key="$1"
-    local legacy_key="$2"
-    local default_value="$3"
-    local value
-
-    value="$(jq -r "${key} // empty" <<<"${LINUX_AGENT_CONFIG_JSON:-{}}" 2>/dev/null || true)"
-    if [[ -n "${value}" ]]; then
-        case "${value,,}" in
-            true|1|yes|on) printf 'true\n' ;;
-            *) printf 'false\n' ;;
-        esac
-        return 0
-    fi
-
-    if [[ -n "${legacy_key}" ]]; then
-        linux_agent_config_bool_default "${legacy_key}" "${default_value}"
-    else
-        linux_agent_config_bool_default "${key}" "${default_value}"
-    fi
-}
-
 linux_agent_auto_approval_enabled() {
     local capability="$1"
     case "${capability}" in
         skill_readonly)
-            linux_agent_config_bool_with_legacy_default '.approvals.auto.skill_readonly' '.agent_loop.auto_execute_low_risk' 'true'
+            linux_agent_config_bool_default '.approvals.auto.skill_readonly' 'true'
             ;;
         shell_readonly)
-            linux_agent_config_bool_with_legacy_default '.approvals.auto.shell_readonly' '.agent_loop.auto_execute_shell_low_risk' 'false'
+            linux_agent_config_bool_default '.approvals.auto.shell_readonly' 'false'
             ;;
         file_match)
-            linux_agent_config_bool_with_legacy_default '.approvals.auto.file_match' '' 'true'
+            linux_agent_config_bool_default '.approvals.auto.file_match' 'true'
             ;;
         file_patch)
-            linux_agent_config_bool_with_legacy_default '.approvals.auto.file_patch' '' 'false'
+            linux_agent_config_bool_default '.approvals.auto.file_patch' 'false'
             ;;
         file_download)
-            linux_agent_config_bool_with_legacy_default '.approvals.auto.file_download' '' 'false'
+            linux_agent_config_bool_default '.approvals.auto.file_download' 'false'
             ;;
         local_analyze)
-            linux_agent_config_bool_with_legacy_default '.approvals.auto.local_analyze' '' 'true'
+            linux_agent_config_bool_default '.approvals.auto.local_analyze' 'true'
             ;;
         remote_script)
-            linux_agent_config_bool_with_legacy_default '.approvals.auto.remote_script' '' 'false'
+            linux_agent_config_bool_default '.approvals.auto.remote_script' 'false'
             ;;
         *)
             printf 'false\n'

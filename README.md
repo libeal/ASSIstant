@@ -56,7 +56,7 @@ bash bin/agent
 export LINUX_AGENT_API_KEY="你的密钥"
 ```
 
-`config/config.json` 中仍需配置 `api_url` 和 `model`。如果不想使用环境变量，也可以把密钥写入本机 secret 文件，并在 `config.json` 中设置 `api_key_file`，不建议把真实密钥直接写入 `.api_key` 明文字段。
+`config/config.json` 中仍需配置 `api_url` 和 `model`。如果不想使用环境变量，也可以在 `config.json` 中设置 `api_key` 作为兜底。
 
 启动 Web：
 
@@ -65,6 +65,7 @@ bash bin/agent-web
 ```
 
 默认访问 `http://127.0.0.1:8765/`。静态页面不需要认证，所有 `/api/` 请求都需要 `Authorization: Bearer <token>`。如果 `web.token` 留空，启动时会生成本次运行的临时 token 并打印到终端。
+连接后 Web 会申请一次服务器权限以启用 auditd observer；用户跳过或启用失败都会写入 Web 审计日志，后续任务仍可继续运行并按 observer 降级事件记录。
 
 常用命令：
 
@@ -102,7 +103,7 @@ bash bin/agent api terminal run '{"command":"printf api-ok"}' | jq '.timeline, .
 - 执行层：shell、skill_script、remote_script、文件编辑等执行器，以及 policy、approval、observer、audit。
 - 能力层：skills、policies、prompts、config、audit、context 等可替换或可扩展资源。
 
-这个边界借鉴 rssh 的思路：不同入口共享同一套核心能力，AI 只提出计划，执行层独立审查、确认、执行和审计。更详细的架构记录见 [`docs/architecture.md`](docs/architecture.md)，CLI/Web 机器协议见 [`docs/api-protocol.md`](docs/api-protocol.md)。
+不同入口共享同一套核心能力，AI 只提出计划，执行层独立审查、确认、执行和审计。整体设计见 [`docs/design.md`](docs/design.md)，更详细的架构记录见 [`docs/architecture.md`](docs/architecture.md)，CLI/Web 机器协议见 [`docs/api-protocol.md`](docs/api-protocol.md)。
 
 ```text
 Linux 运维 Agent
@@ -123,7 +124,7 @@ Linux 运维 Agent
 │  ├─ AI 与编排
 │  │  ├─ ai.sh               模型请求、响应规范化和 schema 校验
 │  │  ├─ orchestrator.sh     work/edit/script/terminal 高层编排和反思循环
-│  │  ├─ executor.sh         work plan 执行状态机
+│  │  ├─ executor.sh         work plan 执行状态机、审批输入队列和自动批准判断
 │  │  ├─ command_guard.py    Python 标准库 AST/Token 命令风险守卫
 │  │  ├─ protocol.sh         timeline、approval_card、output_blocks 协议构造器
 │  │  ├─ editor.sh           skill edit/staging/提交
@@ -292,14 +293,11 @@ Web 版 edit 使用浏览器内联编辑器，但保存前仍调用同一套 `ed
 | --- | --- |
 | `provider` | 供应商展示名。 |
 | `api_url` | Chat Completions 兼容接口地址。 |
-| `api_key_file` | 可选的本机 API key 文件路径；相对路径按项目根目录解析。 |
-| `api_key` | 旧版兼容字段，不推荐继续写入真实密钥；优先使用 `LINUX_AGENT_API_KEY` 或 `api_key_file`。 |
+| `api_key` | 可选的模型 API key；优先级低于 `LINUX_AGENT_API_KEY`，不会在 Web 响应中回显。 |
 | `model` | 模型名称。 |
 | `request_timeout_sec` | AI 请求超时时间。 |
 | `context_turns` | 会话历史窗口大小。 |
 | `agent_loop.enabled_for_work` | 是否启用 work 反思续写循环。 |
-| `agent_loop.auto_execute_low_risk` | 旧版兼容开关；当 `approvals.auto.skill_readonly` 未设置时作为默认值。 |
-| `agent_loop.auto_execute_shell_low_risk` | 旧版兼容开关；当 `approvals.auto.shell_readonly` 未设置时作为默认值。 |
 | `agent_loop.observation_text_limit` | observation 文本摘要上限。 |
 | `agent_loop.thinking_trace_enabled` | 是否保存并展示简短 `thinking_summary`。 |
 | `agent_loop.checkpoint_turns` | 强制 checkpoint 轮次，`0` 表示使用默认窗口。 |
@@ -330,7 +328,7 @@ Web 版 edit 使用浏览器内联编辑器，但保存前仍调用同一套 `ed
 | 变量 | 作用 |
 | --- | --- |
 | `EDITOR` | Edit 模式打开脚本确认文件的编辑器，未设置时使用 `vi`。 |
-| `LINUX_AGENT_API_KEY` | 推荐的模型 API 密钥来源，优先级高于 `api_key_file` 和旧版 `config.api_key`。 |
+| `LINUX_AGENT_API_KEY` | 推荐的模型 API 密钥来源，优先级高于 `config.api_key`。 |
 | `LINUX_AGENT_OUTPUT_JSON=1` | 将 CLI 业务输出切换为机器可读 JSON。 |
 
 内部变量如 `LINUX_AGENT_TMP_DIR`、`LINUX_AGENT_SESSION_ID`、`LINUX_AGENT_AUDIT_LOG` 由程序设置，不建议外部手工使用。
@@ -341,9 +339,11 @@ Web 版 edit 使用浏览器内联编辑器，但保存前仍调用同一套 `ed
 - Skill 脚本必须同时登记在 `skills/INDEX.md` 和对应 `SKILL.md`。
 - Work 和 Script 都经过 `policies/risk-rules.json`。
 - Terminal 也会执行策略审查，高风险命令需要确认。
+- 保护路径覆盖 `/`、`/etc`、`/boot`、`/usr`、`/var/lib`、`/root` 和用户 `.ssh`。
 - 自由 shell 文件修改默认阻断；文件匹配、补丁、下载和本地文本分析应通过 `controlled-tools` 登记脚本执行。
 - Remote script 只能 HTTPS 下载后审查，不允许流式管道执行。
 - Web `/api/` 全部需要 Bearer token。
+- Web 启动后会在浏览器中申请一次服务器权限以启用 auditd observer；未启用会记录审计日志。
 - Web 策略编辑只允许 `policies/` 下 JSON 文件，保存前做策略校验，写入前做 sudo 校验。
 - 审计文本和上下文会脱敏并截断。
 - 当前 session 的临时目录只在当前进程结束时清理。
@@ -406,6 +406,7 @@ done
 
 | 文件 | 功能 |
 | --- | --- |
+| `docs/design.md` | 项目设计文档，说明设计目标、非目标、核心组件、运行时数据流、策略模型、审批模型、API 协议、Web 设计、扩展规则和测试策略。 |
 | `docs/architecture.md` | 架构边界说明，记录 rssh 借鉴点、core/adapter 分层、skill registry 契约、安全执行模型和未来远程运行方向。 |
 | `docs/api-protocol.md` | CLI/Web API 机器协议，定义通用响应、timeline、approval_card、output_blocks、review、job 和 secret 配置状态。 |
 
@@ -439,7 +440,7 @@ done
 | `lib/policy.sh` | 聚合 AST 守卫和项目风险规则，对命令、脚本、参数、远程脚本、保护路径和保护服务做审查。 |
 | `lib/protocol.sh` | 为 API/CLI 构造 `timeline`、`approval_card`、`output_blocks` 工作台协议。 |
 | `lib/observer.sh` | auditd observer 预检、规则安装和清理、`ausearch` 解析、执行过程 marker 和降级记录。 |
-| `lib/executor.sh` | Work 计划执行状态机，包含自动审批、人工审批、跳过/修改/终止、远程脚本下载审查、步骤执行、失败修复建议和输出渲染。 |
+| `lib/executor.sh` | Work 计划执行状态机，包含 API 审批输入队列、自动审批、人工审批、跳过/修改/终止、远程脚本下载审查、步骤执行、失败修复建议和输出渲染。 |
 | `lib/editor.sh` | Edit 模式实现，生成 `SKILL.md`，打开编辑器，记录人工修改 diff，staging 校验并提交 skill。 |
 | `lib/api.sh` | 机器可读 JSON API，给 Web 提供 health、config、doctor、sense、tools、skills、audit、work、script、terminal、edit 等入口。 |
 | `lib/interactive.sh` | REPL 输入、斜杠菜单、命令补全菜单和模式选择菜单。 |
@@ -526,7 +527,7 @@ done
 ## 故障排查
 
 - `config/config.json` 缺失：运行 `cp config/config.example.json config/config.json`。
-- API key 未配置：设置 `LINUX_AGENT_API_KEY`，或配置 `api_key_file` 指向本机 secret 文件；旧版 `.api_key` 仍兼容但会提示迁移。
+- API key 未配置：设置 `LINUX_AGENT_API_KEY`，或配置 `config.api_key`。
 - Web 端口被占用：停止旧进程或修改 `web.port`。
 - Web 认证失败：确认页面右上角 token 与 `agent-web` 启动日志一致。
 - `skills validate` 失败：检查 `skills/INDEX.md`、对应 `SKILL.md` 和 `scripts/*.sh` 是否一致。

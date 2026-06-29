@@ -10,7 +10,7 @@ linux_agent_observer_config_enabled() {
         enabled="$(linux_agent_config_get_default '.observer.enabled' 'auto')"
     fi
     case "${enabled}" in
-        auto|disabled) printf '%s\n' "${enabled}" ;;
+        auto|auditd|disabled) printf '%s\n' "${enabled}" ;;
         *) printf 'auto\n' ;;
     esac
 }

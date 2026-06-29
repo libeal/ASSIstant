@@ -29,6 +29,8 @@ export function createInitialState() {
     configSnapshot: null,
     configOriginal: {},
     configDraft: {},
+    observerBootstrap: null,
+    observerBootstrapPrompted: false,
     auditPaused: false,
     draggedPanelId: "",
     webRunId: "",

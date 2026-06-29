@@ -34,6 +34,10 @@ redirect_result="$(linux_agent_policy_review_text "shell" "printf bad > /etc/hos
 grep -q '"approved": false' <<<"$(jq . <<<"${redirect_result}")"
 grep -q 'REGEX_BLOCKED\|PROTECTED_PATH' <<<"${redirect_result}"
 
+root_redirect_result="$(linux_agent_policy_review_text "shell" "printf bad > /root/.bashrc")"
+grep -q '"approved": false' <<<"$(jq . <<<"${root_redirect_result}")"
+grep -q 'PROTECTED_PATH\|AST_PROTECTED_REDIRECT' <<<"${root_redirect_result}"
+
 free_redirect_result="$(linux_agent_policy_review_text "shell" "printf bad > /tmp/agent-free-write-test")"
 grep -q '"approved": false' <<<"$(jq . <<<"${free_redirect_result}")"
 grep -q 'AST_FILE_MUTATION_REQUIRES_SKILL' <<<"${free_redirect_result}"

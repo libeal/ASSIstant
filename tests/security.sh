@@ -33,12 +33,10 @@ source "${ROOT_DIR}/lib/executor.sh"
 
 linux_agent_init_env "${ROOT_DIR}"
 linux_agent_load_config
-test_secret_file="${tmp_root}/test-api-key.secret"
-printf 'test-api-key\n' > "${test_secret_file}"
-LINUX_AGENT_CONFIG_JSON="$(jq --arg api_url "${FAKE_AI_URL}" --arg api_key_file "${test_secret_file}" '
+LINUX_AGENT_CONFIG_JSON="$(jq --arg api_url "${FAKE_AI_URL}" '
     .api_url = $api_url
-    | .api_key_file = $api_key_file
-    | del(.api_key)
+    | .api_key = "TEST_CONFIG_API_KEY_123456"
+    | del(.api_key_file)
     | .model = "fake-chat-completions"
     | .request_timeout_sec = 10
 ' <<<"${LINUX_AGENT_CONFIG_JSON}")"
@@ -52,19 +50,28 @@ grep -q '"environment_context":{"topic":"disk"}' <<<"${payload_context}"
 repair_response="$(linux_agent_call_ai_with_context "repair" "${request_context}" "repair" '{"topic":"disk"}')"
 jq -e '(.failure_context | fromjson).environment_context.topic == "disk"' <<<"${repair_response}" >/dev/null
 
-file_key_state="$(linux_agent_api_key_state_json)"
-jq -e '.configured == true and .source == "file" and .file_configured == true' <<<"${file_key_state}" >/dev/null
-! grep -q 'test-api-key' <<<"${LINUX_AGENT_LAST_AI_PAYLOAD}"
+config_key_state="$(linux_agent_api_key_state_json)"
+jq -e '.configured == true and .source == "config" and .config_configured == true and (.file_configured | not)' <<<"${config_key_state}" >/dev/null
+! grep -q 'TEST_CONFIG_API_KEY_123456' <<<"${LINUX_AGENT_LAST_AI_PAYLOAD}"
+
+config_only_json="$(jq '.api_key = "TEST_CONFIG_KEY_123456" | del(.api_key_file)' <<<"${LINUX_AGENT_CONFIG_JSON}")"
+saved_config_json="${LINUX_AGENT_CONFIG_JSON}"
+LINUX_AGENT_CONFIG_JSON="${config_only_json}"
+config_key_value="$(linux_agent_config_api_key)"
+config_only_state="$(linux_agent_api_key_state_json)"
+[[ "${config_key_value}" == "TEST_CONFIG_KEY_123456" ]]
+jq -e '.configured == true and .source == "config" and .config_configured == true and (.file_configured | not)' <<<"${config_only_state}" >/dev/null
+LINUX_AGENT_CONFIG_JSON="${saved_config_json}"
 
 LINUX_AGENT_API_KEY="TEST_ENV_API_KEY_123456"
-env_config_json="$(jq 'del(.api_key) | .api_key_file = ""' <<<"${LINUX_AGENT_CONFIG_JSON}")"
-saved_config_json="${LINUX_AGENT_CONFIG_JSON}"
+env_config_json="$(jq '.api_key = "TEST_CONFIG_KEY_MUST_NOT_WIN" | del(.api_key_file)' <<<"${LINUX_AGENT_CONFIG_JSON}")"
 LINUX_AGENT_CONFIG_JSON="${env_config_json}"
 env_response="$(linux_agent_call_ai_with_context "env secret" "${request_context}" "repair" '{"topic":"disk"}')"
 jq -e '(.failure_context | fromjson).environment_context.topic == "disk"' <<<"${env_response}" >/dev/null
 env_key_state="$(linux_agent_api_key_state_json)"
-jq -e '.configured == true and .source == "env"' <<<"${env_key_state}" >/dev/null
+jq -e '.configured == true and .source == "env" and .config_configured == true and (.file_configured | not)' <<<"${env_key_state}" >/dev/null
 ! grep -q 'TEST_ENV_API_KEY' <<<"${LINUX_AGENT_LAST_AI_PAYLOAD}"
+! grep -q 'TEST_CONFIG_KEY_MUST_NOT_WIN' <<<"${LINUX_AGENT_LAST_AI_PAYLOAD}"
 unset LINUX_AGENT_API_KEY
 LINUX_AGENT_CONFIG_JSON="${saved_config_json}"
 
@@ -179,14 +186,16 @@ low_review='{"approved":true,"approval_required":false,"risk_level":"low","findi
 readonly_skill_step='{"id":"auto-1","title":"resource","executor_type":"skill_script","skill_script":"ops-basic/resource-inspect","arguments":{},"reason":"test","expected_effect":"test","risk_level":"low","rollback_hint":"none"}'
 file_match_step='{"id":"auto-2","title":"match","executor_type":"skill_script","skill_script":"controlled-tools/file-match","arguments":{},"reason":"test","expected_effect":"test","risk_level":"low","rollback_hint":"none"}'
 file_patch_step='{"id":"auto-3","title":"patch","executor_type":"skill_script","skill_script":"controlled-tools/file-patch","arguments":{},"reason":"test","expected_effect":"test","risk_level":"low","rollback_hint":"none"}'
-legacy_auto_config="${LINUX_AGENT_CONFIG_JSON}"
-LINUX_AGENT_CONFIG_JSON="$(jq 'del(.approvals) | .agent_loop.auto_execute_low_risk=true | .agent_loop.auto_execute_shell_low_risk=false' <<<"${legacy_auto_config}")"
+shell_step='{"id":"auto-4","title":"shell","executor_type":"shell","command":"printf ok","arguments":{},"reason":"test","expected_effect":"test","risk_level":"low","rollback_hint":"none"}'
+auto_config="${LINUX_AGENT_CONFIG_JSON}"
+LINUX_AGENT_CONFIG_JSON="$(jq 'del(.approvals) | .agent_loop.auto_execute_low_risk=false | .agent_loop.auto_execute_shell_low_risk=true' <<<"${auto_config}")"
 linux_agent_should_auto_execute_step "${readonly_skill_step}" "${low_review}"
-LINUX_AGENT_CONFIG_JSON="$(jq '.approvals.auto.skill_readonly=false | .approvals.auto.file_match=true | .approvals.auto.file_patch=false' <<<"${legacy_auto_config}")"
+! linux_agent_should_auto_execute_step "${shell_step}" "${low_review}"
+LINUX_AGENT_CONFIG_JSON="$(jq '.approvals.auto.skill_readonly=false | .approvals.auto.file_match=true | .approvals.auto.file_patch=false' <<<"${auto_config}")"
 ! linux_agent_should_auto_execute_step "${readonly_skill_step}" "${low_review}"
 linux_agent_should_auto_execute_step "${file_match_step}" "${low_review}"
 ! linux_agent_should_auto_execute_step "${file_patch_step}" "${low_review}"
-LINUX_AGENT_CONFIG_JSON="${legacy_auto_config}"
+LINUX_AGENT_CONFIG_JSON="${auto_config}"
 
 linux_agent_download_remote_script() {
     printf '\000\001' > "$2"

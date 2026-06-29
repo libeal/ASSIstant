@@ -1,12 +1,13 @@
 import { createInitialState } from "./modules/state.js";
 import { requestJson } from "./modules/api.js";
-import { normalizeProtocolExecutionEntries, completedExecutionCount as completedProtocolExecutionCount } from "./modules/timeline.js";
+import { normalizeExecutionEntries, completedExecutionCount } from "./modules/timeline.js";
 import {
   findBlockJson,
   outputBlocksFrom,
   outputBlocksSummary,
   outputBlocksText,
   renderOutputBlocksHtml,
+  tableFromText,
 } from "./modules/output-blocks.js";
 import { normalizeApprovalCard } from "./modules/approval.js";
 import * as auditProtocol from "./modules/audit.js";
@@ -172,24 +173,6 @@ function statusKind(value) {
   return pillKind(text);
 }
 
-function normalizeExecutionEntries(title, result) {
-  const protocolEntries = normalizeProtocolExecutionEntries(title, result);
-  if (protocolEntries.length) return protocolEntries;
-  const root = result || {};
-  return [{
-    index: 0,
-    number: 1,
-    title,
-    status: root.status || result?.status || (root.ok ? "executed" : "完成"),
-    step: {},
-    output: root,
-  }];
-}
-
-function completedExecutionCount(result) {
-  return completedProtocolExecutionCount(result);
-}
-
 function primaryOutputObject(output) {
   const blocks = outputBlocksFrom(output);
   const blockJson = findBlockJson(blocks, "json");
@@ -210,20 +193,6 @@ function outputSummaryText(output) {
   if (raw) return compactText(raw, 260);
   const text = renderUserOutputText(payload);
   return compactText(text, 260) || "无摘要输出";
-}
-
-function tableFromText(text) {
-  const lines = String(text || "").split("\n").filter((line) => line.trim());
-  if (lines.length < 2) return "";
-  const rows = lines.slice(0, 12).map((line) => line.trim().split(/\s{2,}|\t/).filter(Boolean));
-  const width = Math.max(...rows.map((row) => row.length));
-  if (width < 2) return "";
-  const body = rows.map((row, index) => {
-    const cells = [...row, ...Array(Math.max(0, width - row.length)).fill("")];
-    const tag = index === 0 ? "th" : "td";
-    return `<tr>${cells.map((cell) => `<${tag}>${escapeHtml(cell)}</${tag}>`).join("")}</tr>`;
-  }).join("");
-  return `<div class="data-table-wrap"><table class="data-table">${body}</table></div>`;
 }
 
 function renderOutputSection(key, value) {
@@ -673,6 +642,94 @@ function showShutdownScreen(result) {
   `;
 }
 
+function observerStatusKind(status) {
+  const text = String(status || "").toLowerCase();
+  if (["enabled", "disabled"].includes(text)) return "low";
+  if (["pending", "skipped", "sudo_required"].includes(text)) return "medium";
+  return "high";
+}
+
+function setObserverBootstrapState(data) {
+  state.observerBootstrap = data || null;
+  const status = data?.status || "pending";
+  const button = $("observerAuditBtn");
+  if (button) {
+    const kind = observerStatusKind(status);
+    button.className = `pill status-action risk ${kind}`;
+    button.title = data?.diagnostic || "observer bootstrap status";
+  }
+  setText("observerState", status);
+  setStatus("observerAuditStatus", status, observerStatusKind(status));
+  const output = $("observerAuditOutput");
+  if (output && data) output.textContent = pretty(data);
+}
+
+function shouldPromptObserverBootstrap(data) {
+  return Boolean(data?.requires_permission && data.status === "pending" && !state.observerBootstrapPrompted);
+}
+
+async function loadObserverBootstrapStatus({ prompt = false } = {}) {
+  const data = await api("/api/observer/bootstrap");
+  setObserverBootstrapState(data);
+  if (prompt && shouldPromptObserverBootstrap(data)) {
+    state.observerBootstrapPrompted = true;
+    openObserverAuditDialog(data);
+  }
+  return data;
+}
+
+function openObserverAuditDialog(data = state.observerBootstrap) {
+  if (!state.token) {
+    showToast("Token required");
+    return;
+  }
+  setObserverBootstrapState(data || state.observerBootstrap || { status: "pending", ok: true });
+  const password = $("observerAuditPassword");
+  if (password) password.value = "";
+  const dialog = $("observerAuditDialog");
+  if (!dialog) return;
+  if (typeof dialog.showModal === "function") {
+    if (!dialog.open) dialog.showModal();
+  } else {
+    dialog.setAttribute("open", "");
+  }
+  password?.focus();
+}
+
+function closeObserverAuditDialog() {
+  const dialog = $("observerAuditDialog");
+  if (!dialog) return;
+  if (typeof dialog.close === "function" && dialog.open) dialog.close();
+  else dialog.removeAttribute("open");
+}
+
+async function enableObserverAudit() {
+  const password = $("observerAuditPassword")?.value || "";
+  const data = await api("/api/observer/bootstrap", {
+    method: "POST",
+    body: { action: "enable", password },
+  });
+  if ($("observerAuditPassword")) $("observerAuditPassword").value = "";
+  setObserverBootstrapState(data);
+  if (data.ok && data.status === "enabled") {
+    closeObserverAuditDialog();
+    showToast("内核审计已启用");
+    return;
+  }
+  showToast(data.error || data.status || "observer bootstrap failed");
+}
+
+async function skipObserverAudit() {
+  const data = await api("/api/observer/bootstrap", {
+    method: "POST",
+    body: { action: "skip" },
+  });
+  if ($("observerAuditPassword")) $("observerAuditPassword").value = "";
+  setObserverBootstrapState(data);
+  closeObserverAuditDialog();
+  showToast(data.logged ? "已记录未启用审计" : "已跳过审计授权");
+}
+
 function parseJsonText(id) {
   const raw = $(id).value.trim();
   if (!raw) return {};
@@ -1058,6 +1115,7 @@ async function connect() {
   setStatus("connectionState", "online", "ok");
   setText("rootPath", health.root || "connected");
   await loadConfig();
+  await loadObserverBootstrapStatus({ prompt: true });
   await loadSense();
   await loadTools();
   await loadSkillTree();
@@ -1146,17 +1204,18 @@ function renderConfigRuntimeSummary(config) {
   if (!container) return;
   const web = config.web || {};
   const apiKeySource = config.api_key_source || (config.api_key_configured ? "configured" : "missing");
+  const apiKeyHint = [
+    `source ${apiKeySource}`,
+    config.api_key_configured_in_config ? "config set" : "",
+  ].filter(Boolean).join(" · ");
   const rows = [
     ["model", config.model || "--", config.provider || "provider"],
-    ["api_key", config.api_key_configured ? "configured" : "missing", `source ${apiKeySource}`],
+    ["api_key", config.api_key_configured ? "configured" : "missing", apiKeyHint],
     ["audit", config.audit_mode || "--", `limit ${config.audit_text_limit ?? "--"}`],
     ["observer", config.observer?.enabled || "--", config.observer?.privilege || "privilege"],
     ["web", `${web.host || "--"}:${web.port || "--"}`, web.enabled === false ? "disabled" : "enabled"],
     ["token", web.token_configured ? "configured" : "runtime only", "不回显明文"],
   ];
-  if (config.api_key_migration_recommended) {
-    rows.splice(2, 0, ["api_key_migration", "recommended", "迁移到环境变量或 secret 文件"]);
-  }
   container.innerHTML = rows.map(([label, value, hint]) => `
     <div class="metric">
       <div class="label">${escapeHtml(label)}</div>
@@ -1744,7 +1803,7 @@ function renderAuditSessionList() {
     item.type = "button";
     item.className = "event";
     item.innerHTML = `
-      <time>${escapeHtml(compactAuditTime(session.started_at || session.updated_at || ""))}</time>
+      <time>${escapeHtml(auditProtocol.compactAuditTime(session.started_at || session.updated_at || ""))}</time>
       <div class="body">
         <strong>${escapeHtml(session.session_id || session.path || "session")}</strong>
         <span>status=${escapeHtml(session.status || "unknown")} · file=${escapeHtml(session.path || session.file || "logs/session")}</span>
@@ -1793,12 +1852,12 @@ function renderAuditEventTimeline() {
   for (const event of events) {
     const item = document.createElement("div");
     item.className = "event";
-    const name = auditEventName(event);
+    const name = auditProtocol.auditEventName(event);
     item.innerHTML = `
-      <time>${escapeHtml(compactAuditTime(auditEventTime(event)))}</time>
+      <time>${escapeHtml(auditProtocol.compactAuditTime(auditProtocol.auditEventTime(event)))}</time>
       <div class="body">
         <strong>${escapeHtml(name)}</strong>
-        <span>${escapeHtml(auditEventSummary(event))}</span>
+        <span>${escapeHtml(auditSummaryText(event))}</span>
       </div>
     `;
     container.appendChild(item);
@@ -1809,34 +1868,18 @@ function filteredAuditEvents() {
   const category = String($("auditEventFilter")?.value || "");
   const limit = Math.max(1, Math.min(200, Number($("auditLimitInput")?.value || 40)));
   return (state.auditEvents || [])
-    .filter((event) => !category || auditEventMatchesCategory(event, category))
+    .filter((event) => !category || auditProtocol.auditEventMatchesCategory(event, category, pretty))
     .slice(0, limit);
 }
 
-function auditEventMatchesCategory(event, category) {
-  return auditProtocol.auditEventMatchesCategory(event, category, pretty);
-}
-
-function auditEventName(event) {
-  return auditProtocol.auditEventName(event);
-}
-
-function auditEventTime(event) {
-  return auditProtocol.auditEventTime(event);
-}
-
-function compactAuditTime(value) {
-  return auditProtocol.compactAuditTime(value);
-}
-
-function auditEventSummary(event) {
+function auditSummaryText(event) {
   return auditProtocol.auditEventSummary(event, pretty) || "无摘要字段，完整内容见右侧报告。";
 }
 
 function renderAuditObserverSummary() {
   const container = $("auditObserverSummary");
   if (!container) return;
-  const observerEvents = (state.auditEvents || []).filter((event) => auditEventMatchesCategory(event, "observer"));
+  const observerEvents = (state.auditEvents || []).filter((event) => auditProtocol.auditEventMatchesCategory(event, "observer", pretty));
   container.innerHTML = "";
   if (!observerEvents.length) {
     container.innerHTML = '<tr><td colspan="3">当前 session 没有 observer 事件。</td></tr>';
@@ -1844,12 +1887,12 @@ function renderAuditObserverSummary() {
   }
   for (const event of observerEvents.slice(0, 12)) {
     const payload = event.payload || event.data || event;
-    const status = payload.status || payload.lifecycle || auditEventName(event);
+    const status = payload.status || payload.lifecycle || auditProtocol.auditEventName(event);
     const row = document.createElement("tr");
     row.innerHTML = `
       <td><span class="pill risk ${statusKind(status)}">${escapeHtml(status)}</span></td>
-      <td class="mono">${escapeHtml(auditEventName(event))}</td>
-      <td>${escapeHtml(auditEventSummary(event))}</td>
+      <td class="mono">${escapeHtml(auditProtocol.auditEventName(event))}</td>
+      <td>${escapeHtml(auditSummaryText(event))}</td>
     `;
     container.appendChild(row);
   }
@@ -1857,10 +1900,10 @@ function renderAuditObserverSummary() {
 
 function updateAuditMetrics() {
   const events = state.auditEvents || [];
-  const textFor = (event) => `${auditEventName(event)} ${pretty(event)}`.toLowerCase();
+  const textFor = (event) => `${auditProtocol.auditEventName(event)} ${pretty(event)}`.toLowerCase();
   const decisions = events.filter((event) => /decision|approve|reject|skip|terminate/.test(textFor(event))).length;
   const commands = events.filter((event) => /command|terminal|script|execution/.test(textFor(event))).length;
-  const observer = events.filter((event) => auditEventMatchesCategory(event, "observer")).length;
+  const observer = events.filter((event) => auditProtocol.auditEventMatchesCategory(event, "observer", pretty)).length;
   setText("auditMetricEvents", String(events.length));
   setText("auditMetricDecisions", String(decisions));
   setText("auditMetricCommands", String(commands));
@@ -2239,6 +2282,10 @@ function bindActions() {
     await safeAction(connect);
   });
   on("shutdownServerBtn", "click", () => safeAction(shutdownServer));
+  on("observerAuditBtn", "click", () => safeAction(async () => openObserverAuditDialog(await loadObserverBootstrapStatus())));
+  on("observerAuditEnableBtn", "click", () => safeAction(enableObserverAudit));
+  on("observerAuditSkipBtn", "click", () => safeAction(skipObserverAudit));
+  on("observerAuditDialog", "cancel", (event) => event.preventDefault());
   on("workRunBtn", "click", () => safeAction(runWork));
   on("workCancelBtn", "click", () => safeAction(cancelWork));
   on("workSuspendBtn", "click", suspendWork);
