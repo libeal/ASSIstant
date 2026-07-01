@@ -101,7 +101,7 @@
               <aside class="stack workbench-side">
                 <div class="panel tight status-panel">
                   <div class="panel-header">
-                    <div><h3>服务器运行状态</h3><p>作为 work 与 terminal 的常驻上下文。</p></div>
+                    <div><h3>服务器运行状态</h3><p>作为 work 的常驻上下文。</p></div>
                     <div class="toolbar">
                       <select class="select compact-select" id="senseTopicSelect" aria-label="环境采集主题">
                         <option value="all">all</option>
@@ -327,13 +327,9 @@
                 </div>
 
                 <div class="panel">
-                  <div class="panel-header"><div><h3>audit 边界策略</h3><p>定义 observer 可以记录什么、如何降级，以及哪些路径必须保护。</p></div><button class="btn secondary policy-edit" id="policyEditBoundaryBtn" type="button" disabled>编辑边界</button></div>
+                  <div class="panel-header"><div><h3>audit 边界策略</h3><p>直接核对 audit-boundaries.json 的生效字段；短注释只标明字段用途。</p></div><button class="btn secondary policy-edit" id="policyEditBoundaryBtn" type="button" disabled>编辑边界</button></div>
                   <div id="policyBoundaryList">
-                    <div class="kv"><div class="k">audit_backend</div><div class="v">auto：优先 auditd，失败则 degraded observer event。</div></div>
-                    <div class="kv"><div class="k">session_source</div><div class="v mono">logs/session/*.jsonl</div></div>
-                    <div class="kv"><div class="k">protected_paths</div><div class="v mono">/etc, /boot, /usr, /var/lib, /root</div></div>
-                    <div class="kv"><div class="k">output_policy</div><div class="v">stdout/stderr 通过 output_blocks 保存脱敏分块与截断信息。</div></div>
-                    <div class="kv"><div class="k">remote_script</div><div class="v">HTTPS、文本类型、大小限制、SHA256、预览、强制高风险审批。</div></div>
+                    <div class="kv"><div class="k">observing</div><div class="v">等待加载当前生效字段。</div></div>
                   </div>
                   <div class="divider"></div>
                   <div id="policyBoundaryOptions" hidden>

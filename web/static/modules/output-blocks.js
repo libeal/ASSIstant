@@ -22,6 +22,19 @@ export function outputBlocksFrom(value) {
   return [];
 }
 
+export function userOutputBlocks(blocks) {
+  return outputBlocksFrom(blocks).filter((block) => {
+    const kind = String(block?.kind || "");
+    return ["stdout", "stderr", "markdown", "json"].includes(kind);
+  });
+}
+
+export function displayOutputBlocks(blocks) {
+  const source = outputBlocksFrom(blocks);
+  const userBlocks = userOutputBlocks(source);
+  return userBlocks.length ? userBlocks : source;
+}
+
 export function findBlockJson(blocks, kind, title = "") {
   const match = outputBlocksFrom(blocks).find((block) => {
     if (kind && block.kind !== kind) return false;
@@ -32,7 +45,7 @@ export function findBlockJson(blocks, kind, title = "") {
 }
 
 export function outputBlocksText(blocks) {
-  return outputBlocksFrom(blocks)
+  return displayOutputBlocks(blocks)
     .map((block) => {
       if (typeof block.text === "string" && block.text.trim()) return block.text;
       if (block.json !== undefined) return pretty(block.json);
@@ -43,7 +56,7 @@ export function outputBlocksText(blocks) {
 }
 
 export function outputBlocksSummary(blocks) {
-  for (const block of outputBlocksFrom(blocks)) {
+  for (const block of displayOutputBlocks(blocks)) {
     if (typeof block.text === "string" && block.text.trim()) return compactText(block.text);
     if (block.json?.summary) return compactText(block.json.summary);
     if (block.json?.message) return compactText(block.json.message);
@@ -68,14 +81,13 @@ export function tableFromText(text) {
 }
 
 export function renderOutputBlocksHtml(blocks) {
-  const sections = outputBlocksFrom(blocks).map((block) => {
+  const sections = displayOutputBlocks(blocks).map((block) => {
     const title = block.title || block.kind || "输出";
     if (typeof block.text === "string") {
-      const table = tableFromText(block.text);
       return `
         <section class="output-section">
           <h5>${escapeHtml(title)}</h5>
-          ${table || `<pre class="inline-code">${escapeHtml(block.text)}</pre>`}
+          <pre class="inline-code">${escapeHtml(block.text)}</pre>
         </section>
       `;
     }

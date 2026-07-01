@@ -62,6 +62,10 @@ grep -q 'id="skillsValidateBtn"' <<<"${index_html}"
 grep -q 'id="policyValidateBtn"' <<<"${index_html}"
 grep -q 'id="auditRestoreTimelineBtn"' <<<"${index_html}"
 grep -q 'id="observerAuditDialog"' <<<"${index_html}"
+grep -q 'on("workInput", "keydown"' "${project}/web/static/app.js"
+grep -q 'event.shiftKey' "${project}/web/static/app.js"
+grep -q 'userOutputBlocks(blocks)' "${project}/web/static/app.js"
+grep -q 'state.terminalSubmitting' "${project}/web/static/app.js"
 
 unauth_body="${tmp_root}/unauth.json"
 unauth_code="$(curl --noproxy '*' -sS -o "${unauth_body}" -w '%{http_code}' "${base_url}/api/health" || true)"
@@ -235,7 +239,8 @@ jq -e '.ok == true
     and (.sessions[0].modes | index("terminal"))
     and (.sessions[0].event_count >= 1)
     and (.sessions[0].event_summary | length > 0)
-    and (.sessions[0].headline | contains("Web"))' <<<"${audit_after_job}" >/dev/null
+    and (.sessions[0].headline | contains("Web"))
+    and ([.sessions[]?.session_id | startswith("web_")] | any | not)' <<<"${audit_after_job}" >/dev/null
 job_session_id="$(jq -r '.sessions[0].session_id // empty' <<<"${audit_after_job}")"
 [[ -n "${job_session_id}" ]]
 audit_read_payload="$(jq -cn --arg session_id "${job_session_id}" '{session_id:$session_id}')"

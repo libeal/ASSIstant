@@ -191,6 +191,42 @@ grep -q '"risk_level":"high"' <<<"${review}"
 sudo_review="$(linux_agent_policy_review_text "terminal" "sudo systemctl restart nginx")"
 [[ "$(linux_agent_execution_privilege_from_review "${sudo_review}")" == "current" ]]
 
+fake_priv_bin="${tmp_root}/fake-root-bin"
+mkdir -p "${fake_priv_bin}"
+cat > "${fake_priv_bin}/id" <<'SH'
+#!/usr/bin/env bash
+case "$*" in
+    "-u") printf '0\n' ;;
+    "-un") printf 'root\n' ;;
+    "-u nobody") printf '65534\n' ;;
+    "-g nobody") printf '65534\n' ;;
+    "-u nfsnobody") exit 1 ;;
+    "-u daemon") printf '1\n' ;;
+    "-g daemon") printf '1\n' ;;
+    *) /usr/bin/id "$@" ;;
+esac
+SH
+cat > "${fake_priv_bin}/runuser" <<'SH'
+#!/usr/bin/env bash
+printf 'fake runuser should not execute in this test\n' >&2
+exit 127
+SH
+chmod +x "${fake_priv_bin}/id" "${fake_priv_bin}/runuser"
+old_path="${PATH}"
+PATH="${fake_priv_bin}:${PATH}"
+root_prepared=()
+linux_agent_prepare_execution_command "least" root_prepared bash -lc 'id -u'
+[[ "${root_prepared[0]}" == "runuser" ]]
+[[ "${root_prepared[1]}" == "-u" ]]
+[[ "${root_prepared[2]}" == "nobody" ]]
+[[ "${root_prepared[3]}" == "--" ]]
+current_prepared=()
+linux_agent_prepare_execution_command "current" current_prepared bash -lc 'id -u'
+[[ "${current_prepared[0]}" == "bash" ]]
+proxy_meta="$(linux_agent_execution_proxy_metadata "least" "true")"
+jq -e '.enabled == true and .requested_privilege == "least" and .execution_user == "root" and .target_user == "nobody" and .prepared_root == true' <<<"${proxy_meta}" >/dev/null
+PATH="${old_path}"
+
 linux_agent_init_env "${ROOT_DIR}"
 linux_agent_load_config
 low_review='{"approved":true,"approval_required":false,"risk_level":"low","findings":[]}'

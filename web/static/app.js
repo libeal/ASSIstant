@@ -7,7 +7,7 @@ import {
   outputBlocksSummary,
   outputBlocksText,
   renderOutputBlocksHtml,
-  tableFromText,
+  userOutputBlocks,
 } from "./modules/output-blocks.js";
 import { normalizeApprovalCard } from "./modules/approval.js";
 import * as auditProtocol from "./modules/audit.js";
@@ -198,11 +198,10 @@ function outputSummaryText(output) {
 function renderOutputSection(key, value) {
   const label = outputLabel(key);
   const text = renderUserOutputText(value);
-  const table = tableFromText(text);
   return `
     <section class="output-section">
       <h5>${escapeHtml(label)}</h5>
-      ${table || `<pre class="inline-code">${escapeHtml(text)}</pre>`}
+      <pre class="inline-code">${escapeHtml(text)}</pre>
     </section>
   `;
 }
@@ -235,7 +234,10 @@ function renderPrimaryOutputHtml(output) {
 
 function terminalReturnPayload(output) {
   const blocks = outputBlocksFrom(output);
-  if (blocks.length) return { output_blocks: blocks };
+  if (blocks.length) {
+    const visibleBlocks = userOutputBlocks(blocks);
+    return visibleBlocks.length ? { output_blocks: visibleBlocks } : {};
+  }
   const payload = primaryOutputObject(output);
   const merged = {};
   for (const key of ["command", "stdout", "stderr", "summary", "message", "error"]) {
@@ -759,10 +761,16 @@ function emptyEvent(text) {
 function updateWorkActionLabel() {
   const button = $("workRunBtn");
   if (!button) return;
-  button.textContent = state.awaitingWorkApproval ? "等待审批选择" : (state.workSuspended ? "继续" : "发送");
-  button.disabled = state.awaitingWorkApproval;
+  const running = Boolean(state.activeWorkJobId && !state.workSuspended);
+  button.textContent = state.awaitingWorkApproval ? "等待审批选择" : (running ? "运行中" : (state.workSuspended ? "继续" : (state.workSubmitting ? "发送中" : "发送")));
+  button.disabled = state.awaitingWorkApproval || state.workSubmitting || running;
   if ($("workCancelBtn")) $("workCancelBtn").disabled = !state.activeWorkJobId;
   if ($("workSuspendBtn")) $("workSuspendBtn").disabled = !state.activeWorkJobId || state.workSuspended;
+}
+
+function updateTerminalActionState() {
+  const button = $("terminalRunBtn");
+  if (button) button.disabled = Boolean(state.activeTerminalJobId || state.terminalSubmitting || state.pendingApproval?.type === "terminal");
 }
 
 function closeApprovalDrawer() {
@@ -773,6 +781,7 @@ function closeApprovalDrawer() {
   const drawer = $("approvalDrawer");
   if (drawer) drawer.hidden = true;
   updateWorkActionLabel();
+  updateTerminalActionState();
 }
 
 function openApprovalDrawer(result, input) {
@@ -843,6 +852,7 @@ function openTerminalApprovalDrawer(command, review) {
   document.body.classList.add("terminal-approval");
   const drawer = $("approvalDrawer");
   if (drawer) drawer.hidden = false;
+  updateTerminalActionState();
 }
 
 async function submitApprovalDecision(decision) {
@@ -857,9 +867,21 @@ async function submitApprovalDecision(decision) {
       return;
     }
     closeApprovalDrawer();
-    const job = await createJob("terminal", "run", { command, approve: true });
-    const completed = await pollJob(job.job_id, "terminalJobStatus", "terminalOutput");
-    renderSharedProtocolExecution("终端输出", completed.result || completed, "terminalOutput");
+    if (state.activeTerminalJobId || state.terminalSubmitting) return showToast("Terminal job is already running.");
+    state.terminalSubmitting = true;
+    updateTerminalActionState();
+    try {
+      const job = await createJob("terminal", "run", { command, approve: true });
+      state.activeTerminalJobId = job.job_id;
+      state.terminalSubmitting = false;
+      updateTerminalActionState();
+      const completed = await pollJob(job.job_id, "terminalJobStatus", "terminalOutput");
+      renderSharedProtocolExecution("终端输出", completed.result || completed, "terminalOutput");
+    } finally {
+      state.activeTerminalJobId = "";
+      state.terminalSubmitting = false;
+      updateTerminalActionState();
+    }
     return;
   }
 
@@ -871,12 +893,21 @@ async function submitApprovalDecision(decision) {
   };
   if (decision === "s") payload.decisions.push($("approvalRevision")?.value || "");
   closeApprovalDrawer();
-  const job = await createJob("work", "run", payload);
-  state.activeWorkJobId = job.job_id;
-  state.workSuspended = false;
+  if (state.activeWorkJobId || state.workSubmitting) return showToast("Work job is already running.");
+  state.workSubmitting = true;
   updateWorkActionLabel();
-  const completed = await pollJob(job.job_id, "workJobStatus", null, { suspendFlag: "workSuspended" });
-  handleCompletedWork(completed, payload.input);
+  try {
+    const job = await createJob("work", "run", payload);
+    state.activeWorkJobId = job.job_id;
+    state.workSubmitting = false;
+    state.workSuspended = false;
+    updateWorkActionLabel();
+    const completed = await pollJob(job.job_id, "workJobStatus", null, { suspendFlag: "workSuspended" });
+    handleCompletedWork(completed, payload.input);
+  } finally {
+    state.workSubmitting = false;
+    updateWorkActionLabel();
+  }
 }
 
 function renderPlanStep(step, index, awaitingApproval = false, pendingIndex = -1) {
@@ -1002,12 +1033,13 @@ function renderStepDetail(entry) {
   const observer = findBlockJson(blocks, "observer");
   const review = findBlockJson(blocks, "review");
   const commandLabel = step.skill_script || step.command || output.command || primaryOutputObject(output).command || "";
+  const subtitle = step.reason || step.expected_effect || "";
   container.className = "step-detail";
   container.innerHTML = `
     <div class="detail-title-row">
       <div>
         <h4>${escapeHtml(entry.title || step.title || "步骤详情")}</h4>
-        <p>${escapeHtml(step.reason || outputSummaryText(output))}</p>
+        ${subtitle ? `<p>${escapeHtml(subtitle)}</p>` : ""}
       </div>
       <span class="pill risk ${statusKind(entry.status)}">${escapeHtml(entry.status || "selected")}</span>
     </div>
@@ -1568,7 +1600,7 @@ function inlineMarkdown(value) {
 }
 
 async function runWork() {
-  if (state.activeWorkJobId && !state.workSuspended) {
+  if (state.workSubmitting || (state.activeWorkJobId && !state.workSuspended)) {
     showToast("Work job is already running.");
     return;
   }
@@ -1583,12 +1615,20 @@ async function runWork() {
   if (!input) return showToast("Work input required");
   closeApprovalDrawer();
   const payload = { input };
-  const job = await createJob("work", "run", payload);
-  state.activeWorkJobId = job.job_id;
-  state.workSuspended = false;
+  state.workSubmitting = true;
   updateWorkActionLabel();
-  const completed = await pollJob(job.job_id, "workJobStatus", null, { suspendFlag: "workSuspended" });
-  handleCompletedWork(completed, input);
+  try {
+    const job = await createJob("work", "run", payload);
+    state.activeWorkJobId = job.job_id;
+    state.workSubmitting = false;
+    state.workSuspended = false;
+    updateWorkActionLabel();
+    const completed = await pollJob(job.job_id, "workJobStatus", null, { suspendFlag: "workSuspended" });
+    handleCompletedWork(completed, input);
+  } finally {
+    state.workSubmitting = false;
+    updateWorkActionLabel();
+  }
 }
 
 function handleCompletedWork(completed, input) {
@@ -1663,23 +1703,38 @@ async function runScript() {
 }
 
 async function runTerminal() {
+  if (state.terminalSubmitting || state.activeTerminalJobId || state.pendingApproval?.type === "terminal") {
+    showToast("Terminal job is already running.");
+    return;
+  }
   const command = $("terminalCommand").value.trim();
   if (!command) return showToast("Command required");
-  const review = await api("/api/terminal/review", { method: "POST", body: { command } });
-  if (review.status === "blocked") {
-    setStatus("terminalJobStatus", "blocked", "high");
-    printOutput("terminalOutput", review);
-    return;
+  state.terminalSubmitting = true;
+  updateTerminalActionState();
+  try {
+    const review = await api("/api/terminal/review", { method: "POST", body: { command } });
+    if (review.status === "blocked") {
+      setStatus("terminalJobStatus", "blocked", "high");
+      printOutput("terminalOutput", review);
+      return;
+    }
+    if (review.status === "approval_required") {
+      setStatus("terminalJobStatus", "approval_required", "medium");
+      printOutput("terminalOutput", review);
+      openTerminalApprovalDrawer(command, review.approval_card || review.review || review);
+      return;
+    }
+    const job = await createJob("terminal", "run", { command, approve: false });
+    state.activeTerminalJobId = job.job_id;
+    state.terminalSubmitting = false;
+    updateTerminalActionState();
+    const completed = await pollJob(job.job_id, "terminalJobStatus", "terminalOutput");
+    renderSharedProtocolExecution("终端输出", completed.result || completed, "terminalOutput");
+  } finally {
+    state.activeTerminalJobId = "";
+    state.terminalSubmitting = false;
+    updateTerminalActionState();
   }
-  if (review.status === "approval_required") {
-    setStatus("terminalJobStatus", "approval_required", "medium");
-    printOutput("terminalOutput", review);
-    openTerminalApprovalDrawer(command, review.approval_card || review.review || review);
-    return;
-  }
-  const job = await createJob("terminal", "run", { command, approve: false });
-  const completed = await pollJob(job.job_id, "terminalJobStatus", "terminalOutput");
-  renderSharedProtocolExecution("终端输出", completed.result || completed, "terminalOutput");
 }
 
 async function cancelScript() {
@@ -2273,39 +2328,27 @@ function renderAuditBoundaries(json) {
   const active = json.active_boundary || running.id || running.audit_payload_mode || running.audit_mode || "safe_summary";
   setText("activeBoundary", active);
   if (list) {
-    const applicationEvents = running.event_sources || running.application_events || [];
-    const syscalls = running.observer_syscalls || [];
-    const fields = running.observer_result_fields || [];
-    const payloadMode = running.audit_mode || running.audit_payload_mode || "safe_summary";
-    const rows = [
-      ["审计载荷", payloadMode, payloadMode === "redacted_verbose" ? "保留更多脱敏上下文，适合排障复盘。" : "默认只写安全摘要，减少敏感信息暴露。"],
-      ["文本上限", `${running.audit_text_limit || 1000} 字符`, "输入、输出和错误会脱敏后按该上限生成预览。"],
-      ["应用事件", `${applicationEvents.length} 类`, summarizeList(applicationEvents, 5) || "未选择应用事件。"],
-      ["Observer syscall", `${syscalls.length} 个`, summarizeList(syscalls, 8) || "未启用 syscall 观察。"],
-      ["Observer 字段", `${fields.length} 类`, summarizeList(fields, 6) || "未选择 observer 汇总字段。"],
-      ["事件上限", `${running.observer_max_events || 200} 条`, "限制单个 session 的内核观察事件体量。"],
-      ["Session 来源", "logs/*.jsonl", "CLI 与 Web 共用同一套审计日志目录。"],
-      ["保护方式", "策略审查 + 人工审批", "命令守卫先判断形态，正则策略再补充业务边界。"],
+    list.className = "policy-boundary-raw";
+    const sections = [
+      ["observing", running, "当前生效字段"],
+      ["allowed_to_observe", allowed, "允许范围上限"],
     ];
-    list.className = "policy-boundary-grid";
-    for (const [title, value, description] of rows) {
-      const item = document.createElement("div");
-      item.className = "policy-card";
-      item.innerHTML = `<strong>${escapeHtml(title)}</strong><span class="policy-card-value">${escapeHtml(value)}</span><p>${escapeHtml(description)}</p>`;
-      list.appendChild(item);
+    if (Array.isArray(json.available_boundaries) && json.available_boundaries.length) {
+      sections.push(["available_boundaries", json.available_boundaries, "可选预设"]);
     }
+    list.innerHTML = sections.map(([title, value, note]) => renderBoundaryRawSection(title, value, note)).join("");
   }
 
   if (options) {
     const boundaryRows = json.available_boundaries || (allowed.audit_payload_modes || []).map((mode) => ({
       id: mode,
-      description: mode === "redacted_verbose" ? "保留更多脱敏后的输入输出内容，适合详细复盘。" : "只写安全摘要，适合默认运行。",
+      description: mode === "redacted_verbose" ? "redacted verbose payload" : "safe summary payload",
     }));
     for (const boundary of boundaryRows) {
       const item = document.createElement("article");
       item.className = "item";
       item.innerHTML = `
-        <div class="item-head"><h4>${escapeHtml(boundary.id === "safe_summary" ? "安全摘要" : "脱敏详录")}</h4><span class="pill risk ${boundary.id === active ? "low" : "medium"}">${boundary.id === active ? "当前启用" : "可选"}</span></div>
+        <div class="item-head"><h4 class="mono">${escapeHtml(boundary.id || boundary.name || "boundary")}</h4><span class="pill risk ${boundary.id === active ? "low" : "medium"}">${boundary.id === active ? "active" : "option"}</span></div>
         <p>${escapeHtml(boundary.description || boundary.name || "")}</p>
       `;
       options.appendChild(item);
@@ -2313,11 +2356,16 @@ function renderAuditBoundaries(json) {
   }
 }
 
-function summarizeList(values, max = 6) {
-  if (!Array.isArray(values) || !values.length) return "";
-  const visible = values.slice(0, max).join("、");
-  const rest = values.length > max ? `，另 ${values.length - max} 项` : "";
-  return `${visible}${rest}`;
+function renderBoundaryRawSection(title, value, note) {
+  return `
+    <section class="policy-raw-section">
+      <div class="policy-raw-head">
+        <strong class="mono">${escapeHtml(title)}</strong>
+        <span>${escapeHtml(note)}</span>
+      </div>
+      <pre class="code">${escapeHtml(pretty(value))}</pre>
+    </section>
+  `;
 }
 
 function showScreen(name) {
@@ -2431,6 +2479,11 @@ function bindActions() {
   on("auditPauseBtn", "click", toggleAuditPause);
   on("auditFindFailureBtn", "click", findAuditFailure);
   on("editInput", "input", markEditDirty);
+  on("workInput", "keydown", (event) => {
+    if (event.key !== "Enter" || event.shiftKey || event.isComposing) return;
+    event.preventDefault();
+    safeAction(runWork);
+  });
   on("terminalCommand", "keydown", (event) => {
     if (event.key !== "Enter" || event.shiftKey || event.isComposing) return;
     event.preventDefault();
@@ -2457,6 +2510,7 @@ async function safeAction(fn) {
 function init() {
   $("tokenInput").value = state.token;
   updateWorkActionLabel();
+  updateTerminalActionState();
   updatePolicyEditState();
   initPanelLayout();
   bindNavigation();

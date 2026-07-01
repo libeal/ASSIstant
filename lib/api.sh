@@ -69,20 +69,24 @@ linux_agent_api_tools_list() {
 
 linux_agent_api_audit_list() {
     local payload="$1"
-    local limit entries item path session_id size mtime count summary
+    local limit include_runtime entries item path session_id size mtime count summary
     limit="$(jq -r '.limit // 50' <<<"${payload}")"
     [[ "${limit}" =~ ^[0-9]+$ && "${limit}" -gt 0 ]] || limit=50
+    include_runtime="$(jq -r '.include_runtime // false' <<<"${payload}")"
     entries='[]'
     count=0
 
     while IFS= read -r item; do
         [[ -n "${item}" ]] || continue
+        path="${item#* }"
+        session_id="$(basename "${path}" .jsonl)"
+        if [[ "${include_runtime}" != "true" && "${session_id}" == web_* ]]; then
+            continue
+        fi
         if [[ "${count}" -ge "${limit}" ]]; then
             break
         fi
         count=$((count + 1))
-        path="${item#* }"
-        session_id="$(basename "${path}" .jsonl)"
         size="$(stat -c '%s' "${path}" 2>/dev/null || printf '0')"
         mtime="$(stat -c '%Y' "${path}" 2>/dev/null || printf '0')"
         summary="$(jq -s -c \
