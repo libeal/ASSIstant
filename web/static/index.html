@@ -295,6 +295,21 @@
                 </div>
               </div>
 
+              <div class="panel">
+                <div class="panel-header">
+                  <div><h3>命令守卫与 AST 安全审计</h3><p>策略执行前会先用结构化命令守卫审查 shell 形态，再叠加正则策略。</p></div>
+                  <span class="pill risk low">ast+rules</span>
+                </div>
+                <div class="policy-guard-grid" id="astGuardSummary">
+                  <article class="policy-card"><strong>远程脚本管道</strong><span>阻断 curl/wget 直接管道到 sh/bash，包括 env/sudo 包装。</span></article>
+                  <article class="policy-card"><strong>文件变更</strong><span>重定向、cp/mv/rm/tee/rsync/chmod/chown 等必须走受控 Skill。</span></article>
+                  <article class="policy-card"><strong>隐藏执行</strong><span>命令替换、进程替换、shell -c、xargs/timeout 等转发器需要审查。</span></article>
+                  <article class="policy-card"><strong>数据外传</strong><span>curl/wget 上传本地内容、file:// 读取等进入人工审批。</span></article>
+                  <article class="policy-card"><strong>混淆检测</strong><span>识别 ${IFS} 等分词混淆后再做远程管道和命令头审查。</span></article>
+                  <article class="policy-card"><strong>交互命令</strong><span>watch、less、vim、tail -f、未带批处理参数的 top 不适合 agent 执行。</span></article>
+                </div>
+              </div>
+
               <div class="split-wide">
                 <div class="panel">
                   <div class="panel-header"><div><h3>正则审查表</h3><p>阻断规则、警告规则和原因一屏可查；解锁后可编辑。</p></div><button class="btn secondary policy-edit" id="policyAddRuleBtn" type="button" disabled>新增规则</button></div>
@@ -326,13 +341,16 @@
                     <div class="list" id="policyBoundaryOptionsList"></div>
                     <div class="divider"></div>
                   </div>
-                  <textarea class="textarea policy-edit mono" id="policyEditor" disabled>{
+                  <details class="detail-block policy-raw-editor">
+                    <summary>查看或编辑原始策略 JSON</summary>
+                    <textarea class="textarea policy-edit mono" id="policyEditor" disabled>{
   "audit_boundary": {
     "observer": "auto",
     "session_log_dir": "logs/session",
     "output_block_text_limit": 4096
   }
 }</textarea>
+                  </details>
                   <pre class="code action-gap" id="policyOutput">policy editor: read-only</pre>
                 </div>
               </div>

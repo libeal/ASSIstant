@@ -359,6 +359,8 @@ linux_agent_audit_safe_summary() {
                 skill_script:($s.skill_script // null),
                 risk_level:($s.risk_level // null),
                 has_command:($s | has("command")),
+                command_preview:(.command // "" | preview),
+                argument_keys:(if (.arguments? | type) == "object" then (.arguments | keys) else null end),
                 url:($s.url // $s.command // null | if type == "string" and test("^https://") then . else null end),
                 sha256:($s.sha256 // null),
                 size_bytes:($s.size_bytes // null),
@@ -371,6 +373,16 @@ linux_agent_audit_safe_summary() {
                 exit_code:($r.exit_code // null),
                 tool:($r.output.tool // $r.tool // null),
                 action:($r.output.action // $r.action // null),
+                output_preview:(
+                    if ($r.output.raw? | type) == "string" then ($r.output.raw | preview)
+                    elif ($r.stdout? | type) == "string" then ($r.stdout | preview)
+                    elif ($r.output.summary? | type) == "string" then ($r.output.summary | preview)
+                    elif ($r.output.message? | type) == "string" then ($r.output.message | preview)
+                    elif ($r.output.error? | type) == "string" then ($r.output.error | preview)
+                    elif ($r.output.action? | type) == "string" then ($r.output.action | preview)
+                    else null end
+                ),
+                stderr_preview:(if ($r.stderr? | type) == "string" then ($r.stderr | preview) else null end),
                 result_count:(if ($r.results? | type) == "array" then ($r.results | length) else null end),
                 output_keys:(if ($r.output? | type) == "object" then ($r.output | keys) else null end),
                 finding_count:(if ($r.findings? | type) == "array" then ($r.findings | length) else null end)
@@ -498,6 +510,16 @@ linux_agent_audit_safe_summary() {
                 script:(.script // null),
                 diff_lines:(if (.diff? | type) == "string" then (.diff | split("\n") | length) else 0 end)
             }
+        elif $stage == "step_policy_checked" then
+            {
+                step:step_summary(.step),
+                review:{
+                    approved:(.review.approved // null),
+                    approval_required:(.review.approval_required // null),
+                    risk_level:(.review.risk_level // null),
+                    finding_count:(if (.review.findings? | type) == "array" then (.review.findings | length) else 0 end)
+                }
+            }
         elif $stage == "step_revision_requested" then
             {
                 status:(.status // "revision_requested"),
@@ -511,16 +533,6 @@ linux_agent_audit_safe_summary() {
                 step:step_summary(.step),
                 detail:result_summary(.detail),
                 findings:(.detail.findings // [])
-            }
-        elif $stage == "step_policy_checked" then
-            {
-                step:step_summary(.step),
-                review:{
-                    approved:(.review.approved // null),
-                    approval_required:(.review.approval_required // null),
-                    risk_level:(.review.risk_level // null),
-                    finding_count:(if (.review.findings? | type) == "array" then (.review.findings | length) else 0 end)
-                }
             }
         elif ($stage | startswith("observer_")) then
             {
@@ -577,7 +589,7 @@ linux_agent_audit_payload() {
 
 linux_agent_start_session() {
     local user_input="$1"
-    local boundary_summary
+    local boundary_summary entrypoint
 
     if [[ "${LINUX_AGENT_SESSION_ACTIVE:-0}" -eq 1 && "${LINUX_AGENT_SESSION_FINISHED:-0}" -eq 0 ]]; then
         return 0
@@ -593,11 +605,17 @@ linux_agent_start_session() {
 
     : > "${LINUX_AGENT_AUDIT_LOG}"
     boundary_summary="$(linux_agent_audit_boundary_runtime_summary)"
+    if [[ "${LINUX_AGENT_WEB:-0}" == "1" ]]; then
+        entrypoint="web"
+    else
+        entrypoint="cli"
+    fi
     linux_agent_log_event "session_started" "$(jq -cn \
         --arg request "${user_input}" \
+        --arg entrypoint "${entrypoint}" \
         --arg audit_mode "$(linux_agent_audit_mode)" \
         --argjson audit_boundary "${boundary_summary}" \
-        '{request:$request, audit_mode:$audit_mode, audit_boundary:$audit_boundary}')"
+        '{request:$request, entrypoint:$entrypoint, audit_mode:$audit_mode, audit_boundary:$audit_boundary}')"
     if declare -F linux_agent_observer_session_start >/dev/null 2>&1; then
         linux_agent_observer_session_start "session" "$(jq -cn --arg request "${user_input}" '{request:$request}')"
     fi
@@ -720,6 +738,80 @@ linux_agent_show_audit() {
     ' "${log_file}")"
     printf '# 审计报告\n\n'
     linux_agent_sanitize_text "${report}"
+
+    printf '\n# 事件时间线\n\n'
+    jq -s -r '
+        def stage_label($s):
+            if $s == "session_started" then "会话开始"
+            elif $s == "session_finished" then "会话结束"
+            elif $s == "command_started" then "命令入口开始"
+            elif $s == "command_finished" then "命令入口结束"
+            elif $s == "received" then "收到请求"
+            elif $s == "sensed" then "采集环境"
+            elif $s == "request_context_built" then "构建模型上下文"
+            elif $s == "planned" then "生成执行计划"
+            elif $s == "step_policy_checked" then "策略审查"
+            elif $s == "step_auto_approved" then "自动批准步骤"
+            elif $s == "step_approval_required" then "等待人工审批"
+            elif $s == "step_approved" then "批准步骤"
+            elif $s == "step_running" then "开始执行步骤"
+            elif $s == "step_succeeded" then "步骤执行成功"
+            elif $s == "step_failed" then "步骤执行失败"
+            elif $s == "step_blocked" then "步骤被阻断"
+            elif $s == "step_rejected" then "步骤被拒绝"
+            elif $s == "step_skipped_user" then "用户跳过步骤"
+            elif $s == "step_skipped_unexecuted" then "后续步骤未执行"
+            elif $s == "executed" then "工作流执行结果"
+            elif $s == "terminal_executed" then "终端执行结果"
+            elif $s == "script_executed" then "Skill 执行结果"
+            elif $s == "finished" then "业务状态完成"
+            elif ($s | startswith("observer_")) then "Observer 事件"
+            elif ($s | startswith("agent_")) then "Agent 循环"
+            else $s end;
+        def step_name($p): ($p.step.title // $p.step.id // $p.step.skill_script // $p.step.command_preview // "");
+        def result_text($d):
+            [
+                (if ($d.status // "") != "" then "状态=" + ($d.status | tostring) else empty end),
+                (if ($d.exit_code // null) != null then "退出码=" + ($d.exit_code | tostring) else empty end),
+                (if ($d.tool // "") != "" then "工具=" + ($d.tool | tostring) else empty end),
+                (if ($d.action // "") != "" then "动作=" + ($d.action | tostring) else empty end),
+                (if ($d.output_preview // "") != "" then "输出=" + ($d.output_preview | tostring) else empty end),
+                (if ($d.stderr_preview // "") != "" then "错误=" + ($d.stderr_preview | tostring) else empty end)
+            ] | join("；");
+        def describe:
+            .stage as $s
+            | (.payload // {}) as $p
+            | if $s == "session_started" then
+                "入口=" + (($p.entrypoint // "cli") | tostring) + "；请求=" + (($p.request // "") | tostring)
+              elif $s == "session_finished" or $s == "finished" or $s == "command_finished" then
+                "状态=" + (($p.status // "unknown") | tostring)
+              elif $s == "command_started" then
+                "调用=" + (($p.command // "") | tostring) + "；参数=" + (($p.args_preview // $p.args // "") | tostring)
+              elif $s == "received" then
+                "模式=" + (($p.mode // "unknown") | tostring) + "；输入=" + (($p.input_preview // $p.command // $p.ref // "") | tostring)
+              elif $s == "sensed" then
+                "主题=" + (($p.topic // "unknown") | tostring) + "；上下文字段=" + ((($p.context_keys // []) | join(",")) | tostring)
+              elif $s == "request_context_built" then
+                "模式=" + (($p.mode // "unknown") | tostring) + "；当前请求=" + (($p.current_request_preview // "") | tostring)
+              elif $s == "planned" or $s == "revision_planned" or $s == "repair_planned" then
+                "摘要=" + (($p.summary_preview // "") | tostring) + "；步骤数=" + (($p.step_count // 0) | tostring)
+              elif $s == "step_policy_checked" then
+                "步骤=" + (step_name($p) | tostring) + "；风险=" + (($p.review.risk_level // "unknown") | tostring) + "；发现项=" + (($p.review.finding_count // 0) | tostring)
+              elif ($s | startswith("step_")) then
+                "步骤=" + (step_name($p) | tostring) + "；" + (result_text($p.detail // {}))
+              elif $s == "executed" then
+                "状态=" + (($p.status // "unknown") | tostring) + "；结果数=" + (($p.result_count // (($p.results // []) | length)) | tostring)
+              elif $s == "terminal_executed" or $s == "script_executed" then
+                result_text($p)
+              elif ($s | startswith("observer_")) then
+                "状态=" + (($p.status // "unknown") | tostring) + "；后端=" + (($p.backend // "auditd") | tostring) + "；exec=" + (($p.exec_count // 0) | tostring) + "；file=" + (($p.file_event_count // 0) | tostring)
+              else
+                ($p.message // $p.status // $p.event // ($p | tostring))
+              end;
+        .[] | "- " + ((.timestamp // "--") | tostring) + " · " + stage_label(.stage // "event") + "： " + describe
+    ' "${log_file}" | while IFS= read -r line; do
+        linux_agent_sanitize_text "${line}"
+    done
 
     printf '\n# JSONL 审计流\n\n'
     while IFS= read -r line; do

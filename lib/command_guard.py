@@ -41,6 +41,7 @@ SUDO_FLAGS_WITH_ARG = {"-u", "-g", "-U", "-C", "-h", "-T", "-D", "-p", "-r", "-t
 ENV_FLAGS_WITH_ARG = {"-u", "--unset", "-C", "--chdir"}
 FORWARDERS = {
     "xargs",
+    "parallel",
     "nice",
     "time",
     "timeout",
@@ -86,13 +87,17 @@ WRITE_VERBS = {
     "install",
     "truncate",
     "ed",
+    "patch",
     "tar",
     "unzip",
     "cpio",
     "mkdir",
     "rmdir",
     "touch",
+    "rsync",
+    "scp",
 }
+PERMISSION_VERBS = {"chmod", "chown", "chgrp", "setfacl", "setcap"}
 FILE_MUTATION_COMMANDS = {"rm", "unlink", "dd", "mount", "umount"}
 ALIASES = {
     "gsed": "sed",
@@ -107,6 +112,7 @@ ALIASES = {
     "gxargs": "xargs",
     "gchmod": "chmod",
     "gchown": "chown",
+    "gchgrp": "chgrp",
     "gtouch": "touch",
     "gtail": "tail",
     "gtimeout": "timeout",
@@ -133,6 +139,27 @@ PROTECTED_SERVICES = {
     "mysql",
     "mariadb",
     "postgresql",
+}
+XARGS_FLAGS_WITH_ARG = {
+    "-a",
+    "--arg-file",
+    "-d",
+    "--delimiter",
+    "-E",
+    "-e",
+    "-I",
+    "-i",
+    "-L",
+    "-l",
+    "-n",
+    "-P",
+    "-s",
+    "--eof",
+    "--max-args",
+    "--max-chars",
+    "--max-lines",
+    "--max-procs",
+    "--replace",
 }
 
 
@@ -202,6 +229,11 @@ def is_number(token: str) -> bool:
 
 def is_fd_dup_destination(token: str) -> bool:
     return is_number(token) or token in {"-", "&1", "&2"}
+
+
+def normalize_shell_spacing_markers(text: str) -> tuple[str, bool]:
+    normalized = re.sub(r"\$\{IFS[^}]*\}|\$IFS\b", " ", text)
+    return normalized, normalized != text
 
 
 def protected_path(value: str) -> bool:
@@ -518,6 +550,99 @@ def archive_command_is_readonly(head: str, argv: list[str]) -> bool:
     return False
 
 
+def rsync_is_dry_run(argv: list[str]) -> bool:
+    for arg in argv:
+        if arg == "--dry-run":
+            return True
+        if arg.startswith("-") and not arg.startswith("--") and "n" in arg:
+            return True
+    return False
+
+
+def add_file_write_finding(findings: list[dict], head: str, argv: list[str], text: str) -> None:
+    severity = "critical" if has_protected_target(argv) else "high"
+    if severity == "critical" and head == "tee":
+        code = "AST_PROTECTED_REDIRECT"
+    elif severity == "critical":
+        code = "AST_PROTECTED_WRITE"
+    else:
+        code = "AST_FILE_MUTATION_REQUIRES_SKILL"
+    findings.append(
+        finding(
+            "critical" if code == "AST_FILE_MUTATION_REQUIRES_SKILL" else severity,
+            code,
+            "File modifications must use a registered controlled skill instead of free-form shell."
+            if code == "AST_FILE_MUTATION_REQUIRES_SKILL"
+            else "Command writes filesystem state.",
+            category="protected_path" if severity == "critical" and code != "AST_FILE_MUTATION_REQUIRES_SKILL" else "controlled_file_modification",
+            command_head=head,
+            text=text,
+        )
+    )
+
+
+def add_permission_write_finding(findings: list[dict], head: str, argv: list[str], text: str) -> None:
+    severity = "critical" if has_protected_target(argv) else "high"
+    code = "AST_PROTECTED_WRITE" if severity == "critical" else "AST_FILE_MUTATION_REQUIRES_SKILL"
+    findings.append(
+        finding(
+            "critical" if code == "AST_FILE_MUTATION_REQUIRES_SKILL" else severity,
+            code,
+            "Permission, ownership, ACL, or capability changes must use a registered controlled skill."
+            if code == "AST_FILE_MUTATION_REQUIRES_SKILL"
+            else "Command changes protected file permissions or ownership.",
+            category="protected_path" if severity == "critical" and code != "AST_FILE_MUTATION_REQUIRES_SKILL" else "controlled_file_modification",
+            command_head=head,
+            text=text,
+        )
+    )
+
+
+def xargs_subcommand(argv: list[str]) -> tuple[str, list[str]] | None:
+    i = 0
+    while i < len(argv):
+        arg = argv[i]
+        if arg == "--":
+            i += 1
+            break
+        if not arg.startswith("-"):
+            break
+        if "=" in arg:
+            i += 1
+            continue
+        if arg in XARGS_FLAGS_WITH_ARG and i + 1 < len(argv):
+            i += 2
+            continue
+        i += 1
+    if i >= len(argv):
+        return None
+    return canonical(argv[i]), argv[i + 1 :]
+
+
+def has_curl_upload(argv: list[str]) -> bool:
+    for idx, arg in enumerate(argv):
+        if arg in {"-T", "--upload-file", "--data-binary", "--data-raw", "--data"} and idx + 1 < len(argv):
+            return True
+        if arg.startswith("--upload-file=") or arg.startswith("--data-binary=") or arg.startswith("--data-raw=") or arg.startswith("--data="):
+            return True
+        if arg.startswith("-T") and arg != "-T":
+            return True
+    return False
+
+
+def has_wget_upload(argv: list[str]) -> bool:
+    for idx, arg in enumerate(argv):
+        if arg in {"--post-file", "--body-file"} and idx + 1 < len(argv):
+            return True
+        if arg.startswith("--post-file=") or arg.startswith("--body-file="):
+            return True
+    return False
+
+
+def has_file_url(argv: list[str]) -> bool:
+    return any(arg.startswith("file://") for arg in argv)
+
+
 def check_command_rules(cmd: CommandNode, findings: list[dict]) -> None:
     head = cmd.head
     argv = cmd.argv
@@ -623,25 +748,12 @@ def check_command_rules(cmd: CommandNode, findings: list[dict]) -> None:
     if head in WRITE_VERBS:
         if archive_command_is_readonly(head, argv):
             return
-        severity = "critical" if has_protected_target(argv) else "high"
-        if severity == "critical" and head == "tee":
-            code = "AST_PROTECTED_REDIRECT"
-        elif severity == "high":
-            code = "AST_FILE_MUTATION_REQUIRES_SKILL"
-        else:
-            code = "AST_PROTECTED_WRITE"
-        findings.append(
-            finding(
-                "critical" if code == "AST_FILE_MUTATION_REQUIRES_SKILL" else severity,
-                code,
-                "File modifications must use a registered controlled skill instead of free-form shell."
-                if code == "AST_FILE_MUTATION_REQUIRES_SKILL"
-                else "Command writes filesystem state.",
-                category="protected_path" if severity == "critical" and code != "AST_FILE_MUTATION_REQUIRES_SKILL" else "controlled_file_modification",
-                command_head=head,
-                text=text,
-            )
-        )
+        if head == "rsync" and rsync_is_dry_run(argv):
+            return
+        add_file_write_finding(findings, head, argv, text)
+
+    if head in PERMISSION_VERBS:
+        add_permission_write_finding(findings, head, argv, text)
 
     if head in {"chmod", "chown"} and has_recursive_flag(argv):
         severity = "critical" if has_protected_target(argv) else "high"
@@ -694,6 +806,15 @@ def check_command_rules(cmd: CommandNode, findings: list[dict]) -> None:
             )
         )
 
+    if head == "xargs":
+        forwarded = xargs_subcommand(argv)
+        if forwarded:
+            forwarded_head, forwarded_argv = forwarded
+            if forwarded_head in FILE_MUTATION_COMMANDS or forwarded_head in WRITE_VERBS:
+                add_file_write_finding(findings, forwarded_head, forwarded_argv, text)
+            elif forwarded_head in PERMISSION_VERBS:
+                add_permission_write_finding(findings, forwarded_head, forwarded_argv, text)
+
     if head == "curl":
         for idx, arg in enumerate(argv):
             if arg in {"-O", "--remote-name", "--remote-name-all"}:
@@ -702,6 +823,28 @@ def check_command_rules(cmd: CommandNode, findings: list[dict]) -> None:
                 findings.append(file_mutation_requires_skill(command_head=head, text=argv[idx + 1]))
             if arg.startswith("--output=") and arg.split("=", 1)[1] not in {"-", "/dev/null"}:
                 findings.append(file_mutation_requires_skill(command_head=head, text=arg))
+        if has_curl_upload(argv):
+            findings.append(
+                finding(
+                    "high",
+                    "AST_NETWORK_UPLOAD",
+                    "Command uploads local data to a remote endpoint and requires review.",
+                    category="information_disclosure",
+                    command_head=head,
+                    text=text,
+                )
+            )
+        if has_file_url(argv):
+            findings.append(
+                finding(
+                    "high",
+                    "AST_LOCAL_FILE_URL",
+                    "Command reads local file URLs and requires review.",
+                    category="information_disclosure",
+                    command_head=head,
+                    text=text,
+                )
+            )
 
     if head == "wget":
         for idx, arg in enumerate(argv):
@@ -709,6 +852,28 @@ def check_command_rules(cmd: CommandNode, findings: list[dict]) -> None:
                 findings.append(file_mutation_requires_skill(command_head=head, text=argv[idx + 1]))
             if arg.startswith("--output-document=") and arg.split("=", 1)[1] not in {"-", "/dev/null"}:
                 findings.append(file_mutation_requires_skill(command_head=head, text=arg))
+        if has_wget_upload(argv):
+            findings.append(
+                finding(
+                    "high",
+                    "AST_NETWORK_UPLOAD",
+                    "Command uploads local data to a remote endpoint and requires review.",
+                    category="information_disclosure",
+                    command_head=head,
+                    text=text,
+                )
+            )
+        if has_file_url(argv):
+            findings.append(
+                finding(
+                    "high",
+                    "AST_LOCAL_FILE_URL",
+                    "Command reads local file URLs and requires review.",
+                    category="information_disclosure",
+                    command_head=head,
+                    text=text,
+                )
+            )
 
     if head in INTERACTIVE:
         findings.append(
@@ -854,7 +1019,19 @@ def analyze(text: str, mode: str = "local", depth: int = 0, syntax_check: bool =
                 )
             )
 
-    cleaned, sub_findings, fragments = strip_and_collect_substitutions(text, depth)
+    normalized_text, used_spacing_markers = normalize_shell_spacing_markers(text)
+    if used_spacing_markers:
+        findings.append(
+            finding(
+                "high",
+                "AST_SHELL_OBFUSCATION",
+                "Command uses shell word-splitting markers such as IFS; review obfuscated command flow.",
+                category="obfuscation",
+                text=text,
+            )
+        )
+
+    cleaned, sub_findings, fragments = strip_and_collect_substitutions(normalized_text, depth)
     findings.extend(sub_findings)
     for fragment in fragments:
         findings.extend(analyze(fragment, mode=mode, depth=depth + 1, syntax_check=False))

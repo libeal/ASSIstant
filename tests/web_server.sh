@@ -230,6 +230,12 @@ jq -e '.result_status == "executed" and .result_ok == true
     and ([.result.output_blocks[]? | select(.kind == "meta" and .title == "Agent runtime") | .json.exit_code] | first) == 0' <<<"${job_result}" >/dev/null
 
 audit_after_job="$(curl --noproxy '*' -sS -H "Authorization: Bearer ${token}" "${base_url}/api/audit/list")"
+jq -e '.ok == true
+    and .sessions[0].entrypoint == "web"
+    and (.sessions[0].modes | index("terminal"))
+    and (.sessions[0].event_count >= 1)
+    and (.sessions[0].event_summary | length > 0)
+    and (.sessions[0].headline | contains("Web"))' <<<"${audit_after_job}" >/dev/null
 job_session_id="$(jq -r '.sessions[0].session_id // empty' <<<"${audit_after_job}")"
 [[ -n "${job_session_id}" ]]
 audit_read_payload="$(jq -cn --arg session_id "${job_session_id}" '{session_id:$session_id}')"

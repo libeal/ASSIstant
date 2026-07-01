@@ -69,7 +69,7 @@ linux_agent_api_tools_list() {
 
 linux_agent_api_audit_list() {
     local payload="$1"
-    local limit entries item path session_id status started finished size mtime count
+    local limit entries item path session_id size mtime count summary
     limit="$(jq -r '.limit // 50' <<<"${payload}")"
     [[ "${limit}" =~ ^[0-9]+$ && "${limit}" -gt 0 ]] || limit=50
     entries='[]'
@@ -83,21 +83,93 @@ linux_agent_api_audit_list() {
         count=$((count + 1))
         path="${item#* }"
         session_id="$(basename "${path}" .jsonl)"
-        status="$(jq -r 'select(.stage=="session_finished") | .payload.status // empty' "${path}" 2>/dev/null | tail -n 1)"
-        started="$(jq -r 'select(.stage=="session_started") | .timestamp // empty' "${path}" 2>/dev/null | head -n 1)"
-        finished="$(jq -r 'select(.stage=="session_finished") | .timestamp // empty' "${path}" 2>/dev/null | tail -n 1)"
         size="$(stat -c '%s' "${path}" 2>/dev/null || printf '0')"
         mtime="$(stat -c '%Y' "${path}" 2>/dev/null || printf '0')"
-        entries="$(jq -cn \
-            --argjson prior "${entries}" \
+        summary="$(jq -s -c \
             --arg session_id "${session_id}" \
-            --arg status "${status:-unknown}" \
-            --arg started_at "${started}" \
-            --arg finished_at "${finished}" \
+            --arg path "${path}" \
+            --argjson size_bytes "${size}" \
+            --argjson mtime "${mtime}" '
+            def stage: (.stage // .event // .type // .status // "event");
+            def payload: (.payload // {});
+            def mode_from_event:
+                payload as $p
+                | if (($p.mode // "") != "") then $p.mode
+                  elif (stage | test("terminal")) then "terminal"
+                  elif (stage | test("script")) then "script"
+                  elif (stage | test("edit")) then "edit"
+                  elif (stage | test("step_|planned|executed|agent_loop|agent_reflection|agent_checkpoint|work_revision|revision_")) then "work"
+                  else empty end;
+            def event_title:
+                stage as $s
+                | payload as $p
+                | if $s == "received" then "收到" + (($p.mode // "请求") | tostring) + "请求"
+                  elif $s == "planned" then "生成" + (($p.step_count // 0) | tostring) + "个步骤"
+                  elif $s == "step_policy_checked" then "策略审查:" + (($p.step.title // $p.step.id // "步骤") | tostring)
+                  elif $s == "step_auto_approved" then "自动批准:" + (($p.step.title // $p.step.id // "步骤") | tostring)
+                  elif $s == "step_approval_required" then "等待审批:" + (($p.step.title // $p.step.id // "步骤") | tostring)
+                  elif $s == "step_blocked" then "阻断:" + (($p.step.title // $p.step.id // "步骤") | tostring)
+                  elif $s == "step_failed" then "失败:" + (($p.step.title // $p.step.id // "步骤") | tostring)
+                  elif $s == "step_succeeded" then "完成:" + (($p.step.title // $p.step.id // "步骤") | tostring)
+                  elif $s == "terminal_executed" then "终端执行:" + (($p.status // "unknown") | tostring)
+                  elif $s == "script_executed" then "Skill执行:" + (($p.status // "unknown") | tostring)
+                  elif ($s | startswith("observer_")) then "Observer:" + (($p.status // "event") | tostring)
+                  elif $s == "finished" then "业务状态:" + (($p.status // "unknown") | tostring)
+                  elif $s == "session_finished" then "会话结束:" + (($p.status // "unknown") | tostring)
+                  else $s end;
+            def event_detail:
+                payload as $p
+                | [
+                    ($p.input_preview // empty),
+                    ($p.command // empty),
+                    ($p.ref // empty),
+                    ($p.detail.output_preview // empty),
+                    ($p.detail.action // empty),
+                    ($p.diagnostic // empty)
+                  ] | map(tostring | select(length > 0)) | first // "";
+            . as $events
+            | ($events | map(select(stage == "session_started")) | first) as $started
+            | ($events | map(select(stage == "session_finished")) | last) as $finished
+            | ([($events[] | mode_from_event)] | unique) as $modes
+            | ([ $events[]
+                  | select(stage | test("received|planned|step_policy_checked|step_auto_approved|step_approval_required|step_blocked|step_failed|step_succeeded|terminal_executed|script_executed|observer_|finished"))
+                  | {stage:stage, title:event_title, detail:event_detail}
+              ] | .[0:6]) as $highlights
+            | ($started.payload.entrypoint // (if ($session_id | startswith("web_")) then "web" else "cli" end)) as $entrypoint
+            | {
+                session_id:$session_id,
+                status:($finished.payload.status // ($events | map(select(stage == "finished")) | last | .payload.status) // "unknown"),
+                started_at:($started.timestamp // ""),
+                finished_at:($finished.timestamp // ""),
+                updated_at:($events[-1].timestamp // ""),
+                entrypoint:$entrypoint,
+                entrypoint_label:(if $entrypoint == "web" then "Web" else "CLI" end),
+                modes:$modes,
+                mode_label:(if ($modes | length) == 0 then "未记录模式" else ($modes | join(" + ")) end),
+                has_multiple_modes:(($modes | length) > 1),
+                event_count:($events | length),
+                command_count:([$events[] | select(stage | test("command_|terminal_executed|script_executed|execution_"))] | length),
+                decision_count:([$events[] | select((stage | test("approval|rejected|skipped|terminated|control_event")) or ((payload.event // "") | test("approve|reject|skip|terminate")))] | length),
+                observer_count:([$events[] | select(stage | startswith("observer_"))] | length),
+                policy_count:([$events[] | select(stage | test("policy|step_policy_checked"))] | length),
+                important_events:($highlights | map(.stage)),
+                event_summary:(if ($highlights | length) == 0 then "无关键事件" else ($highlights | map(.title) | join("；")) end),
+                highlights:$highlights,
+                headline:((($events | length) | tostring) + " 个事件 · " + (if $entrypoint == "web" then "Web" else "CLI" end) + " · " + (if ($modes | length) == 0 then "未记录模式" else ($modes | join(" + ")) end)),
+                path:$path,
+                size_bytes:$size_bytes,
+                mtime:$mtime
+              }
+        ' "${path}" 2>/dev/null || jq -cn \
+            --arg session_id "${session_id}" \
             --arg path "${path}" \
             --argjson size_bytes "${size}" \
             --argjson mtime "${mtime}" \
-            '$prior + [{session_id:$session_id, status:$status, started_at:$started_at, finished_at:$finished_at, size_bytes:$size_bytes, mtime:$mtime, path:$path}]')"
+            '{session_id:$session_id,status:"unreadable",started_at:"",finished_at:"",updated_at:"",entrypoint:"cli",entrypoint_label:"CLI",modes:[],mode_label:"未记录模式",has_multiple_modes:false,event_count:0,command_count:0,decision_count:0,observer_count:0,policy_count:0,important_events:[],event_summary:"审计文件无法读取",highlights:[],headline:"审计文件无法读取",path:$path,size_bytes:$size_bytes,mtime:$mtime}')"
+        entries="$(jq -cn \
+            --argjson prior "${entries}" \
+            --argjson summary "${summary}" \
+            '$prior + [$summary]')"
     done < <(find "${LINUX_AGENT_LOG_DIR}" -maxdepth 1 -type f -name '*.jsonl' -printf '%T@ %p\n' 2>/dev/null | sort -rn)
 
     jq -cn --argjson entries "${entries}" '{ok:true, status:"listed", sessions:$entries}'

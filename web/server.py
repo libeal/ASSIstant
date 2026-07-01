@@ -1012,6 +1012,12 @@ def build_web_timeline_from_audit(session_id, events):
 
         if stage in {"terminal_executed", "script_executed"}:
             status = str(payload.get("status") or ("executed" if payload.get("ok") else "failed"))
+            output_blocks = []
+            if payload.get("output_preview"):
+                output_blocks.append({"kind": "stdout", "title": "审计输出预览", "text": str(payload.get("output_preview") or ""), "truncated_bytes": 0})
+            if payload.get("stderr_preview"):
+                output_blocks.append({"kind": "stderr", "title": "审计错误预览", "text": str(payload.get("stderr_preview") or ""), "truncated_bytes": 0})
+            output_blocks.append({"kind": "meta", "title": "审计恢复摘要", "json": {"stage": stage, "status": status, "payload": payload}})
             timeline.append(
                 {
                     "id": f"{stage}-{len(timeline) + 1}",
@@ -1022,7 +1028,7 @@ def build_web_timeline_from_audit(session_id, events):
                     "summary": compact_summary(payload.get("action") or status),
                     "risk_level": None,
                     "step": {"id": stage, "title": "终端执行" if stage == "terminal_executed" else "Skill 执行", "executor_type": "terminal" if stage == "terminal_executed" else "skill_script"},
-                    "output_blocks": [{"kind": "meta", "title": "审计恢复摘要", "json": {"stage": stage, "status": status, "payload": payload}}],
+                    "output_blocks": output_blocks,
                 }
             )
             continue
@@ -1047,6 +1053,10 @@ def build_web_timeline_from_audit(session_id, events):
                 },
             }
         ]
+        if detail.get("output_preview"):
+            blocks.insert(0, {"kind": "stdout", "title": "审计输出预览", "text": str(detail.get("output_preview") or ""), "truncated_bytes": 0})
+        if detail.get("stderr_preview"):
+            blocks.insert(1 if detail.get("output_preview") else 0, {"kind": "stderr", "title": "审计错误预览", "text": str(detail.get("stderr_preview") or ""), "truncated_bytes": 0})
         if findings:
             blocks.append({"kind": "review", "title": "策略审查 findings", "json": {"findings": findings}})
         timeline.append(

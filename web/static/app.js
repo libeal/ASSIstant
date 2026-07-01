@@ -1801,12 +1801,30 @@ function renderAuditSessionList() {
   for (const session of sessions) {
     const item = document.createElement("button");
     item.type = "button";
-    item.className = "event";
+    item.className = "event session-event";
+    const modes = Array.isArray(session.modes) ? session.modes : [];
+    const highlights = Array.isArray(session.highlights) ? session.highlights : [];
+    const modeDisplay = auditModeLabel(modes, session.mode_label);
+    const headline = auditSessionHeadline(session, modeDisplay);
+    const badges = [
+      session.entrypoint_label || (session.entrypoint === "web" ? "Web" : "CLI"),
+      modeDisplay,
+      `${session.event_count ?? 0} 个事件`,
+      session.has_multiple_modes ? "多模式" : "",
+    ].filter(Boolean);
     item.innerHTML = `
       <time>${escapeHtml(auditProtocol.compactAuditTime(session.started_at || session.updated_at || ""))}</time>
       <div class="body">
         <strong>${escapeHtml(session.session_id || session.path || "session")}</strong>
-        <span>status=${escapeHtml(session.status || "unknown")} · file=${escapeHtml(session.path || session.file || "logs/session")}</span>
+        <span>${escapeHtml(headline)}</span>
+        <div class="event-meta">
+          ${badges.map((badge) => `<span class="mini-pill">${escapeHtml(badge)}</span>`).join("")}
+          <span class="mini-pill risk ${statusKind(session.status)}">${escapeHtml(session.status || "unknown")}</span>
+        </div>
+        <p class="event-detail">${escapeHtml(session.event_summary || "没有关键事件摘要。")}</p>
+        ${highlights.length ? `<div class="event-lines">${highlights.slice(0, 3).map((highlight) => `
+          <div class="event-line">${escapeHtml(highlight.title || highlight.stage || "事件")}${highlight.detail ? `：${escapeHtml(highlight.detail)}` : ""}</div>
+        `).join("")}</div>` : ""}
       </div>
     `;
     item.addEventListener("click", () => readAudit(session.session_id));
@@ -1820,7 +1838,19 @@ function filteredAuditSessions() {
   const limit = Math.max(1, Math.min(200, Number($("auditLimitInput")?.value || 40)));
   return (state.auditSessions || [])
     .filter((session) => {
-      const haystack = [session.session_id, session.status, session.started_at, session.updated_at, session.path, session.file].join(" ").toLowerCase();
+      const haystack = [
+        session.session_id,
+        session.status,
+        session.started_at,
+        session.updated_at,
+        session.path,
+        session.file,
+        session.entrypoint,
+        session.mode_label,
+        auditModeLabel(session.modes || [], session.mode_label),
+        session.event_summary,
+        ...(session.modes || []),
+      ].join(" ").toLowerCase();
       if (text && !haystack.includes(text)) return false;
       if (status && String(session.status || "") !== status) return false;
       return true;
@@ -1836,7 +1866,7 @@ async function readAudit(sessionId) {
   renderAuditEventTimeline();
   renderAuditObserverSummary();
   updateAuditMetrics();
-  $("auditOutput").textContent = data.report || pretty(data);
+  $("auditOutput").textContent = renderAuditReadableReport(data);
   if ($("auditRestoreTimelineBtn")) $("auditRestoreTimelineBtn").disabled = !state.auditWebTimeline?.timeline?.length;
 }
 
@@ -1852,12 +1882,18 @@ function renderAuditEventTimeline() {
   for (const event of events) {
     const item = document.createElement("div");
     item.className = "event";
-    const name = auditProtocol.auditEventName(event);
+    const display = auditProtocol.auditEventDisplay(event, pretty);
     item.innerHTML = `
       <time>${escapeHtml(auditProtocol.compactAuditTime(auditProtocol.auditEventTime(event)))}</time>
       <div class="body">
-        <strong>${escapeHtml(name)}</strong>
-        <span>${escapeHtml(auditSummaryText(event))}</span>
+        <strong>${escapeHtml(display.title)}</strong>
+        <span>${escapeHtml(display.summary || "事件已记录。")}</span>
+        <div class="event-meta">
+          <span class="mini-pill">${escapeHtml(display.stage)}</span>
+          ${display.status ? `<span class="mini-pill risk ${statusKind(display.status)}">${escapeHtml(display.status)}</span>` : ""}
+          ${display.badges.map((badge) => `<span class="mini-pill">${escapeHtml(badge)}</span>`).join("")}
+        </div>
+        ${display.details.length ? `<div class="event-lines">${display.details.map((line) => `<div class="event-line">${escapeHtml(line)}</div>`).join("")}</div>` : ""}
       </div>
     `;
     container.appendChild(item);
@@ -1876,6 +1912,51 @@ function auditSummaryText(event) {
   return auditProtocol.auditEventSummary(event, pretty) || "无摘要字段，完整内容见右侧报告。";
 }
 
+function renderAuditReadableReport(data) {
+  const events = Array.isArray(data.events) ? data.events : [];
+  const restored = data.web_timeline || {};
+  const selectedSession = (state.auditSessions || []).find((session) => session.session_id === data.session_id) || {};
+  const lines = [
+    `Session: ${data.session_id || state.currentAuditSession || "--"}`,
+    `来源: ${selectedSession.entrypoint_label || (selectedSession.entrypoint === "web" ? "Web" : "CLI") || "--"}`,
+    `模式: ${auditModeLabel(selectedSession.modes || [], selectedSession.mode_label) || "--"}`,
+    `状态: ${selectedSession.status || restored.status || data.status || "--"}`,
+    `事件数: ${events.length}`,
+    `可回放步骤: ${Array.isArray(restored.timeline) ? restored.timeline.length : 0}`,
+    "",
+    "事件时间线:",
+  ];
+  events.slice(0, 80).forEach((event, index) => {
+    const display = auditProtocol.auditEventDisplay(event, pretty);
+    lines.push(`${index + 1}. ${auditProtocol.compactAuditTime(auditProtocol.auditEventTime(event))} ${display.title} - ${display.summary || "已记录"}`);
+    display.details.slice(0, 4).forEach((detail) => lines.push(`   ${detail}`));
+  });
+  if (events.length > 80) lines.push(`... 还有 ${events.length - 80} 个事件未在预览中展开。`);
+  return lines.join("\n");
+}
+
+function auditModeLabel(modes, fallback = "") {
+  const labels = {
+    work: "Work 工作台",
+    terminal: "Terminal 终端",
+    script: "Script 脚本",
+    edit: "Edit 编辑",
+  };
+  const source = Array.isArray(modes) && modes.length ? modes : String(fallback || "").split("+").map((item) => item.trim()).filter(Boolean);
+  if (!source.length) return fallback || "";
+  return source.map((mode) => labels[mode] || mode).join(" + ");
+}
+
+function auditSessionHeadline(session, modeDisplay) {
+  if (session.headline && session.mode_label) {
+    return session.headline.replace(session.mode_label, modeDisplay || session.mode_label);
+  }
+  if (session.headline && !modeDisplay) return session.headline;
+  const entrypoint = session.entrypoint_label || (session.entrypoint === "web" ? "Web" : "CLI");
+  const eventCount = session.event_count ?? 0;
+  return `${eventCount} 个事件 · ${entrypoint} · ${modeDisplay || "未记录模式"}`;
+}
+
 function renderAuditObserverSummary() {
   const container = $("auditObserverSummary");
   if (!container) return;
@@ -1887,12 +1968,13 @@ function renderAuditObserverSummary() {
   }
   for (const event of observerEvents.slice(0, 12)) {
     const payload = event.payload || event.data || event;
+    const display = auditProtocol.auditEventDisplay(event, pretty);
     const status = payload.status || payload.lifecycle || auditProtocol.auditEventName(event);
     const row = document.createElement("tr");
     row.innerHTML = `
       <td><span class="pill risk ${statusKind(status)}">${escapeHtml(status)}</span></td>
       <td class="mono">${escapeHtml(auditProtocol.auditEventName(event))}</td>
-      <td>${escapeHtml(auditSummaryText(event))}</td>
+      <td>${escapeHtml([display.summary, ...display.details].filter(Boolean).join("；"))}</td>
     `;
     container.appendChild(row);
   }
@@ -1994,8 +2076,8 @@ function updatePolicyEditState() {
   if ($("policyEditor")) $("policyEditor").disabled = !unlocked;
   if ($("policySaveBtn")) $("policySaveBtn").disabled = !unlocked || !state.currentPolicyPath;
   if ($("policyBoundaryOptions")) $("policyBoundaryOptions").hidden = !unlocked;
-  setStatus("policyLockPill", unlocked ? "editable" : "locked", unlocked ? "ok" : "medium");
-  setText("policyEditMode", unlocked ? "editable for current session" : "read-only");
+  setStatus("policyLockPill", unlocked ? "可编辑" : "已锁定", unlocked ? "ok" : "medium");
+  setText("policyEditMode", unlocked ? "本次会话可编辑" : "只读");
 }
 
 async function loadPolicies() {
@@ -2076,7 +2158,7 @@ async function unlockPolicy() {
   state.policySudoUnlocked = true;
   $("policyPassword").value = "";
   updatePolicyEditState();
-  showToast("Policy editing unlocked");
+  showToast("策略编辑已解锁");
 }
 
 async function validatePolicy({ silent = false } = {}) {
@@ -2100,7 +2182,7 @@ function lockPolicy() {
   state.policySudoPassword = "";
   state.policySudoUnlocked = false;
   updatePolicyEditState();
-  showToast("Policy editing locked");
+  showToast("策略编辑已锁定");
 }
 
 async function savePolicy() {
@@ -2191,19 +2273,25 @@ function renderAuditBoundaries(json) {
   const active = json.active_boundary || running.id || running.audit_payload_mode || running.audit_mode || "safe_summary";
   setText("activeBoundary", active);
   if (list) {
+    const applicationEvents = running.event_sources || running.application_events || [];
+    const syscalls = running.observer_syscalls || [];
+    const fields = running.observer_result_fields || [];
+    const payloadMode = running.audit_mode || running.audit_payload_mode || "safe_summary";
     const rows = [
-      ["audit_backend", running.observer_backend || "auto"],
-      ["audit_mode", running.audit_mode || running.audit_payload_mode || "safe_summary"],
-      ["session_source", "logs/session/*.jsonl"],
-      ["application_events", (running.event_sources || running.application_events || []).join(", ")],
-      ["observer_syscalls", (running.observer_syscalls || []).join(", ")],
-      ["observer_result_fields", (running.observer_result_fields || []).join(", ")],
-      ["observer_max_events", String(running.observer_max_events || "")],
+      ["审计载荷", payloadMode, payloadMode === "redacted_verbose" ? "保留更多脱敏上下文，适合排障复盘。" : "默认只写安全摘要，减少敏感信息暴露。"],
+      ["文本上限", `${running.audit_text_limit || 1000} 字符`, "输入、输出和错误会脱敏后按该上限生成预览。"],
+      ["应用事件", `${applicationEvents.length} 类`, summarizeList(applicationEvents, 5) || "未选择应用事件。"],
+      ["Observer syscall", `${syscalls.length} 个`, summarizeList(syscalls, 8) || "未启用 syscall 观察。"],
+      ["Observer 字段", `${fields.length} 类`, summarizeList(fields, 6) || "未选择 observer 汇总字段。"],
+      ["事件上限", `${running.observer_max_events || 200} 条`, "限制单个 session 的内核观察事件体量。"],
+      ["Session 来源", "logs/*.jsonl", "CLI 与 Web 共用同一套审计日志目录。"],
+      ["保护方式", "策略审查 + 人工审批", "命令守卫先判断形态，正则策略再补充业务边界。"],
     ];
-    for (const [key, value] of rows) {
+    list.className = "policy-boundary-grid";
+    for (const [title, value, description] of rows) {
       const item = document.createElement("div");
-      item.className = "kv";
-      item.innerHTML = `<div class="k">${escapeHtml(key)}</div><div class="v">${escapeHtml(value)}</div>`;
+      item.className = "policy-card";
+      item.innerHTML = `<strong>${escapeHtml(title)}</strong><span class="policy-card-value">${escapeHtml(value)}</span><p>${escapeHtml(description)}</p>`;
       list.appendChild(item);
     }
   }
@@ -2211,18 +2299,25 @@ function renderAuditBoundaries(json) {
   if (options) {
     const boundaryRows = json.available_boundaries || (allowed.audit_payload_modes || []).map((mode) => ({
       id: mode,
-      description: `audit_payload_mode=${mode}`,
+      description: mode === "redacted_verbose" ? "保留更多脱敏后的输入输出内容，适合详细复盘。" : "只写安全摘要，适合默认运行。",
     }));
     for (const boundary of boundaryRows) {
       const item = document.createElement("article");
       item.className = "item";
       item.innerHTML = `
-        <div class="item-head"><h4 class="mono">${escapeHtml(boundary.id)}</h4><span class="pill risk ${boundary.id === active ? "low" : "medium"}">${boundary.id === active ? "active" : "option"}</span></div>
+        <div class="item-head"><h4>${escapeHtml(boundary.id === "safe_summary" ? "安全摘要" : "脱敏详录")}</h4><span class="pill risk ${boundary.id === active ? "low" : "medium"}">${boundary.id === active ? "当前启用" : "可选"}</span></div>
         <p>${escapeHtml(boundary.description || boundary.name || "")}</p>
       `;
       options.appendChild(item);
     }
   }
+}
+
+function summarizeList(values, max = 6) {
+  if (!Array.isArray(values) || !values.length) return "";
+  const visible = values.slice(0, max).join("、");
+  const rest = values.length > max ? `，另 ${values.length - max} 项` : "";
+  return `${visible}${rest}`;
 }
 
 function showScreen(name) {

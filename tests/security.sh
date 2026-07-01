@@ -133,8 +133,19 @@ audit_output="$(bash "${ROOT_DIR}/bin/agent" audit "${safe_session_id}")"
     "${ROOT_DIR}/logs/${safe_session_id}.jsonl"
 ! grep -q 'TEST_AUDIT_SECRET\|TEST_AUDIT_PASS\|TEST_CONTEXT_TOKEN\|TEST_HISTORY_PASS\|TEST_ENV_BEARER\|TEST_SKILL_SECRET\|TEST_DIFF_PASS' <<<"${audit_output}"
 [[ ! -e "${ROOT_DIR}/sessions/${safe_session_id}.md" ]]
+grep -q '# 事件时间线' <<<"${audit_output}"
+grep -q '构建模型上下文' <<<"${audit_output}"
 grep -q '"stage":"script_manual_edit"' "${ROOT_DIR}/logs/${safe_session_id}.jsonl"
 grep -q '"diff_lines"' "${ROOT_DIR}/logs/${safe_session_id}.jsonl"
+audit_list_summary="$(bash "${ROOT_DIR}/bin/agent" api audit list '{"limit":50}')"
+jq -e --arg session_id "${safe_session_id}" '
+    [.sessions[] | select(.session_id == $session_id)] | first
+    | .entrypoint == "cli"
+      and (.event_count >= 1)
+      and (.modes | index("work"))
+      and (.event_summary | length > 0)
+      and (.highlights | length > 0)
+' <<<"${audit_list_summary}" >/dev/null
 
 verbose_project="${tmp_root}/verbose-project"
 mkdir -p "${verbose_project}"
