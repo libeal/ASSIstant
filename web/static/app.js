@@ -603,7 +603,8 @@ function renderObjectOutputText(value) {
 }
 
 function renderProtocolText(title, result) {
-  return normalizeExecutionEntries(title, result)
+  const flowText = outputBlocksText(executionFlowBlocks(result));
+  const entriesText = normalizeExecutionEntries(title, result)
     .map((entry) => {
       const body = outputBlocksFrom(entry.output).length ? outputBlocksText(entry.output) : renderUserOutputText(entry.output);
       const number = entry.number ?? entry.index;
@@ -611,6 +612,16 @@ function renderProtocolText(title, result) {
       return body.trim() ? `${header}\n${body}` : header;
     })
     .join("\n\n");
+  return [flowText, entriesText].filter((text) => text.trim()).join("\n\n");
+}
+
+function executionFlowBlocks(result = state.lastProtocolResult) {
+  return outputBlocksFrom(result).filter((block) => block?.title === "执行流程" && typeof block.text === "string" && block.text.trim());
+}
+
+function renderExecutionFlowHtml(result = state.lastProtocolResult) {
+  const blocks = executionFlowBlocks(result);
+  return blocks.length ? renderOutputBlocksHtml(blocks) : "";
 }
 
 async function api(path, options = {}) {
@@ -761,7 +772,7 @@ function emptyEvent(text) {
 function updateWorkActionLabel() {
   const button = $("workRunBtn");
   if (!button) return;
-  const running = Boolean(state.activeWorkJobId && !state.workSuspended);
+  const running = Boolean((state.activeWorkJobId && !state.workSuspended) || state.workApprovalSubmitting);
   button.textContent = state.awaitingWorkApproval ? "等待审批选择" : (running ? "运行中" : (state.workSuspended ? "继续" : (state.workSubmitting ? "发送中" : "发送")));
   button.disabled = state.awaitingWorkApproval || state.workSubmitting || running;
   if ($("workCancelBtn")) $("workCancelBtn").disabled = !state.activeWorkJobId;
@@ -895,17 +906,21 @@ async function submitApprovalDecision(decision) {
   closeApprovalDrawer();
   if (state.activeWorkJobId || state.workSubmitting) return showToast("Work job is already running.");
   state.workSubmitting = true;
+  state.workApprovalSubmitting = true;
+  setStatus("workJobStatus", "running", "running");
   updateWorkActionLabel();
   try {
     const job = await createJob("work", "run", payload);
     state.activeWorkJobId = job.job_id;
     state.workSubmitting = false;
+    state.workApprovalSubmitting = false;
     state.workSuspended = false;
     updateWorkActionLabel();
     const completed = await pollJob(job.job_id, "workJobStatus", null, { suspendFlag: "workSuspended" });
     handleCompletedWork(completed, payload.input);
   } finally {
     state.workSubmitting = false;
+    state.workApprovalSubmitting = false;
     updateWorkActionLabel();
   }
 }
@@ -1059,6 +1074,7 @@ function renderStepDetail(entry) {
     <section class="detail-section terminal-return-section">
       <h5>终端返回</h5>
       <div class="primary-output">
+        ${renderExecutionFlowHtml()}
         ${renderTerminalReturnHtml(output)}
       </div>
     </section>
@@ -1634,6 +1650,7 @@ async function runWork() {
 function handleCompletedWork(completed, input) {
   if (completed.status === "suspended") return;
   state.activeWorkJobId = "";
+  state.workApprovalSubmitting = false;
   const result = completed.result || {};
   state.lastProtocolResult = result;
   state.lastThinkingSummary = result.response?.thinking_summary || state.lastThinkingSummary || "";

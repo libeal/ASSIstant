@@ -2,8 +2,8 @@
 
 set -euo pipefail
 
-LINUX_AGENT_SESSION_ID=""
-LINUX_AGENT_AUDIT_LOG=""
+LINUX_AGENT_SESSION_ID="${LINUX_AGENT_SESSION_ID:-}"
+LINUX_AGENT_AUDIT_LOG="${LINUX_AGENT_AUDIT_LOG:-}"
 LINUX_AGENT_SESSION_ACTIVE=0
 LINUX_AGENT_SESSION_FINISHED=0
 LINUX_AGENT_LAST_BUSINESS_STATUS=""
@@ -595,6 +595,21 @@ linux_agent_start_session() {
         return 0
     fi
 
+    if [[ "${LINUX_AGENT_SESSION_MANAGED_EXTERNALLY:-0}" == "1" && -n "${LINUX_AGENT_SESSION_ID:-}" ]]; then
+        LINUX_AGENT_AUDIT_LOG="${LINUX_AGENT_AUDIT_LOG:-${LINUX_AGENT_LOG_DIR}/${LINUX_AGENT_SESSION_ID}.jsonl}"
+        mkdir -p "$(dirname "${LINUX_AGENT_AUDIT_LOG}")"
+        touch "${LINUX_AGENT_AUDIT_LOG}"
+        if declare -F linux_agent_use_session_tmp_dir >/dev/null 2>&1; then
+            linux_agent_use_session_tmp_dir "${LINUX_AGENT_SESSION_ID}"
+        fi
+        LINUX_AGENT_SESSION_ACTIVE=1
+        LINUX_AGENT_SESSION_FINISHED=0
+        if declare -F linux_agent_observer_session_start >/dev/null 2>&1; then
+            linux_agent_observer_session_start "session" "$(jq -cn --arg request "${user_input}" '{request:$request}')"
+        fi
+        return 0
+    fi
+
     LINUX_AGENT_SESSION_ID="$(linux_agent_new_session_id)"
     if declare -F linux_agent_use_session_tmp_dir >/dev/null 2>&1; then
         linux_agent_use_session_tmp_dir "${LINUX_AGENT_SESSION_ID}"
@@ -668,6 +683,10 @@ linux_agent_finish_session() {
     fi
     if declare -F linux_agent_observer_session_finish >/dev/null 2>&1; then
         linux_agent_observer_session_finish "${final_status}"
+    fi
+    if [[ "${LINUX_AGENT_SESSION_MANAGED_EXTERNALLY:-0}" == "1" ]]; then
+        LINUX_AGENT_SESSION_ACTIVE=0
+        return 0
     fi
     linux_agent_log_event "session_finished" "$(jq -cn --arg status "${final_status}" '{status:$status}')"
     LINUX_AGENT_SESSION_ACTIVE=0

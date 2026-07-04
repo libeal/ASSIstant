@@ -3,10 +3,13 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# shellcheck source=helpers.sh
+source "${ROOT_DIR}/tests/helpers.sh"
 
 tmp_root="$(mktemp -d)"
 server_pid=""
 cleanup() {
+    stop_fake_ai_server
     if [[ -n "${server_pid}" ]] && kill -0 "${server_pid}" >/dev/null 2>&1; then
         kill "${server_pid}" >/dev/null 2>&1 || true
         wait "${server_pid}" 2>/dev/null || true
@@ -14,6 +17,7 @@ cleanup() {
     rm -rf "${tmp_root}"
 }
 trap cleanup EXIT
+start_fake_ai_server "$((24000 + RANDOM % 1000))" "${tmp_root}"
 
 copy_project() {
     local target="$1"
@@ -31,6 +35,7 @@ copy_project() {
 
 project="${tmp_root}/project-web"
 copy_project "${project}"
+configure_fake_ai "${project}"
 port="$((19000 + RANDOM % 1000))"
 token="test-web-token-12345"
 tmp_config="$(mktemp)"
@@ -207,6 +212,59 @@ policy_write="$(curl --noproxy '*' -sS \
     -d "${policy_write_payload}" \
     "${base_url}/api/policies/write")"
 jq -e 'if .ok then .status == "saved" and (.method == "root" or .method == "sudo") else .status == "sudo_required" end' <<<"${policy_write}" >/dev/null
+
+work_payload="$(jq -cn '{resource:"work", action:"run", payload:{input:"查看cpu占用"}}')"
+work_job_one="$(curl --noproxy '*' -sS \
+    -H "Authorization: Bearer ${token}" \
+    -H "Content-Type: application/json" \
+    -d "${work_payload}" \
+    "${base_url}/api/jobs")"
+work_job_one_id="$(jq -r '.job_id' <<<"${work_job_one}")"
+[[ "${work_job_one_id}" =~ ^[0-9a-f]+$ ]]
+work_result_one=""
+for _ in $(seq 1 100); do
+    work_result_one="$(curl --noproxy '*' -sS -H "Authorization: Bearer ${token}" "${base_url}/api/jobs/${work_job_one_id}")"
+    work_status_one="$(jq -r '.status' <<<"${work_result_one}")"
+    if [[ "${work_status_one}" != "queued" && "${work_status_one}" != "running" ]]; then
+        break
+    fi
+    sleep 0.2
+done
+[[ "${work_status_one}" == "succeeded" ]]
+jq -e '.result_status == "executed" and .result_ok == true
+    and ([.result.timeline[]? | select(.kind == "execution") | .output_blocks[]? | select(.kind == "json") | .json | select(.tool == "system.resource.inspect")] | length) > 0
+    and ([.result.output_blocks[]? | select(.title == "执行流程") | .text | contains("# 工作计划") and contains("步骤输出")] | any)' <<<"${work_result_one}" >/dev/null
+
+work_job_two="$(curl --noproxy '*' -sS \
+    -H "Authorization: Bearer ${token}" \
+    -H "Content-Type: application/json" \
+    -d "${work_payload}" \
+    "${base_url}/api/jobs")"
+work_job_two_id="$(jq -r '.job_id' <<<"${work_job_two}")"
+[[ "${work_job_two_id}" =~ ^[0-9a-f]+$ ]]
+work_result_two=""
+for _ in $(seq 1 100); do
+    work_result_two="$(curl --noproxy '*' -sS -H "Authorization: Bearer ${token}" "${base_url}/api/jobs/${work_job_two_id}")"
+    work_status_two="$(jq -r '.status' <<<"${work_result_two}")"
+    if [[ "${work_status_two}" != "queued" && "${work_status_two}" != "running" ]]; then
+        break
+    fi
+    sleep 0.2
+done
+[[ "${work_status_two}" == "succeeded" ]]
+
+audit_after_work="$(curl --noproxy '*' -sS -H "Authorization: Bearer ${token}" "${base_url}/api/audit/list")"
+jq -e '.ok == true and ([.sessions[]? | select(.entrypoint == "web")] | length) == 1' <<<"${audit_after_work}" >/dev/null
+web_work_session_id="$(jq -r '.sessions[]? | select(.entrypoint == "web") | .session_id' <<<"${audit_after_work}")"
+[[ -n "${web_work_session_id}" ]]
+web_work_audit_payload="$(jq -cn --arg session_id "${web_work_session_id}" '{session_id:$session_id}')"
+web_work_audit="$(curl --noproxy '*' -sS \
+    -H "Authorization: Bearer ${token}" \
+    -H "Content-Type: application/json" \
+    -d "${web_work_audit_payload}" \
+    "${base_url}/api/audit/read")"
+jq -e '[.events[]? | select(.stage == "request_context_built") | .payload.conversation_turns] as $turns
+    | ($turns | length) >= 2 and $turns[0] == 0 and $turns[1] > 0' <<<"${web_work_audit}" >/dev/null
 
 job_payload="$(jq -cn '{resource:"terminal", action:"run", payload:{command:"printf web-job-ok"}}')"
 job="$(curl --noproxy '*' -sS \

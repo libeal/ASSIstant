@@ -16,6 +16,42 @@ function pretty(value) {
   return JSON.stringify(value, null, 2);
 }
 
+const hiddenJsonKeys = new Set(["ok", "tool"]);
+
+function jsonDisplayText(value) {
+  if (value === undefined || value === null || value === "") return "";
+  if (typeof value === "string") return value;
+  if (typeof value === "number" || typeof value === "boolean") return String(value);
+  if (Array.isArray(value)) {
+    return value
+      .map((entry, index) => {
+        const text = jsonDisplayText(entry);
+        if (!text.trim()) return "";
+        return typeof entry === "object" && entry !== null ? `${index + 1}. ${text}` : text;
+      })
+      .filter(Boolean)
+      .join("\n\n");
+  }
+  if (typeof value !== "object") return String(value);
+  const rows = Object.entries(value)
+    .filter(([key, entry]) => !hiddenJsonKeys.has(key) && !isEmptyValue(entry))
+    .map(([key, entry]) => {
+      const text = jsonDisplayText(entry);
+      if (!text.trim()) return "";
+      const label = key.replace(/_/g, " ");
+      return text.includes("\n") ? `${label}:\n${text}` : `${label}: ${text}`;
+    })
+    .filter(Boolean);
+  return rows.join("\n\n");
+}
+
+function isEmptyValue(value) {
+  if (value === undefined || value === null || value === "") return true;
+  if (Array.isArray(value)) return value.length === 0;
+  if (typeof value === "object") return Object.keys(value).length === 0;
+  return false;
+}
+
 export function outputBlocksFrom(value) {
   if (Array.isArray(value?.output_blocks)) return value.output_blocks;
   if (Array.isArray(value)) return value;
@@ -48,7 +84,7 @@ export function outputBlocksText(blocks) {
   return displayOutputBlocks(blocks)
     .map((block) => {
       if (typeof block.text === "string" && block.text.trim()) return block.text;
-      if (block.json !== undefined) return pretty(block.json);
+      if (block.json !== undefined) return jsonDisplayText(block.json) || pretty(block.json);
       return "";
     })
     .filter(Boolean)
@@ -62,6 +98,10 @@ export function outputBlocksSummary(blocks) {
     if (block.json?.message) return compactText(block.json.message);
     if (block.json?.action) return compactText(block.json.action);
     if (block.json?.tool) return compactText(block.json.tool);
+    if (block.json !== undefined) {
+      const text = jsonDisplayText(block.json);
+      if (text) return compactText(text);
+    }
   }
   return "";
 }
@@ -91,10 +131,11 @@ export function renderOutputBlocksHtml(blocks) {
         </section>
       `;
     }
+    const text = jsonDisplayText(block.json) || pretty(block.json ?? block);
     return `
       <section class="output-section">
         <h5>${escapeHtml(title)}</h5>
-        <pre class="inline-code">${escapeHtml(pretty(block.json ?? block))}</pre>
+        <pre class="inline-code">${escapeHtml(text)}</pre>
       </section>
     `;
   });

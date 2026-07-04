@@ -8,6 +8,54 @@ linux_agent_context_turns() {
     linux_agent_config_get_default '.context_turns' '6'
 }
 
+linux_agent_conversation_history_file() {
+    [[ -n "${LINUX_AGENT_CONVERSATION_HISTORY_FILE:-}" ]] || return 1
+    printf '%s\n' "${LINUX_AGENT_CONVERSATION_HISTORY_FILE}"
+}
+
+linux_agent_load_conversation_history() {
+    local history_file
+    history_file="$(linux_agent_conversation_history_file 2>/dev/null || true)"
+    [[ -n "${history_file}" && -f "${history_file}" ]] || return 0
+    if jq -e 'type == "array"' "${history_file}" >/dev/null 2>&1; then
+        LINUX_AGENT_CONVERSATION_HISTORY="$(jq -c . "${history_file}")"
+    else
+        LINUX_AGENT_CONVERSATION_HISTORY='[]'
+    fi
+}
+
+linux_agent_persist_conversation_history() {
+    local history_file dir tmp_file
+    history_file="$(linux_agent_conversation_history_file 2>/dev/null || true)"
+    [[ -n "${history_file}" ]] || return 0
+    dir="$(dirname "${history_file}")"
+    mkdir -p "${dir}"
+    tmp_file="${history_file}.$$.$RANDOM.tmp"
+    printf '%s\n' "${LINUX_AGENT_CONVERSATION_HISTORY}" > "${tmp_file}"
+    mv "${tmp_file}" "${history_file}"
+}
+
+linux_agent_history_lock_acquire() {
+    local history_file lock_dir attempt
+    history_file="$(linux_agent_conversation_history_file 2>/dev/null || true)"
+    [[ -n "${history_file}" ]] || return 1
+    lock_dir="${history_file}.lock"
+    for attempt in $(seq 1 80); do
+        if mkdir "${lock_dir}" 2>/dev/null; then
+            printf '%s\n' "${lock_dir}"
+            return 0
+        fi
+        sleep 0.05
+    done
+    return 1
+}
+
+linux_agent_history_lock_release() {
+    local lock_dir="$1"
+    [[ -n "${lock_dir}" ]] || return 0
+    rmdir "${lock_dir}" 2>/dev/null || true
+}
+
 linux_agent_redact_json() {
     local input="$1"
     linux_agent_sanitize_json "${input}"
@@ -15,6 +63,7 @@ linux_agent_redact_json() {
 
 linux_agent_history_window() {
     local turns
+    linux_agent_load_conversation_history
     turns="$(linux_agent_context_turns)"
     if [[ ! "${turns}" =~ ^[0-9]+$ ]]; then
         turns=6
@@ -26,6 +75,9 @@ linux_agent_record_turn() {
     local role="$1"
     local content="$2"
     local status="${3:-}"
+    local lock_dir
+    lock_dir="$(linux_agent_history_lock_acquire 2>/dev/null || true)"
+    linux_agent_load_conversation_history
     content="$(linux_agent_sanitize_text "${content}")"
     LINUX_AGENT_CONVERSATION_HISTORY="$(jq -cn \
         --argjson prior "${LINUX_AGENT_CONVERSATION_HISTORY}" \
@@ -34,6 +86,8 @@ linux_agent_record_turn() {
         --arg status "${status}" \
         --arg ts "$(linux_agent_now_iso)" \
         '$prior + [{role:$role, content:$content, status:$status, timestamp:$ts}]')"
+    linux_agent_persist_conversation_history
+    linux_agent_history_lock_release "${lock_dir}"
 }
 
 linux_agent_build_request_context() {

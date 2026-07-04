@@ -18,6 +18,7 @@ export function createInitialState() {
     activeScriptJobId: "",
     activeTerminalJobId: "",
     workSubmitting: false,
+    workApprovalSubmitting: false,
     terminalSubmitting: false,
     selectedStepIndex: -1,
     approvalDrawerOpen: false,

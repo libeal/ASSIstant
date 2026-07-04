@@ -31,6 +31,9 @@ JOB_PROCESSES = {}
 JOB_PROCESSES_LOCK = threading.Lock()
 SERVER_RUN_ID = uuid.uuid4().hex
 SERVER_STARTED_AT = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+WEB_AGENT_SESSION_ID = f"session_web_{SERVER_RUN_ID[:16]}"
+WEB_AGENT_AUDIT_LOG = ROOT / "logs" / f"{WEB_AGENT_SESSION_ID}.jsonl"
+WEB_AGENT_HISTORY_FILE = ROOT / "tmp" / "web" / "sessions" / f"{WEB_AGENT_SESSION_ID}.history.json"
 API_KEY_PLACEHOLDER = "please-set-your-api-key"
 WEB_AUDIT_SESSION_ID = f"web_{SERVER_RUN_ID[:16]}"
 WEB_AUDIT_LOG = ROOT / "logs" / f"{WEB_AUDIT_SESSION_ID}.jsonl"
@@ -403,18 +406,43 @@ def sudo_check(password):
     }
 
 
-def record_web_audit_event(stage, payload=None):
+def append_audit_event(log_path, session_id, stage, payload=None):
     payload = payload if isinstance(payload, dict) else {}
-    WEB_AUDIT_LOG.parent.mkdir(parents=True, exist_ok=True)
+    log_path.parent.mkdir(parents=True, exist_ok=True)
     event = {
         "timestamp": now_iso(),
-        "session_id": WEB_AUDIT_SESSION_ID,
+        "session_id": session_id,
         "stage": stage,
         "payload": payload,
     }
-    with WEB_AUDIT_LOG.open("a", encoding="utf-8") as handle:
+    with log_path.open("a", encoding="utf-8") as handle:
         handle.write(json.dumps(event, ensure_ascii=False, separators=(",", ":")))
         handle.write("\n")
+
+
+def record_web_audit_event(stage, payload=None):
+    append_audit_event(WEB_AUDIT_LOG, WEB_AUDIT_SESSION_ID, stage, payload)
+
+
+def record_web_agent_session_event(stage, payload=None):
+    append_audit_event(WEB_AGENT_AUDIT_LOG, WEB_AGENT_SESSION_ID, stage, payload)
+
+
+def initialize_web_agent_session():
+    WEB_AGENT_AUDIT_LOG.parent.mkdir(parents=True, exist_ok=True)
+    WEB_AGENT_AUDIT_LOG.write_text("", encoding="utf-8")
+    WEB_AGENT_HISTORY_FILE.parent.mkdir(parents=True, exist_ok=True)
+    WEB_AGENT_HISTORY_FILE.write_text("[]\n", encoding="utf-8")
+    record_web_agent_session_event(
+        "session_started",
+        {
+            "request": "agent-web",
+            "entrypoint": "web",
+            "run_id": SERVER_RUN_ID,
+            "started_at": SERVER_STARTED_AT,
+            "audit_mode": read_config().get("audit_mode", "safe_summary"),
+        },
+    )
 
 
 def observer_runtime_config():
@@ -800,6 +828,10 @@ def run_agent_api(resource, action="", payload=None, timeout=None, job_id=None):
     command.append(json.dumps(payload, ensure_ascii=False, separators=(",", ":")))
     env = os.environ.copy()
     env.setdefault("LINUX_AGENT_WEB", "1")
+    env["LINUX_AGENT_SESSION_MANAGED_EXTERNALLY"] = "1"
+    env["LINUX_AGENT_SESSION_ID"] = WEB_AGENT_SESSION_ID
+    env["LINUX_AGENT_AUDIT_LOG"] = str(WEB_AGENT_AUDIT_LOG)
+    env["LINUX_AGENT_CONVERSATION_HISTORY_FILE"] = str(WEB_AGENT_HISTORY_FILE)
     if job_id is None:
         process = subprocess.run(
             command,
@@ -860,8 +892,10 @@ def run_agent_api(resource, action="", payload=None, timeout=None, job_id=None):
             blocks = []
             result["output_blocks"] = blocks
         if stderr:
+            stderr_title = "执行流程" if resource == "work" else "Agent stderr"
+            stderr_kind = "stdout" if resource == "work" else "stderr"
             blocks.append(
-                {"kind": "stderr", "title": "Agent stderr", "text": stderr[:4000], "truncated_bytes": max(0, len(stderr) - 4000)}
+                {"kind": stderr_kind, "title": stderr_title, "text": stderr[:4000], "truncated_bytes": max(0, len(stderr) - 4000)}
             )
         blocks.append({"kind": "meta", "title": "Agent runtime", "json": {"exit_code": returncode}})
     return result
@@ -1375,6 +1409,7 @@ def main():
             print("[提示] web.host 不是当前机器可用地址。默认建议使用 127.0.0.1。", file=sys.stderr, flush=True)
         raise SystemExit(1) from exc
 
+    initialize_web_agent_session()
     print(f"[信息] Web 控制台: http://{HOST}:{PORT}/", file=sys.stderr, flush=True)
     print(f"[信息] Authorization Bearer token: {AUTH_TOKEN}", file=sys.stderr, flush=True)
     print(f"[info] serving {STATIC_ROOT} on http://{HOST}:{PORT}/", flush=True)
@@ -1384,6 +1419,13 @@ def main():
         print("\n[信息] Web 控制台已停止。", file=sys.stderr, flush=True)
     finally:
         record_web_audit_event(
+            "session_finished",
+            {
+                "status": "stopped",
+                "run_id": SERVER_RUN_ID,
+            },
+        )
+        record_web_agent_session_event(
             "session_finished",
             {
                 "status": "stopped",
