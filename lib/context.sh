@@ -16,7 +16,10 @@ linux_agent_conversation_history_file() {
 linux_agent_load_conversation_history() {
     local history_file
     history_file="$(linux_agent_conversation_history_file 2>/dev/null || true)"
-    [[ -n "${history_file}" && -f "${history_file}" ]] || return 0
+    if [[ -z "${history_file}" || ! -f "${history_file}" ]]; then
+        LINUX_AGENT_CONVERSATION_HISTORY='[]'
+        return 0
+    fi
     if jq -e 'type == "array"' "${history_file}" >/dev/null 2>&1; then
         LINUX_AGENT_CONVERSATION_HISTORY="$(jq -c . "${history_file}")"
     else
@@ -61,14 +64,110 @@ linux_agent_redact_json() {
     linux_agent_sanitize_json "${input}"
 }
 
+linux_agent_normalized_conversation_history() {
+    jq -c '
+        def string_value:
+            if . == null then "" else tostring end;
+        def legacy_turn($user; $assistant):
+            {
+                type:"request",
+                mode:($user.status // "work"),
+                request:{content:($user.content // "" | string_value)},
+                response:{
+                    content:($assistant.content // "" | string_value),
+                    status:($assistant.status // "")
+                },
+                status:($assistant.status // ""),
+                started_at:($user.timestamp // ""),
+                completed_at:($assistant.timestamp // "")
+            };
+        reduce (.[]? | select(type == "object")) as $item (
+            {turns:[], pending:null};
+            if (($item.type // "") != "") then
+                .turns += [$item]
+            elif (($item.role // "") == "user") then
+                .pending = $item
+            elif (($item.role // "") == "assistant") then
+                if .pending != null then
+                    .turns += [legacy_turn(.pending; $item)] | .pending = null
+                else
+                    .turns += [legacy_turn({content:"", status:"work", timestamp:($item.timestamp // "")}; $item)]
+                end
+            else
+                .
+            end
+        )
+        | .turns + (
+            if .pending != null then
+                [legacy_turn(.pending; {content:"", status:"pending", timestamp:(.pending.timestamp // "")})]
+            else
+                []
+            end
+        )
+    ' <<<"${LINUX_AGENT_CONVERSATION_HISTORY}"
+}
+
 linux_agent_history_window() {
     local turns
     linux_agent_load_conversation_history
+    LINUX_AGENT_CONVERSATION_HISTORY="$(linux_agent_normalized_conversation_history)"
     turns="$(linux_agent_context_turns)"
     if [[ ! "${turns}" =~ ^[0-9]+$ ]]; then
         turns=6
     fi
     jq -c --argjson turns "${turns}" 'if $turns == 0 then [] else .[-$turns:] end' <<<"${LINUX_AGENT_CONVERSATION_HISTORY}"
+}
+
+linux_agent_record_conversation_turn() {
+    local mode="$1"
+    local request_content="$2"
+    local response_content="$3"
+    local status="${4:-completed}"
+    local turn_type="${5:-request}"
+    local metadata="${6:-}"
+    local lock_dir normalized_history timestamp
+
+    if [[ -z "${metadata}" ]]; then
+        metadata='{}'
+    fi
+    if ! jq -e 'type == "object"' <<<"${metadata}" >/dev/null 2>&1; then
+        metadata='{}'
+    fi
+
+    lock_dir="$(linux_agent_history_lock_acquire 2>/dev/null || true)"
+    linux_agent_load_conversation_history
+    LINUX_AGENT_CONVERSATION_HISTORY="$(linux_agent_normalized_conversation_history)"
+    normalized_history="${LINUX_AGENT_CONVERSATION_HISTORY}"
+    request_content="$(linux_agent_sanitize_text "${request_content}")"
+    response_content="$(linux_agent_sanitize_text "${response_content}")"
+    timestamp="$(linux_agent_now_iso)"
+
+    LINUX_AGENT_CONVERSATION_HISTORY="$(jq -cn \
+        --argjson prior "${normalized_history}" \
+        --arg type "${turn_type}" \
+        --arg mode "${mode}" \
+        --arg request_content "${request_content}" \
+        --arg response_content "${response_content}" \
+        --arg status "${status}" \
+        --arg timestamp "${timestamp}" \
+        --argjson metadata "${metadata}" \
+        '$prior + [($response_content | (fromjson? // {}) | .iteration? // null) as $response_iteration | ({
+            type:$type,
+            mode:$mode,
+            request:{content:$request_content},
+            response:{content:$response_content, status:$status},
+            status:$status,
+            started_at:$timestamp,
+            completed_at:$timestamp,
+            metadata:$metadata
+        } + (
+            if $metadata.iteration? != null then {iteration:$metadata.iteration}
+            elif $response_iteration != null then {iteration:$response_iteration}
+            else {}
+            end
+        ))]')"
+    linux_agent_persist_conversation_history
+    linux_agent_history_lock_release "${lock_dir}"
 }
 
 linux_agent_record_turn() {

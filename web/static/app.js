@@ -18,6 +18,7 @@ const state = createInitialState();
 const $ = (id) => document.getElementById(id);
 const LAYOUT_STORAGE_PREFIX = "assistant.panelLayout.v1";
 const THINKING_TRACE_KEY = "agent_loop.thinking_trace_enabled";
+let sessionTurnCounter = 0;
 
 const titles = {
   workbench: "工作台",
@@ -615,6 +616,20 @@ function renderProtocolText(title, result) {
   return [flowText, entriesText].filter((text) => text.trim()).join("\n\n");
 }
 
+function renderSharedExecutionOutput(title, result) {
+  const flowText = outputBlocksText(executionFlowBlocks(result));
+  if (flowText.trim()) return flowText;
+  const blocks = outputBlocksFrom(result);
+  if (blocks.length) return outputBlocksText(blocks);
+  const entries = normalizeExecutionEntries(title, result);
+  if (entries.length === 1) {
+    const output = entries[0].output || result;
+    const outputText = outputBlocksFrom(output).length ? outputBlocksText(output) : renderUserOutputText(output);
+    if (outputText.trim()) return outputText;
+  }
+  return renderUserOutputText(result);
+}
+
 function executionFlowBlocks(result = state.lastProtocolResult) {
   return outputBlocksFrom(result).filter((block) => block?.title === "执行流程" && typeof block.text === "string" && block.text.trim());
 }
@@ -805,6 +820,7 @@ function openApprovalDrawer(result, input) {
     input,
     response,
     context: result.context || state.workContext || {},
+    turnId: state.activeWorkTurnId || "",
     card,
     step,
     index: Math.max(0, steps.indexOf(step)),
@@ -896,14 +912,17 @@ async function submitApprovalDecision(decision) {
     return;
   }
 
+  const pendingApproval = state.pendingApproval;
+  const turnId = pendingApproval.turnId || state.activeWorkTurnId || "";
   const payload = {
-    input: state.pendingApproval.input,
-    response: state.pendingApproval.response,
-    context: state.pendingApproval.context,
+    input: pendingApproval.input,
+    response: pendingApproval.response,
+    context: pendingApproval.context,
     decisions: [decision],
   };
   if (decision === "s") payload.decisions.push($("approvalRevision")?.value || "");
   closeApprovalDrawer();
+  state.activeWorkTurnId = turnId;
   if (state.activeWorkJobId || state.workSubmitting) return showToast("Work job is already running.");
   state.workSubmitting = true;
   state.workApprovalSubmitting = true;
@@ -925,118 +944,378 @@ async function submitApprovalDecision(decision) {
   }
 }
 
-function renderPlanStep(step, index, awaitingApproval = false, pendingIndex = -1) {
-  const item = document.createElement("article");
-  const isPending = awaitingApproval && index === pendingIndex;
-  item.className = `timeline-card plan-step${isPending ? " needs-decision" : ""}`;
-  item.innerHTML = `
-    <button class="timeline-step-button" type="button">
-      <span class="step-index">${index + 1}</span>
-      <span class="timeline-main">
-        <span class="timeline-title">${escapeHtml(step.title || step.id || "step")}</span>
-        <span class="timeline-copy">${escapeHtml([step.executor_type, step.skill_script || step.command, step.expected_effect].filter(Boolean).join(" · "))}</span>
-      </span>
-      <span class="pill risk ${riskKind(step.risk_level)}">${escapeHtml(isPending ? "待审批" : (step.risk_level || "unknown"))}</span>
-    </button>
-  `;
-  item.querySelector("button").addEventListener("click", () => {
-    state.selectedStepIndex = index;
-    renderPendingStepDetail(step, index, isPending);
-  });
-  return item;
-}
-
 function renderWorkPlan(response, input = "", context = null, awaitingApproval = false) {
   state.workPlan = response;
   state.workContext = context;
   state.workPlanInput = input;
   state.awaitingWorkApproval = awaitingApproval;
   updateWorkActionLabel();
-
-  const container = $("workPlan");
-  container.innerHTML = "";
-  if (!response) return;
-
-  if (response.response_type === "answer") {
-    const item = document.createElement("article");
-    item.className = "timeline-card answer-card";
-    item.innerHTML = `
-      <div class="timeline-step-button static">
-        <span class="step-index">A</span>
-        <span class="timeline-main">
-          <span class="timeline-title">answer_received</span>
-          <span class="timeline-copy"></span>
-        </span>
-        <span class="pill risk low">answer</span>
-      </div>
-    `;
-    item.querySelector(".timeline-copy").textContent = response.answer || "";
-    container.appendChild(item);
-    renderStepDetail({ index: 0, number: "A", title: "answer_received", status: "answer", step: {}, output: { summary: response.answer || "" } });
-    return;
-  }
-
-  const steps = response.steps || [];
-  if (!steps.length) {
-    container.appendChild(emptyItem("暂无步骤"));
-    return;
-  }
-  const pendingIndex = awaitingApproval ? completedExecutionCount(state.lastProtocolResult) : -1;
-  steps.forEach((step, index) => container.appendChild(renderPlanStep(step, index, awaitingApproval, pendingIndex)));
-  renderPendingStepDetail(steps[0], 0, awaitingApproval && pendingIndex === 0);
 }
 
 function renderTimelineReturns(title, result) {
-  const container = $("workPlan");
-  container.innerHTML = "";
-  state.lastProtocolResult = result;
-  const entries = normalizeExecutionEntries(title, result);
-  if (!entries.length) {
-    container.appendChild(emptyItem("暂无执行结果"));
-    return;
-  }
-  for (const entry of entries) {
-    appendReturnCard(container, entry);
-  }
-  const selected = entries[Math.max(0, Math.min(state.selectedStepIndex, entries.length - 1))] || entries[0];
-  renderStepDetail(selected);
+  return upsertSessionTurn(title, result, result?.input || state.workPlanInput || "", {
+    turnId: state.activeWorkTurnId || "",
+    mode: "work",
+  });
 }
 
 function renderSharedProtocolExecution(title, result, outputId = "terminalOutput") {
   state.lastProtocolResult = result;
-  const text = renderProtocolText(title, result);
+  const text = renderSharedExecutionOutput(title, result);
   if (outputId) printOutput(outputId, text);
-  renderTimelineReturns(title, result);
+  upsertSessionTurn(title, result, result?.input || "", {
+    mode: title.includes("终端") ? "terminal" : "work",
+    contextEligible: false,
+  });
 }
 
-function appendReturnCard(container, entry) {
-  const output = entry.output || {};
-  const displayStatus = entry.status || output.status || (output.ok ? "ok" : "failed");
+function executionItems(result) {
+  return (Array.isArray(result?.timeline) ? result.timeline : []).filter((item) => ["execution", "failure", "observer", "audit"].includes(item.kind));
+}
+
+function entryStepKey(entry) {
+  return String(entry?.step?.id || entry?.output?.step_id || entry?.index || "0");
+}
+
+function normalizedTurnEntries(title, result) {
+  const response = result?.response || {};
+  const steps = Array.isArray(response.steps) ? response.steps : [];
+  const protocolEntries = executionItems(result).length ? normalizeExecutionEntries(title, result) : [];
+  if (steps.length) {
+    const byStepId = new Map(protocolEntries.map((entry) => [entryStepKey(entry), entry]));
+    const pendingIndex = result?.status === "approval_required" ? completedExecutionCount(result) : -1;
+    return steps.map((step, index) => {
+      const key = String(step.id || index);
+      const matched = byStepId.get(key) || protocolEntries.find((entry) => entry.index === index);
+      if (matched) {
+        return {
+          ...matched,
+          index,
+          number: index + 1,
+          title: matched.title || step.title || step.id || `step-${index + 1}`,
+          step: { ...step, ...(matched.step || {}) },
+        };
+      }
+      const status = index === pendingIndex ? "approval_required" : "planned";
+      return {
+        index,
+        number: index + 1,
+        title: step.title || step.id || `step-${index + 1}`,
+        status,
+        step,
+        output: {
+          status,
+          summary: step.expected_effect || step.reason || (status === "approval_required" ? "等待审批后执行。" : "尚未执行。"),
+        },
+      };
+    });
+  }
+  if (response.response_type === "answer") {
+    return [{
+      index: 0,
+      number: "A",
+      title: "answer_received",
+      status: result?.status || "answered",
+      step: {},
+      output: { status: result?.status || "answered", summary: response.answer || "" },
+    }];
+  }
+  return normalizeExecutionEntries(title, result);
+}
+
+function contextTurnCapacity() {
+  const raw = Number(state.sessionInfo?.context_turns ?? state.configSnapshot?.context_turns ?? 6);
+  if (!Number.isFinite(raw) || raw <= 0) return 0;
+  return Math.floor(raw);
+}
+
+function turnCanEnterContext(turn) {
+  const mode = String(turn?.mode || "work");
+  const status = String(turn?.status || "");
+  return turn?.contextEligible !== false && mode === "work" && status !== "approval_required";
+}
+
+function contextMetaByTurn() {
+  const capacity = contextTurnCapacity();
+  const eligible = [...state.sessionTurns]
+    .sort((a, b) => (a.order || 0) - (b.order || 0))
+    .filter(turnCanEnterContext);
+  const active = capacity > 0 ? eligible.slice(-capacity) : [];
+  const meta = new Map();
+  [...active].reverse().forEach((turn, depth) => {
+    meta.set(turn.id, { included: true, depth: Math.min(depth, 5), label: depth === 0 ? "上下文 最新" : `上下文 -${depth}` });
+  });
+  for (const turn of state.sessionTurns) {
+    if (!meta.has(turn.id)) {
+      meta.set(turn.id, {
+        included: false,
+        depth: 6,
+        label: turnCanEnterContext(turn) ? "不在上下文" : "不加入上下文",
+      });
+    }
+  }
+  return meta;
+}
+
+function createSessionTurn(title, result, input = "", options = {}) {
+  const now = new Date().toISOString();
+  const status = String(result?.status || options.status || (result?.ok ? "executed" : "completed"));
+  const mode = options.mode || result?.mode || "work";
+  const order = options.order ?? ++sessionTurnCounter;
+  const number = options.number ?? (state.sessionTurns.length + 1);
+  return {
+    id: options.id || `turn-${order}-${Date.now()}`,
+    number,
+    order,
+    title: title || (mode === "terminal" ? "终端执行" : "work 请求"),
+    mode,
+    input: input || result?.input || "",
+    status,
+    created_at: options.created_at || now,
+    updated_at: options.updated_at || now,
+    source: options.source || result?.source || "live",
+    result: result || {},
+    entries: normalizedTurnEntries(title, result || {}),
+    contextEligible: options.contextEligible ?? (mode === "work" && status !== "approval_required"),
+  };
+}
+
+function normalizeRestoredTurn(turn, index) {
+  const result = turn?.result || turn || {};
+  const order = index + 1;
+  sessionTurnCounter = Math.max(sessionTurnCounter, order);
+  return createSessionTurn(`审计恢复 ${turn?.number || order}`, result, turn?.input || result.input || "", {
+    id: turn?.id || `restored-${order}`,
+    number: turn?.number || order,
+    order,
+    mode: turn?.mode || "work",
+    status: turn?.status || result.status || "restored",
+    source: "audit",
+    created_at: turn?.created_at || "",
+    updated_at: turn?.updated_at || "",
+    contextEligible: (turn?.mode || "work") === "work" && (turn?.status || result.status) !== "approval_required",
+  });
+}
+
+function upsertSessionTurn(title, result, input = "", options = {}) {
+  const existingIndex = options.turnId ? state.sessionTurns.findIndex((turn) => turn.id === options.turnId) : -1;
+  const existing = existingIndex >= 0 ? state.sessionTurns[existingIndex] : null;
+  const keepSelection = existing?.id && state.selectedTurnId === existing.id;
+  const turn = createSessionTurn(title, result, input, {
+    ...options,
+    id: existing?.id || options.turnId || options.id,
+    number: existing?.number,
+    order: existing?.order,
+    created_at: existing?.created_at,
+  });
+  if (existingIndex >= 0) state.sessionTurns.splice(existingIndex, 1, turn);
+  else state.sessionTurns.push(turn);
+  state.lastProtocolResult = result;
+  renderSessionTimeline();
+  if (keepSelection) {
+    const selectedEntry = state.selectedStepKey
+      ? (turn.entries || []).find((entry) => entryStepKey(entry) === state.selectedStepKey)
+      : null;
+    if (selectedEntry) renderStepDetail(selectedEntry, turn.result, turn);
+    else renderTurnDetail(turn);
+  } else if (!state.selectedTurnId) {
+    renderStepDetail(null);
+  }
+  return turn;
+}
+
+function replaceSessionTurns(turns) {
+  sessionTurnCounter = 0;
+  state.sessionTurns = (Array.isArray(turns) ? turns : []).map(normalizeRestoredTurn);
+  state.selectedTurnId = "";
+  state.selectedStepKey = "";
+  renderSessionTimeline();
+  renderStepDetail(null);
+}
+
+function selectedTurn() {
+  return state.sessionTurns.find((turn) => turn.id === state.selectedTurnId) || null;
+}
+
+function selectSessionTurn(turnId) {
+  state.selectedTurnId = turnId;
+  state.selectedStepKey = "";
+  renderSessionTimeline();
+  renderTurnDetail(selectedTurn());
+}
+
+function selectTurnStep(turnId, stepKey) {
+  const turn = state.sessionTurns.find((candidate) => candidate.id === turnId);
+  if (!turn) return;
+  const entry = (turn.entries || []).find((candidate) => entryStepKey(candidate) === stepKey);
+  if (!entry) return;
+  state.selectedTurnId = turnId;
+  state.selectedStepKey = stepKey;
+  state.selectedStepIndex = entry.index;
+  renderSessionTimeline();
+  renderStepDetail(entry, turn.result, turn);
+}
+
+function renderSessionTimeline() {
+  const container = $("workPlan");
+  if (!container) return;
+  container.innerHTML = "";
+  if (!state.sessionTurns.length) {
+    container.appendChild(emptyItem("当前会话还没有执行轮次"));
+    renderStepDetail(null);
+    return;
+  }
+  const contextMeta = contextMetaByTurn();
+  const turns = [...state.sessionTurns].sort((a, b) => (b.order || 0) - (a.order || 0));
+  for (const turn of turns) appendTurnCard(container, turn, contextMeta.get(turn.id));
+}
+
+function modeLabel(mode) {
+  if (mode === "terminal") return "terminal";
+  if (mode === "script") return "script";
+  if (mode === "edit") return "edit";
+  return "work";
+}
+
+function appendTurnCard(container, turn, contextMeta = {}) {
+  const displayStatus = turn.status || "selected";
+  const selected = state.selectedTurnId === turn.id;
   const item = document.createElement("article");
-  item.className = `timeline-card result-step ${statusKind(displayStatus)}`;
+  item.className = `timeline-card session-turn ${statusKind(displayStatus)}${selected ? " selected" : ""}`;
+  const contextClass = contextMeta.included ? `context-active context-depth-${contextMeta.depth || 0}` : "context-muted";
   item.innerHTML = `
-    <button class="timeline-step-button" type="button">
-      <span class="step-index">${entry.number}</span>
+    <button class="timeline-step-button session-turn-button" type="button">
+      <span class="step-index">${escapeHtml(turn.number || "?")}</span>
       <span class="timeline-main">
-        <span class="timeline-title">${escapeHtml(entry.title)}</span>
-        <span class="timeline-copy">${escapeHtml(outputSummaryText(output))}</span>
+        <span class="timeline-title">${escapeHtml(`第 ${turn.number || "?"} 轮 · ${modeLabel(turn.mode)}`)}</span>
+        <span class="timeline-copy">${escapeHtml(turn.input || turn.title || "无输入摘要")}</span>
       </span>
-      <span class="pill risk ${statusKind(displayStatus)}">${escapeHtml(displayStatus)}</span>
+      <span class="turn-pills">
+        <span class="pill context-pill ${contextClass}">${escapeHtml(contextMeta.label || "上下文")}</span>
+        <span class="pill risk ${statusKind(displayStatus)}">${escapeHtml(displayStatus)}</span>
+      </span>
     </button>
+    ${selected ? renderTurnStepChips(turn) : ""}
   `;
-  item.querySelector("button").addEventListener("click", () => {
-    state.selectedStepIndex = entry.index;
-    renderStepDetail(entry);
+  item.querySelector(".session-turn-button").addEventListener("click", () => selectSessionTurn(turn.id));
+  item.querySelectorAll(".turn-step-chip").forEach((button) => {
+    button.addEventListener("click", (event) => {
+      event.stopPropagation();
+      selectTurnStep(turn.id, button.dataset.stepKey || "");
+    });
   });
   container.appendChild(item);
 }
 
-function renderStepDetail(entry) {
+function renderTurnStepChips(turn) {
+  const entries = turn.entries || [];
+  if (!entries.length) return '<div class="turn-step-list"><span class="mini-pill">本轮没有步骤输出</span></div>';
+  return `
+    <div class="turn-step-list">
+      ${entries.map((entry) => {
+        const key = entryStepKey(entry);
+        const selected = state.selectedTurnId === turn.id && state.selectedStepKey === key;
+        return `
+          <button class="turn-step-chip ${selected ? "selected" : ""}" type="button" data-step-key="${escapeHtml(key)}">
+            <span class="mini-step-index">${escapeHtml(entry.number ?? entry.index + 1)}</span>
+            <span>${escapeHtml(entry.title || "步骤")}</span>
+            <span class="mini-pill risk ${statusKind(entry.status)}">${escapeHtml(entry.status || "step")}</span>
+          </button>
+        `;
+      }).join("")}
+    </div>
+  `;
+}
+
+function workPlanMarkdown(response) {
+  if (!response) return "";
+  if (response.response_type === "answer") {
+    return ["# 回答", "", response.answer || response.summary || ""].join("\n").trim();
+  }
+  const steps = Array.isArray(response.steps) ? response.steps : [];
+  const lines = ["# 工作计划", ""];
+  if (response.summary) {
+    lines.push(response.summary, "");
+  }
+  for (const step of steps) {
+    const id = step.id || "step";
+    const title = step.title || id;
+    const executor = step.executor_type || "executor";
+    const risk = step.risk_level || "unknown";
+    lines.push(`- ${id}: ${title} [${executor}, risk=${risk}]`);
+    if (step.expected_effect) lines.push(`  预测: ${step.expected_effect}`);
+  }
+  return lines.join("\n").trim();
+}
+
+function renderTurnDetail(turn) {
+  const container = $("workDetail");
+  if (!container) return;
+  if (!turn) {
+    renderStepDetail(null);
+    return;
+  }
+  updateSelectedStepStatus({ status: turn.status || "selected" });
+  const entries = turn.entries || [];
+  const flowHtml = renderExecutionFlowHtml(turn.result);
+  const planMarkdown = workPlanMarkdown(turn.result?.response);
+  container.className = "step-detail turn-detail";
+  container.innerHTML = `
+    <div class="detail-title-row">
+      <div>
+        <h4>${escapeHtml(`第 ${turn.number || "?"} 轮 · ${modeLabel(turn.mode)}`)}</h4>
+        <p>${escapeHtml(turn.input || turn.title || "")}</p>
+      </div>
+      <span class="pill risk ${statusKind(turn.status)}">${escapeHtml(turn.status || "selected")}</span>
+    </div>
+    <section class="detail-section">
+      <h5>轮次摘要</h5>
+      <div class="meta-grid">
+        ${renderMetaRows([
+          ["模式", modeLabel(turn.mode)],
+          ["状态", turn.status || ""],
+          ["步骤数", entries.length],
+          ["来源", turn.source || ""],
+        ])}
+      </div>
+    </section>
+    ${planMarkdown ? `
+      <section class="detail-section">
+        <h5>工作计划</h5>
+        <div class="markdown-preview work-plan-preview">${renderMarkdown(planMarkdown)}</div>
+      </section>
+    ` : ""}
+    <section class="detail-section terminal-return-section">
+      <h5>本轮步骤输出</h5>
+      <div class="turn-output-list">
+        ${entries.length ? entries.map((entry) => renderTurnStepOutput(entry)).join("") : '<p class="muted">本轮没有可展示的步骤输出。</p>'}
+      </div>
+    </section>
+    ${flowHtml ? `<details class="detail-block"><summary>轮次完整执行流程</summary>${flowHtml}</details>` : ""}
+    ${renderJsonDetails("轮次原始数据", { result: turn.result }, false)}
+  `;
+}
+
+function renderTurnStepOutput(entry) {
+  const output = entry.output || {};
+  return `
+    <article class="turn-step-output">
+      <div class="turn-step-output-head">
+        <span class="step-index">${escapeHtml(entry.number ?? entry.index + 1)}</span>
+        <strong>${escapeHtml(entry.title || "步骤")}</strong>
+        <span class="pill risk ${statusKind(entry.status)}">${escapeHtml(entry.status || "step")}</span>
+      </div>
+      <div class="primary-output">${renderTerminalReturnHtml(output)}</div>
+    </article>
+  `;
+}
+
+function renderStepDetail(entry, result = state.lastProtocolResult, turn = selectedTurn()) {
   const container = $("workDetail");
   if (!container) return;
   if (!entry) {
     container.className = "detail-empty";
-    container.textContent = "选择时间线中的步骤查看详情。";
+    container.textContent = "选择时间线中的轮次或步骤查看详情。";
     updateSelectedStepStatus(null);
     return;
   }
@@ -1048,7 +1327,7 @@ function renderStepDetail(entry) {
   const observer = findBlockJson(blocks, "observer");
   const review = findBlockJson(blocks, "review");
   const commandLabel = step.skill_script || step.command || output.command || primaryOutputObject(output).command || "";
-  const subtitle = step.reason || step.expected_effect || "";
+  const subtitle = step.reason || step.expected_effect || turn?.input || "";
   container.className = "step-detail";
   container.innerHTML = `
     <div class="detail-title-row">
@@ -1062,6 +1341,7 @@ function renderStepDetail(entry) {
       <h5>执行摘要</h5>
       <div class="meta-grid">
         ${renderMetaRows([
+          ["轮次", turn?.number ? `第 ${turn.number} 轮` : ""],
           ["状态", entry.status || output.status || ""],
           ["退出码", output.exit_code ?? ""],
           ["自动批准", output.auto_approved === true ? "是" : (output.auto_approved === false ? "否" : "")],
@@ -1071,10 +1351,22 @@ function renderStepDetail(entry) {
         ])}
       </div>
     </section>
+    <section class="detail-section">
+      <h5>步骤事宜</h5>
+      <div class="meta-grid">
+        ${renderMetaRows([
+          ["步骤 ID", step.id || ""],
+          ["原因", step.reason || ""],
+          ["预期效果", step.expected_effect || ""],
+          ["脚本", step.skill_script || ""],
+          ["命令", step.command || ""],
+          ["参数", step.arguments ? JSON.stringify(step.arguments) : ""],
+        ]) || '<p class="muted">本步骤没有计划元数据。</p>'}
+      </div>
+    </section>
     <section class="detail-section terminal-return-section">
       <h5>终端返回</h5>
       <div class="primary-output">
-        ${renderExecutionFlowHtml()}
         ${renderTerminalReturnHtml(output)}
       </div>
     </section>
@@ -1101,7 +1393,7 @@ function renderStepDetail(entry) {
       </div>
     </section>
     ${renderJsonDetails("策略审查", review || step.review || null)}
-    ${renderJsonDetails("原始调试数据", { step, output }, false)}
+    ${renderJsonDetails("原始调试数据", { step, output, result_session: result?.session_id || "" }, false)}
   `;
 }
 
@@ -1163,6 +1455,7 @@ async function connect() {
   setStatus("connectionState", "online", "ok");
   setText("rootPath", health.root || "connected");
   await loadConfig();
+  await loadSessionState();
   await loadObserverBootstrapStatus({ prompt: true });
   await loadSense();
   await loadTools();
@@ -1180,7 +1473,55 @@ async function loadConfig() {
   renderConfigCenter(state.configSnapshot);
   syncThinkingTraceFromConfig();
   renderThinkingSummary();
+  renderSessionTimeline();
   setConfigDirtyState(false);
+}
+
+async function loadSessionState() {
+  const data = await api("/api/session/state");
+  state.sessionInfo = data;
+  state.restoredAuditSessionId = data.restored_from || "";
+  updateSessionLeaveState();
+  renderSessionTimeline();
+  return data;
+}
+
+function updateSessionLeaveState() {
+  const button = $("sessionLeaveBtn");
+  if (!button) return;
+  const restoredFrom = state.sessionInfo?.restored_from || "";
+  button.textContent = restoredFrom ? "离开历史" : "离开";
+  button.title = restoredFrom
+    ? `离开恢复自 ${restoredFrom} 的历史会话并清空上下文`
+    : "结束当前 Web 会话并开启新的 session_web_* 上下文";
+}
+
+async function leaveWorkbenchSession() {
+  if (state.activeWorkJobId || state.workSubmitting || state.workApprovalSubmitting || state.activeTerminalJobId || state.terminalSubmitting) {
+    showToast("当前仍有任务运行，结束后再离开会话");
+    return;
+  }
+  const result = await api("/api/session/leave", { method: "POST", body: {} });
+  if (!result.ok) {
+    showToast(result.error || result.status || "离开会话失败");
+    return;
+  }
+  state.sessionInfo = result.session || state.sessionInfo;
+  state.restoredAuditSessionId = "";
+  state.sessionTurns = [];
+  state.selectedTurnId = "";
+  state.selectedStepKey = "";
+  state.activeWorkTurnId = "";
+  state.workPlan = null;
+  state.workContext = null;
+  state.workPlanInput = "";
+  state.lastProtocolResult = null;
+  state.awaitingWorkApproval = false;
+  closeApprovalDrawer();
+  updateSessionLeaveState();
+  renderSessionTimeline();
+  setStatus("workJobStatus", result.status || "new_session", result.ok ? "ok" : "failed");
+  showToast(result.status === "left_restored" ? "已离开历史会话，上下文已清空" : "已开启新的 Web 会话");
 }
 
 function syncThinkingTraceFromConfig() {
@@ -1663,14 +2004,25 @@ function handleCompletedWork(completed, input) {
     closeApprovalDrawer();
     updateWorkActionLabel();
   }
-  if (result.status !== "approval_required" && (Array.isArray(result.timeline) || Array.isArray(result.output_blocks) || result.status === "executed" || result.status === "failed" || result.status === "cancelled")) {
-    renderTimelineReturns(result.status || "work_return", result);
-    printOutput("terminalOutput", renderProtocolText(result.status || "work_return", result));
+  const hasWorkbenchResult = Boolean(
+    result.response ||
+      Array.isArray(result.timeline) ||
+      Array.isArray(result.output_blocks) ||
+      ["approval_required", "executed", "answered", "failed", "cancelled"].includes(result.status)
+  );
+  let turn = null;
+  if (hasWorkbenchResult) {
+    turn = renderTimelineReturns(result.status || "work_return", result);
+  }
+  if (result.status !== "approval_required" && hasWorkbenchResult) {
+    printOutput("terminalOutput", renderSharedExecutionOutput(result.status || "work_return", result));
   }
   if (result.status === "approval_required") {
+    state.activeWorkTurnId = turn?.id || state.activeWorkTurnId || "";
     openApprovalDrawer(result, input);
     showToast("需要审批后继续");
   } else {
+    state.activeWorkTurnId = "";
     closeApprovalDrawer();
   }
 }
@@ -1939,7 +2291,12 @@ async function readAudit(sessionId) {
   renderAuditObserverSummary();
   updateAuditMetrics();
   $("auditOutput").textContent = renderAuditReadableReport(data);
-  if ($("auditRestoreTimelineBtn")) $("auditRestoreTimelineBtn").disabled = !state.auditWebTimeline?.timeline?.length;
+  if ($("auditRestoreTimelineBtn")) {
+    $("auditRestoreTimelineBtn").disabled = !(
+      state.auditWebTimeline?.timeline?.length ||
+      state.auditWebTimeline?.turns?.length
+    );
+  }
 }
 
 function renderAuditEventTimeline() {
@@ -1994,6 +2351,7 @@ function renderAuditReadableReport(data) {
     `模式: ${auditModeLabel(selectedSession.modes || [], selectedSession.mode_label) || "--"}`,
     `状态: ${selectedSession.status || restored.status || data.status || "--"}`,
     `事件数: ${events.length}`,
+    `可回放轮次: ${Array.isArray(restored.turns) ? restored.turns.length : 0}`,
     `可回放步骤: ${Array.isArray(restored.timeline) ? restored.timeline.length : 0}`,
     "",
     "事件时间线:",
@@ -2104,21 +2462,45 @@ function findAuditFailure() {
   window.setTimeout(() => target.classList.remove("focused-event"), 1800);
 }
 
-function restoreAuditTimelineToWorkbench() {
+async function restoreAuditTimelineToWorkbench() {
   const restored = state.auditWebTimeline;
-  if (!restored?.timeline?.length) return showToast("当前审计 session 没有可恢复的工作时间线");
+  if (!restored?.timeline?.length && !restored?.turns?.length) {
+    return showToast("当前审计 session 没有可恢复的工作时间线");
+  }
+  const sessionId = state.currentAuditSession || restored.session_id || "";
+  const backend = await api("/api/session/restore", { method: "POST", body: { session_id: sessionId } });
+  if (!backend.ok) {
+    showToast(backend.error || backend.status || "恢复会话失败");
+    return;
+  }
+  state.sessionInfo = backend.session || state.sessionInfo;
+  state.restoredAuditSessionId = sessionId;
   state.lastProtocolResult = restored;
   state.workPlan = restored.response || null;
-  state.workContext = { restored_from_audit: restored.session_id };
+  state.workContext = { restored_from_audit: sessionId };
   state.workPlanInput = restored.input || "";
   state.awaitingWorkApproval = false;
+  state.activeWorkTurnId = "";
   closeApprovalDrawer();
   if ($("workInput") && restored.input) $("workInput").value = restored.input;
-  renderTimelineReturns(`审计恢复 ${restored.session_id || ""}`, restored);
-  printOutput("terminalOutput", renderProtocolText("审计恢复", restored));
-  setStatus("workJobStatus", restored.status || "restored", statusKind(restored.status || "restored"));
+  updateSessionLeaveState();
+  if (Array.isArray(restored.turns) && restored.turns.length) {
+    replaceSessionTurns(restored.turns);
+  } else {
+    replaceSessionTurns([
+      {
+        id: `restored-${sessionId || "audit"}`,
+        number: 1,
+        mode: "work",
+        input: restored.input || `审计恢复 ${sessionId || ""}`,
+        status: restored.status || "restored",
+        result: restored,
+      },
+    ]);
+  }
+  setStatus("workJobStatus", backend.status || restored.status || "restored", statusKind(backend.status || restored.status || "restored"));
   showScreen("workbench");
-  showToast("已从审计恢复工作时间线");
+  showToast("已从审计恢复工作时间线和上下文");
 }
 
 async function runDoctor() {
@@ -2449,6 +2831,7 @@ function bindActions() {
   on("workRunBtn", "click", () => safeAction(runWork));
   on("workCancelBtn", "click", () => safeAction(cancelWork));
   on("workSuspendBtn", "click", suspendWork);
+  on("sessionLeaveBtn", "click", () => safeAction(leaveWorkbenchSession));
   on("senseRefreshBtn", "click", () => safeAction(() => loadSense()));
   on("approvalApproveBtn", "click", () => safeAction(() => submitApprovalDecision("y")));
   on("approvalRejectBtn", "click", () => safeAction(() => submitApprovalDecision("n")));
@@ -2464,7 +2847,7 @@ function bindActions() {
   on("editReviewBtn", "click", () => safeAction(reviewEdit));
   on("editApplyBtn", "click", () => safeAction(applyEdit));
   on("auditRefreshBtn", "click", () => safeAction(loadAuditList));
-  on("auditRestoreTimelineBtn", "click", restoreAuditTimelineToWorkbench);
+  on("auditRestoreTimelineBtn", "click", () => safeAction(restoreAuditTimelineToWorkbench));
   on("auditSessionFilter", "input", renderAuditSessionList);
   on("auditStatusFilter", "change", renderAuditSessionList);
   on("auditEventFilter", "change", () => state.currentAuditSession ? renderAuditEventTimeline() : renderAuditSessionList());

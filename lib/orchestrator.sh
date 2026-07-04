@@ -209,6 +209,44 @@ linux_agent_request_agent_reflection() {
     printf '%s\n' "${response_json}"
 }
 
+linux_agent_record_agent_loop_iteration_turn() {
+    local user_input="$1"
+    local mode="$2"
+    local iteration="$3"
+    local plan_json="$4"
+    local execution_json="$5"
+    local reflection_json="${6:-null}"
+    local stopped_reason="${7:-}"
+    local status_override="${8:-}"
+    local status result_count plan_summary reflection_summary response_content metadata
+
+    if ! jq -e . <<<"${reflection_json}" >/dev/null 2>&1; then
+        reflection_json='null'
+    fi
+    status="$(jq -r '.status // "unknown"' <<<"${execution_json}" 2>/dev/null || printf 'unknown\n')"
+    if [[ -n "${status_override}" ]]; then
+        status="${status_override}"
+    fi
+    result_count="$(jq -r '(.results // []) | length' <<<"${execution_json}" 2>/dev/null || printf '0\n')"
+    plan_summary="$(jq -r '.summary // ""' <<<"${plan_json}" 2>/dev/null || true)"
+    reflection_summary="$(jq -r '.summary // .answer // ""' <<<"${reflection_json}" 2>/dev/null || true)"
+    response_content="$(jq -cn \
+        --arg status "${status}" \
+        --argjson iteration "${iteration}" \
+        --argjson result_count "${result_count}" \
+        --arg stopped_reason "${stopped_reason}" \
+        --arg reflection_summary "${reflection_summary}" \
+        '{iteration:$iteration, status:$status, result_count:$result_count, stopped_reason:$stopped_reason, reflection_summary:$reflection_summary}')"
+    metadata="$(jq -cn \
+        --argjson iteration "${iteration}" \
+        --argjson result_count "${result_count}" \
+        --arg plan_summary "${plan_summary}" \
+        --arg reflection_summary "${reflection_summary}" \
+        --arg stopped_reason "${stopped_reason}" \
+        '{iteration:$iteration, result_count:$result_count, plan_summary:$plan_summary, reflection_summary:$reflection_summary, stopped_reason:$stopped_reason}')"
+    linux_agent_record_conversation_turn "${mode}" "${user_input}" "${response_content}" "${status}" "agent_loop_iteration" "${metadata}"
+}
+
 linux_agent_run_agent_loop() {
     local user_input="$1"
     local mode="$2"
@@ -240,6 +278,7 @@ linux_agent_run_agent_loop() {
 
     while true; do
         iteration=$((iteration + 1))
+        reflection_json='null'
         linux_agent_log_event "agent_loop_iteration_started" "$(jq -cn \
             --argjson iteration "${iteration}" \
             --argjson plan "$(linux_agent_response_without_thinking "${current_plan}")" \
@@ -257,11 +296,13 @@ linux_agent_run_agent_loop() {
 
         if [[ "${status}" != "executed" && "${status}" != "failed" ]]; then
             stopped_reason="${status}"
+            linux_agent_record_agent_loop_iteration_turn "${user_input}" "${mode}" "${iteration}" "${current_plan}" "${execution_json}" "${reflection_json}" "${stopped_reason}" "${final_status}"
             break
         fi
 
         if [[ "${status}" == "executed" ]] && ! linux_agent_plan_should_reflect_after_execution "${current_plan}"; then
             stopped_reason="$(linux_agent_plan_stop_reason "${current_plan}")"
+            linux_agent_record_agent_loop_iteration_turn "${user_input}" "${mode}" "${iteration}" "${current_plan}" "${execution_json}" "${reflection_json}" "${stopped_reason}" "${final_status}"
             break
         fi
 
@@ -274,11 +315,13 @@ linux_agent_run_agent_loop() {
                 printf '%s\n' "${final_answer}" >&2
             fi
             stopped_reason="$(jq -r '.continue_decision.reason // "model_stopped"' <<<"${reflection_json}")"
+            linux_agent_record_agent_loop_iteration_turn "${user_input}" "${mode}" "${iteration}" "${current_plan}" "${execution_json}" "${reflection_json}" "${stopped_reason}" "${final_status}"
             break
         fi
 
         if [[ "$(jq -r '.response_type' <<<"${reflection_json}")" != "work_plan" ]]; then
             stopped_reason="continue_without_work_plan"
+            linux_agent_record_agent_loop_iteration_turn "${user_input}" "${mode}" "${iteration}" "${current_plan}" "${execution_json}" "${reflection_json}" "${stopped_reason}" "${final_status}"
             break
         fi
 
@@ -298,10 +341,12 @@ linux_agent_run_agent_loop() {
                     '{iteration:$iteration, approved:false}')"
                 final_status="checkpoint_stopped"
                 stopped_reason="checkpoint_rejected"
+                linux_agent_record_agent_loop_iteration_turn "${user_input}" "${mode}" "${iteration}" "${current_plan}" "${execution_json}" "${reflection_json}" "${stopped_reason}" "${final_status}"
                 break
             fi
         fi
 
+        linux_agent_record_agent_loop_iteration_turn "${user_input}" "${mode}" "${iteration}" "${current_plan}" "${execution_json}" "${reflection_json}" "continue" "${final_status}"
         current_plan="${reflection_json}"
     done
 
@@ -330,7 +375,7 @@ linux_agent_run_agent_loop() {
 linux_agent_process_work_request() {
     local user_input="$1"
     local mode="${2:-work}"
-    local topic context_json request_context response_json execution_json final_status response_type safe_response
+    local topic context_json request_context response_json execution_json final_status response_type safe_response used_agent_loop
 
     linux_agent_log_event "received" "$(jq -cn --arg input "${user_input}" --arg mode "${mode}" '{input:$input, mode:$mode}')"
 
@@ -368,14 +413,15 @@ linux_agent_process_work_request() {
         printf '%s\n' "$(jq -r '.answer' <<<"${response_json}")"
         final_status="answered"
         linux_agent_log_event "finished" "$(jq -cn --arg status "${final_status}" '{status:$status}')"
-        linux_agent_record_turn "user" "${user_input}" "${mode}"
-        linux_agent_record_turn "assistant" "$(jq -r '.answer' <<<"${response_json}")" "${final_status}"
+        linux_agent_record_conversation_turn "${mode}" "${user_input}" "$(jq -r '.answer' <<<"${response_json}")" "${final_status}" "request"
         return 0
     fi
 
     if [[ "$(linux_agent_agent_loop_enabled)" == "true" ]]; then
+        used_agent_loop=true
         execution_json="$(linux_agent_run_agent_loop "${user_input}" "${mode}" "${context_json}" "${response_json}")"
     else
+        used_agent_loop=false
         execution_json="$(linux_agent_execute_work_plan "${response_json}" "${user_input}")"
     fi
     linux_agent_log_event "executed" "${execution_json}"
@@ -387,8 +433,9 @@ linux_agent_process_work_request() {
 
     final_status="$(jq -r '.status' <<<"${execution_json}")"
     linux_agent_log_event "finished" "$(jq -cn --arg status "${final_status}" '{status:$status}')"
-    linux_agent_record_turn "user" "${user_input}" "${mode}"
-    linux_agent_record_turn "assistant" "$(jq -c '{status:.status, results:(.results | length)}' <<<"${execution_json}")" "${final_status}"
+    if [[ "${used_agent_loop}" != "true" ]]; then
+        linux_agent_record_conversation_turn "${mode}" "${user_input}" "$(jq -c '{status:.status, results:(.results | length)}' <<<"${execution_json}")" "${final_status}" "request"
+    fi
 }
 
 linux_agent_print_execution_protocol_json() {

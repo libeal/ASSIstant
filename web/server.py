@@ -29,11 +29,13 @@ TOKEN = os.environ.get("LINUX_AGENT_WEB_TOKEN", "")
 JOB_RETENTION_HOURS = int(os.environ.get("LINUX_AGENT_WEB_JOB_RETENTION_HOURS", "24"))
 JOB_PROCESSES = {}
 JOB_PROCESSES_LOCK = threading.Lock()
+WEB_AGENT_LOCK = threading.RLock()
 SERVER_RUN_ID = uuid.uuid4().hex
 SERVER_STARTED_AT = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 WEB_AGENT_SESSION_ID = f"session_web_{SERVER_RUN_ID[:16]}"
 WEB_AGENT_AUDIT_LOG = ROOT / "logs" / f"{WEB_AGENT_SESSION_ID}.jsonl"
 WEB_AGENT_HISTORY_FILE = ROOT / "tmp" / "web" / "sessions" / f"{WEB_AGENT_SESSION_ID}.history.json"
+WEB_AGENT_RESTORED_FROM = ""
 API_KEY_PLACEHOLDER = "please-set-your-api-key"
 WEB_AUDIT_SESSION_ID = f"web_{SERVER_RUN_ID[:16]}"
 WEB_AUDIT_LOG = ROOT / "logs" / f"{WEB_AUDIT_SESSION_ID}.jsonl"
@@ -428,21 +430,253 @@ def record_web_agent_session_event(stage, payload=None):
     append_audit_event(WEB_AGENT_AUDIT_LOG, WEB_AGENT_SESSION_ID, stage, payload)
 
 
-def initialize_web_agent_session():
+def new_web_agent_session_id():
+    return f"session_web_{uuid.uuid4().hex[:16]}"
+
+
+def set_web_agent_session_paths(session_id):
+    global WEB_AGENT_SESSION_ID, WEB_AGENT_AUDIT_LOG, WEB_AGENT_HISTORY_FILE
+    WEB_AGENT_SESSION_ID = session_id
+    WEB_AGENT_AUDIT_LOG = ROOT / "logs" / f"{WEB_AGENT_SESSION_ID}.jsonl"
+    WEB_AGENT_HISTORY_FILE = ROOT / "tmp" / "web" / "sessions" / f"{WEB_AGENT_SESSION_ID}.history.json"
+
+
+def read_json_array(path):
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            value = json.load(handle)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return []
+    return value if isinstance(value, list) else []
+
+
+def write_json_atomic(path, value):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_suffix(f"{path.suffix}.tmp")
+    with tmp_path.open("w", encoding="utf-8") as handle:
+        json.dump(value, handle, ensure_ascii=False, separators=(",", ":"))
+        handle.write("\n")
+    tmp_path.replace(path)
+
+
+def context_turn_limit():
+    try:
+        value = int(read_config().get("context_turns", 6))
+    except (TypeError, ValueError):
+        value = 6
+    return max(0, value)
+
+
+def web_agent_session_state_locked():
+    history = read_json_array(WEB_AGENT_HISTORY_FILE)
+    turns = context_turn_limit()
+    window = history[-turns:] if turns else []
+    return {
+        "ok": True,
+        "status": "active",
+        "session_id": WEB_AGENT_SESSION_ID,
+        "audit_log": str(WEB_AGENT_AUDIT_LOG),
+        "history_file": str(WEB_AGENT_HISTORY_FILE),
+        "history_count": len(history),
+        "context_turns": turns,
+        "context_window_count": len(window),
+        "restored_from": WEB_AGENT_RESTORED_FROM,
+    }
+
+
+def web_agent_session_state():
+    with WEB_AGENT_LOCK:
+        return web_agent_session_state_locked()
+
+
+def finish_current_web_agent_session_locked(status):
+    if not WEB_AGENT_SESSION_ID:
+        return
+    record_web_agent_session_event(
+        "session_finished",
+        {
+            "status": status,
+            "run_id": SERVER_RUN_ID,
+        },
+    )
+
+
+def start_web_agent_session_locked(history=None, restored_from="", start_reason="started", session_id=None):
+    global WEB_AGENT_RESTORED_FROM
+    next_session_id = session_id or new_web_agent_session_id()
+    set_web_agent_session_paths(next_session_id)
+    WEB_AGENT_RESTORED_FROM = restored_from
     WEB_AGENT_AUDIT_LOG.parent.mkdir(parents=True, exist_ok=True)
     WEB_AGENT_AUDIT_LOG.write_text("", encoding="utf-8")
-    WEB_AGENT_HISTORY_FILE.parent.mkdir(parents=True, exist_ok=True)
-    WEB_AGENT_HISTORY_FILE.write_text("[]\n", encoding="utf-8")
+    write_json_atomic(WEB_AGENT_HISTORY_FILE, history if isinstance(history, list) else [])
     record_web_agent_session_event(
         "session_started",
         {
             "request": "agent-web",
             "entrypoint": "web",
             "run_id": SERVER_RUN_ID,
-            "started_at": SERVER_STARTED_AT,
+            "started_at": now_iso(),
             "audit_mode": read_config().get("audit_mode", "safe_summary"),
+            "restored_from": restored_from,
+            "start_reason": start_reason,
+            "history_count": len(history) if isinstance(history, list) else 0,
         },
     )
+    return web_agent_session_state_locked()
+
+
+def initialize_web_agent_session():
+    with WEB_AGENT_LOCK:
+        return start_web_agent_session_locked(
+            history=[],
+            restored_from="",
+            start_reason="server_started",
+            session_id=f"session_web_{SERVER_RUN_ID[:16]}",
+        )
+
+
+def rotate_web_agent_session(reason="rotated", history=None, restored_from=""):
+    with WEB_AGENT_LOCK:
+        finish_current_web_agent_session_locked(reason)
+        return start_web_agent_session_locked(
+            history=history if isinstance(history, list) else [],
+            restored_from=restored_from,
+            start_reason=reason,
+        )
+
+
+def read_audit_events(session_id):
+    if not session_id or not all(ch.isalnum() or ch in "_.-" for ch in session_id):
+        raise ValueError("session_id is required and must be a safe file name.")
+    log_file = ROOT / "logs" / f"{session_id}.jsonl"
+    if not log_file.exists():
+        raise FileNotFoundError("Audit session not found.")
+    events = []
+    with log_file.open("r", encoding="utf-8") as handle:
+        for line in handle:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(event, dict):
+                events.append(event)
+    return events
+
+
+def compact_history_text(value, limit=1200):
+    text = " ".join(str(value or "").split())
+    if len(text) > limit:
+        return text[:limit] + "[TRUNCATED]"
+    return text
+
+
+def audit_history_from_events(events):
+    history = []
+    current = None
+
+    def finish_turn(finished_at=""):
+        nonlocal current
+        if not current:
+            return
+        assistant = "；".join(part for part in current.get("assistant_parts", []) if part)
+        if not assistant:
+            assistant = current.get("status") or "restored"
+        history.append(
+            {
+                "type": "request",
+                "mode": current.get("mode", "work"),
+                "request": {"content": compact_history_text(current.get("input", ""))},
+                "response": {
+                    "content": compact_history_text(assistant),
+                    "status": current.get("status") or "restored",
+                },
+                "status": current.get("status") or "restored",
+                "started_at": current.get("started_at") or now_iso(),
+                "completed_at": finished_at or current.get("updated_at") or now_iso(),
+                "metadata": {"source": "audit_restore"},
+            }
+        )
+        current = None
+
+    for event in events if isinstance(events, list) else []:
+        stage = audit_stage(event)
+        payload = audit_payload(event)
+        event_time = str(event.get("timestamp") or now_iso())
+        if stage == "received":
+            mode = str(payload.get("mode") or "")
+            if mode not in {"work", "edit"}:
+                finish_turn(event_time)
+                continue
+            finish_turn(event_time)
+            current = {
+                "mode": mode,
+                "input": payload.get("input_preview") or payload.get("input") or "",
+                "assistant_parts": [],
+                "status": "",
+                "started_at": event_time,
+                "updated_at": event_time,
+            }
+            continue
+        if not current:
+            continue
+        current["updated_at"] = event_time
+        if stage in {"planned", "edit_planned"}:
+            summary = payload.get("summary_preview") or payload.get("notes_preview") or payload.get("response_type")
+            if summary:
+                current["assistant_parts"].append(f"计划: {summary}")
+        elif stage == "executed":
+            status = str(payload.get("status") or "executed")
+            current["status"] = status
+            result_count = payload.get("result_count")
+            if result_count is None and isinstance(payload.get("results"), list):
+                result_count = len(payload.get("results"))
+            current["assistant_parts"].append(f"执行状态: {status}; 结果数: {result_count if result_count is not None else 0}")
+        elif stage == "edit_applied":
+            status = str(payload.get("status") or ("edited" if payload.get("ok") else "failed"))
+            current["status"] = status
+            current["assistant_parts"].append(f"编辑状态: {status}")
+        elif stage == "finished":
+            current["status"] = str(payload.get("status") or current.get("status") or "finished")
+            finish_turn(event_time)
+
+    finish_turn()
+    return history
+
+
+def restore_web_agent_session_from_audit(session_id):
+    try:
+        events = read_audit_events(session_id)
+    except ValueError as exc:
+        return {"ok": False, "status": "invalid_session_id", "error": str(exc)}
+    except FileNotFoundError as exc:
+        return {"ok": False, "status": "not_found", "error": str(exc)}
+    history = audit_history_from_events(events)
+    session = rotate_web_agent_session(
+        reason="restored_from_audit",
+        history=history,
+        restored_from=session_id,
+    )
+    return {"ok": True, "status": "restored", "session": session, "history_count": len(history)}
+
+
+def leave_web_agent_session():
+    with WEB_AGENT_LOCK:
+        restored = WEB_AGENT_RESTORED_FROM
+        finish_current_web_agent_session_locked("left_restored" if restored else "rotated")
+        session = start_web_agent_session_locked(
+            history=[],
+            restored_from="",
+            start_reason="left_restored" if restored else "rotated",
+        )
+    return {
+        "ok": True,
+        "status": "left_restored" if restored else "rotated",
+        "left_restored_from": restored,
+        "session": session,
+    }
 
 
 def observer_runtime_config():
@@ -828,10 +1062,14 @@ def run_agent_api(resource, action="", payload=None, timeout=None, job_id=None):
     command.append(json.dumps(payload, ensure_ascii=False, separators=(",", ":")))
     env = os.environ.copy()
     env.setdefault("LINUX_AGENT_WEB", "1")
+    with WEB_AGENT_LOCK:
+        session_id = WEB_AGENT_SESSION_ID
+        audit_log = str(WEB_AGENT_AUDIT_LOG)
+        history_file = str(WEB_AGENT_HISTORY_FILE)
     env["LINUX_AGENT_SESSION_MANAGED_EXTERNALLY"] = "1"
-    env["LINUX_AGENT_SESSION_ID"] = WEB_AGENT_SESSION_ID
-    env["LINUX_AGENT_AUDIT_LOG"] = str(WEB_AGENT_AUDIT_LOG)
-    env["LINUX_AGENT_CONVERSATION_HISTORY_FILE"] = str(WEB_AGENT_HISTORY_FILE)
+    env["LINUX_AGENT_SESSION_ID"] = session_id
+    env["LINUX_AGENT_AUDIT_LOG"] = audit_log
+    env["LINUX_AGENT_CONVERSATION_HISTORY_FILE"] = history_file
     if job_id is None:
         process = subprocess.run(
             command,
@@ -999,7 +1237,7 @@ def audit_payload(event):
     return event if isinstance(event, dict) else {}
 
 
-def build_web_timeline_from_audit(session_id, events):
+def build_web_timeline_from_audit(session_id, events, include_turns=True):
     steps_by_id = {}
     planned_steps = []
     timeline = []
@@ -1107,7 +1345,7 @@ def build_web_timeline_from_audit(session_id, events):
             }
         )
 
-    return {
+    restored = {
         "ok": True,
         "status": final_status,
         "source": "audit",
@@ -1134,6 +1372,60 @@ def build_web_timeline_from_audit(session_id, events):
             }
         ],
     }
+    if include_turns:
+        restored["turns"] = build_web_turns_from_audit(session_id, events)
+    return restored
+
+
+def build_web_turns_from_audit(session_id, events):
+    turns = []
+    current_events = []
+    current_input = ""
+    current_mode = ""
+    current_started_at = ""
+
+    def finish_current():
+        nonlocal current_events, current_input, current_mode, current_started_at
+        if not current_events:
+            return
+        turn_number = len(turns) + 1
+        result = build_web_timeline_from_audit(session_id, current_events, include_turns=False)
+        status = result.get("status") or "restored"
+        turns.append(
+            {
+                "id": f"{session_id}-turn-{turn_number}",
+                "number": turn_number,
+                "mode": current_mode or "work",
+                "input": current_input,
+                "status": status,
+                "created_at": current_started_at,
+                "updated_at": str(current_events[-1].get("timestamp") or current_started_at),
+                "source": "audit",
+                "result": result,
+            }
+        )
+        current_events = []
+        current_input = ""
+        current_mode = ""
+        current_started_at = ""
+
+    for event in events if isinstance(events, list) else []:
+        stage = audit_stage(event)
+        payload = audit_payload(event)
+        if stage == "received":
+            finish_current()
+            current_events = [event]
+            current_input = str(payload.get("input_preview") or payload.get("command") or payload.get("ref") or "")
+            current_mode = str(payload.get("mode") or "")
+            current_started_at = str(event.get("timestamp") or "")
+            continue
+        if current_events:
+            current_events.append(event)
+            if stage == "finished":
+                finish_current()
+
+    finish_current()
+    return turns
 
 
 def terminate_running_jobs():
@@ -1251,6 +1543,9 @@ class Handler(SimpleHTTPRequestHandler):
         if path == "/api/observer/bootstrap":
             json_response(self, HTTPStatus.OK, observer_bootstrap_public_state(force_ok=True))
             return
+        if path == "/api/session/state":
+            json_response(self, HTTPStatus.OK, web_agent_session_state())
+            return
         if path == "/api/skills/tree":
             json_response(self, HTTPStatus.OK, list_skill_files())
             return
@@ -1338,6 +1633,13 @@ class Handler(SimpleHTTPRequestHandler):
             else:
                 result = {"ok": False, "status": "invalid_action", "error": "action must be enable or skip."}
             json_response(self, HTTPStatus.OK, result)
+            return
+        if path == "/api/session/restore":
+            result = restore_web_agent_session_from_audit(str(body.get("session_id") or ""))
+            json_response(self, HTTPStatus.OK, result)
+            return
+        if path == "/api/session/leave":
+            json_response(self, HTTPStatus.OK, leave_web_agent_session())
             return
         if path == "/api/skills/read":
             try:

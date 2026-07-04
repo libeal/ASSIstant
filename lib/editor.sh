@@ -627,6 +627,5 @@ linux_agent_process_edit_request() {
     fi
 
     linux_agent_log_event "finished" "$(jq -cn --arg status "${final_status}" '{status:$status}')"
-    linux_agent_record_turn "user" "${user_input}" "edit"
-    linux_agent_record_turn "assistant" "$(jq -c '.skill // {}' <<<"${edit_json}")" "${final_status}"
+    linux_agent_record_conversation_turn "edit" "${user_input}" "$(jq -c '.skill // {}' <<<"${edit_json}")" "${final_status}" "request"
 }

@@ -815,7 +815,10 @@ linux_agent_execute_step_command() {
     esac
 
     subject="$(jq -cn --argjson step "${step_json}" '{kind:"work_step", step:$step}')"
-    LINUX_AGENT_EXECUTION_PRIVILEGE="$(linux_agent_execution_privilege_from_review "${review_json:-{}}")" \
+    if [[ -z "${review_json}" ]]; then
+        review_json='{}'
+    fi
+    LINUX_AGENT_EXECUTION_PRIVILEGE="$(linux_agent_execution_privilege_from_review "${review_json}")" \
         linux_agent_execute_observed_command_output "step_${executor_type}" "${subject}" -- "${command_args[@]}"
 }
 

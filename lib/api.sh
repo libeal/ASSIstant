@@ -244,7 +244,7 @@ linux_agent_api_work_prepare_response() {
 
 linux_agent_api_work_run() {
     local payload="$1"
-    local user_input prepared response_json context_json response_type execution_json final_status compact answer
+    local user_input prepared response_json context_json response_type execution_json final_status compact answer used_agent_loop
     user_input="$(jq -r '.input // .request // empty' <<<"${payload}")"
     if [[ -z "${user_input}" ]]; then
         linux_agent_api_error "missing_input" "input is required."
@@ -295,8 +295,7 @@ linux_agent_api_work_run() {
     if [[ "${response_type}" == "answer" ]]; then
         answer="$(jq -r '.answer // empty' <<<"${response_json}")"
         linux_agent_log_event "finished" "$(jq -cn '{status:"answered"}')"
-        linux_agent_record_turn "user" "${user_input}" "work"
-        linux_agent_record_turn "assistant" "${answer}" "answered"
+        linux_agent_record_conversation_turn "work" "${user_input}" "${answer}" "answered" "request"
         jq -cn --arg answer "${answer}" --argjson context "${context_json}" --argjson response "${response_json}" --argjson timeline "$(linux_agent_timeline_plan_items "${response_json}")" \
             '{
                 ok:true,
@@ -311,15 +310,18 @@ linux_agent_api_work_run() {
     fi
 
     if [[ "$(linux_agent_agent_loop_enabled)" == "true" ]]; then
+        used_agent_loop=true
         execution_json="$(linux_agent_run_agent_loop "${user_input}" "work" "${context_json}" "${response_json}")"
     else
+        used_agent_loop=false
         execution_json="$(linux_agent_execute_work_plan "${response_json}" "${user_input}")"
     fi
     linux_agent_log_event "executed" "${execution_json}"
     final_status="$(jq -r '.status // "unknown"' <<<"${execution_json}")"
     linux_agent_log_event "finished" "$(jq -cn --arg status "${final_status}" '{status:$status}')"
-    linux_agent_record_turn "user" "${user_input}" "work"
-    linux_agent_record_turn "assistant" "$(jq -c '{status:.status, results:(.results | length)}' <<<"${execution_json}")" "${final_status}"
+    if [[ "${used_agent_loop}" != "true" ]]; then
+        linux_agent_record_conversation_turn "work" "${user_input}" "$(jq -c '{status:.status, results:(.results | length)}' <<<"${execution_json}")" "${final_status}" "request"
+    fi
     jq -cn --arg status "${final_status}" --argjson context "${context_json}" --argjson response "${response_json}" --argjson protocol "$(linux_agent_protocol_for_work "${final_status}" "${response_json}" "${execution_json}")" \
         '{
             ok:($status == "executed" or $status == "answered"),
@@ -489,8 +491,7 @@ linux_agent_api_edit_plan() {
     fi
     linux_agent_log_event "edit_planned" "${edit_json}"
     linux_agent_log_event "finished" "$(jq -cn '{status:"planned"}')"
-    linux_agent_record_turn "user" "${user_input}" "edit"
-    linux_agent_record_turn "assistant" "$(jq -c '.skill // {}' <<<"${edit_json}")" "planned"
+    linux_agent_record_conversation_turn "edit" "${user_input}" "$(jq -c '.skill // {}' <<<"${edit_json}")" "planned" "request"
     jq -cn --argjson edit "${edit_json}" '{ok:true, status:"planned", edit:$edit}'
 }
 

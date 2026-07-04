@@ -75,6 +75,7 @@
                       <button class="btn" id="workRunBtn" type="button">发送</button>
                       <button class="btn danger" id="workCancelBtn" type="button" disabled>终止</button>
                       <button class="btn secondary" id="workSuspendBtn" type="button" disabled>挂起</button>
+                      <button class="btn secondary" id="sessionLeaveBtn" type="button">离开</button>
                     </div>
                   </div>
                   <div id="terminalModePanel" hidden>
@@ -90,7 +91,7 @@
                   <div class="panel-header">
                     <div>
                       <h3>执行时间线</h3>
-                      <p>先看计划、审批状态与执行结论；点击步骤查看详情和原始数据。</p>
+                      <p>倒序展示当前会话轮次；点击轮次展开步骤，再查看对应输出。</p>
                     </div>
                     <span class="pill risk low" id="workJobStatus">idle</span>
                   </div>
@@ -133,10 +134,10 @@
 
                 <div class="panel tight detail-panel">
                   <div class="panel-header">
-                    <div><h3>选中步骤详情</h3><p>终端返回优先展示；observer、review 和 raw JSON 仅作为调试信息折叠查看。</p></div>
+                    <div><h3>选中轮次/步骤详情</h3><p>轮次展示本轮所有步骤输出；步骤展示单步终端返回。</p></div>
                     <span class="pill" id="selectedStepStatus">none</span>
                   </div>
-                  <div id="workDetail" class="detail-empty">选择时间线中的步骤查看详情。</div>
+                  <div id="workDetail" class="detail-empty">选择时间线中的轮次或步骤查看详情。</div>
                 </div>
 
                 <div class="panel tight summary-panel">

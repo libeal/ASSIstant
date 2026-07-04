@@ -36,6 +36,57 @@ run_agent_cmd() {
     (cd "${project}" && "$@")
 }
 
+context_project="${tmp_root}/context-turns"
+copy_project "${context_project}"
+context_history_file="${context_project}/tmp/conversation-history.json"
+(
+    cd "${context_project}"
+    # shellcheck source=/dev/null
+    source lib/common.sh
+    # shellcheck source=/dev/null
+    source lib/config.sh
+    # shellcheck source=/dev/null
+    source lib/context.sh
+    linux_agent_init_env "${context_project}"
+    linux_agent_load_config
+    LINUX_AGENT_CONVERSATION_HISTORY_FILE="${context_history_file}"
+    LINUX_AGENT_CONFIG_JSON="$(jq '.context_turns=2' <<<"${LINUX_AGENT_CONFIG_JSON}")"
+    linux_agent_record_conversation_turn "work" "第一轮请求" "第一轮完成" "executed" "request"
+    linux_agent_record_conversation_turn "work" "第二轮请求" "第二轮完成" "executed" "request"
+    linux_agent_record_conversation_turn "work" "第三轮请求" "第三轮完成" "executed" "request"
+    linux_agent_history_window
+) > "${tmp_root}/context-window.json"
+jq -e 'length == 2
+    and .[0].request.content == "第二轮请求"
+    and .[1].request.content == "第三轮请求"
+    and all(.[]; .type == "request" and (.request | type) == "object" and (.response | type) == "object")' \
+    "${tmp_root}/context-window.json" >/dev/null
+
+legacy_history_file="${tmp_root}/legacy-history.json"
+jq -cn '[
+    {role:"user", content:"旧用户请求", status:"work", timestamp:"t1"},
+    {role:"assistant", content:"旧助手响应", status:"executed", timestamp:"t2"}
+]' > "${legacy_history_file}"
+legacy_window="$(
+    cd "${context_project}"
+    # shellcheck source=/dev/null
+    source lib/common.sh
+    # shellcheck source=/dev/null
+    source lib/config.sh
+    # shellcheck source=/dev/null
+    source lib/context.sh
+    linux_agent_init_env "${context_project}"
+    linux_agent_load_config
+    LINUX_AGENT_CONVERSATION_HISTORY_FILE="${legacy_history_file}"
+    LINUX_AGENT_CONFIG_JSON="$(jq '.context_turns=1' <<<"${LINUX_AGENT_CONFIG_JSON}")"
+    linux_agent_history_window
+)"
+jq -e 'length == 1
+    and .[0].type == "request"
+    and .[0].request.content == "旧用户请求"
+    and .[0].response.content == "旧助手响应"
+    and .[0].status == "executed"' <<<"${legacy_window}" >/dev/null
+
 failure_output="$(run_agent_cmd failure bash bin/agent work "请演示失败中断" <<< $'y\n' 2>&1)"
 grep -q '工作流执行完成: status=failed' <<<"${failure_output}"
 grep -q '步骤执行结果: 失败' <<<"${failure_output}"
@@ -89,6 +140,20 @@ continue_output="$(run_agent_cmd continue bash bin/agent work "查看cpu继续�
 grep -q '工作流执行完成: status=executed' <<<"${continue_output}"
 grep -q '补充查看 CPU 与内存资源概况' <<<"${continue_output}"
 [[ "$(grep -c '低风险步骤已自动批准执行' <<<"${continue_output}")" -ge 2 ]]
+
+loop_history_project="${tmp_root}/loop-history"
+copy_project "${loop_history_project}"
+loop_history_file="${loop_history_project}/tmp/loop-history.json"
+(
+    cd "${loop_history_project}"
+    LINUX_AGENT_CONVERSATION_HISTORY_FILE="${loop_history_file}" bash bin/agent work "查看cpu继续深入" >/dev/null
+)
+jq -e 'length == 2
+    and all(.[]; .type == "agent_loop_iteration")
+    and .[0].iteration == 1
+    and .[1].iteration == 2
+    and all(.[]; (.request.content | contains("查看cpu继续深入")) and (.response | type) == "object")' \
+    "${loop_history_file}" >/dev/null
 
 invalid_reflect_output="$(run_agent_cmd invalid-reflect bash bin/agent work "查看cpu 非法继续决策" 2>&1)"
 grep -q '模型反思响应缺少合法 continue_decision' <<<"${invalid_reflect_output}"

@@ -66,11 +66,15 @@ grep -q 'id="senseTopicSelect"' <<<"${index_html}"
 grep -q 'id="skillsValidateBtn"' <<<"${index_html}"
 grep -q 'id="policyValidateBtn"' <<<"${index_html}"
 grep -q 'id="auditRestoreTimelineBtn"' <<<"${index_html}"
+grep -q 'id="sessionLeaveBtn"' <<<"${index_html}"
 grep -q 'id="observerAuditDialog"' <<<"${index_html}"
 grep -q 'on("workInput", "keydown"' "${project}/web/static/app.js"
 grep -q 'event.shiftKey' "${project}/web/static/app.js"
 grep -q 'userOutputBlocks(blocks)' "${project}/web/static/app.js"
 grep -q 'state.terminalSubmitting' "${project}/web/static/app.js"
+grep -q 'session-turn' "${project}/web/static/app.js"
+grep -q 'renderSharedExecutionOutput' "${project}/web/static/app.js"
+grep -q 'work-plan-preview' "${project}/web/static/app.js"
 
 unauth_body="${tmp_root}/unauth.json"
 unauth_code="$(curl --noproxy '*' -sS -o "${unauth_body}" -w '%{http_code}' "${base_url}/api/health" || true)"
@@ -264,7 +268,75 @@ web_work_audit="$(curl --noproxy '*' -sS \
     -d "${web_work_audit_payload}" \
     "${base_url}/api/audit/read")"
 jq -e '[.events[]? | select(.stage == "request_context_built") | .payload.conversation_turns] as $turns
-    | ($turns | length) >= 2 and $turns[0] == 0 and $turns[1] > 0' <<<"${web_work_audit}" >/dev/null
+    | ($turns | length) >= 2 and $turns[0] == 0 and $turns[1] == 1' <<<"${web_work_audit}" >/dev/null
+jq -e '.ok == true
+    and .web_timeline.source == "audit"
+    and (.web_timeline.turns | length) >= 2
+    and all(.web_timeline.turns[]; (.result.timeline | type) == "array")' <<<"${web_work_audit}" >/dev/null
+
+restore_result="$(curl --noproxy '*' -sS \
+    -H "Authorization: Bearer ${token}" \
+    -H "Content-Type: application/json" \
+    -d "${web_work_audit_payload}" \
+    "${base_url}/api/session/restore")"
+restored_session_id="$(jq -r '.session.session_id // empty' <<<"${restore_result}")"
+jq -e --arg session_id "${web_work_session_id}" '.ok == true
+    and .status == "restored"
+    and .session.restored_from == $session_id
+    and (.session.session_id | startswith("session_web_"))
+    and .history_count >= 2
+    and .session.history_count == .history_count' <<<"${restore_result}" >/dev/null
+[[ -n "${restored_session_id}" ]]
+
+session_state="$(curl --noproxy '*' -sS -H "Authorization: Bearer ${token}" "${base_url}/api/session/state")"
+jq -e --arg session_id "${web_work_session_id}" --arg restored_session_id "${restored_session_id}" '.ok == true
+    and .session_id == $restored_session_id
+    and .restored_from == $session_id
+    and .history_count >= 2
+    and .context_window_count > 0' <<<"${session_state}" >/dev/null
+
+leave_result="$(curl --noproxy '*' -sS \
+    -H "Authorization: Bearer ${token}" \
+    -H "Content-Type: application/json" \
+    -d '{}' \
+    "${base_url}/api/session/leave")"
+left_session_id="$(jq -r '.session.session_id // empty' <<<"${leave_result}")"
+jq -e --arg session_id "${web_work_session_id}" --arg restored_session_id "${restored_session_id}" '.ok == true
+    and .status == "left_restored"
+    and .left_restored_from == $session_id
+    and .session.restored_from == ""
+    and .session.history_count == 0
+    and .session.context_window_count == 0
+    and .session.session_id != $restored_session_id
+    and (.session.session_id | startswith("session_web_"))' <<<"${leave_result}" >/dev/null
+[[ -n "${left_session_id}" ]]
+
+work_job_after_leave="$(curl --noproxy '*' -sS \
+    -H "Authorization: Bearer ${token}" \
+    -H "Content-Type: application/json" \
+    -d "${work_payload}" \
+    "${base_url}/api/jobs")"
+work_job_after_leave_id="$(jq -r '.job_id' <<<"${work_job_after_leave}")"
+[[ "${work_job_after_leave_id}" =~ ^[0-9a-f]+$ ]]
+work_result_after_leave=""
+for _ in $(seq 1 100); do
+    work_result_after_leave="$(curl --noproxy '*' -sS -H "Authorization: Bearer ${token}" "${base_url}/api/jobs/${work_job_after_leave_id}")"
+    work_status_after_leave="$(jq -r '.status' <<<"${work_result_after_leave}")"
+    if [[ "${work_status_after_leave}" != "queued" && "${work_status_after_leave}" != "running" ]]; then
+        break
+    fi
+    sleep 0.2
+done
+[[ "${work_status_after_leave}" == "succeeded" ]]
+
+left_work_audit_payload="$(jq -cn --arg session_id "${left_session_id}" '{session_id:$session_id}')"
+left_work_audit="$(curl --noproxy '*' -sS \
+    -H "Authorization: Bearer ${token}" \
+    -H "Content-Type: application/json" \
+    -d "${left_work_audit_payload}" \
+    "${base_url}/api/audit/read")"
+jq -e '[.events[]? | select(.stage == "request_context_built") | .payload.conversation_turns] as $turns
+    | ($turns | length) >= 1 and $turns[0] == 0' <<<"${left_work_audit}" >/dev/null
 
 job_payload="$(jq -cn '{resource:"terminal", action:"run", payload:{command:"printf web-job-ok"}}')"
 job="$(curl --noproxy '*' -sS \
