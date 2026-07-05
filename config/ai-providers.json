@@ -187,8 +187,9 @@
       "request_format": "openai_chat",
       "custom_url": true,
       "models": {
-        "supported": false,
-        "reason": "No stable public official Xiaomi API endpoint is configured in this project; provide an official endpoint manually."
+        "supported": true,
+        "url":"https://token-plan-cn.xiaomimimo.com/v1/models",
+        "parser": "openai_data_id"
       }
     },
     {
