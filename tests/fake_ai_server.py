@@ -2,6 +2,7 @@
 
 import json
 import sys
+import time
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -90,6 +91,23 @@ def extract_request(messages):
 
 
 def work_plan_response(current_request):
+    if "慢速实时" in current_request:
+        return work_plan(
+            "慢速实时测试：先执行一次资源检查，然后等待反思返回最终回答。",
+            [
+                step(
+                    "step-1",
+                    "慢速实时资源检查",
+                    "skill_script",
+                    "用于验证 Web job 运行中可以增量展示执行流程。",
+                    "返回资源摘要，并在反思阶段给出最终回答。",
+                    skill_script="ops-basic/resource-inspect",
+                    arguments={"top_n": 3},
+                )
+            ],
+            should_continue=True,
+            reason="该测试需要在执行结果出现后等待反思，验证运行中的 partial output。",
+        )
     if "失败" in current_request:
         return work_plan(
             "演示失败中断：先执行一个会失败的命令，随后计划中的步骤应被标记为未执行。",
@@ -175,6 +193,14 @@ def reflection_response(request_context):
     iteration = int(observation.get("iteration") or 1)
     serialized = json.dumps(request_context, ensure_ascii=False)
 
+    if "慢速实时" in original_request:
+        time.sleep(2)
+        return answer(
+            "慢速实时检查已完成。",
+            "最终回答: 慢速实时检查已完成。",
+            reason="已拿到资源检查结果，结束慢速实时测试。",
+            thinking_summary="慢速实时测试在反思阶段延迟，便于 Web 轮询读取 partial output。",
+        )
     if "继续深入" in original_request and iteration == 1:
         return work_plan(
             "继续深入：补充查看 CPU 与内存资源概况。",

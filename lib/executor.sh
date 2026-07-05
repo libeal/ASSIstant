@@ -947,6 +947,7 @@ linux_agent_request_revised_work_plan() {
 linux_agent_execute_work_plan() {
     local plan_json="$1"
     local user_input="$2"
+    local resume_state="${3:-{}}"
     local execution_user sudo_probe step_count results executed_steps status
 
     execution_user="$(id -un 2>/dev/null || printf 'unknown')"
@@ -956,9 +957,34 @@ linux_agent_execute_work_plan() {
     executed_steps='[]'
     status="executed"
 
+    if ! jq -e 'type == "object"' <<<"${resume_state}" >/dev/null 2>&1; then
+        resume_state='{}'
+    fi
+    local resume_index
+    resume_index="$(jq -r '.next_step_index // .start_index // 0' <<<"${resume_state}")"
+    if [[ ! "${resume_index}" =~ ^[0-9]+$ ]]; then
+        resume_index=0
+    fi
+    if [[ "${resume_index}" -gt "${step_count}" ]]; then
+        resume_index="${step_count}"
+    fi
+    if [[ "${resume_index}" -gt 0 ]]; then
+        results="$(jq -c '.results // [] | if type == "array" then . else [] end' <<<"${resume_state}")"
+        local restored_result_count
+        restored_result_count="$(jq 'length' <<<"${results}")"
+        if [[ "${restored_result_count}" -lt "${resume_index}" ]]; then
+            resume_index="${restored_result_count}"
+        fi
+        executed_steps="$(jq -c '[.[] | select(.result.ok == true)]' <<<"${results}")"
+        linux_agent_log_event "execution_resumed" "$(jq -cn \
+            --argjson next_step_index "${resume_index}" \
+            --argjson restored_result_count "${restored_result_count}" \
+            '{next_step_index:$next_step_index, restored_result_count:$restored_result_count}')"
+    fi
+
     linux_agent_print_work_plan "${plan_json}" >&2
 
-    local i=0
+    local i="${resume_index}"
     while [[ "${i}" -lt "${step_count}" ]]; do
         local step step_review_text review result skipped prepared step_decision revision_request auto_approved
         step="$(jq -c --argjson index "${i}" '.steps[$index]' <<<"${plan_json}")"
@@ -1017,7 +1043,7 @@ linux_agent_execute_work_plan() {
         if [[ "$(jq -r '.approval_required' <<<"${review}")" == "true" ]]; then
             printf '审查风险: %s，发现项: %s\n' "$(jq -r '.risk_level' <<<"${review}")" "$(jq '.findings | length' <<<"${review}")" >&2
         fi
-        if linux_agent_should_auto_execute_step "${step}" "${review}" && ! linux_agent_api_has_pending_decision_lines; then
+        if linux_agent_should_auto_execute_step "${step}" "${review}"; then
             step_decision="approve"
             auto_approved=1
             linux_agent_log_step_status "${step}" "auto_approved" "${review}"

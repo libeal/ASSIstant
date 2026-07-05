@@ -27,3 +27,7 @@
 - `controlled-tools/file-patch`: 在 `expected_count` 匹配时对目标文件做字面量替换、diff 预览、备份和原子写入。
 - `controlled-tools/file-download`: 安全下载 HTTPS 公网文件到本机路径，限制大小并可校验 sha256。
 - `controlled-tools/local-analyze`: 对文本或本地文件做只读关键词和错误样本分析。
+
+## session-history
+
+- `session-history/last-command-output`: 从审计 session 中读取上一轮或指定轮次的命令、步骤和 shell/stdout/stderr 输出预览。

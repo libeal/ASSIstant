@@ -44,9 +44,17 @@ jq -e '.ok == true and .status == "executed"
 jq -e '([.timeline[]? | select(.kind == "execution") | .output_blocks[]? | select(.kind == "json") | .json
     | select(.tool == "system.resource.inspect" and (.top_processes | length > 0))] | length) > 0' <<<"${work_run}" >/dev/null
 
+continue_answer="$(cd "${project_work}" && bash bin/agent api work run '{"input":"慢速实时输出检查"}' 2>/dev/null)"
+jq -e '.ok == true and .status == "executed"
+    and ([.output_blocks[]? | select(.kind == "markdown" and .title == "最终回答") | .text | contains("慢速实时检查已完成")] | any)
+    and ([.output_blocks[]? | select(.kind == "meta" and .title == "工作流摘要") | .json.iterations] | first) == 1
+    and ([.timeline[]? | select(.kind == "execution")] | length) == 1' <<<"${continue_answer}" >/dev/null
+
 approval_first="$(cd "${project_work}" && bash bin/agent api work run '{"input":"帮我检查磁盘空间是否异常"}' 2>/dev/null)"
 jq -e '.ok == false and .status == "approval_required" and .response.response_type == "work_plan"
-    and .approval_card.review.approval_required == true and .approval_card.step.id != ""' <<<"${approval_first}" >/dev/null
+    and .approval_card.review.approval_required == true and .approval_card.step.id != ""
+    and .execution_state.next_step_index == 1
+    and (.execution_state.results | length) == 1' <<<"${approval_first}" >/dev/null
 jq -e '([.timeline[]? | select(.kind == "execution") | .output_blocks[]? | select(.kind == "json") | .json
     | select(.tool == "system.disk.hotspots" and (.top_dirs | length > 0) and (.top_files | length > 0))] | length) > 0' <<<"${approval_first}" >/dev/null
 approval_payload="$(
@@ -54,10 +62,12 @@ approval_payload="$(
         --arg input "帮我检查磁盘空间是否异常" \
         --argjson response "$(jq -c '.response' <<<"${approval_first}")" \
         --argjson context "$(jq -c '.context' <<<"${approval_first}")" \
-        '{input:$input, response:$response, context:$context, decisions:["y","y"]}'
+        --argjson execution_state "$(jq -c '.execution_state' <<<"${approval_first}")" \
+        '{input:$input, response:$response, context:$context, execution_state:$execution_state, decisions:["y"]}'
 )"
 approval_second="$(cd "${project_work}" && bash bin/agent api work run "${approval_payload}" 2>/dev/null)"
-jq -e '.ok == true and .status == "executed" and .response.response_type == "work_plan"' <<<"${approval_second}" >/dev/null
+jq -e '.ok == true and .status == "executed" and .response.response_type == "work_plan"
+    and ([.timeline[]? | select(.kind == "execution")] | length) == 2' <<<"${approval_second}" >/dev/null
 
 project_missing="${tmp_root}/project-missing-ai"
 copy_project "${project_missing}"
@@ -104,5 +114,31 @@ jq -e '.ok == false and .status == "ai_invalid_response"' <<<"${invalid_edit}" >
 
 audit_list="$(bash "${ROOT_DIR}/bin/agent" api audit list '{"limit":5}')"
 jq -e '.ok == true and (.sessions | type == "array")' <<<"${audit_list}" >/dev/null
+
+large_audit_project="${tmp_root}/project-large-audit"
+copy_project "${large_audit_project}"
+mkdir -p "${large_audit_project}/logs"
+large_log="${large_audit_project}/logs/session_large_api_read.jsonl"
+printf '{"timestamp":"2026-07-05T00:00:00Z","session_id":"session_large_api_read","stage":"session_started","payload":{"request":"large","entrypoint":"web"}}\n' > "${large_log}"
+for index in $(seq 1 420); do
+    printf '{"timestamp":"2026-07-05T00:00:01Z","session_id":"session_large_api_read","stage":"step_succeeded","payload":{"status":"succeeded","step":{"id":"step-%s","title":"Large output step %s","executor_type":"shell","command_preview":"printf line-%s"},"detail":{"ok":true,"exit_code":0,"output_preview":"line-%s repeated payload for audit read regression"}}}\n' "${index}" "${index}" "${index}" "${index}" >> "${large_log}"
+done
+printf '{"timestamp":"2026-07-05T00:00:02Z","session_id":"session_large_api_read","stage":"session_finished","payload":{"status":"executed"}}\n' >> "${large_log}"
+large_audit_read="$(cd "${large_audit_project}" && bash bin/agent api audit read '{"session_id":"session_large_api_read"}')"
+jq -e '.ok == true and .status == "read" and (.events | length) == 422 and (.report | contains("session_large_api_read"))' <<<"${large_audit_read}" >/dev/null
+
+history_project="${tmp_root}/project-history-skill"
+copy_project "${history_project}"
+mkdir -p "${history_project}/logs"
+cat > "${history_project}/logs/session_history_fixture.jsonl" <<'JSONL'
+{"timestamp":"2026-07-05T00:00:00Z","session_id":"session_history_fixture","stage":"session_started","payload":{"request":"fixture","entrypoint":"web"}}
+{"timestamp":"2026-07-05T00:00:01Z","session_id":"session_history_fixture","stage":"received","payload":{"mode":"terminal","command":"printf previous-output"}}
+{"timestamp":"2026-07-05T00:00:02Z","session_id":"session_history_fixture","stage":"terminal_executed","payload":{"status":"executed","exit_code":0,"output_preview":"previous-output","stderr_preview":""}}
+{"timestamp":"2026-07-05T00:00:03Z","session_id":"session_history_fixture","stage":"finished","payload":{"status":"executed"}}
+JSONL
+history_read="$(cd "${history_project}" && bash bin/agent api script run '{"ref":"session-history/last-command-output","arguments":{"session_id":"session_history_fixture","turn_offset":0},"approve":true}' 2>/dev/null)"
+jq -e '.ok == true and .status == "executed"
+    and ([.output_blocks[]? | select(.kind == "json") | .json
+      | select(.tool == "session.history.last-command-output" and .turn.input == "printf previous-output" and (.outputs[0].output_preview == "previous-output"))] | length) == 1' <<<"${history_read}" >/dev/null
 
 printf 'web_api: ok\n'

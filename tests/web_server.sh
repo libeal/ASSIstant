@@ -75,6 +75,8 @@ grep -q 'state.terminalSubmitting' "${project}/web/static/app.js"
 grep -q 'session-turn' "${project}/web/static/app.js"
 grep -q 'renderSharedExecutionOutput' "${project}/web/static/app.js"
 grep -q 'work-plan-preview' "${project}/web/static/app.js"
+grep -q 'prepareNewWorkRun' "${project}/web/static/app.js"
+grep -q 'execution_state' "${project}/web/static/app.js"
 
 unauth_body="${tmp_root}/unauth.json"
 unauth_code="$(curl --noproxy '*' -sS -o "${unauth_body}" -w '%{http_code}' "${base_url}/api/health" || true)"
@@ -239,6 +241,44 @@ jq -e '.result_status == "executed" and .result_ok == true
     and ([.result.timeline[]? | select(.kind == "execution") | .output_blocks[]? | select(.kind == "json") | .json | select(.tool == "system.resource.inspect")] | length) > 0
     and ([.result.output_blocks[]? | select(.title == "执行流程") | .text | contains("# 工作计划") and contains("步骤输出")] | any)' <<<"${work_result_one}" >/dev/null
 
+slow_work_payload="$(jq -cn '{resource:"work", action:"run", payload:{input:"慢速实时输出检查"}}')"
+slow_work_job="$(curl --noproxy '*' -sS \
+    -H "Authorization: Bearer ${token}" \
+    -H "Content-Type: application/json" \
+    -d "${slow_work_payload}" \
+    "${base_url}/api/jobs")"
+slow_work_job_id="$(jq -r '.job_id' <<<"${slow_work_job}")"
+[[ "${slow_work_job_id}" =~ ^[0-9a-f]+$ ]]
+slow_partial_seen=0
+slow_work_state=""
+for _ in $(seq 1 40); do
+    slow_work_state="$(curl --noproxy '*' -sS -H "Authorization: Bearer ${token}" "${base_url}/api/jobs/${slow_work_job_id}")"
+    if jq -e '.status == "running"
+        and .result.status == "running"
+        and ([.result.output_blocks[]? | select(.title == "执行流程") | .text | contains("# 工作计划")] | any)' <<<"${slow_work_state}" >/dev/null; then
+        slow_partial_seen=1
+        break
+    fi
+    slow_status="$(jq -r '.status' <<<"${slow_work_state}")"
+    if [[ "${slow_status}" != "queued" && "${slow_status}" != "running" ]]; then
+        break
+    fi
+    sleep 0.1
+done
+[[ "${slow_partial_seen}" == "1" ]]
+for _ in $(seq 1 100); do
+    slow_work_result="$(curl --noproxy '*' -sS -H "Authorization: Bearer ${token}" "${base_url}/api/jobs/${slow_work_job_id}")"
+    slow_work_status="$(jq -r '.status' <<<"${slow_work_result}")"
+    if [[ "${slow_work_status}" != "queued" && "${slow_work_status}" != "running" ]]; then
+        break
+    fi
+    sleep 0.1
+done
+[[ "${slow_work_status}" == "succeeded" ]]
+jq -e '.result_status == "executed" and .result_ok == true
+    and ([.result.output_blocks[]? | select(.kind == "markdown" and .title == "最终回答") | .text | contains("慢速实时检查已完成")] | any)
+    and ([.result.output_blocks[]? | select(.title == "执行流程") | .text | contains("# 工作计划") and contains("步骤输出")] | any)' <<<"${slow_work_result}" >/dev/null
+
 work_job_two="$(curl --noproxy '*' -sS \
     -H "Authorization: Bearer ${token}" \
     -H "Content-Type: application/json" \
@@ -261,6 +301,13 @@ audit_after_work="$(curl --noproxy '*' -sS -H "Authorization: Bearer ${token}" "
 jq -e '.ok == true and ([.sessions[]? | select(.entrypoint == "web")] | length) == 1' <<<"${audit_after_work}" >/dev/null
 web_work_session_id="$(jq -r '.sessions[]? | select(.entrypoint == "web") | .session_id' <<<"${audit_after_work}")"
 [[ -n "${web_work_session_id}" ]]
+audit_query_payload="$(jq -cn --arg query "${web_work_session_id}" '{limit:1, query:$query}')"
+audit_query_result="$(curl --noproxy '*' -sS \
+    -H "Authorization: Bearer ${token}" \
+    -H "Content-Type: application/json" \
+    -d "${audit_query_payload}" \
+    "${base_url}/api/audit/list")"
+jq -e --arg session_id "${web_work_session_id}" '.ok == true and (.sessions | length) == 1 and .sessions[0].session_id == $session_id' <<<"${audit_query_result}" >/dev/null
 web_work_audit_payload="$(jq -cn --arg session_id "${web_work_session_id}" '{session_id:$session_id}')"
 web_work_audit="$(curl --noproxy '*' -sS \
     -H "Authorization: Bearer ${token}" \
@@ -273,6 +320,24 @@ jq -e '.ok == true
     and .web_timeline.source == "audit"
     and (.web_timeline.turns | length) >= 2
     and all(.web_timeline.turns[]; (.result.timeline | type) == "array")' <<<"${web_work_audit}" >/dev/null
+
+mkdir -p "${project}/logs"
+reflection_answer_log="${project}/logs/session_web_reflection_answer.jsonl"
+printf '%s\n' \
+    '{"timestamp":"2026-07-05T00:00:00Z","session_id":"session_web_reflection_answer","stage":"session_started","payload":{"request":"agent-web","entrypoint":"web"}}' \
+    '{"timestamp":"2026-07-05T00:00:01Z","session_id":"session_web_reflection_answer","stage":"received","payload":{"mode":"work","input_preview":"fixture"}}' \
+    '{"timestamp":"2026-07-05T00:00:02Z","session_id":"session_web_reflection_answer","stage":"planned","payload":{"response_type":"work_plan","summary_preview":"fixture plan","step_count":1,"steps":[{"id":"step-1","title":"fixture step","executor_type":"skill_script","skill_script":"ops-basic/resource-inspect","risk_level":"low"}]}}' \
+    '{"timestamp":"2026-07-05T00:00:03Z","session_id":"session_web_reflection_answer","stage":"agent_reflection_planned","payload":{"response_type":"answer","summary_preview":"最终回答摘要: fixture complete","continue_decision":{"should_continue":false,"reason":"done"},"step_count":0,"steps":[]}}' \
+    '{"timestamp":"2026-07-05T00:00:04Z","session_id":"session_web_reflection_answer","stage":"finished","payload":{"status":"executed"}}' \
+    > "${reflection_answer_log}"
+reflection_answer_payload="$(jq -cn '{session_id:"session_web_reflection_answer"}')"
+reflection_answer_audit="$(curl --noproxy '*' -sS \
+    -H "Authorization: Bearer ${token}" \
+    -H "Content-Type: application/json" \
+    -d "${reflection_answer_payload}" \
+    "${base_url}/api/audit/read")"
+jq -e '.ok == true
+    and ([.web_timeline.output_blocks[]? | select(.kind == "markdown" and .title == "最终回答") | .text | contains("最终回答摘要")] | any)' <<<"${reflection_answer_audit}" >/dev/null
 
 restore_result="$(curl --noproxy '*' -sS \
     -H "Authorization: Bearer ${token}" \

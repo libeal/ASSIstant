@@ -85,8 +85,8 @@ linux_agent_timeline_plan_items() {
 linux_agent_timeline_execution_items() {
     local execution_json="$1"
     jq -c '
-        [(.results // [])[] | {
-            id:(.step.id // ("result-" + ((.result.exit_code // 0) | tostring))),
+        [(.results // []) | to_entries[] | .key as $index | .value | {
+            id:("execution-" + (($index + 1) | tostring) + "-" + (.step.id // ("result-" + ((.result.exit_code // 0) | tostring)))),
             kind:"execution",
             status:(.result.status // (if (.result.ok // false) then "executed" else "failed" end)),
             step_id:(.step.id // null),
@@ -170,13 +170,18 @@ linux_agent_protocol_for_work() {
     plan_items="$(linux_agent_timeline_plan_items "${response_json}")"
     execution_items="$(linux_agent_timeline_execution_items "${execution_json}")"
     approval_card="$(linux_agent_approval_card_for_work "${response_json}" "${execution_json}")"
-    output_blocks="$(jq -cn --argjson execution "${execution_json}" '[{kind:"meta", title:"工作流摘要", json:{
-        status:($execution.status // null),
-        iterations:($execution.iterations // null),
-        auto_executed_count:($execution.auto_executed_count // null),
-        stopped_reason:($execution.stopped_reason // null),
-        final_answer:($execution.final_answer // null)
-    } | with_entries(select(.value != null))}]')"
+    output_blocks="$(jq -cn --argjson execution "${execution_json}" '[
+        (if (($execution.final_answer // "") | length) > 0 then
+            {kind:"markdown", title:"最终回答", text:($execution.final_answer // ""), truncated_bytes:0}
+        else empty end),
+        {kind:"meta", title:"工作流摘要", json:{
+            status:($execution.status // null),
+            iterations:($execution.iterations // null),
+            auto_executed_count:($execution.auto_executed_count // null),
+            stopped_reason:($execution.stopped_reason // null),
+            final_answer:($execution.final_answer // null)
+        } | with_entries(select(.value != null))}
+    ]')"
 
     jq -cn \
         --arg status "${status}" \

@@ -69,10 +69,11 @@ linux_agent_api_tools_list() {
 
 linux_agent_api_audit_list() {
     local payload="$1"
-    local limit include_runtime entries item path session_id size mtime count summary
+    local limit include_runtime query entries item path session_id size mtime count summary haystack
     limit="$(jq -r '.limit // 50' <<<"${payload}")"
     [[ "${limit}" =~ ^[0-9]+$ && "${limit}" -gt 0 ]] || limit=50
     include_runtime="$(jq -r '.include_runtime // false' <<<"${payload}")"
+    query="$(jq -r '.query // .filter // .session_id // empty' <<<"${payload}")"
     entries='[]'
     count=0
 
@@ -83,10 +84,6 @@ linux_agent_api_audit_list() {
         if [[ "${include_runtime}" != "true" && "${session_id}" == web_* ]]; then
             continue
         fi
-        if [[ "${count}" -ge "${limit}" ]]; then
-            break
-        fi
-        count=$((count + 1))
         size="$(stat -c '%s' "${path}" 2>/dev/null || printf '0')"
         mtime="$(stat -c '%Y' "${path}" 2>/dev/null || printf '0')"
         summary="$(jq -s -c \
@@ -170,6 +167,16 @@ linux_agent_api_audit_list() {
             --argjson size_bytes "${size}" \
             --argjson mtime "${mtime}" \
             '{session_id:$session_id,status:"unreadable",started_at:"",finished_at:"",updated_at:"",entrypoint:"cli",entrypoint_label:"CLI",modes:[],mode_label:"未记录模式",has_multiple_modes:false,event_count:0,command_count:0,decision_count:0,observer_count:0,policy_count:0,important_events:[],event_summary:"审计文件无法读取",highlights:[],headline:"审计文件无法读取",path:$path,size_bytes:$size_bytes,mtime:$mtime}')"
+        if [[ -n "${query}" ]]; then
+            haystack="$(jq -r '[.session_id, .status, .started_at, .finished_at, .updated_at, .entrypoint, .entrypoint_label, .mode_label, .event_summary, .headline, .path, ((.modes // []) | join(" "))] | map(tostring) | join(" ")' <<<"${summary}")"
+            if ! grep -Fqi -- "${query}" <<<"${haystack}"; then
+                continue
+            fi
+        fi
+        if [[ "${count}" -ge "${limit}" ]]; then
+            break
+        fi
+        count=$((count + 1))
         entries="$(jq -cn \
             --argjson prior "${entries}" \
             --argjson summary "${summary}" \
@@ -181,7 +188,7 @@ linux_agent_api_audit_list() {
 
 linux_agent_api_audit_read() {
     local payload="$1"
-    local session_id log_file report events
+    local session_id log_file report_file tmp_root
     session_id="$(jq -r '.session_id // empty' <<<"${payload}")"
     if [[ -z "${session_id}" || ! "${session_id}" =~ ^[A-Za-z0-9_.-]+$ ]]; then
         linux_agent_api_error "invalid_session_id" "session_id is required and must be a safe file name."
@@ -192,10 +199,17 @@ linux_agent_api_audit_read() {
         linux_agent_api_error "not_found" "Audit session not found."
         return 0
     fi
-    report="$(linux_agent_show_audit "${session_id}")"
-    events="$(jq -s '.' "${log_file}")"
-    jq -cn --arg session_id "${session_id}" --arg report "${report}" --argjson events "${events}" \
+
+    tmp_root="${LINUX_AGENT_TMP_DIR:-/tmp}"
+    report_file="$(mktemp "${tmp_root%/}/audit-report.XXXXXX")"
+    if ! linux_agent_show_audit "${session_id}" > "${report_file}"; then
+        rm -f "${report_file}"
+        linux_agent_api_error "read_failed" "Audit session could not be rendered."
+        return 0
+    fi
+    jq -n --arg session_id "${session_id}" --rawfile report "${report_file}" --slurpfile events "${log_file}" \
         '{ok:true, status:"read", session_id:$session_id, report:$report, events:$events}'
+    rm -f "${report_file}"
 }
 
 linux_agent_api_work_prepare_response() {
@@ -244,7 +258,7 @@ linux_agent_api_work_prepare_response() {
 
 linux_agent_api_work_run() {
     local payload="$1"
-    local user_input prepared response_json context_json response_type execution_json final_status compact answer used_agent_loop
+    local user_input prepared response_json context_json response_type execution_json final_status compact answer used_agent_loop execution_state_json
     user_input="$(jq -r '.input // .request // empty' <<<"${payload}")"
     if [[ -z "${user_input}" ]]; then
         linux_agent_api_error "missing_input" "input is required."
@@ -253,6 +267,7 @@ linux_agent_api_work_run() {
 
     LINUX_AGENT_OUTPUT_JSON=1
     linux_agent_api_set_decision_lines "${payload}"
+    execution_state_json="$(jq -c '.execution_state // {} | if type == "object" then . else {} end' <<<"${payload}")"
 
     if jq -e '(.response? // .plan?) | type == "object"' <<<"${payload}" >/dev/null; then
         response_json="$(jq -c '.response // .plan' <<<"${payload}")"
@@ -311,10 +326,10 @@ linux_agent_api_work_run() {
 
     if [[ "$(linux_agent_agent_loop_enabled)" == "true" ]]; then
         used_agent_loop=true
-        execution_json="$(linux_agent_run_agent_loop "${user_input}" "work" "${context_json}" "${response_json}")"
+        execution_json="$(linux_agent_run_agent_loop "${user_input}" "work" "${context_json}" "${response_json}" "${execution_state_json}")"
     else
         used_agent_loop=false
-        execution_json="$(linux_agent_execute_work_plan "${response_json}" "${user_input}")"
+        execution_json="$(linux_agent_execute_work_plan "${response_json}" "${user_input}" "${execution_state_json}")"
     fi
     linux_agent_log_event "executed" "${execution_json}"
     final_status="$(jq -r '.status // "unknown"' <<<"${execution_json}")"
@@ -322,7 +337,15 @@ linux_agent_api_work_run() {
     if [[ "${used_agent_loop}" != "true" ]]; then
         linux_agent_record_conversation_turn "work" "${user_input}" "$(jq -c '{status:.status, results:(.results | length)}' <<<"${execution_json}")" "${final_status}" "request"
     fi
-    jq -cn --arg status "${final_status}" --argjson context "${context_json}" --argjson response "${response_json}" --argjson protocol "$(linux_agent_protocol_for_work "${final_status}" "${response_json}" "${execution_json}")" \
+    execution_state_json="$(jq -c '
+        {
+            next_step_index:((.results // []) | length),
+            approval_step_id:(.approval_step.id // null),
+            status:(.status // null),
+            results:(.results // [])
+        }
+    ' <<<"${execution_json}")"
+    jq -cn --arg status "${final_status}" --argjson context "${context_json}" --argjson response "${response_json}" --argjson protocol "$(linux_agent_protocol_for_work "${final_status}" "${response_json}" "${execution_json}")" --argjson execution_state "${execution_state_json}" \
         '{
             ok:($status == "executed" or $status == "answered"),
             status:$status,
@@ -330,7 +353,8 @@ linux_agent_api_work_run() {
             response:$response,
             timeline:$protocol.timeline,
             approval_card:$protocol.approval_card,
-            output_blocks:$protocol.output_blocks
+            output_blocks:$protocol.output_blocks,
+            execution_state:$execution_state
         }'
 }
 

@@ -19,6 +19,7 @@ const $ = (id) => document.getElementById(id);
 const LAYOUT_STORAGE_PREFIX = "assistant.panelLayout.v1";
 const THINKING_TRACE_KEY = "agent_loop.thinking_trace_enabled";
 let sessionTurnCounter = 0;
+let auditListReloadTimer = 0;
 
 const titles = {
   workbench: "工作台",
@@ -631,7 +632,11 @@ function renderSharedExecutionOutput(title, result) {
 }
 
 function executionFlowBlocks(result = state.lastProtocolResult) {
-  return outputBlocksFrom(result).filter((block) => block?.title === "执行流程" && typeof block.text === "string" && block.text.trim());
+  return outputBlocksFrom(result).filter((block) => {
+    if (block?.title === "执行流程" && typeof block.text === "string" && block.text.trim()) return true;
+    if (block?.title === "最终回答" && typeof block.text === "string" && block.text.trim()) return true;
+    return false;
+  });
 }
 
 function renderExecutionFlowHtml(result = state.lastProtocolResult) {
@@ -825,6 +830,11 @@ function openApprovalDrawer(result, input) {
     step,
     index: Math.max(0, steps.indexOf(step)),
     review: card?.review || null,
+    executionState: result.execution_state || {
+      next_step_index: completedExecutionCount(result),
+      approval_step_id: step.id || null,
+      results: [],
+    },
   };
   state.approvalDrawerOpen = true;
   state.awaitingWorkApproval = true;
@@ -918,6 +928,7 @@ async function submitApprovalDecision(decision) {
     input: pendingApproval.input,
     response: pendingApproval.response,
     context: pendingApproval.context,
+    execution_state: pendingApproval.executionState || {},
     decisions: [decision],
   };
   if (decision === "s") payload.decisions.push($("approvalRevision")?.value || "");
@@ -935,7 +946,7 @@ async function submitApprovalDecision(decision) {
     state.workApprovalSubmitting = false;
     state.workSuspended = false;
     updateWorkActionLabel();
-    const completed = await pollJob(job.job_id, "workJobStatus", null, { suspendFlag: "workSuspended" });
+    const completed = await pollJob(job.job_id, "workJobStatus", null, { suspendFlag: "workSuspended", onProgress: renderWorkJobProgress });
     handleCompletedWork(completed, payload.input);
   } finally {
     state.workSubmitting = false;
@@ -950,6 +961,19 @@ function renderWorkPlan(response, input = "", context = null, awaitingApproval =
   state.workPlanInput = input;
   state.awaitingWorkApproval = awaitingApproval;
   updateWorkActionLabel();
+}
+
+function prepareNewWorkRun(input) {
+  state.activeWorkTurnId = "";
+  state.selectedTurnId = "";
+  state.selectedStepKey = "";
+  state.selectedStepIndex = -1;
+  state.lastProtocolResult = null;
+  state.awaitingWorkApproval = false;
+  state.workPlanInput = input;
+  printOutput("terminalOutput", { status: "running", message: "本轮执行中，等待返回新的共享执行输出。" });
+  renderSessionTimeline();
+  renderStepDetail(null);
 }
 
 function renderTimelineReturns(title, result) {
@@ -969,11 +993,24 @@ function renderSharedProtocolExecution(title, result, outputId = "terminalOutput
   });
 }
 
+function renderWorkJobProgress(job) {
+  const result = job?.result;
+  if (!result) return;
+  const text = renderSharedExecutionOutput(result.status || "work_running", result);
+  if (!text.trim()) return;
+  state.lastProtocolResult = result;
+  printOutput("terminalOutput", text);
+}
+
 function executionItems(result) {
   return (Array.isArray(result?.timeline) ? result.timeline : []).filter((item) => ["execution", "failure", "observer", "audit"].includes(item.kind));
 }
 
 function entryStepKey(entry) {
+  return String(entry?.output?.id || entry?.step?.id || entry?.output?.step_id || entry?.index || "0");
+}
+
+function entryMatchStepKey(entry) {
   return String(entry?.step?.id || entry?.output?.step_id || entry?.index || "0");
 }
 
@@ -982,12 +1019,18 @@ function normalizedTurnEntries(title, result) {
   const steps = Array.isArray(response.steps) ? response.steps : [];
   const protocolEntries = executionItems(result).length ? normalizeExecutionEntries(title, result) : [];
   if (steps.length) {
-    const byStepId = new Map(protocolEntries.map((entry) => [entryStepKey(entry), entry]));
+    const byStepId = new Map();
+    for (const entry of protocolEntries) {
+      const key = entryMatchStepKey(entry);
+      if (!byStepId.has(key)) byStepId.set(key, entry);
+    }
     const pendingIndex = result?.status === "approval_required" ? completedExecutionCount(result) : -1;
-    return steps.map((step, index) => {
+    const usedEntries = new Set();
+    const plannedEntries = steps.map((step, index) => {
       const key = String(step.id || index);
       const matched = byStepId.get(key) || protocolEntries.find((entry) => entry.index === index);
       if (matched) {
+        usedEntries.add(matched);
         return {
           ...matched,
           index,
@@ -1009,6 +1052,14 @@ function normalizedTurnEntries(title, result) {
         },
       };
     });
+    const extraEntries = protocolEntries
+      .filter((entry) => !usedEntries.has(entry))
+      .map((entry, extraIndex) => ({
+        ...entry,
+        index: steps.length + extraIndex,
+        number: steps.length + extraIndex + 1,
+      }));
+    return [...plannedEntries, ...extraEntries];
   }
   if (response.response_type === "answer") {
     return [{
@@ -1433,6 +1484,7 @@ async function pollJob(jobId, statusId, outputId, options = {}) {
     }
     const job = await api(`/api/jobs/${jobId}`);
     if (job.status === "queued" || job.status === "running") {
+      if (typeof options.onProgress === "function") options.onProgress(job);
       await new Promise((resolve) => window.setTimeout(resolve, 900));
       continue;
     }
@@ -1964,13 +2016,14 @@ async function runWork() {
   if (state.activeWorkJobId && state.workSuspended) {
     state.workSuspended = false;
     updateWorkActionLabel();
-    const completed = await pollJob(state.activeWorkJobId, "workJobStatus", null, { suspendFlag: "workSuspended" });
+    const completed = await pollJob(state.activeWorkJobId, "workJobStatus", null, { suspendFlag: "workSuspended", onProgress: renderWorkJobProgress });
     handleCompletedWork(completed, state.workPlanInput);
     return;
   }
   const input = $("workInput").value.trim();
   if (!input) return showToast("Work input required");
   closeApprovalDrawer();
+  prepareNewWorkRun(input);
   const payload = { input };
   state.workSubmitting = true;
   updateWorkActionLabel();
@@ -1980,7 +2033,7 @@ async function runWork() {
     state.workSubmitting = false;
     state.workSuspended = false;
     updateWorkActionLabel();
-    const completed = await pollJob(job.job_id, "workJobStatus", null, { suspendFlag: "workSuspended" });
+    const completed = await pollJob(job.job_id, "workJobStatus", null, { suspendFlag: "workSuspended", onProgress: renderWorkJobProgress });
     handleCompletedWork(completed, input);
   } finally {
     state.workSubmitting = false;
@@ -2013,9 +2066,8 @@ function handleCompletedWork(completed, input) {
   let turn = null;
   if (hasWorkbenchResult) {
     turn = renderTimelineReturns(result.status || "work_return", result);
-  }
-  if (result.status !== "approval_required" && hasWorkbenchResult) {
-    printOutput("terminalOutput", renderSharedExecutionOutput(result.status || "work_return", result));
+    const sharedText = renderSharedExecutionOutput(result.status || "work_return", result);
+    if (sharedText.trim()) printOutput("terminalOutput", sharedText);
   }
   if (result.status === "approval_required") {
     state.activeWorkTurnId = turn?.id || state.activeWorkTurnId || "";
@@ -2204,13 +2256,22 @@ async function loadAuditList() {
     showToast("Audit replay is paused");
     return;
   }
-  const data = await api("/api/audit/list");
+  const query = String($("auditSessionFilter")?.value || "").trim();
+  const limit = Math.max(1, Math.min(200, Number($("auditLimitInput")?.value || 40)));
+  const data = await api("/api/audit/list", { method: "POST", body: { limit, query } });
   state.auditSessions = data.sessions || [];
   state.auditEvents = [];
   state.auditWebTimeline = null;
   state.currentAuditSession = "";
   renderAuditSessionList();
   resetAuditSummary();
+}
+
+function scheduleAuditListReload() {
+  window.clearTimeout(auditListReloadTimer);
+  auditListReloadTimer = window.setTimeout(() => {
+    safeAction(loadAuditList);
+  }, 250);
 }
 
 function renderAuditSessionList() {
@@ -2848,10 +2909,10 @@ function bindActions() {
   on("editApplyBtn", "click", () => safeAction(applyEdit));
   on("auditRefreshBtn", "click", () => safeAction(loadAuditList));
   on("auditRestoreTimelineBtn", "click", () => safeAction(restoreAuditTimelineToWorkbench));
-  on("auditSessionFilter", "input", renderAuditSessionList);
+  on("auditSessionFilter", "input", scheduleAuditListReload);
   on("auditStatusFilter", "change", renderAuditSessionList);
   on("auditEventFilter", "change", () => state.currentAuditSession ? renderAuditEventTimeline() : renderAuditSessionList());
-  on("auditLimitInput", "input", () => state.currentAuditSession ? renderAuditEventTimeline() : renderAuditSessionList());
+  on("auditLimitInput", "input", () => state.currentAuditSession ? renderAuditEventTimeline() : scheduleAuditListReload());
   on("configReloadBtn", "click", () => safeAction(loadConfig));
   on("configSaveBtn", "click", () => safeAction(saveConfigChanges));
   on("configEditorRoot", "input", (event) => updateConfigDraftFromControl(event.target));

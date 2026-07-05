@@ -30,6 +30,8 @@ JOB_RETENTION_HOURS = int(os.environ.get("LINUX_AGENT_WEB_JOB_RETENTION_HOURS", 
 JOB_PROCESSES = {}
 JOB_PROCESSES_LOCK = threading.Lock()
 WEB_AGENT_LOCK = threading.RLock()
+DEFAULT_STDERR_TEXT_LIMIT = 4000
+WORK_EXECUTION_FLOW_TEXT_LIMIT = 200000
 SERVER_RUN_ID = uuid.uuid4().hex
 SERVER_STARTED_AT = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 WEB_AGENT_SESSION_ID = f"session_web_{SERVER_RUN_ID[:16]}"
@@ -1054,6 +1056,106 @@ def read_skill_file(relative_path):
     }
 
 
+def limited_text(text, limit):
+    raw = str(text or "")
+    if limit <= 0:
+        return "", len(raw)
+    if len(raw) <= limit:
+        return raw, 0
+    return raw[:limit], len(raw) - limit
+
+
+def agent_stderr_block(resource, stderr):
+    if not stderr:
+        return None
+    is_work = resource == "work"
+    limit = WORK_EXECUTION_FLOW_TEXT_LIMIT if is_work else DEFAULT_STDERR_TEXT_LIMIT
+    text, truncated = limited_text(stderr, limit)
+    return {
+        "kind": "stdout" if is_work else "stderr",
+        "title": "执行流程" if is_work else "Agent stderr",
+        "text": text,
+        "truncated_bytes": truncated,
+    }
+
+
+def update_job_partial_output(job_id, resource, stderr):
+    if not job_id or not stderr:
+        return
+    job = read_job(job_id)
+    if not isinstance(job, dict) or job.get("status") != "running":
+        return
+    block = agent_stderr_block(resource, stderr)
+    if not block:
+        return
+    job["result"] = {
+        "ok": False,
+        "status": "running",
+        "timeline": [],
+        "approval_card": None,
+        "output_blocks": [block],
+    }
+    job["result_ok"] = False
+    job["result_status"] = "running"
+    job["updated_at"] = now_iso()
+    write_job(job_id, job)
+
+
+def run_agent_api_job_process(command, env, resource, timeout, job_id):
+    process = subprocess.Popen(
+        command,
+        cwd=str(ROOT),
+        env=env,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        start_new_session=True,
+    )
+    with JOB_PROCESSES_LOCK:
+        JOB_PROCESSES[job_id] = process
+
+    stdout_chunks = []
+    stderr_chunks = []
+    last_partial_update = [0.0]
+
+    def read_stdout():
+        if process.stdout is None:
+            return
+        stdout_chunks.append(process.stdout.read() or "")
+
+    stdout_thread = threading.Thread(target=read_stdout, daemon=True)
+    stdout_thread.start()
+    start_time = time.monotonic()
+    returncode = None
+    try:
+        if process.stderr is not None:
+            for line in process.stderr:
+                stderr_chunks.append(line)
+                now = time.monotonic()
+                if now - last_partial_update[0] >= 0.25:
+                    update_job_partial_output(job_id, resource, "".join(stderr_chunks).strip())
+                    last_partial_update[0] = now
+                if timeout is not None and now - start_time > timeout:
+                    process.kill()
+                    break
+        if timeout is None:
+            returncode = process.wait()
+        else:
+            remaining = max(0.1, timeout - (time.monotonic() - start_time))
+            returncode = process.wait(timeout=remaining)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        returncode = process.wait()
+    finally:
+        stdout_thread.join(timeout=1)
+        with JOB_PROCESSES_LOCK:
+            JOB_PROCESSES.pop(job_id, None)
+
+    stderr = "".join(stderr_chunks).strip()
+    update_job_partial_output(job_id, resource, stderr)
+    return "".join(stdout_chunks).strip(), stderr, returncode
+
+
 def run_agent_api(resource, action="", payload=None, timeout=None, job_id=None):
     payload = payload or {}
     command = ["bash", str(AGENT), "api", resource]
@@ -1084,28 +1186,7 @@ def run_agent_api(resource, action="", payload=None, timeout=None, job_id=None):
         stderr = process.stderr.strip()
         returncode = process.returncode
     else:
-        process = subprocess.Popen(
-            command,
-            cwd=str(ROOT),
-            env=env,
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            start_new_session=True,
-        )
-        with JOB_PROCESSES_LOCK:
-            JOB_PROCESSES[job_id] = process
-        try:
-            stdout, stderr = process.communicate(timeout=timeout)
-        except subprocess.TimeoutExpired:
-            process.kill()
-            stdout, stderr = process.communicate()
-        finally:
-            with JOB_PROCESSES_LOCK:
-                JOB_PROCESSES.pop(job_id, None)
-        stdout = stdout.strip()
-        stderr = stderr.strip()
-        returncode = process.returncode
+        stdout, stderr, returncode = run_agent_api_job_process(command, env, resource, timeout, job_id)
     try:
         result = json.loads(stdout) if stdout else {}
     except json.JSONDecodeError:
@@ -1129,12 +1210,9 @@ def run_agent_api(resource, action="", payload=None, timeout=None, job_id=None):
         if not isinstance(blocks, list):
             blocks = []
             result["output_blocks"] = blocks
-        if stderr:
-            stderr_title = "执行流程" if resource == "work" else "Agent stderr"
-            stderr_kind = "stdout" if resource == "work" else "stderr"
-            blocks.append(
-                {"kind": stderr_kind, "title": stderr_title, "text": stderr[:4000], "truncated_bytes": max(0, len(stderr) - 4000)}
-            )
+        stderr_block = agent_stderr_block(resource, stderr)
+        if stderr_block:
+            blocks.append(stderr_block)
         blocks.append({"kind": "meta", "title": "Agent runtime", "json": {"exit_code": returncode}})
     return result
 
@@ -1242,6 +1320,7 @@ def build_web_timeline_from_audit(session_id, events, include_turns=True):
     planned_steps = []
     timeline = []
     summary = ""
+    final_answer_summary = ""
     input_preview = ""
     final_status = "restored"
     step_statuses = {
@@ -1279,6 +1358,8 @@ def build_web_timeline_from_audit(session_id, events, include_turns=True):
                 }
                 steps_by_id[step_id] = normalized
                 planned_steps.append(normalized)
+        elif stage == "agent_reflection_planned" and str(payload.get("response_type") or "") == "answer":
+            final_answer_summary = str(payload.get("summary_preview") or final_answer_summary)
         elif stage in {"finished", "session_finished", "command_finished"}:
             final_status = str(payload.get("status") or final_status)
 
@@ -1345,6 +1426,29 @@ def build_web_timeline_from_audit(session_id, events, include_turns=True):
             }
         )
 
+    output_blocks = []
+    if final_answer_summary:
+        output_blocks.append(
+            {
+                "kind": "markdown",
+                "title": "最终回答",
+                "text": final_answer_summary,
+                "truncated_bytes": 0,
+            }
+        )
+    output_blocks.append(
+        {
+            "kind": "meta",
+            "title": "Web 时间线恢复",
+            "json": {
+                "session_id": session_id,
+                "event_count": len(events) if isinstance(events, list) else 0,
+                "timeline_count": len(timeline),
+                "planned_step_count": len(planned_steps),
+            },
+        }
+    )
+
     restored = {
         "ok": True,
         "status": final_status,
@@ -1359,18 +1463,7 @@ def build_web_timeline_from_audit(session_id, events, include_turns=True):
         },
         "timeline": timeline,
         "approval_card": None,
-        "output_blocks": [
-            {
-                "kind": "meta",
-                "title": "Web 时间线恢复",
-                "json": {
-                    "session_id": session_id,
-                    "event_count": len(events) if isinstance(events, list) else 0,
-                    "timeline_count": len(timeline),
-                    "planned_step_count": len(planned_steps),
-                },
-            }
-        ],
+        "output_blocks": output_blocks,
     }
     if include_turns:
         restored["turns"] = build_web_turns_from_audit(session_id, events)
@@ -1618,6 +1711,10 @@ class Handler(SimpleHTTPRequestHandler):
             result = run_agent_api("audit", "read", body, timeout=180)
             if isinstance(result, dict) and isinstance(result.get("events"), list):
                 result["web_timeline"] = build_web_timeline_from_audit(str(body.get("session_id") or result.get("session_id") or ""), result["events"])
+            json_response(self, HTTPStatus.OK, result)
+            return
+        if path == "/api/audit/list":
+            result = run_agent_api("audit", "list", body, timeout=120)
             json_response(self, HTTPStatus.OK, result)
             return
         if path == "/api/config/update":
