@@ -977,10 +977,12 @@ function prepareNewWorkRun(input) {
 }
 
 function renderTimelineReturns(title, result) {
-  return upsertSessionTurn(title, result, result?.input || state.workPlanInput || "", {
-    turnId: state.activeWorkTurnId || "",
-    mode: "work",
-  });
+  const turnSpecs = workResultTurnSpecs(title, result, result?.input || state.workPlanInput || "");
+  let lastTurn = null;
+  for (const spec of turnSpecs) {
+    lastTurn = upsertSessionTurn(spec.title, spec.result, spec.input, spec.options);
+  }
+  return lastTurn;
 }
 
 function renderSharedProtocolExecution(title, result, outputId = "terminalOutput") {
@@ -1004,6 +1006,92 @@ function renderWorkJobProgress(job) {
 
 function executionItems(result) {
   return (Array.isArray(result?.timeline) ? result.timeline : []).filter((item) => ["execution", "failure", "observer", "audit"].includes(item.kind));
+}
+
+function executionIteration(item) {
+  const value = Number(item?.iteration);
+  if (!Number.isFinite(value) || value <= 0) return null;
+  return Math.floor(value);
+}
+
+function executionIterations(result) {
+  const seen = new Set();
+  const iterations = [];
+  for (const item of executionItems(result)) {
+    const iteration = executionIteration(item);
+    if (iteration === null || seen.has(iteration)) continue;
+    seen.add(iteration);
+    iterations.push(iteration);
+  }
+  return iterations;
+}
+
+function fallbackStepFromExecution(item, index) {
+  if (isPlainObject(item?.step) && Object.keys(item.step).length) return item.step;
+  return {
+    id: item?.step_id || `step-${index + 1}`,
+    title: item?.title || item?.step_id || `step-${index + 1}`,
+    executor_type: item?.step?.executor_type || "skill_script",
+    risk_level: item?.risk_level || "low",
+  };
+}
+
+function workResultTurnSpecs(title, result, input = "") {
+  const iterations = executionIterations(result);
+  if (iterations.length <= 1) {
+    return [{
+      title,
+      result,
+      input,
+      options: {
+        turnId: state.activeWorkTurnId || "",
+        mode: "work",
+      },
+    }];
+  }
+  const response = isPlainObject(result?.response) ? result.response : {};
+  const rootTimeline = Array.isArray(result?.timeline) ? result.timeline : [];
+  const lastIteration = iterations[iterations.length - 1];
+  return iterations.map((iteration, index) => {
+    const isFirst = index === 0;
+    const isLast = iteration === lastIteration;
+    const iterExecutions = executionItems(result).filter((item) => executionIteration(item) === iteration);
+    const iterTimeline = rootTimeline.filter((item) => {
+      if (["execution", "failure", "observer", "audit"].includes(item?.kind)) return executionIteration(item) === iteration;
+      return isFirst && item?.kind === "plan_step";
+    });
+    const steps = isFirst && Array.isArray(response.steps) && response.steps.length
+      ? response.steps
+      : iterExecutions.map(fallbackStepFromExecution);
+    const iterResult = {
+      ...result,
+      status: isLast ? result?.status : "executed",
+      response: {
+        ...response,
+        response_type: response.response_type || "work_plan",
+        summary: isFirst ? (response.summary || response.summary_preview || "") : `Agent loop 第 ${iteration} 轮`,
+        steps,
+      },
+      timeline: iterTimeline,
+      output_blocks: isLast ? (result?.output_blocks || []) : [{
+        kind: "meta",
+        title: "工作流摘要",
+        json: { status: "executed", iteration, source: "loop_iteration" },
+      }],
+      iteration,
+      loop_iteration: iteration,
+      input: result?.input || input,
+    };
+    return {
+      title: `${title || "work_return"} · 第 ${iteration} 轮`,
+      result: iterResult,
+      input: result?.input || input,
+      options: {
+        turnId: isFirst ? (state.activeWorkTurnId || "") : "",
+        mode: "work",
+      },
+    };
+  });
 }
 
 function entryStepKey(entry) {

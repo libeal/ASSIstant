@@ -85,10 +85,11 @@ linux_agent_timeline_plan_items() {
 linux_agent_timeline_execution_items() {
     local execution_json="$1"
     jq -c '
-        [(.results // []) | to_entries[] | .key as $index | .value | {
-            id:("execution-" + (($index + 1) | tostring) + "-" + (.step.id // ("result-" + ((.result.exit_code // 0) | tostring)))),
+        [(.results // []) | to_entries[] | .key as $index | .value | (.iteration // null) as $iteration | {
+            id:("execution-" + (if $iteration == null then "" else ("i" + ($iteration | tostring) + "-") end) + (($index + 1) | tostring) + "-" + (.step.id // ("result-" + ((.result.exit_code // 0) | tostring)))),
             kind:"execution",
             status:(.result.status // (if (.result.ok // false) then "executed" else "failed" end)),
+            iteration:$iteration,
             step_id:(.step.id // null),
             title:(.step.title // .step.id // "步骤执行"),
             summary:(

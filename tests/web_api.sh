@@ -50,6 +50,12 @@ jq -e '.ok == true and .status == "executed"
     and ([.output_blocks[]? | select(.kind == "meta" and .title == "工作流摘要") | .json.iterations] | first) == 1
     and ([.timeline[]? | select(.kind == "execution")] | length) == 1' <<<"${continue_answer}" >/dev/null
 
+loop_run="$(cd "${project_work}" && bash bin/agent api work run '{"input":"查看cpu继续深入"}' 2>/dev/null)"
+jq -e '.ok == true and .status == "executed"
+    and ([.output_blocks[]? | select(.kind == "meta" and .title == "工作流摘要") | .json.iterations] | first) == 2
+    and ([.timeline[]? | select(.kind == "execution") | .iteration] | unique) == [1, 2]
+    and ([.timeline[]? | select(.kind == "execution")] | length) == 2' <<<"${loop_run}" >/dev/null
+
 approval_first="$(cd "${project_work}" && bash bin/agent api work run '{"input":"帮我检查磁盘空间是否异常"}' 2>/dev/null)"
 jq -e '.ok == false and .status == "approval_required" and .response.response_type == "work_plan"
     and .approval_card.review.approval_required == true and .approval_card.step.id != ""

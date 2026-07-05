@@ -253,7 +253,7 @@ linux_agent_run_agent_loop() {
     local environment_context="$3"
     local initial_plan="$4"
     local resume_state="${5:-{}}"
-    local current_plan execution_json all_results iteration status final_status final_answer stopped_reason
+    local current_plan execution_json iteration_results all_results iteration status final_status final_answer stopped_reason
     local observation_json reflection_json checkpoint_turns auto_executed_count checkpoint_required final_review final_approval_step
     local execution_user sudo_probe
 
@@ -289,7 +289,8 @@ linux_agent_run_agent_loop() {
         resume_state='{}'
         execution_user="$(jq -r '.execution_user // empty' <<<"${execution_json}" 2>/dev/null || true)"
         sudo_probe="$(jq -r '.sudo_probe // empty' <<<"${execution_json}" 2>/dev/null || true)"
-        all_results="$(jq -cn --argjson prior "${all_results}" --argjson next "$(jq '.results // []' <<<"${execution_json}")" '$prior + $next')"
+        iteration_results="$(jq -c --argjson iteration "${iteration}" '(.results // []) | map(. + {iteration:$iteration})' <<<"${execution_json}")"
+        all_results="$(jq -cn --argjson prior "${all_results}" --argjson next "${iteration_results}" '$prior + $next')"
         status="$(jq -r '.status // "unknown"' <<<"${execution_json}")"
         final_status="${status}"
         final_review="$(jq -c '.review // null' <<<"${execution_json}")"

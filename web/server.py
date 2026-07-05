@@ -577,74 +577,63 @@ def compact_history_text(value, limit=1200):
 
 def audit_history_from_events(events):
     history = []
-    current = None
-
-    def finish_turn(finished_at=""):
-        nonlocal current
-        if not current:
-            return
-        assistant = "；".join(part for part in current.get("assistant_parts", []) if part)
-        if not assistant:
-            assistant = current.get("status") or "restored"
+    turns = build_web_turns_from_audit("audit_restore", events)
+    for turn in turns:
+        result = turn.get("result") if isinstance(turn.get("result"), dict) else {}
+        response = result.get("response") if isinstance(result.get("response"), dict) else {}
+        timeline = result.get("timeline") if isinstance(result.get("timeline"), list) else []
+        executions = [item for item in timeline if isinstance(item, dict) and item.get("kind") == "execution"]
+        status = str(turn.get("status") or result.get("status") or "restored")
+        iteration = result.get("iteration")
+        plan_summary = response.get("summary") or ""
+        final_answer = ""
+        for block in result.get("output_blocks") if isinstance(result.get("output_blocks"), list) else []:
+            if isinstance(block, dict) and block.get("title") == "最终回答":
+                final_answer = str(block.get("text") or "")
+                break
+        if iteration is not None:
+            response_content = {
+                "iteration": iteration,
+                "status": status,
+                "result_count": len(executions),
+                "stopped_reason": response.get("continue_decision", {}).get("reason") if isinstance(response.get("continue_decision"), dict) else "",
+                "reflection_summary": final_answer or plan_summary,
+            }
+            response_text = json.dumps(response_content, ensure_ascii=False, separators=(",", ":"))
+            metadata = {
+                "source": "audit_restore",
+                "iteration": iteration,
+                "result_count": len(executions),
+                "plan_summary": plan_summary,
+                "reflection_summary": final_answer,
+            }
+            turn_type = "agent_loop_iteration"
+        else:
+            assistant_parts = []
+            if plan_summary:
+                assistant_parts.append(f"计划: {plan_summary}")
+            assistant_parts.append(f"执行状态: {status}; 结果数: {len(executions)}")
+            if final_answer:
+                assistant_parts.append(f"最终回答: {final_answer}")
+            response_text = "；".join(part for part in assistant_parts if part) or status
+            metadata = {"source": "audit_restore"}
+            turn_type = "request"
         history.append(
             {
-                "type": "request",
-                "mode": current.get("mode", "work"),
-                "request": {"content": compact_history_text(current.get("input", ""))},
+                "type": turn_type,
+                "mode": turn.get("mode") or "work",
+                "request": {"content": compact_history_text(turn.get("input", ""))},
                 "response": {
-                    "content": compact_history_text(assistant),
-                    "status": current.get("status") or "restored",
+                    "content": compact_history_text(response_text),
+                    "status": status,
                 },
-                "status": current.get("status") or "restored",
-                "started_at": current.get("started_at") or now_iso(),
-                "completed_at": finished_at or current.get("updated_at") or now_iso(),
-                "metadata": {"source": "audit_restore"},
+                "status": status,
+                "started_at": turn.get("created_at") or now_iso(),
+                "completed_at": turn.get("updated_at") or now_iso(),
+                "metadata": metadata,
+                **({"iteration": iteration} if iteration is not None else {}),
             }
         )
-        current = None
-
-    for event in events if isinstance(events, list) else []:
-        stage = audit_stage(event)
-        payload = audit_payload(event)
-        event_time = str(event.get("timestamp") or now_iso())
-        if stage == "received":
-            mode = str(payload.get("mode") or "")
-            if mode not in {"work", "edit"}:
-                finish_turn(event_time)
-                continue
-            finish_turn(event_time)
-            current = {
-                "mode": mode,
-                "input": payload.get("input_preview") or payload.get("input") or "",
-                "assistant_parts": [],
-                "status": "",
-                "started_at": event_time,
-                "updated_at": event_time,
-            }
-            continue
-        if not current:
-            continue
-        current["updated_at"] = event_time
-        if stage in {"planned", "edit_planned"}:
-            summary = payload.get("summary_preview") or payload.get("notes_preview") or payload.get("response_type")
-            if summary:
-                current["assistant_parts"].append(f"计划: {summary}")
-        elif stage == "executed":
-            status = str(payload.get("status") or "executed")
-            current["status"] = status
-            result_count = payload.get("result_count")
-            if result_count is None and isinstance(payload.get("results"), list):
-                result_count = len(payload.get("results"))
-            current["assistant_parts"].append(f"执行状态: {status}; 结果数: {result_count if result_count is not None else 0}")
-        elif stage == "edit_applied":
-            status = str(payload.get("status") or ("edited" if payload.get("ok") else "failed"))
-            current["status"] = status
-            current["assistant_parts"].append(f"编辑状态: {status}")
-        elif stage == "finished":
-            current["status"] = str(payload.get("status") or current.get("status") or "finished")
-            finish_turn(event_time)
-
-    finish_turn()
     return history
 
 
@@ -1315,15 +1304,70 @@ def audit_payload(event):
     return event if isinstance(event, dict) else {}
 
 
+def audit_plan_steps(payload):
+    if isinstance(payload.get("steps"), list):
+        return payload.get("steps") or []
+    plan = payload.get("plan") if isinstance(payload.get("plan"), dict) else {}
+    if isinstance(plan.get("steps"), list):
+        return plan.get("steps") or []
+    return []
+
+
+def audit_plan_summary(payload):
+    plan = payload.get("plan") if isinstance(payload.get("plan"), dict) else {}
+    return str(payload.get("summary_preview") or payload.get("summary") or plan.get("summary") or "")
+
+
+def audit_normalized_step(step, index, iteration=None):
+    step_id = str(step.get("id") or f"step-{index + 1}")
+    normalized = {
+        "id": step_id,
+        "title": step.get("title") or step_id,
+        "executor_type": step.get("executor_type"),
+        "skill_script": step.get("skill_script"),
+        "risk_level": step.get("risk_level") or "low",
+        "expected_effect": step.get("expected_effect") or "",
+        "reason": step.get("reason") or "",
+    }
+    normalized.update(step)
+    if iteration is not None:
+        normalized["iteration"] = iteration
+    return normalized
+
+
+def audit_step_status_rank(status):
+    status = str(status or "")
+    if status in {"succeeded", "executed", "failed", "rejected", "blocked", "skipped_user", "skipped_unexecuted", "terminated"}:
+        return 100
+    if status == "approval_required":
+        return 80
+    if status == "running":
+        return 70
+    if status in {"approved", "auto_approved"}:
+        return 50
+    if status == "policy_checked":
+        return 40
+    if status == "pending":
+        return 10
+    return 0
+
+
 def build_web_timeline_from_audit(session_id, events, include_turns=True):
-    steps_by_id = {}
+    steps_by_scope = {}
+    planned_keys = set()
     planned_steps = []
-    timeline = []
+    timeline_order = []
+    step_records = {}
     summary = ""
     final_answer_summary = ""
     input_preview = ""
     final_status = "restored"
+    current_request = 0
+    current_iteration = 0
     step_statuses = {
+        "step_pending",
+        "step_policy_checked",
+        "step_approved",
         "step_auto_approved",
         "step_approval_required",
         "step_blocked",
@@ -1336,95 +1380,193 @@ def build_web_timeline_from_audit(session_id, events, include_turns=True):
         "step_terminated",
     }
 
+    def store_plan_steps(payload, iteration):
+        nonlocal summary
+        plan_summary = audit_plan_summary(payload)
+        if plan_summary:
+            summary = plan_summary
+        normalized_steps = []
+        for index, step in enumerate(audit_plan_steps(payload)):
+            if not isinstance(step, dict):
+                continue
+            normalized = audit_normalized_step(step, index, iteration)
+            step_id = str(normalized.get("id") or f"step-{index + 1}")
+            key = (current_request, iteration, step_id)
+            steps_by_scope[key] = normalized
+            normalized_steps.append(normalized)
+            if key not in planned_keys:
+                planned_keys.add(key)
+                planned_steps.append(normalized)
+        return normalized_steps
+
+    def lifecycle_status(stage, payload):
+        status = str(payload.get("status") or stage.replace("step_", ""))
+        if stage == "step_policy_checked":
+            status = "policy_checked"
+        return status
+
+    def upsert_step_record(stage, payload):
+        step = payload.get("step") if isinstance(payload.get("step"), dict) else {}
+        iteration = safe_int(payload.get("iteration"), current_iteration or 1)
+        step_id = str(step.get("id") or f"{stage}-{len(timeline_order) + 1}")
+        key = (current_request, iteration, step_id)
+        merged_step = {**steps_by_scope.get(key, {}), **step}
+        if "id" not in merged_step:
+            merged_step["id"] = step_id
+        if "title" not in merged_step:
+            merged_step["title"] = step_id
+        status = lifecycle_status(stage, payload)
+        detail = payload.get("detail") if isinstance(payload.get("detail"), dict) else {}
+        findings = payload.get("findings") if isinstance(payload.get("findings"), list) else []
+        record = step_records.get(key)
+        if not record:
+            record = {
+                "request_index": current_request,
+                "iteration": iteration,
+                "step_id": step_id,
+                "step": merged_step,
+                "status": status,
+                "status_rank": -1,
+                "latest_stage": stage,
+                "detail": {},
+                "output_detail": {},
+                "findings": [],
+                "stages": [],
+            }
+            step_records[key] = record
+            timeline_order.append(("step", key))
+        else:
+            record["step"] = {**record.get("step", {}), **merged_step}
+        record["stages"].append({"stage": stage, "status": status})
+        rank = audit_step_status_rank(status)
+        if rank >= record.get("status_rank", -1):
+            record["status"] = status
+            record["status_rank"] = rank
+            record["latest_stage"] = stage
+            record["detail"] = detail
+        if detail.get("output_preview") or detail.get("stderr_preview"):
+            record["output_detail"] = detail
+        if findings:
+            record["findings"] = findings
+
+    def output_blocks_for_record(record):
+        detail = record.get("detail") if isinstance(record.get("detail"), dict) else {}
+        output_detail = record.get("output_detail") if isinstance(record.get("output_detail"), dict) else {}
+        preview = output_detail or detail
+        findings = record.get("findings") if isinstance(record.get("findings"), list) else []
+        blocks = []
+        if preview.get("output_preview"):
+            blocks.append({"kind": "stdout", "title": "审计输出预览", "text": str(preview.get("output_preview") or ""), "truncated_bytes": 0})
+        if preview.get("stderr_preview"):
+            blocks.append({"kind": "stderr", "title": "审计错误预览", "text": str(preview.get("stderr_preview") or ""), "truncated_bytes": 0})
+        blocks.append(
+            {
+                "kind": "meta",
+                "title": "审计恢复摘要",
+                "json": {
+                    "stage": record.get("latest_stage"),
+                    "status": record.get("status"),
+                    "iteration": record.get("iteration"),
+                    "request_index": record.get("request_index"),
+                    "detail": detail,
+                    "stages": record.get("stages") or [],
+                    "finding_count": len(findings),
+                },
+            }
+        )
+        if findings:
+            blocks.append({"kind": "review", "title": "策略审查 findings", "json": {"findings": findings}})
+        return blocks
+
+    def timeline_item_for_record(record):
+        detail = record.get("detail") if isinstance(record.get("detail"), dict) else {}
+        step = record.get("step") if isinstance(record.get("step"), dict) else {}
+        iteration = record.get("iteration")
+        request_index = record.get("request_index")
+        step_id = record.get("step_id")
+        return {
+            "id": f"execution-r{request_index}-i{iteration}-{step_id}",
+            "kind": "execution",
+            "status": record.get("status"),
+            "iteration": iteration,
+            "request_index": request_index,
+            "step_id": step_id,
+            "title": step.get("title") or step_id,
+            "summary": compact_summary(detail.get("status") or detail.get("action") or detail.get("tool") or record.get("status")),
+            "risk_level": step.get("risk_level"),
+            "step": step,
+            "output_blocks": output_blocks_for_record(record),
+        }
+
     for event in events if isinstance(events, list) else []:
         stage = audit_stage(event)
         payload = audit_payload(event)
         if stage == "received" and not input_preview:
             input_preview = str(payload.get("input_preview") or payload.get("command") or payload.get("ref") or "")
+        if stage == "received":
+            current_request += 1
+            current_iteration = 0
         elif stage == "planned":
-            summary = str(payload.get("summary_preview") or summary)
-            for index, step in enumerate(payload.get("steps") or []):
-                if not isinstance(step, dict):
-                    continue
-                step_id = str(step.get("id") or f"step-{index + 1}")
-                normalized = {
-                    "id": step_id,
-                    "title": step.get("title") or step_id,
-                    "executor_type": step.get("executor_type"),
-                    "skill_script": step.get("skill_script"),
-                    "risk_level": step.get("risk_level") or "low",
-                    "expected_effect": step.get("expected_effect") or "",
-                    "reason": step.get("reason") or "",
-                }
-                steps_by_id[step_id] = normalized
-                planned_steps.append(normalized)
-        elif stage == "agent_reflection_planned" and str(payload.get("response_type") or "") == "answer":
-            final_answer_summary = str(payload.get("summary_preview") or final_answer_summary)
-        elif stage in {"finished", "session_finished", "command_finished"}:
+            planned_iteration = safe_int(payload.get("iteration"), current_iteration or 1)
+            store_plan_steps(payload, planned_iteration)
+        elif stage == "agent_loop_iteration_started":
+            current_iteration = safe_int(payload.get("iteration"), current_iteration + 1 if current_iteration else 1)
+            if isinstance(payload.get("plan"), dict):
+                store_plan_steps(payload, current_iteration)
+        elif stage == "agent_reflection_planned":
+            response_type = str(payload.get("response_type") or "")
+            if response_type == "answer":
+                final_answer_summary = str(payload.get("summary_preview") or payload.get("summary") or final_answer_summary)
+            elif response_type == "work_plan":
+                store_plan_steps(payload, (current_iteration or 0) + 1)
+        elif stage in {"finished", "session_finished", "command_finished", "agent_loop_finished"}:
             final_status = str(payload.get("status") or final_status)
 
         if stage in {"terminal_executed", "script_executed"}:
             status = str(payload.get("status") or ("executed" if payload.get("ok") else "failed"))
+            iteration = current_iteration or None
             output_blocks = []
             if payload.get("output_preview"):
                 output_blocks.append({"kind": "stdout", "title": "审计输出预览", "text": str(payload.get("output_preview") or ""), "truncated_bytes": 0})
             if payload.get("stderr_preview"):
                 output_blocks.append({"kind": "stderr", "title": "审计错误预览", "text": str(payload.get("stderr_preview") or ""), "truncated_bytes": 0})
             output_blocks.append({"kind": "meta", "title": "审计恢复摘要", "json": {"stage": stage, "status": status, "payload": payload}})
-            timeline.append(
-                {
-                    "id": f"{stage}-{len(timeline) + 1}",
-                    "kind": "execution",
-                    "status": status,
-                    "step_id": stage,
-                    "title": "终端执行" if stage == "terminal_executed" else "Skill 执行",
-                    "summary": compact_summary(payload.get("action") or status),
-                    "risk_level": None,
-                    "step": {"id": stage, "title": "终端执行" if stage == "terminal_executed" else "Skill 执行", "executor_type": "terminal" if stage == "terminal_executed" else "skill_script"},
-                    "output_blocks": output_blocks,
-                }
+            timeline_order.append(
+                (
+                    "item",
+                    {
+                        "id": f"{stage}-r{current_request}-i{iteration or 0}-{len(timeline_order) + 1}",
+                        "kind": "execution",
+                        "status": status,
+                        "iteration": iteration,
+                        "request_index": current_request,
+                        "step_id": stage,
+                        "title": "终端执行" if stage == "terminal_executed" else "Skill 执行",
+                        "summary": compact_summary(payload.get("action") or status),
+                        "risk_level": None,
+                        "step": {
+                            "id": stage,
+                            "title": "终端执行" if stage == "terminal_executed" else "Skill 执行",
+                            "executor_type": "terminal" if stage == "terminal_executed" else "skill_script",
+                        },
+                        "output_blocks": output_blocks,
+                    },
+                )
             )
             continue
 
         if stage not in step_statuses:
             continue
-        step = payload.get("step") if isinstance(payload.get("step"), dict) else {}
-        step_id = str(step.get("id") or f"{stage}-{len(timeline) + 1}")
-        merged_step = {**steps_by_id.get(step_id, {}), **step}
-        status = str(payload.get("status") or stage.replace("step_", ""))
-        detail = payload.get("detail") if isinstance(payload.get("detail"), dict) else {}
-        findings = payload.get("findings") if isinstance(payload.get("findings"), list) else []
-        blocks = [
-            {
-                "kind": "meta",
-                "title": "审计恢复摘要",
-                "json": {
-                    "stage": stage,
-                    "status": status,
-                    "detail": detail,
-                    "finding_count": len(findings),
-                },
-            }
-        ]
-        if detail.get("output_preview"):
-            blocks.insert(0, {"kind": "stdout", "title": "审计输出预览", "text": str(detail.get("output_preview") or ""), "truncated_bytes": 0})
-        if detail.get("stderr_preview"):
-            blocks.insert(1 if detail.get("output_preview") else 0, {"kind": "stderr", "title": "审计错误预览", "text": str(detail.get("stderr_preview") or ""), "truncated_bytes": 0})
-        if findings:
-            blocks.append({"kind": "review", "title": "策略审查 findings", "json": {"findings": findings}})
-        timeline.append(
-            {
-                "id": f"{stage}-{len(timeline) + 1}",
-                "kind": "execution",
-                "status": status,
-                "step_id": step_id,
-                "title": merged_step.get("title") or step_id,
-                "summary": compact_summary(detail.get("status") or detail.get("action") or status),
-                "risk_level": merged_step.get("risk_level"),
-                "step": merged_step,
-                "output_blocks": blocks,
-            }
-        )
+        upsert_step_record(stage, payload)
+
+    timeline = []
+    for item_type, value in timeline_order:
+        if item_type == "step":
+            record = step_records.get(value)
+            if record:
+                timeline.append(timeline_item_for_record(record))
+        else:
+            timeline.append(value)
 
     output_blocks = []
     if final_answer_summary:
@@ -1477,26 +1619,115 @@ def build_web_turns_from_audit(session_id, events):
     current_mode = ""
     current_started_at = ""
 
-    def finish_current():
-        nonlocal current_events, current_input, current_mode, current_started_at
-        if not current_events:
+    def cloned_event(event, stage=None, payload=None, timestamp=None):
+        cloned = dict(event) if isinstance(event, dict) else {}
+        if stage is not None:
+            cloned["stage"] = stage
+        if payload is not None:
+            cloned["payload"] = payload
+        if timestamp is not None:
+            cloned["timestamp"] = timestamp
+        return cloned
+
+    def planned_event_from_reflection(event, iteration):
+        payload = dict(audit_payload(event))
+        payload["iteration"] = iteration
+        if not payload.get("summary_preview") and payload.get("summary"):
+            payload["summary_preview"] = payload.get("summary")
+        return cloned_event(event, stage="planned", payload=payload)
+
+    def synthetic_finished_event(status, timestamp):
+        return {
+            "timestamp": timestamp or now_iso(),
+            "session_id": session_id,
+            "stage": "finished",
+            "payload": {"status": status},
+        }
+
+    def append_turn(turn_events, input_value, mode_value, started_at, iteration=None, status_override=""):
+        if not turn_events:
             return
         turn_number = len(turns) + 1
-        result = build_web_timeline_from_audit(session_id, current_events, include_turns=False)
+        result = build_web_timeline_from_audit(session_id, turn_events, include_turns=False)
+        if iteration is not None:
+            result["iteration"] = iteration
+            result["loop_iteration"] = iteration
+        if status_override and result.get("status") == "restored":
+            result["status"] = status_override
         status = result.get("status") or "restored"
         turns.append(
             {
                 "id": f"{session_id}-turn-{turn_number}",
                 "number": turn_number,
-                "mode": current_mode or "work",
-                "input": current_input,
+                "mode": mode_value or "work",
+                "input": input_value,
                 "status": status,
-                "created_at": current_started_at,
-                "updated_at": str(current_events[-1].get("timestamp") or current_started_at),
+                "created_at": started_at,
+                "updated_at": str(turn_events[-1].get("timestamp") or started_at),
                 "source": "audit",
                 "result": result,
             }
         )
+
+    def append_request_turns(request_events, input_value, mode_value, started_at):
+        if not request_events:
+            return
+        iteration_starts = []
+        for index, event in enumerate(request_events):
+            if audit_stage(event) != "agent_loop_iteration_started":
+                continue
+            iteration = safe_int(audit_payload(event).get("iteration"), len(iteration_starts) + 1)
+            iteration_starts.append((index, iteration))
+        if len(iteration_starts) <= 1:
+            iteration = iteration_starts[0][1] if iteration_starts else None
+            append_turn(request_events, input_value, mode_value, started_at, iteration=iteration)
+            return
+
+        received_event = next((event for event in request_events if audit_stage(event) == "received"), None)
+        first_iteration_index = iteration_starts[0][0]
+        initial_plan_event = next(
+            (
+                event
+                for event in request_events[:first_iteration_index]
+                if audit_stage(event) == "planned"
+            ),
+            None,
+        )
+        for position, (start_index, iteration) in enumerate(iteration_starts):
+            next_start_index = iteration_starts[position + 1][0] if position + 1 < len(iteration_starts) else len(request_events)
+            seed_events = []
+            if received_event:
+                seed_events.append(received_event)
+            if iteration == 1 and initial_plan_event:
+                seed_events.append(initial_plan_event)
+            elif iteration > 1:
+                reflected_plan = next(
+                    (
+                        event
+                        for event in reversed(request_events[:start_index])
+                        if audit_stage(event) == "agent_reflection_planned"
+                        and str(audit_payload(event).get("response_type") or "") == "work_plan"
+                    ),
+                    None,
+                )
+                if reflected_plan:
+                    seed_events.append(planned_event_from_reflection(reflected_plan, iteration))
+
+            loop_events = []
+            for event in request_events[start_index:next_start_index]:
+                if audit_stage(event) == "agent_reflection_planned" and str(audit_payload(event).get("response_type") or "") == "work_plan":
+                    continue
+                loop_events.append(event)
+            if position + 1 < len(iteration_starts) and not any(audit_stage(event) in {"finished", "agent_loop_finished"} for event in loop_events):
+                last_timestamp = str(loop_events[-1].get("timestamp") if loop_events else started_at)
+                loop_events.append(synthetic_finished_event("executed", last_timestamp))
+            append_turn(seed_events + loop_events, input_value, mode_value, started_at, iteration=iteration, status_override="executed")
+
+    def finish_current():
+        nonlocal current_events, current_input, current_mode, current_started_at
+        if not current_events:
+            return
+        append_request_turns(current_events, current_input, current_mode, current_started_at)
         current_events = []
         current_input = ""
         current_mode = ""

@@ -339,6 +339,50 @@ reflection_answer_audit="$(curl --noproxy '*' -sS \
 jq -e '.ok == true
     and ([.web_timeline.output_blocks[]? | select(.kind == "markdown" and .title == "最终回答") | .text | contains("最终回答摘要")] | any)' <<<"${reflection_answer_audit}" >/dev/null
 
+loop_coalesce_log="${project}/logs/session_web_loop_coalesce.jsonl"
+printf '%s\n' \
+    '{"timestamp":"2026-07-05T00:10:00Z","session_id":"session_web_loop_coalesce","stage":"session_started","payload":{"request":"agent-web","entrypoint":"web"}}' \
+    '{"timestamp":"2026-07-05T00:10:01Z","session_id":"session_web_loop_coalesce","stage":"received","payload":{"mode":"work","input_preview":"loop fixture"}}' \
+    '{"timestamp":"2026-07-05T00:10:02Z","session_id":"session_web_loop_coalesce","stage":"planned","payload":{"response_type":"work_plan","summary_preview":"first plan","step_count":1,"steps":[{"id":"step-1","title":"first step","executor_type":"skill_script","skill_script":"ops-basic/resource-inspect","risk_level":"low"}]}}' \
+    '{"timestamp":"2026-07-05T00:10:03Z","session_id":"session_web_loop_coalesce","stage":"agent_loop_iteration_started","payload":{"iteration":1,"plan":{"response_type":"work_plan","summary":"first plan","steps":[{"id":"step-1","title":"first step","executor_type":"skill_script","skill_script":"ops-basic/resource-inspect","risk_level":"low"}]}}}' \
+    '{"timestamp":"2026-07-05T00:10:04Z","session_id":"session_web_loop_coalesce","stage":"step_auto_approved","payload":{"status":"auto_approved","step":{"id":"step-1","title":"first step","executor_type":"skill_script","skill_script":"ops-basic/resource-inspect","risk_level":"low"},"detail":{"finding_count":0},"findings":[]}}' \
+    '{"timestamp":"2026-07-05T00:10:05Z","session_id":"session_web_loop_coalesce","stage":"step_running","payload":{"status":"running","step":{"id":"step-1","title":"first step","executor_type":"skill_script","skill_script":"ops-basic/resource-inspect","risk_level":"low"},"detail":{},"findings":[]}}' \
+    '{"timestamp":"2026-07-05T00:10:06Z","session_id":"session_web_loop_coalesce","stage":"step_succeeded","payload":{"status":"succeeded","step":{"id":"step-1","title":"first step","executor_type":"skill_script","skill_script":"ops-basic/resource-inspect","risk_level":"low"},"detail":{"ok":true,"exit_code":0,"output_preview":"first output"},"findings":[]}}' \
+    '{"timestamp":"2026-07-05T00:10:07Z","session_id":"session_web_loop_coalesce","stage":"agent_reflection_planned","payload":{"response_type":"work_plan","summary_preview":"second plan","continue_decision":{"should_continue":true,"reason":"continue"},"step_count":1,"steps":[{"id":"step-2","title":"second step","executor_type":"skill_script","skill_script":"ops-basic/process-inspect","risk_level":"low"}]}}' \
+    '{"timestamp":"2026-07-05T00:10:08Z","session_id":"session_web_loop_coalesce","stage":"agent_loop_iteration_started","payload":{"iteration":2,"plan":{"response_type":"work_plan","summary":"second plan","steps":[{"id":"step-2","title":"second step","executor_type":"skill_script","skill_script":"ops-basic/process-inspect","risk_level":"low"}]}}}' \
+    '{"timestamp":"2026-07-05T00:10:09Z","session_id":"session_web_loop_coalesce","stage":"step_running","payload":{"status":"running","step":{"id":"step-2","title":"second step","executor_type":"skill_script","skill_script":"ops-basic/process-inspect","risk_level":"low"},"detail":{},"findings":[]}}' \
+    '{"timestamp":"2026-07-05T00:10:10Z","session_id":"session_web_loop_coalesce","stage":"step_succeeded","payload":{"status":"succeeded","step":{"id":"step-2","title":"second step","executor_type":"skill_script","skill_script":"ops-basic/process-inspect","risk_level":"low"},"detail":{"ok":true,"exit_code":0,"output_preview":"second output"},"findings":[]}}' \
+    '{"timestamp":"2026-07-05T00:10:11Z","session_id":"session_web_loop_coalesce","stage":"agent_reflection_planned","payload":{"response_type":"answer","summary_preview":"final answer","continue_decision":{"should_continue":false,"reason":"done"},"step_count":0,"steps":[]}}' \
+    '{"timestamp":"2026-07-05T00:10:12Z","session_id":"session_web_loop_coalesce","stage":"agent_loop_finished","payload":{"status":"executed","stopped_reason":"done","iterations":2,"auto_executed_count":2}}' \
+    '{"timestamp":"2026-07-05T00:10:13Z","session_id":"session_web_loop_coalesce","stage":"finished","payload":{"status":"executed"}}' \
+    > "${loop_coalesce_log}"
+loop_coalesce_payload="$(jq -cn '{session_id:"session_web_loop_coalesce"}')"
+loop_coalesce_audit="$(curl --noproxy '*' -sS \
+    -H "Authorization: Bearer ${token}" \
+    -H "Content-Type: application/json" \
+    -d "${loop_coalesce_payload}" \
+    "${base_url}/api/audit/read")"
+jq -e '.ok == true
+    and ([.web_timeline.timeline[]? | select(.kind == "execution")] | length) == 2
+    and ([.web_timeline.timeline[]? | select(.kind == "execution" and .step_id == "step-1")] | length) == 1
+    and ([.web_timeline.timeline[]? | select(.kind == "execution" and .step_id == "step-1") | .status] | first) == "succeeded"
+    and ([.web_timeline.timeline[]? | select(.kind == "execution" and .status == "auto_approved")] | length) == 0
+    and (.web_timeline.turns | length) == 2
+    and ([.web_timeline.turns[0].result.timeline[]? | select(.kind == "execution")] | length) == 1
+    and ([.web_timeline.turns[1].result.timeline[]? | select(.kind == "execution")] | length) == 1
+    and .web_timeline.turns[0].result.iteration == 1
+    and .web_timeline.turns[1].result.iteration == 2' <<<"${loop_coalesce_audit}" >/dev/null
+
+loop_restore_result="$(curl --noproxy '*' -sS \
+    -H "Authorization: Bearer ${token}" \
+    -H "Content-Type: application/json" \
+    -d "${loop_coalesce_payload}" \
+    "${base_url}/api/session/restore")"
+jq -e '.ok == true
+    and .status == "restored"
+    and .history_count == 2
+    and .session.history_count == 2' <<<"${loop_restore_result}" >/dev/null
+
 restore_result="$(curl --noproxy '*' -sS \
     -H "Authorization: Bearer ${token}" \
     -H "Content-Type: application/json" \
