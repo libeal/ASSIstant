@@ -77,6 +77,9 @@ grep -q 'renderSharedExecutionOutput' "${project}/web/static/app.js"
 grep -q 'work-plan-preview' "${project}/web/static/app.js"
 grep -q 'prepareNewWorkRun' "${project}/web/static/app.js"
 grep -q 'execution_state' "${project}/web/static/app.js"
+grep -q 'data-config-model-fetch' "${project}/web/static/app.js"
+grep -q 'type: "provider"' "${project}/web/static/modules/policy-config.js"
+grep -q 'type: "model"' "${project}/web/static/modules/policy-config.js"
 
 unauth_body="${tmp_root}/unauth.json"
 unauth_code="$(curl --noproxy '*' -sS -o "${unauth_body}" -w '%{http_code}' "${base_url}/api/health" || true)"
@@ -113,6 +116,35 @@ jq -e '.ok == true and (.config.agent_loop.thinking_trace_enabled | type == "boo
     and .config.approvals.auto.skill_readonly == true
     and .config.approvals.auto.shell_readonly == false
     and .config.approvals.auto.file_patch == false' <<<"${config_state}" >/dev/null
+
+providers_state="$(curl --noproxy '*' -sS -H "Authorization: Bearer ${token}" "${base_url}/api/config/providers")"
+jq -e '.ok == true and .status == "listed"
+    and ([.providers[].id] | index("openai"))
+    and ([.providers[].id] | index("openai_compatible"))
+    and ([.providers[].id] | index("anthropic"))
+    and ([.providers[] | select(.id == "openai_compatible") | .custom_url] | first) == true
+    and ([.providers[] | select(.id == "openai") | .api_url] | first | endswith("/v1/chat/completions"))' <<<"${providers_state}" >/dev/null
+
+model_key_value="test-model-fetch-key-12345"
+models_payload="$(jq -cn \
+    --arg provider "openai_compatible" \
+    --arg api_url "${FAKE_AI_URL}" \
+    --arg api_key "${model_key_value}" \
+    '{provider:$provider, api_url:$api_url, api_key:$api_key}')"
+models_state="$(curl --noproxy '*' -sS \
+    -H "Authorization: Bearer ${token}" \
+    -H "Content-Type: application/json" \
+    -d "${models_payload}" \
+    "${base_url}/api/config/models")"
+jq -e '.ok == true and .status == "listed" and .provider == "openai_compatible"
+    and ([.models[].id] | index("fake-chat-completions"))
+    and ([.models[].id] | index("fake-chat-completions-2"))
+    and (.models | length) == 2
+    and (.api_key | not)' <<<"${models_state}" >/dev/null
+if grep -q "${model_key_value}" <<<"${models_state}"; then
+    printf 'model fetch response leaked the transient api_key\n' >&2
+    exit 1
+fi
 
 config_update_payload="$(jq -cn '{key:"agent_loop.thinking_trace_enabled", value:true}')"
 config_update="$(curl --noproxy '*' -sS \

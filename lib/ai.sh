@@ -205,6 +205,131 @@ linux_agent_normalize_model_response() {
     printf '%s\n' "${response_json}"
 }
 
+linux_agent_ai_provider_id() {
+    local provider
+    provider="$(linux_agent_config_get '.provider')"
+    provider="${provider,,}"
+    provider="${provider//-/_}"
+    provider="${provider// /_}"
+    provider="${provider//\//_}"
+    case "${provider}" in
+        ""|openai_compatible|openai_compatible___custom|openai_compatible_custom)
+            printf 'openai_compatible\n'
+            ;;
+        zhipu|zhipuai|zhipu_ai)
+            printf 'zhipu_ai\n'
+            ;;
+        sarvam|sarvam_ai)
+            printf 'sarvam_ai\n'
+            ;;
+        moonshot|moonshot_ai)
+            printf 'moonshot_ai\n'
+            ;;
+        xai|x_ai)
+            printf 'x_ai\n'
+            ;;
+        *)
+            printf '%s\n' "${provider}"
+            ;;
+    esac
+}
+
+linux_agent_ai_provider_json() {
+    local provider_id="$1"
+    local providers_file="${LINUX_AGENT_ROOT}/config/ai-providers.json"
+
+    if [[ -f "${providers_file}" ]]; then
+        jq -c --arg provider_id "${provider_id}" '
+            (.providers // [])
+            | map(select(.id == $provider_id))
+            | first
+            // ((.providers // []) | map(select(.id == "openai_compatible")) | first)
+            // {id:"openai_compatible", auth:"bearer", request_format:"openai_chat"}
+        ' "${providers_file}" 2>/dev/null && return 0
+    fi
+
+    jq -cn '{id:"openai_compatible", auth:"bearer", request_format:"openai_chat"}'
+}
+
+linux_agent_ai_build_payload() {
+    local request_format="$1"
+    local model="$2"
+    local system_prompt="$3"
+    local purpose="$4"
+    local payload_context="$5"
+
+    case "${request_format}" in
+        anthropic_messages)
+            jq -cn \
+                --arg model "${model}" \
+                --arg system_prompt "${system_prompt}" \
+                --arg purpose "${purpose}" \
+                --argjson request_context "${payload_context}" \
+                '{
+                    model:$model,
+                    max_tokens:4096,
+                    temperature:0.2,
+                    system:($system_prompt + "\n\npurpose=" + $purpose + "\nReturn exactly one valid JSON object."),
+                    messages:[
+                        {
+                            role:"user",
+                            content:("request_context=" + ($request_context | tostring) + "\n\ncurrent_request=" + $request_context.current_request)
+                        }
+                    ]
+                }'
+            ;;
+        openai_chat_no_json_mode)
+            jq -cn \
+                --arg model "${model}" \
+                --arg system_prompt "${system_prompt}" \
+                --arg purpose "${purpose}" \
+                --argjson request_context "${payload_context}" \
+                '{
+                    model:$model,
+                    temperature:0.2,
+                    messages:[
+                        {role:"system", content:($system_prompt + "\n\nReturn exactly one valid JSON object.")},
+                        {role:"system", content:("purpose=" + $purpose)},
+                        {role:"system", content:("request_context=" + ($request_context | tostring))},
+                        {role:"user", content:$request_context.current_request}
+                    ]
+                }'
+            ;;
+        *)
+            jq -cn \
+                --arg model "${model}" \
+                --arg system_prompt "${system_prompt}" \
+                --arg purpose "${purpose}" \
+                --argjson request_context "${payload_context}" \
+                '{
+                    model:$model,
+                    temperature:0.2,
+                    response_format:{type:"json_object"},
+                    messages:[
+                        {role:"system", content:$system_prompt},
+                        {role:"system", content:("purpose=" + $purpose)},
+                        {role:"system", content:("request_context=" + ($request_context | tostring))},
+                        {role:"user", content:$request_context.current_request}
+                    ]
+                }'
+            ;;
+    esac
+}
+
+linux_agent_ai_response_content() {
+    local request_format="$1"
+    local response="$2"
+
+    case "${request_format}" in
+        anthropic_messages)
+            jq -r '[.content[]? | select((.type // "text") == "text") | .text] | join("\n") // empty' <<<"${response}" 2>/dev/null
+            ;;
+        *)
+            jq -r '.choices[0].message.content // empty' <<<"${response}" 2>/dev/null
+            ;;
+    esac
+}
+
 linux_agent_call_ai_with_context() {
     local current_request="$1"
     local request_context="$2"
@@ -222,10 +347,22 @@ linux_agent_call_ai_with_context() {
     safe_request_context="$(linux_agent_sanitize_json "${request_context}")"
     payload_context="$(linux_agent_build_ai_payload_context "${safe_request_context}" "${runtime_context}")"
 
+    local provider_id provider_json request_format auth_type
+    provider_id="$(linux_agent_ai_provider_id)"
+    provider_json="$(linux_agent_ai_provider_json "${provider_id}")"
+    request_format="$(jq -r '.request_format // "openai_chat"' <<<"${provider_json}")"
+    auth_type="$(jq -r '.auth // "bearer"' <<<"${provider_json}")"
+
     local api_url api_key model timeout_sec system_prompt payload response content
     api_url="$(linux_agent_config_get '.api_url')"
+    if [[ -z "${api_url}" ]]; then
+        api_url="$(jq -r '.api_url // empty' <<<"${provider_json}")"
+    fi
     api_key="$(linux_agent_config_api_key)"
     model="$(linux_agent_config_get '.model')"
+    if [[ -z "${model}" ]]; then
+        model="$(jq -r '.default_model // empty' <<<"${provider_json}")"
+    fi
     timeout_sec="$(linux_agent_config_get_default '.request_timeout_sec' '90')"
     system_prompt="$(linux_agent_build_system_prompt | jq -r '.')"
 
@@ -234,34 +371,32 @@ linux_agent_call_ai_with_context() {
         return 0
     fi
 
-    payload="$(jq -cn \
-        --arg model "${model}" \
-        --arg system_prompt "${system_prompt}" \
-        --arg purpose "${purpose}" \
-        --argjson request_context "${payload_context}" \
-        '{
-            model:$model,
-            temperature:0.2,
-            response_format:{type:"json_object"},
-            messages:[
-                {role:"system", content:$system_prompt},
-                {role:"system", content:("purpose=" + $purpose)},
-                {role:"system", content:("request_context=" + ($request_context | tostring))},
-                {role:"user", content:$request_context.current_request}
-            ]
-        }')"
+    payload="$(linux_agent_ai_build_payload "${request_format}" "${model}" "${system_prompt}" "${purpose}" "${payload_context}")"
     LINUX_AGENT_LAST_AI_PAYLOAD="${payload}"
 
+    local -a curl_headers
+    curl_headers=(-H "Content-Type: application/json")
+    case "${auth_type}" in
+        anthropic)
+            curl_headers+=(-H "x-api-key: ${api_key}" -H "anthropic-version: 2023-06-01")
+            ;;
+        api_subscription_key)
+            curl_headers+=(-H "api-subscription-key: ${api_key}")
+            ;;
+        *)
+            curl_headers+=(-H "Authorization: Bearer ${api_key}")
+            ;;
+    esac
+
     if ! response="$(curl -sS --max-time "${timeout_sec:-90}" \
-        -H "Authorization: Bearer ${api_key}" \
-        -H "Content-Type: application/json" \
+        "${curl_headers[@]}" \
         -d "${payload}" \
         "${api_url}" 2>&1)"; then
         linux_agent_ai_error "ai_request_failed" "模型请求失败。" "${response}"
         return 0
     fi
 
-    if ! content="$(jq -r '.choices[0].message.content // empty' <<<"${response}" 2>/dev/null)"; then
+    if ! content="$(linux_agent_ai_response_content "${request_format}" "${response}")"; then
         linux_agent_ai_error "ai_invalid_response" "模型接口返回的响应不是合法 JSON。" "${response}"
         return 0
     fi

@@ -1,12 +1,12 @@
 export const CONFIG_GROUPS = [
   {
     title: "模型与 API",
-    note: "控制 LLM 供应商、接口、密钥来源、模型和请求超时。优先使用 LINUX_AGENT_API_KEY，其次 config.api_key。",
+    note: "控制 LLM 供应商、接口、密钥来源、模型和请求超时。选择内置厂商会自动填充接口地址。",
     fields: [
-      { key: "provider", label: "provider", type: "text", comment: "供应商名称，用于提示当前适配的 OpenAI-compatible 后端。" },
-      { key: "api_url", label: "api_url", type: "text", comment: "模型接口地址，通常是 chat/completions 兼容端点。" },
+      { key: "provider", label: "provider", type: "provider", comment: "选择官方厂商预设；其他服务商使用 OpenAI-compatible / Custom。" },
+      { key: "api_url", label: "api_url", type: "text", comment: "模型接口地址；厂商预设会自动填充，仍可手动修正。" },
       { key: "api_key", label: "api_key", type: "secret", writeOnly: true, placeholder: "留空保持当前密钥", comment: "写入 config.api_key；后端响应只回显配置状态，不返回明文。" },
-      { key: "model", label: "model", type: "text", comment: "work/edit 等请求调用的模型名。" },
+      { key: "model", label: "model", type: "model", comment: "work/edit 等请求调用的模型名；可用 API key 自动获取可选模型。" },
       { key: "request_timeout_sec", label: "request_timeout_sec", type: "number", min: 1, comment: "单次模型请求最长等待秒数。" },
       { key: "context_turns", label: "context_turns", type: "number", min: 1, comment: "保留的上下文轮数，过大可能增加 token 消耗。" },
     ],

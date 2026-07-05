@@ -290,9 +290,24 @@ class Handler(BaseHTTPRequestHandler):
         if self.path == "/health":
             self.send_json({"ok": True})
             return
+        if self.path in ("/v1/models", "/models"):
+            self.send_json(
+                {
+                    "object": "list",
+                    "data": [
+                        {"id": "fake-chat-completions", "object": "model"},
+                        {"id": "fake-chat-completions-2", "object": "model"},
+                    ],
+                }
+            )
+            return
         self.send_error(HTTPStatus.NOT_FOUND)
 
     def do_POST(self):
+        if self.path.startswith("/require-api-subscription-key/"):
+            if self.headers.get("api-subscription-key") != "TEST_CONFIG_API_KEY_123456":
+                self.send_json({"error": {"message": "api-subscription-key header is required"}}, status=HTTPStatus.UNAUTHORIZED)
+                return
         length = int(self.headers.get("Content-Length", "0") or "0")
         raw = self.rfile.read(length)
         try:
@@ -306,9 +321,9 @@ class Handler(BaseHTTPRequestHandler):
             content = json.dumps(content, ensure_ascii=False, separators=(",", ":"))
         self.send_json({"choices": [{"message": {"content": content}}]})
 
-    def send_json(self, payload):
+    def send_json(self, payload, status=HTTPStatus.OK):
         body = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
-        self.send_response(HTTPStatus.OK)
+        self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()

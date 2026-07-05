@@ -167,6 +167,33 @@ function configInputId(key) {
   return `config-${String(key).replace(/[^A-Za-z0-9_-]/g, "-")}`;
 }
 
+function normalizeProviderId(value) {
+  const normalized = String(value || "")
+    .trim()
+    .toLowerCase()
+    .replace(/[-\s/]+/g, "_");
+  if (!normalized || normalized.startsWith("openai_compatible")) return "openai_compatible";
+  if (["zhipu", "zhipuai"].includes(normalized)) return "zhipu_ai";
+  if (normalized === "sarvam") return "sarvam_ai";
+  if (normalized === "moonshot") return "moonshot_ai";
+  if (normalized === "xai") return "x_ai";
+  return normalized;
+}
+
+function findConfigProvider(providerId) {
+  const normalized = normalizeProviderId(providerId);
+  return state.configProviders.find((provider) => normalizeProviderId(provider.id) === normalized) || null;
+}
+
+function currentProviderId(config = state.configSnapshot || {}) {
+  return normalizeProviderId(state.configDraft?.provider || config.provider_id || config.provider);
+}
+
+function providerLabel(providerId) {
+  const provider = findConfigProvider(providerId);
+  return provider?.label || providerId || "provider";
+}
+
 function statusKind(value) {
   const text = String(value || "").toLowerCase();
   if (["ok", "executed", "succeeded", "success", "approved", "auto_approved"].includes(text)) return "low";
@@ -1606,6 +1633,9 @@ async function connect() {
 }
 
 async function loadConfig() {
+  if (!state.configProviders.length) {
+    await loadConfigProviders();
+  }
   const data = await api("/api/config");
   state.configSnapshot = data.config || {};
   state.configOriginal = collectEditableConfigValues(state.configSnapshot);
@@ -1615,6 +1645,16 @@ async function loadConfig() {
   renderThinkingSummary();
   renderSessionTimeline();
   setConfigDirtyState(false);
+}
+
+async function loadConfigProviders() {
+  const data = await api("/api/config/providers");
+  if (!data.ok) {
+    showToast(data.error || data.status || "provider 加载失败");
+    state.configProviders = [];
+    return;
+  }
+  state.configProviders = Array.isArray(data.providers) ? data.providers : [];
 }
 
 async function loadSessionState() {
@@ -1707,13 +1747,15 @@ function collectEditableConfigValues(config) {
         values[field.key] = "";
         continue;
       }
-      values[field.key] = normalizeConfigFieldValue(field, getNestedValue(config, field.key));
+      const rawValue = field.key === "provider" ? (config.provider_id || config.provider) : getNestedValue(config, field.key);
+      values[field.key] = normalizeConfigFieldValue(field, rawValue);
     }
   }
   return values;
 }
 
 function normalizeConfigFieldValue(field, value) {
+  if (field.type === "provider") return normalizeProviderId(value);
   if (field.type === "boolean") return Boolean(value);
   if (field.type === "number") {
     const next = Number(value);
@@ -1738,7 +1780,7 @@ function renderConfigRuntimeSummary(config) {
     config.api_key_configured_in_config ? "config set" : "",
   ].filter(Boolean).join(" · ");
   const rows = [
-    ["model", config.model || "--", config.provider || "provider"],
+    ["model", config.model || "--", providerLabel(config.provider_id || config.provider || "provider")],
     ["api_key", config.api_key_configured ? "configured" : "missing", apiKeyHint],
     ["audit", config.audit_mode || "--", `limit ${config.audit_text_limit ?? "--"}`],
     ["observer", config.observer?.enabled || "--", config.observer?.privilege || "privilege"],
@@ -1761,7 +1803,7 @@ function renderConfigEditor(config) {
     <div class="config-section">
       <div><h4>${escapeHtml(group.title)}</h4><p class="small">${escapeHtml(group.note)}</p></div>
       <div class="config-field-list">
-        ${group.fields.map((field) => renderConfigField(field, getNestedValue(config, field.key))).join("")}
+        ${group.fields.map((field) => renderConfigField(field, configFieldValue(config, field))).join("")}
       </div>
     </div>
   `);
@@ -1774,6 +1816,14 @@ function renderConfigEditor(config) {
     </div>
   `);
   root.innerHTML = sections.join("");
+}
+
+function configFieldValue(config, field) {
+  if (state.configDraft && Object.prototype.hasOwnProperty.call(state.configDraft, field.key)) {
+    return state.configDraft[field.key];
+  }
+  if (field.key === "provider") return config.provider_id || config.provider;
+  return getNestedValue(config, field.key);
 }
 
 function renderConfigField(field, rawValue) {
@@ -1797,6 +1847,41 @@ function renderConfigField(field, rawValue) {
           ${field.options.map((option) => `<option value="${escapeHtml(option)}"${option === value ? " selected" : ""}>${escapeHtml(option)}</option>`).join("")}
         </select>
         <span class="config-comment">${escapeHtml(field.comment)}</span>
+      </label>
+    `;
+  }
+  if (field.type === "provider") {
+    const providers = state.configProviders.length ? state.configProviders : [{ id: value || "openai_compatible", label: value || "openai_compatible" }];
+    return `
+      <label class="small config-field-label" for="${escapeHtml(configInputId(field.key))}">
+        <span>${escapeHtml(field.label)}</span>
+        <select class="select" id="${escapeHtml(configInputId(field.key))}" data-config-key="${escapeHtml(field.key)}">
+          ${providers.map((provider) => {
+            const providerId = normalizeProviderId(provider.id);
+            return `<option value="${escapeHtml(providerId)}"${providerId === value ? " selected" : ""}>${escapeHtml(provider.label || providerId)}</option>`;
+          }).join("")}
+        </select>
+        <span class="config-comment">${escapeHtml(field.comment)}</span>
+      </label>
+    `;
+  }
+  if (field.type === "model") {
+    const models = state.configModelsProvider === currentProviderId() ? state.configModels : [];
+    const hasCurrent = models.some((model) => model.id === value);
+    const modelOptions = (value && !hasCurrent ? [{ id: value }] : []).concat(models);
+    const control = modelOptions.length
+      ? `<select class="select" id="${escapeHtml(configInputId(field.key))}" data-config-key="${escapeHtml(field.key)}">
+          ${modelOptions.map((model) => `<option value="${escapeHtml(model.id)}"${model.id === value ? " selected" : ""}>${escapeHtml(model.id)}</option>`).join("")}
+        </select>`
+      : `<input class="field" id="${escapeHtml(configInputId(field.key))}" data-config-key="${escapeHtml(field.key)}" type="text" value="${escapeHtml(value)}">`;
+    return `
+      <label class="small config-field-label" for="${escapeHtml(configInputId(field.key))}">
+        <span>${escapeHtml(field.label)}</span>
+        <div class="config-control-row">
+          ${control}
+          <button class="btn secondary compact-btn" type="button" data-config-model-fetch>获取模型</button>
+        </div>
+        <span class="config-comment">${escapeHtml(state.configModelStatus || field.comment)}</span>
       </label>
     `;
   }
@@ -1834,10 +1919,68 @@ function updateConfigDraftFromControl(control) {
     state.configDraft[key] = next;
   } else if (field.type === "number") {
     state.configDraft[key] = Number(control.value);
+  } else if (field.type === "provider") {
+    applyProviderPreset(control.value);
+    return;
   } else {
     state.configDraft[key] = control.value;
   }
   setConfigDirtyState(hasConfigChanges());
+}
+
+function applyProviderPreset(providerId) {
+  const normalized = normalizeProviderId(providerId);
+  const provider = findConfigProvider(normalized);
+  state.configDraft.provider = normalized;
+  if (provider) {
+    state.configDraft.api_url = provider.api_url || "";
+    if (provider.default_model) {
+      state.configDraft.model = provider.default_model;
+    } else if (!provider.api_url) {
+      state.configDraft.model = "";
+    }
+  }
+  state.configModels = [];
+  state.configModelsProvider = "";
+  state.configModelStatus = provider?.model_fetch_reason || "";
+  renderConfigEditor(state.configSnapshot || {});
+  setConfigDirtyState(hasConfigChanges());
+  if (provider?.model_fetch_supported && state.configSnapshot?.api_key_configured) {
+    window.setTimeout(() => safeAction(fetchConfigModels), 0);
+  }
+}
+
+async function fetchConfigModels() {
+  const provider = currentProviderId();
+  const apiKeyControl = $(configInputId("api_key"));
+  const body = {
+    provider,
+    api_url: state.configDraft.api_url || "",
+  };
+  if (apiKeyControl?.value) {
+    body.api_key = apiKeyControl.value;
+  }
+  state.configModelStatus = "正在获取模型...";
+  renderConfigEditor(state.configSnapshot || {});
+  const data = await api("/api/config/models", { method: "POST", body });
+  if (!data.ok) {
+    state.configModels = [];
+    state.configModelsProvider = "";
+    state.configModelStatus = data.error || data.status || "模型获取失败";
+    renderConfigEditor(state.configSnapshot || {});
+    setConfigDirtyState(hasConfigChanges());
+    showToast(state.configModelStatus);
+    return;
+  }
+  state.configModels = Array.isArray(data.models) ? data.models.filter((model) => model?.id) : [];
+  state.configModelsProvider = provider;
+  state.configModelStatus = state.configModels.length ? `已获取 ${state.configModels.length} 个模型` : "该 key 未返回可选模型";
+  if (!state.configDraft.model && state.configModels[0]?.id) {
+    state.configDraft.model = state.configModels[0].id;
+  }
+  renderConfigEditor(state.configSnapshot || {});
+  setConfigDirtyState(hasConfigChanges());
+  showToast(state.configModelStatus);
 }
 
 function findConfigField(key) {
@@ -3006,6 +3149,11 @@ function bindActions() {
   on("configEditorRoot", "input", (event) => updateConfigDraftFromControl(event.target));
   on("configEditorRoot", "change", (event) => updateConfigDraftFromControl(event.target));
   on("configEditorRoot", "click", (event) => {
+    const modelFetchButton = event.target.closest("[data-config-model-fetch]");
+    if (modelFetchButton) {
+      safeAction(fetchConfigModels);
+      return;
+    }
     const button = event.target.closest(".config-switch");
     if (!button) return;
     if (button.dataset.configKey === THINKING_TRACE_KEY) {

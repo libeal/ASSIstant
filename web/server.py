@@ -10,10 +10,12 @@ import sys
 import threading
 import time
 import uuid
+import urllib.error
+import urllib.request
 from http import HTTPStatus
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import unquote, urlparse
+from urllib.parse import urlencode, unquote, urlparse, urlunparse
 
 
 ROOT = Path(os.environ.get("LINUX_AGENT_ROOT", Path(__file__).resolve().parents[1])).resolve()
@@ -22,6 +24,7 @@ JOBS_ROOT = ROOT / "tmp" / "web" / "jobs"
 POLICIES_ROOT = ROOT / "policies"
 SKILLS_ROOT = ROOT / "skills"
 CONFIG_PATH = ROOT / "config" / "config.json"
+PROVIDERS_PATH = ROOT / "config" / "ai-providers.json"
 AGENT = ROOT / "bin" / "agent"
 HOST = os.environ.get("LINUX_AGENT_WEB_HOST", "127.0.0.1")
 PORT = int(os.environ.get("LINUX_AGENT_WEB_PORT", "8765"))
@@ -32,6 +35,7 @@ JOB_PROCESSES_LOCK = threading.Lock()
 WEB_AGENT_LOCK = threading.RLock()
 DEFAULT_STDERR_TEXT_LIMIT = 4000
 WORK_EXECUTION_FLOW_TEXT_LIMIT = 200000
+MODEL_LIST_RESPONSE_LIMIT = 1024 * 1024
 SERVER_RUN_ID = uuid.uuid4().hex
 SERVER_STARTED_AT = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 WEB_AGENT_SESSION_ID = f"session_web_{SERVER_RUN_ID[:16]}"
@@ -57,6 +61,85 @@ def read_config():
             return json.load(handle)
     except FileNotFoundError:
         return {}
+
+
+def read_provider_registry():
+    try:
+        with PROVIDERS_PATH.open("r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+    except (FileNotFoundError, json.JSONDecodeError):
+        payload = {"providers": []}
+    providers = payload.get("providers")
+    return providers if isinstance(providers, list) else []
+
+
+def normalize_provider_id(value):
+    normalized = str(value or "").strip().lower()
+    normalized = normalized.replace("-", "_").replace(" ", "_")
+    normalized = normalized.replace("/", "_")
+    aliases = {
+        "": "openai_compatible",
+        "openai_compatible": "openai_compatible",
+        "openai_compatible_custom": "openai_compatible",
+        "openai-compatible": "openai_compatible",
+        "openai-compatible_custom": "openai_compatible",
+        "openai_compatible___custom": "openai_compatible",
+        "openai_compatible_/_custom": "openai_compatible",
+        "zhipu": "zhipu_ai",
+        "zhipuai": "zhipu_ai",
+        "zhipu_ai": "zhipu_ai",
+        "sarvam": "sarvam_ai",
+        "sarvam_ai": "sarvam_ai",
+        "moonshot": "moonshot_ai",
+        "moonshot_ai": "moonshot_ai",
+        "xai": "x_ai",
+        "x_ai": "x_ai",
+        "nvidia": "nvidia",
+        "mistral": "mistral",
+        "openai": "openai",
+    }
+    return aliases.get(normalized, normalized)
+
+
+def provider_by_id(provider_id):
+    normalized = normalize_provider_id(provider_id)
+    for provider in read_provider_registry():
+        if normalize_provider_id(provider.get("id")) == normalized:
+            return provider
+    if normalized != "openai_compatible":
+        return provider_by_id("openai_compatible")
+    return {}
+
+
+def config_provider_id(config):
+    configured = normalize_provider_id(config.get("provider", ""))
+    known_ids = {normalize_provider_id(provider.get("id")) for provider in read_provider_registry()}
+    if configured in known_ids:
+        return configured
+    return "openai_compatible"
+
+
+def public_provider(provider):
+    models = provider.get("models") if isinstance(provider.get("models"), dict) else {}
+    return {
+        "id": str(provider.get("id") or ""),
+        "label": str(provider.get("label") or provider.get("id") or ""),
+        "api_url": str(provider.get("api_url") or ""),
+        "default_model": str(provider.get("default_model") or ""),
+        "custom_url": bool(provider.get("custom_url", False)),
+        "model_fetch_supported": bool(models.get("supported", False)),
+        "model_fetch_reason": str(models.get("reason") or ""),
+        "request_format": str(provider.get("request_format") or "openai_chat"),
+    }
+
+
+def providers_public_state():
+    providers = [
+        public_provider(provider)
+        for provider in read_provider_registry()
+        if isinstance(provider, dict) and provider.get("id")
+    ]
+    return {"ok": True, "status": "listed", "providers": providers}
 
 
 def write_config(config):
@@ -101,6 +184,220 @@ def api_key_state(config):
     }
 
 
+def configured_api_key(config, override=None):
+    override_value = str(override or "")
+    if secret_value_configured(override_value):
+        return override_value, "request"
+    env_value = os.environ.get("LINUX_AGENT_API_KEY", "")
+    if secret_value_configured(env_value):
+        return env_value, "env"
+    config_value = str(config.get("api_key", ""))
+    if secret_value_configured(config_value):
+        return config_value, "config"
+    return "", "missing"
+
+
+def redacted_text(value, secret=""):
+    text = str(value or "")
+    if secret:
+        text = text.replace(secret, "[REDACTED]")
+    return text[:600]
+
+
+def validate_http_url(raw_url):
+    value = str(raw_url or "").strip()
+    if len(value) > 2048:
+        return "", "url_too_long"
+    parsed = urlparse(value)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        return "", "invalid_url"
+    return value, ""
+
+
+def derive_models_url(api_url):
+    parsed = urlparse(str(api_url or ""))
+    path = parsed.path.rstrip("/")
+    if path.endswith("/chat/completions"):
+        path = path[: -len("/chat/completions")] + "/models"
+    elif path.endswith("/messages"):
+        path = path[: -len("/messages")] + "/models"
+    else:
+        path = path + "/models"
+    return urlunparse((parsed.scheme, parsed.netloc, path, "", "", ""))
+
+
+class NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+def provider_auth_headers(auth, api_key):
+    if auth == "anthropic":
+        return {
+            "x-api-key": api_key,
+            "anthropic-version": "2023-06-01",
+        }
+    if auth == "api_subscription_key":
+        return {"api-subscription-key": api_key}
+    if auth == "google_key_query":
+        return {}
+    return {"Authorization": f"Bearer {api_key}"}
+
+
+def model_list_request_url(provider, api_url, api_key):
+    models = provider.get("models") if isinstance(provider.get("models"), dict) else {}
+    if models.get("derive_from_api_url"):
+        url = derive_models_url(api_url)
+    else:
+        url = str(models.get("url") or "")
+    auth = str(models.get("auth") or provider.get("auth") or "bearer")
+    if auth == "google_key_query":
+        separator = "&" if urlparse(url).query else "?"
+        url = f"{url}{separator}{urlencode({'key': api_key})}"
+    return url, auth
+
+
+def fetch_json_url(url, headers, timeout, secret):
+    request = urllib.request.Request(url, headers=headers, method="GET")
+    opener = urllib.request.build_opener(NoRedirectHandler)
+    try:
+        with opener.open(request, timeout=timeout) as response:
+            body = response.read(MODEL_LIST_RESPONSE_LIMIT + 1)
+            if len(body) > MODEL_LIST_RESPONSE_LIMIT:
+                return None, {
+                    "ok": False,
+                    "status": "provider_response_too_large",
+                    "error": "Model list response is too large.",
+                }
+    except urllib.error.HTTPError as exc:
+        detail = ""
+        try:
+            detail = exc.read(400).decode("utf-8", errors="replace")
+        except OSError:
+            detail = str(exc)
+        return None, {
+            "ok": False,
+            "status": "provider_request_failed",
+            "error": f"Provider returned HTTP {exc.code}.",
+            "detail": redacted_text(detail, secret),
+        }
+    except urllib.error.URLError as exc:
+        return None, {
+            "ok": False,
+            "status": "provider_request_failed",
+            "error": "Provider model list request failed.",
+            "detail": redacted_text(exc.reason, secret),
+        }
+    except TimeoutError:
+        return None, {
+            "ok": False,
+            "status": "provider_request_timeout",
+            "error": "Provider model list request timed out.",
+        }
+    try:
+        return json.loads(body.decode("utf-8")), None
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return None, {
+            "ok": False,
+            "status": "provider_invalid_response",
+            "error": "Provider model list response is not valid JSON.",
+        }
+
+
+def extract_model_ids(payload, parser):
+    ids = []
+    if parser == "google_models":
+        items = payload.get("models") if isinstance(payload, dict) else []
+        if not isinstance(items, list):
+            return []
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            methods = item.get("supportedGenerationMethods")
+            if isinstance(methods, list) and "generateContent" not in methods:
+                continue
+            name = str(item.get("name") or item.get("id") or "")
+            if name.startswith("models/"):
+                name = name[len("models/") :]
+            ids.append(name)
+    elif parser == "models_name_or_id":
+        items = payload.get("models") if isinstance(payload, dict) else []
+        if not isinstance(items, list):
+            return []
+        for item in items:
+            if isinstance(item, dict):
+                ids.append(str(item.get("name") or item.get("id") or ""))
+            else:
+                ids.append(str(item or ""))
+    else:
+        items = payload.get("data") if isinstance(payload, dict) else []
+        if not isinstance(items, list):
+            return []
+        for item in items:
+            if isinstance(item, dict):
+                ids.append(str(item.get("id") or ""))
+            else:
+                ids.append(str(item or ""))
+    clean = []
+    seen = set()
+    for model_id in ids:
+        model_id = " ".join(str(model_id or "").split())
+        if not model_id or len(model_id) > 200 or model_id in seen:
+            continue
+        seen.add(model_id)
+        clean.append(model_id)
+    return sorted(clean)
+
+
+def list_provider_models(body):
+    config = read_config()
+    provider_id = normalize_provider_id(body.get("provider") or config.get("provider") or config_provider_id(config))
+    provider = provider_by_id(provider_id)
+    provider_id = normalize_provider_id(provider.get("id") or provider_id)
+    models = provider.get("models") if isinstance(provider.get("models"), dict) else {}
+    if not models.get("supported", False):
+        return {
+            "ok": False,
+            "status": "model_list_unavailable",
+            "provider": provider_id,
+            "models": [],
+            "error": models.get("reason") or "This provider does not expose a configured model list endpoint.",
+        }
+
+    api_url = str(body.get("api_url") or config.get("api_url") or provider.get("api_url") or "")
+    if models.get("derive_from_api_url") or not models.get("url"):
+        api_url, url_error = validate_http_url(api_url)
+        if url_error:
+            return {"ok": False, "status": url_error, "provider": provider_id, "models": [], "error": "api_url must be a valid http(s) URL."}
+
+    api_key, key_source = configured_api_key(config, body.get("api_key"))
+    url, auth = model_list_request_url(provider, api_url, api_key)
+    url, url_error = validate_http_url(url)
+    if url_error:
+        return {"ok": False, "status": url_error, "provider": provider_id, "models": [], "error": "model list URL must be a valid http(s) URL."}
+    if auth != "none" and not api_key:
+        return {"ok": False, "status": "api_key_missing", "provider": provider_id, "models": [], "error": "API key is required to list models."}
+
+    timeout = min(max(safe_int(config.get("request_timeout_sec", 30) or 30, 30), 1), 60)
+    headers = {"Accept": "application/json"}
+    headers.update(provider_auth_headers(auth, api_key))
+    payload, error = fetch_json_url(url, headers, timeout, api_key)
+    if error:
+        error["provider"] = provider_id
+        error["models"] = []
+        return error
+    parser = str(models.get("parser") or "openai_data_id")
+    model_ids = extract_model_ids(payload, parser)
+    return {
+        "ok": True,
+        "status": "listed",
+        "provider": provider_id,
+        "key_source": key_source,
+        "models": [{"id": model_id} for model_id in model_ids],
+        "model_count": len(model_ids),
+    }
+
+
 def config_public_state():
     config = read_config()
     agent_loop = config.get("agent_loop") if isinstance(config.get("agent_loop"), dict) else {}
@@ -110,11 +407,13 @@ def config_public_state():
     execution = config.get("execution") if isinstance(config.get("execution"), dict) else {}
     web = config.get("web") if isinstance(config.get("web"), dict) else {}
     key_state = api_key_state(config)
+    provider_id = config_provider_id(config)
     return {
         "ok": True,
         "status": "read",
         "config": {
             "provider": config.get("provider", ""),
+            "provider_id": provider_id,
             "api_url": config.get("api_url", ""),
             "api_key_configured": key_state["configured"],
             "api_key_source": key_state["source"],
@@ -1864,6 +2163,9 @@ class Handler(SimpleHTTPRequestHandler):
         if path == "/api/config":
             json_response(self, HTTPStatus.OK, config_public_state())
             return
+        if path == "/api/config/providers":
+            json_response(self, HTTPStatus.OK, providers_public_state())
+            return
         if path == "/api/observer/bootstrap":
             json_response(self, HTTPStatus.OK, observer_bootstrap_public_state(force_ok=True))
             return
@@ -1950,6 +2252,10 @@ class Handler(SimpleHTTPRequestHandler):
             return
         if path == "/api/config/update":
             result = update_config_value(str(body.get("key") or ""), body.get("value"))
+            json_response(self, HTTPStatus.OK, result)
+            return
+        if path == "/api/config/models":
+            result = list_provider_models(body)
             json_response(self, HTTPStatus.OK, result)
             return
         if path == "/api/observer/bootstrap":

@@ -704,6 +704,10 @@ button.event { cursor: pointer; }
 }
 .config-field-label { display: flex; flex-direction: column; gap: 7px; }
 .config-field-label > span:first-child { color: var(--text); font-weight: 600; }
+.config-control-row { display: flex; gap: 8px; align-items: center; }
+.config-control-row .field,
+.config-control-row .select { min-width: 0; flex: 1 1 auto; }
+.compact-btn { flex: 0 0 auto; padding-inline: 10px; white-space: nowrap; }
 .config-comment { color: var(--text-4); line-height: 1.45; }
 .readonly-config-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
 .form-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
@@ -826,6 +830,8 @@ button.event { cursor: pointer; }
   .titlebar { padding: 10px 14px; align-items: flex-start; }
   .content { padding: 14px; }
   .grid-2, .grid-3, .grid-4, .form-grid, .config-section, .config-field-list { grid-template-columns: 1fr; }
+  .config-control-row { align-items: stretch; flex-direction: column; }
+  .compact-btn { width: 100%; }
   .policy-guard-grid { grid-template-columns: 1fr; }
   .event { grid-template-columns: 1fr; gap: 5px; }
   .kv { grid-template-columns: 1fr; gap: 2px; }

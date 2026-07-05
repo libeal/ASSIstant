@@ -54,8 +54,19 @@ config_key_state="$(linux_agent_api_key_state_json)"
 jq -e '.configured == true and .source == "config" and .config_configured == true and (.file_configured | not)' <<<"${config_key_state}" >/dev/null
 ! grep -q 'TEST_CONFIG_API_KEY_123456' <<<"${LINUX_AGENT_LAST_AI_PAYLOAD}"
 
-config_only_json="$(jq '.api_key = "TEST_CONFIG_KEY_123456" | del(.api_key_file)' <<<"${LINUX_AGENT_CONFIG_JSON}")"
 saved_config_json="${LINUX_AGENT_CONFIG_JSON}"
+sarvam_api_url="${FAKE_AI_URL%/v1/chat/completions}/require-api-subscription-key/chat/completions"
+LINUX_AGENT_CONFIG_JSON="$(jq --arg api_url "${sarvam_api_url}" '
+    .provider = "sarvam_ai"
+    | .api_url = $api_url
+    | .api_key = "TEST_CONFIG_API_KEY_123456"
+    | .model = "fake-chat-completions"
+' <<<"${saved_config_json}")"
+sarvam_response="$(linux_agent_call_ai_with_context "sarvam auth" "${request_context}" "repair" '{"topic":"disk"}')"
+jq -e '(.failure_context | fromjson).environment_context.topic == "disk"' <<<"${sarvam_response}" >/dev/null
+LINUX_AGENT_CONFIG_JSON="${saved_config_json}"
+
+config_only_json="$(jq '.api_key = "TEST_CONFIG_KEY_123456" | del(.api_key_file)' <<<"${LINUX_AGENT_CONFIG_JSON}")"
 LINUX_AGENT_CONFIG_JSON="${config_only_json}"
 config_key_value="$(linux_agent_config_api_key)"
 config_only_state="$(linux_agent_api_key_state_json)"

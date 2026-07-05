@@ -1,0 +1,248 @@
+{
+  "providers": [
+    {
+      "id": "openai",
+      "label": "OpenAI",
+      "api_url": "https://api.openai.com/v1/chat/completions",
+      "default_model": "gpt-4.1-mini",
+      "auth": "bearer",
+      "request_format": "openai_chat",
+      "models": {
+        "supported": true,
+        "url": "https://api.openai.com/v1/models",
+        "parser": "openai_data_id"
+      }
+    },
+    {
+      "id": "mistral",
+      "label": "Mistral",
+      "api_url": "https://api.mistral.ai/v1/chat/completions",
+      "default_model": "mistral-small-latest",
+      "auth": "bearer",
+      "request_format": "openai_chat",
+      "models": {
+        "supported": true,
+        "url": "https://api.mistral.ai/v1/models",
+        "parser": "openai_data_id"
+      }
+    },
+    {
+      "id": "nvidia",
+      "label": "NVIDIA",
+      "api_url": "https://integrate.api.nvidia.com/v1/chat/completions",
+      "default_model": "meta/llama-3.1-8b-instruct",
+      "auth": "bearer",
+      "request_format": "openai_chat",
+      "models": {
+        "supported": true,
+        "url": "https://integrate.api.nvidia.com/v1/models",
+        "parser": "openai_data_id"
+      }
+    },
+    {
+      "id": "cohere",
+      "label": "Cohere",
+      "api_url": "https://api.cohere.ai/compatibility/v1/chat/completions",
+      "default_model": "command-a-03-2025",
+      "auth": "bearer",
+      "request_format": "openai_chat",
+      "models": {
+        "supported": true,
+        "url": "https://api.cohere.ai/v1/models",
+        "parser": "models_name_or_id"
+      }
+    },
+    {
+      "id": "alibaba",
+      "label": "Alibaba DashScope",
+      "api_url": "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions",
+      "default_model": "qwen-plus",
+      "auth": "bearer",
+      "request_format": "openai_chat",
+      "models": {
+        "supported": false,
+        "reason": "DashScope model availability depends on workspace and region; enter a model manually if the provider does not expose /models for this account."
+      }
+    },
+    {
+      "id": "anthropic",
+      "label": "Anthropic",
+      "api_url": "https://api.anthropic.com/v1/messages",
+      "default_model": "claude-3-5-haiku-latest",
+      "auth": "anthropic",
+      "request_format": "anthropic_messages",
+      "models": {
+        "supported": true,
+        "url": "https://api.anthropic.com/v1/models",
+        "parser": "openai_data_id"
+      }
+    },
+    {
+      "id": "meta",
+      "label": "Meta",
+      "api_url": "",
+      "default_model": "",
+      "auth": "bearer",
+      "request_format": "openai_chat",
+      "custom_url": true,
+      "models": {
+        "supported": false,
+        "reason": "No stable public official Meta API endpoint is configured in this project; provide an official endpoint manually."
+      }
+    },
+    {
+      "id": "google",
+      "label": "Google Gemini",
+      "api_url": "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions",
+      "default_model": "gemini-2.0-flash",
+      "auth": "bearer",
+      "request_format": "openai_chat",
+      "models": {
+        "supported": true,
+        "url": "https://generativelanguage.googleapis.com/v1beta/models",
+        "auth": "google_key_query",
+        "parser": "google_models"
+      }
+    },
+    {
+      "id": "deepseek",
+      "label": "DeepSeek",
+      "api_url": "https://api.deepseek.com/v1/chat/completions",
+      "default_model": "deepseek-chat",
+      "auth": "bearer",
+      "request_format": "openai_chat",
+      "models": {
+        "supported": true,
+        "url": "https://api.deepseek.com/v1/models",
+        "parser": "openai_data_id"
+      }
+    },
+    {
+      "id": "zhipu_ai",
+      "label": "Zhipu AI",
+      "api_url": "https://open.bigmodel.cn/api/paas/v4/chat/completions",
+      "default_model": "glm-4-plus",
+      "auth": "bearer",
+      "request_format": "openai_chat",
+      "models": {
+        "supported": false,
+        "reason": "Zhipu model access is account-specific; enter a model manually if no official model list endpoint is available."
+      }
+    },
+    {
+      "id": "perplexity",
+      "label": "Perplexity",
+      "api_url": "https://api.perplexity.ai/chat/completions",
+      "default_model": "sonar",
+      "auth": "bearer",
+      "request_format": "openai_chat",
+      "models": {
+        "supported": false,
+        "reason": "Perplexity documents model names separately; enter the selected model manually."
+      }
+    },
+    {
+      "id": "sarvam_ai",
+      "label": "Sarvam AI",
+      "api_url": "https://api.sarvam.ai/v1/chat/completions",
+      "default_model": "sarvam-m",
+      "auth": "api_subscription_key",
+      "request_format": "openai_chat_no_json_mode",
+      "models": {
+        "supported": false,
+        "reason": "Sarvam chat models are documented as fixed values; no model list API is configured."
+      }
+    },
+    {
+      "id": "minimax",
+      "label": "MiniMax",
+      "api_url": "https://api.minimax.io/v1/text/chatcompletion_v2",
+      "default_model": "MiniMax-Text-01",
+      "auth": "bearer",
+      "request_format": "openai_chat_no_json_mode",
+      "models": {
+        "supported": false,
+        "reason": "MiniMax model listing is not exposed as an OpenAI-compatible /models endpoint in this project."
+      }
+    },
+    {
+      "id": "moonshot_ai",
+      "label": "Moonshot AI",
+      "api_url": "https://api.moonshot.ai/v1/chat/completions",
+      "default_model": "moonshot-v1-8k",
+      "auth": "bearer",
+      "request_format": "openai_chat",
+      "models": {
+        "supported": true,
+        "url": "https://api.moonshot.ai/v1/models",
+        "parser": "openai_data_id"
+      }
+    },
+    {
+      "id": "xiaomi",
+      "label": "Xiaomi",
+      "api_url": "https://token-plan-cn.xiaomimimo.com/v1/chat/completions",
+      "default_model": "",
+      "auth": "bearer",
+      "request_format": "openai_chat",
+      "custom_url": true,
+      "models": {
+        "supported": false,
+        "reason": "No stable public official Xiaomi API endpoint is configured in this project; provide an official endpoint manually."
+      }
+    },
+    {
+      "id": "stepfun",
+      "label": "StepFun",
+      "api_url": "https://api.stepfun.com/v1/chat/completions",
+      "default_model": "step-2-mini",
+      "auth": "bearer",
+      "request_format": "openai_chat",
+      "models": {
+        "supported": true,
+        "url": "https://api.stepfun.com/v1/models",
+        "parser": "openai_data_id"
+      }
+    },
+    {
+      "id": "x_ai",
+      "label": "xAI",
+      "api_url": "https://api.x.ai/v1/chat/completions",
+      "default_model": "grok-3-mini",
+      "auth": "bearer",
+      "request_format": "openai_chat",
+      "models": {
+        "supported": true,
+        "url": "https://api.x.ai/v1/models",
+        "parser": "openai_data_id"
+      }
+    },
+    {
+      "id": "meituan",
+      "label": "Meituan",
+      "api_url": "",
+      "default_model": "",
+      "auth": "bearer",
+      "request_format": "openai_chat",
+      "custom_url": true,
+      "models": {
+        "supported": false,
+        "reason": "No stable public official Meituan API endpoint is configured in this project; provide an official endpoint manually."
+      }
+    },
+    {
+      "id": "openai_compatible",
+      "label": "OpenAI-compatible / Custom",
+      "api_url": "https://api.openai.com/v1/chat/completions",
+      "default_model": "",
+      "auth": "bearer",
+      "request_format": "openai_chat",
+      "custom_url": true,
+      "models": {
+        "supported": true,
+        "derive_from_api_url": true,
+        "parser": "openai_data_id"
+      }
+    }
+  ]
+}

@@ -152,6 +152,7 @@ Linux 运维 Agent
 │  └─ controlled-tools/      受控文件匹配、补丁、下载和本地文本分析 skill
 ├─ 配置层
 │  ├─ config/config.example.json 模板配置
+│  ├─ config/ai-providers.json AI 厂商预设、鉴权方式和模型列表规则
 │  └─ config/config.json     本地实际配置，忽略提交
 ├─ 测试层 tests/
 │  ├─ fake_ai_server.py      测试用 Chat Completions 兼容服务
@@ -291,8 +292,8 @@ Web 版 edit 使用浏览器内联编辑器，但保存前仍调用同一套 `ed
 
 | 字段 | 作用 |
 | --- | --- |
-| `provider` | 供应商展示名。 |
-| `api_url` | Chat Completions 兼容接口地址。 |
+| `provider` | AI 厂商 ID；内置值来自 `config/ai-providers.json`，未知值按 OpenAI-compatible/custom 处理。 |
+| `api_url` | 模型接口地址；内置 provider 会自动填充，其他服务商可使用 OpenAI-compatible/custom 地址。 |
 | `api_key` | 可选的模型 API key；优先级低于 `LINUX_AGENT_API_KEY`，不会在 Web 响应中回显。 |
 | `model` | 模型名称。 |
 | `request_timeout_sec` | AI 请求超时时间。 |
@@ -422,6 +423,7 @@ done
 | 文件 | 功能 |
 | --- | --- |
 | `config/config.example.json` | 配置模板。 |
+| `config/ai-providers.json` | Web 配置中心的内置 AI 厂商预设，包含接口地址、默认模型、鉴权方式和模型列表解析规则。 |
 | `config/config.json` | 本地实际配置，由用户创建或首次运行复制模板生成，被 `.gitignore` 忽略。 |
 
 ### `lib/`
@@ -435,7 +437,7 @@ done
 | `lib/sense.sh` | 采集磁盘、资源、进程、网络、日志、服务、权限等环境信息。 |
 | `lib/skills.sh` | 解析 skill 引用、定位脚本、读取索引、校验登记状态、执行 skill 脚本、校验 skill 目录。 |
 | `lib/doctor.sh` | 检查必需命令、可选命令、配置和 skill 目录。 |
-| `lib/ai.sh` | 构造系统提示，记录 AI 输入文件清单，调用 Chat Completions 兼容接口，规范化和校验模型响应。 |
+| `lib/ai.sh` | 构造系统提示，记录 AI 输入文件清单，按 provider 适配鉴权和请求格式，规范化和校验模型响应。 |
 | `lib/command_guard.py` | 标准库命令守卫，识别 pipeline、redirect、wrapper、substitution、remote pipe、保护路径写入和交互命令等风险形态。 |
 | `lib/policy.sh` | 聚合 AST 守卫和项目风险规则，对命令、脚本、参数、远程脚本、保护路径和保护服务做审查。 |
 | `lib/protocol.sh` | 为 API/CLI 构造 `timeline`、`approval_card`、`output_blocks` 工作台协议。 |
