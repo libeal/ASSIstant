@@ -18,7 +18,7 @@ Linux 运维 Agent 是一个以 Bash CLI 为核心的本机运维助手。它把
 | Sense | `bash bin/agent sense <topic>` | 按主题采集环境信息，支持 `all`、`disk`、`resource`、`process`、`network`、`service`、`logs`、`privilege`、`minimal`。 |
 | Tools | `bash bin/agent tools list` | 输出 `skills/INDEX.md` 中登记的可执行 skill 索引。 |
 | Skills | `bash bin/agent skills validate` | 校验 skill 目录、`SKILL.md`、脚本和索引登记一致性。 |
-| MCP | `bash bin/agent mcp list` / `bash bin/agent mcp validate` | 列出和校验 `mcp/` 下安装的外部 MCP server manifest。 |
+| MCP | `bash bin/agent mcp list` / `bash bin/agent mcp validate` / `bash bin/agent mcp tools` | 列出、校验并发现 `mcp/` 下安装的外部 MCP server tools。 |
 | Policy | `bash bin/agent policy validate [file]` | 校验 `policies/` 下策略 JSON、正则和审计边界。 |
 | Audit | `bash bin/agent audit <session-id>` | 读取历史 JSONL 审计会话并生成摘要报告。 |
 | API | `bash bin/agent api <resource> <action> [json]` | 给 Web 后端调用的机器可读 JSON 接口。 |
@@ -33,7 +33,7 @@ Web 视图包括：
 
 - Work 工作台：自然语言任务、terminal 命令、执行时间线、审批抽屉、环境主题刷新。
 - Skill 库：script 运行、script 审查、edit 生成、edit 审查、保存、skill 树、Markdown 预览、`skills validate`。
-- MCP：读取 `mcp/<id>/mcp.json` 外部 MCP server manifest，校验 stdio、legacy SSE 和 Streamable HTTP 三种传输配置。
+- MCP：读取 `mcp/<id>/mcp.json` 外部 MCP server manifest，校验 stdio、legacy SSE 和 Streamable HTTP 三种传输配置，并在 work/edit 上下文暴露可用 tools。
 - Policy：查看、校验和编辑 `policies/` 下的 JSON 策略文件，保存前会先运行策略校验，写入前需要 sudo 校验。
 - Audit：查看 JSONL 审计 session、事件筛选、指标统计、报告导出，并可把审计事件恢复为 Web 工作台时间线。
 - Config：读取和保存白名单配置项，运行 Doctor，展示运行时配置快照。
@@ -80,6 +80,7 @@ bash bin/agent tools list
 bash bin/agent skills validate
 bash bin/agent mcp list
 bash bin/agent mcp validate
+bash bin/agent mcp tools
 bash bin/agent policy validate
 bash bin/agent audit <session-id>
 ```
@@ -178,7 +179,7 @@ Linux 运维 Agent
 - Web 外壳层负责浏览器交互、HTTP API、job 状态和静态资源，不复制核心执行逻辑。
 - 策略与提示层把模型约束、风险规则和观察边界外置，便于审计和独立调整。
 - Skill 能力层提供经过登记的运维能力扩展，脚本通过白名单被 CLI 和 Web 间接使用。
-- MCP 能力层提供外部 MCP server manifest registry；当前只发现、校验和脱敏展示，不直接执行外部 server。
+- MCP 能力层提供外部 MCP server manifest registry 和 tools/list 发现；实际 tools/call 只能作为 work_plan 的 `mcp_tool` 步骤进入审批执行。
 - 配置层保存模板和本地运行配置，本地敏感配置不进入版本库。
 - 测试层包含 fake AI 和回归脚本，只服务验证流程，不应被主流程依赖。
 - 运行时产物层保存日志、临时状态和缓存，均为本地生成内容。
@@ -191,7 +192,7 @@ Linux 运维 Agent
 
 ### MCP Registry 边界
 
-`mcp/` 是外部 MCP server manifest 目录，推荐形态是 `mcp/<server-id>/mcp.json`。当前 registry 只负责发现、校验和脱敏展示，不直接执行外部 MCP server。
+`mcp/` 是外部 MCP server manifest 目录，推荐形态是 `mcp/<server-id>/mcp.json`。registry 负责发现、校验、脱敏展示和 `tools/list` 目录生成；实际 `tools/call` 不提供独立 CLI/Web 任意调用入口，只能由 work 模式计划生成 `executor_type:"mcp_tool"` 的步骤后，经 policy、人工审批、observer 和 audit 执行。edit 模式只能看到 MCP 目录作为生成 skill 的参考，不能直接执行 MCP。
 
 支持的 manifest transport：
 
@@ -199,7 +200,7 @@ Linux 运维 Agent
 - `sse`：兼容旧版 HTTP + Server-Sent Events 双端点模式。
 - `streamable_http`：新版单一 HTTP endpoint，响应可为 JSON 或 SSE stream。
 
-Web MCP 页和 `agent api mcp list|validate` 会隐藏 Authorization、token、secret、password、api_key 等敏感字段。后续若接入 MCP tool 执行，应作为新的执行类型进入 policy、approval、observer 和 audit 链路。
+Web MCP 页和 `agent api mcp list|validate|tools` 会隐藏 Authorization、token、secret、password、api_key 等敏感字段。MCP tool 调用默认标记为需要人工审批，不随配置中心的自动审批开关静默执行。
 
 ### 核心调用关系
 
