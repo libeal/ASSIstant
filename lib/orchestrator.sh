@@ -100,6 +100,8 @@ linux_agent_build_agent_observation() {
             title:($s.title // null),
             executor_type:($s.executor_type // null),
             skill_script:($s.skill_script // null),
+            mcp_server:($s.mcp_server // null),
+            mcp_tool:($s.mcp_tool // null),
             risk_level:($s.risk_level // null),
             has_command:($s | has("command")),
             url:($s.url // null)
@@ -180,6 +182,7 @@ linux_agent_request_agent_reflection() {
             current_request:$current_request,
             agent_loop:$agent_loop
         }')"
+    reflection_context="$(linux_agent_add_mcp_context "${reflection_context}" "work_reflect")"
 
     status="$(jq -r '.agent_observation.execution.status // "unknown"' <<<"${observation_json}")"
     result_count="$(jq -r '.agent_observation.execution.result_count // 0' <<<"${observation_json}")"
@@ -252,10 +255,11 @@ linux_agent_run_agent_loop() {
     local mode="$2"
     local environment_context="$3"
     local initial_plan="$4"
-    local resume_state="${5:-{}}"
+    local resume_state="${5:-}"
     local current_plan execution_json iteration_results all_results iteration status final_status final_answer stopped_reason
     local observation_json reflection_json checkpoint_turns auto_executed_count checkpoint_required final_review final_approval_step
     local execution_user sudo_probe
+    [[ -n "${resume_state}" ]] || resume_state='{}'
 
     current_plan="${initial_plan}"
     all_results='[]'
@@ -389,6 +393,7 @@ linux_agent_process_work_request() {
 
     request_context="$(linux_agent_build_request_context "${user_input}" "${context_json}" "work")"
     request_context="$(linux_agent_add_agent_loop_context "${request_context}")"
+    request_context="$(linux_agent_add_mcp_context "${request_context}" "work")"
     linux_agent_log_event "request_context_built" "${request_context}"
 
     linux_agent_record_ai_request_files "${request_context}"

@@ -139,7 +139,25 @@ linux_agent_validate_work_response() {
         def valid_step:
           (.id | type == "string") and
           (.title | type == "string") and
-          ((.executor_type == "skill_script") or (.executor_type == "shell") or (.executor_type == "remote_script")) and
+          (
+            (
+              .executor_type == "skill_script" and
+              (.skill_script | type == "string")
+            ) or
+            (
+              .executor_type == "shell" and
+              (.command | type == "string")
+            ) or
+            (
+              .executor_type == "remote_script" and
+              (((.url | type) == "string") or ((.command | type) == "string"))
+            ) or
+            (
+              .executor_type == "mcp_tool" and
+              (.mcp_server | type == "string") and
+              (.mcp_tool | type == "string")
+            )
+          ) and
           (.arguments | type == "object") and
           (.reason | type == "string") and
           (.expected_effect | type == "string") and

@@ -237,6 +237,9 @@ linux_agent_step_auto_approval_capability() {
         remote_script)
             printf 'remote_script\n'
             ;;
+        mcp_tool)
+            printf 'mcp_tool\n'
+            ;;
         *)
             printf 'unknown\n'
             ;;
@@ -265,6 +268,11 @@ linux_agent_should_auto_execute_step() {
             ;;
         remote_script)
             return 0
+            ;;
+        mcp_tool)
+            linux_agent_mcp_tool_is_available \
+                "$(jq -r '.mcp_server // empty' <<<"${step_json}")" \
+                "$(jq -r '.mcp_tool // empty' <<<"${step_json}")"
             ;;
         *)
             return 1
@@ -375,6 +383,11 @@ linux_agent_print_step_for_approval() {
                 printf '行数: %s\n' "$(jq -r '.line_count' <<<"${step_json}")"
                 printf '脚本预览（前 40 行，已脱敏）:\n%s\n' "$(jq -r '.preview // ""' <<<"${step_json}")"
             fi
+            ;;
+        mcp_tool)
+            printf 'MCP server: %s\n' "$(jq -r '.mcp_server // empty' <<<"${step_json}")"
+            printf 'MCP tool: %s\n' "$(jq -r '.mcp_tool // empty' <<<"${step_json}")"
+            printf '参数: %s\n' "$(linux_agent_step_arguments_json "${step_json}")"
             ;;
     esac
 }
@@ -662,6 +675,9 @@ linux_agent_step_review_material() {
                 fi
             done
             ;;
+        mcp_tool)
+            linux_agent_mcp_step_review_material "${step_json}"
+            ;;
         *)
             printf ''
             ;;
@@ -794,6 +810,10 @@ linux_agent_execute_step_command() {
     executor_type="$(jq -r '.executor_type' <<<"${step_json}")"
 
     case "${executor_type}" in
+        mcp_tool)
+            linux_agent_execute_mcp_tool_step "${step_json}" "${review_json}"
+            return 0
+            ;;
         skill_script)
             local ref script_path args
             ref="$(jq -r '.skill_script' <<<"${step_json}")"
@@ -820,6 +840,84 @@ linux_agent_execute_step_command() {
     fi
     LINUX_AGENT_EXECUTION_PRIVILEGE="$(linux_agent_execution_privilege_from_review "${review_json}")" \
         linux_agent_execute_observed_command_output "step_${executor_type}" "${subject}" -- "${command_args[@]}"
+}
+
+linux_agent_prepare_mcp_arguments_file() {
+    local args_json="$1"
+    local args_file target_user
+
+    args_file="$(mktemp "${LINUX_AGENT_TMP_DIR}/mcp.args.XXXXXX")"
+    chmod 600 "${args_file}" 2>/dev/null || true
+    printf '%s\n' "${args_json}" > "${args_file}"
+    if [[ "$(id -u)" -eq 0 && "$(linux_agent_min_privilege_proxy_enabled)" == "true" ]]; then
+        target_user="$(linux_agent_least_privilege_user 2>/dev/null || true)"
+        if [[ -n "${target_user}" ]]; then
+            chown "${target_user}" "${args_file}" 2>/dev/null || chmod 644 "${args_file}" 2>/dev/null || true
+        fi
+    fi
+    printf '%s\n' "${args_file}"
+}
+
+linux_agent_execute_mcp_tool_step() {
+    local step_json="$1"
+    local review_json="${2:-}"
+    local server_id tool_name args manifest_path client subject args_file observed
+    [[ -n "${review_json}" ]] || review_json='{}'
+
+    server_id="$(jq -r '.mcp_server // empty' <<<"${step_json}")"
+    tool_name="$(jq -r '.mcp_tool // empty' <<<"${step_json}")"
+    args="$(linux_agent_step_arguments_json "${step_json}")"
+    if ! manifest_path="$(linux_agent_mcp_manifest_path_by_id "${server_id}")"; then
+        jq -cn --arg server_id "${server_id}" --arg tool "${tool_name}" \
+            '{ok:false, status:"server_not_found", exit_code:2, output:{tool:("mcp." + $server_id + "." + $tool), error:"MCP server 未安装。"}}'
+        return 0
+    fi
+    if ! client="$(linux_agent_mcp_client_path)"; then
+        jq -cn --arg server_id "${server_id}" --arg tool "${tool_name}" \
+            '{ok:false, status:"mcp_client_unavailable", exit_code:2, output:{tool:("mcp." + $server_id + "." + $tool), error:"lib/mcp_client.py 不存在。"}}'
+        return 0
+    fi
+
+    args_file="$(linux_agent_prepare_mcp_arguments_file "${args}")"
+    subject="$(jq -cn --argjson step "${step_json}" '{kind:"work_step", external:"mcp", step:$step}')"
+    observed="$(
+        LINUX_AGENT_EXECUTION_PRIVILEGE="$(linux_agent_execution_privilege_from_review "${review_json}")" \
+            linux_agent_execute_observed_command_output "step_mcp_tool" "${subject}" -- python3 "${client}" call-tool "${manifest_path}" "${tool_name}" "${args_file}"
+    )"
+    rm -f "${args_file}"
+
+    jq -cn \
+        --argjson observed "${observed}" \
+        --arg server_id "${server_id}" \
+        --arg tool "${tool_name}" \
+        '
+        ($observed.output // {}) as $helper
+        | {
+            ok:(($observed.ok // false) and (($helper.ok // false) == true)),
+            status:(
+                if (($observed.ok // false) and (($helper.ok // false) == true)) then ($helper.status // "executed")
+                else ($helper.status // "failed") end
+            ),
+            exit_code:($observed.exit_code // null),
+            output:(
+                if ($helper.output | type) == "object" then $helper.output
+                else {
+                    tool:("mcp." + $server_id + "." + $tool),
+                    server_id:$server_id,
+                    mcp_tool:$tool,
+                    error:($helper.error // $observed.output.raw // "MCP tool 执行失败。")
+                } end
+            ),
+            mcp:{
+                server_id:$server_id,
+                tool:$tool,
+                transport:($helper.transport // null),
+                result:($helper.result // null),
+                status:($helper.status // null)
+            },
+            observer:($observed.observer // null),
+            execution_proxy:($observed.execution_proxy // null)
+        }'
 }
 
 linux_agent_skipped_steps_after() {
@@ -850,6 +948,8 @@ linux_agent_request_repair_plan() {
             title:($s.title // null),
             executor_type:($s.executor_type // null),
             skill_script:($s.skill_script // null),
+            mcp_server:($s.mcp_server // null),
+            mcp_tool:($s.mcp_tool // null),
             risk_level:($s.risk_level // null),
             has_command:($s | has("command")),
             url:($s.url // null),
@@ -927,6 +1027,7 @@ linux_agent_request_revised_work_plan() {
             conversation_context:$conversation_context,
             current_request:$current_request
         }')"
+    request_context="$(linux_agent_add_mcp_context "${request_context}" "work_revision")"
 
     linux_agent_log_event "work_revision_requested" "${revision_context}"
     linux_agent_record_ai_request_files "${request_context}"
@@ -947,8 +1048,9 @@ linux_agent_request_revised_work_plan() {
 linux_agent_execute_work_plan() {
     local plan_json="$1"
     local user_input="$2"
-    local resume_state="${3:-{}}"
+    local resume_state="${3:-}"
     local execution_user sudo_probe step_count results executed_steps status
+    [[ -n "${resume_state}" ]] || resume_state='{}'
 
     execution_user="$(id -un 2>/dev/null || printf 'unknown')"
     sudo_probe="$(linux_agent_probe_sudo)"
@@ -1025,8 +1127,23 @@ linux_agent_execute_work_plan() {
                 '{status:$status, execution_user:$execution_user, sudo_probe:$sudo_probe, findings:$findings, results:$results}'
             return 0
         fi
+        if [[ "$(jq -r '.executor_type' <<<"${step}")" == "mcp_tool" ]] && ! linux_agent_mcp_tool_is_available "$(jq -r '.mcp_server // empty' <<<"${step}")" "$(jq -r '.mcp_tool // empty' <<<"${step}")"; then
+            local blocked_detail skipped_steps
+            blocked_detail="$(jq -cn \
+                --arg server_id "$(jq -r '.mcp_server // empty' <<<"${step}")" \
+                --arg tool "$(jq -r '.mcp_tool // empty' <<<"${step}")" \
+                '{approved:false, risk_level:"critical", findings:[{severity:"critical", code:"MCP_TOOL_UNAVAILABLE", server_id:$server_id, tool:$tool, message:"AI 提出的 MCP tool 未安装、未启用或未在 tools/list 中声明。"}]}')"
+            linux_agent_log_step_status "${step}" "blocked" "${blocked_detail}"
+            skipped_steps="$(linux_agent_skipped_steps_after "${plan_json}" "${i}")"
+            while IFS= read -r skipped_step; do
+                [[ -n "${skipped_step}" ]] && linux_agent_log_step_status "${skipped_step}" "skipped_unexecuted"
+            done < <(jq -c '.[]' <<<"${skipped_steps}")
+            jq -cn --arg status "blocked" --arg execution_user "${execution_user}" --arg sudo_probe "${sudo_probe}" --argjson findings "$(jq '.findings' <<<"${blocked_detail}")" --argjson results "${results}" \
+                '{status:$status, execution_user:$execution_user, sudo_probe:$sudo_probe, findings:$findings, results:$results}'
+            return 0
+        fi
         step_review_text="$(linux_agent_step_review_material "${step}")"
-        review="$(linux_agent_policy_review_step "${step}" "${step_review_text}" "$(if [[ "$(jq -r '.executor_type' <<<"${step}")" == "remote_script" ]]; then printf 'remote'; else printf 'local'; fi)")"
+        review="$(linux_agent_policy_review_step "${step}" "${step_review_text}" "$(case "$(jq -r '.executor_type' <<<"${step}")" in remote_script) printf 'remote' ;; mcp_tool) printf 'mcp' ;; *) printf 'local' ;; esac)")"
         linux_agent_log_event "step_policy_checked" "$(jq -cn --argjson step "${step}" --argjson review "${review}" '{step:$step, review:$review}')"
 
         if [[ "$(jq -r '.approved' <<<"${review}")" != "true" ]]; then

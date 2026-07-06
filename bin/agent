@@ -115,7 +115,7 @@ linux_agent_usage() {
   agent sense <topic>           采集环境信息
   agent tools list              列出可用 skill 脚本索引
   agent skills validate         校验 skill 目录
-  agent mcp list|validate       列出或校验 mcp/ 外部 MCP 能力配置
+  agent mcp list|validate|tools 列出、校验或发现 mcp/ 外部 MCP tool
   agent policy validate [file]  校验 policies/ 下策略 JSON 与正则规则
   agent api <resource> <action> [json]
                                 机器可读 JSON API，供 Web 前端调用
@@ -308,8 +308,11 @@ main() {
                 validate)
                     linux_agent_validate_mcp
                     ;;
+                tools)
+                    linux_agent_mcp_tool_catalog
+                    ;;
                 *)
-                    linux_agent_print_error "仅支持 'agent mcp list|validate'。"
+                    linux_agent_print_error "仅支持 'agent mcp list|validate|tools'。"
                     exit 1
                     ;;
             esac

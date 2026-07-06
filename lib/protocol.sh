@@ -74,7 +74,11 @@ linux_agent_timeline_plan_items() {
                 status:"planned",
                 step_id:($step.id // null),
                 title:($step.title // $step.id // "step"),
-                summary:([$step.executor_type, ($step.skill_script // $step.command // ""), ($step.expected_effect // "")] | map(select(. != "")) | join(" · ")),
+                summary:([
+                    $step.executor_type,
+                    ($step.skill_script // $step.command // (if (($step.mcp_server // "") != "" and ($step.mcp_tool // "") != "") then ($step.mcp_server + "/" + $step.mcp_tool) else "" end) // ""),
+                    ($step.expected_effect // "")
+                ] | map(select(. != "")) | join(" · ")),
                 risk_level:($step.risk_level // "low"),
                 step:$step
             }]

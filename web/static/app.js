@@ -66,6 +66,8 @@ const outputLabelMap = {
   risk_level: "风险",
   executor_type: "执行器",
   skill_script: "Skill",
+  mcp_server: "MCP server",
+  mcp_tool: "MCP tool",
 };
 
 const hiddenOutputKeys = new Set([
@@ -876,6 +878,8 @@ function openApprovalDrawer(result, input) {
         ${renderMetaRows([
           ["执行器", step.executor_type || "--"],
           ["Skill", step.skill_script || ""],
+          ["MCP server", step.mcp_server || ""],
+          ["MCP tool", step.mcp_tool || ""],
           ["命令", step.command || ""],
           ["预期效果", step.expected_effect || ""],
           ["原因", step.reason || ""],
@@ -1493,7 +1497,8 @@ function renderStepDetail(entry, result = state.lastProtocolResult, turn = selec
   const proxy = findBlockJson(blocks, "meta", "执行代理");
   const observer = findBlockJson(blocks, "observer");
   const review = findBlockJson(blocks, "review");
-  const commandLabel = step.skill_script || step.command || output.command || primaryOutputObject(output).command || "";
+  const mcpLabel = step.mcp_server && step.mcp_tool ? `${step.mcp_server}/${step.mcp_tool}` : "";
+  const commandLabel = step.skill_script || mcpLabel || step.command || output.command || primaryOutputObject(output).command || "";
   const subtitle = step.reason || step.expected_effect || turn?.input || "";
   container.className = "step-detail";
   container.innerHTML = `
@@ -1514,7 +1519,7 @@ function renderStepDetail(entry, result = state.lastProtocolResult, turn = selec
           ["自动批准", output.auto_approved === true ? "是" : (output.auto_approved === false ? "否" : "")],
           ["执行器", step.executor_type || ""],
           ["风险", step.risk_level || ""],
-          ["命令/Skill", commandLabel],
+          ["命令/Skill/MCP", commandLabel],
         ])}
       </div>
     </section>
@@ -1526,6 +1531,8 @@ function renderStepDetail(entry, result = state.lastProtocolResult, turn = selec
           ["原因", step.reason || ""],
           ["预期效果", step.expected_effect || ""],
           ["脚本", step.skill_script || ""],
+          ["MCP server", step.mcp_server || ""],
+          ["MCP tool", step.mcp_tool || ""],
           ["命令", step.command || ""],
           ["参数", step.arguments ? JSON.stringify(step.arguments) : ""],
         ]) || '<p class="muted">本步骤没有计划元数据。</p>'}
@@ -2108,8 +2115,23 @@ async function loadMcpRegistry() {
   const data = await api("/api/mcp");
   state.mcpRoot = data.root || "";
   state.mcpServers = Array.isArray(data.servers) ? data.servers : [];
+  state.mcpTools = [];
   state.mcpFindings = Array.isArray(data.findings) ? data.findings : [];
   renderMcpRegistry();
+  renderMcpTools();
+  setStatus("mcpStatus", data.status || "listed", state.mcpFindings.length ? "medium" : "ok");
+  printOutput("mcpOutput", data);
+}
+
+async function loadMcpTools() {
+  setStatus("mcpStatus", "loading tools", "medium");
+  const data = await api("/api/mcp/tools");
+  state.mcpRoot = data.root || state.mcpRoot || "";
+  state.mcpServers = Array.isArray(data.servers) ? data.servers : state.mcpServers;
+  state.mcpTools = Array.isArray(data.tools) ? data.tools : [];
+  state.mcpFindings = Array.isArray(data.findings) ? data.findings : [];
+  renderMcpRegistry();
+  renderMcpTools();
   setStatus("mcpStatus", data.status || "listed", state.mcpFindings.length ? "medium" : "ok");
   printOutput("mcpOutput", data);
 }
@@ -2128,6 +2150,7 @@ function renderMcpRegistry() {
   setText("mcpRoot", state.mcpRoot || "--");
   setText("mcpCount", String(state.mcpServers.length));
   setText("mcpValidCount", String(state.mcpServers.filter((server) => server.valid).length));
+  setText("mcpToolCount", String(state.mcpTools.length));
   const container = $("mcpCatalog");
   if (!container) return;
   container.innerHTML = "";
@@ -2145,12 +2168,41 @@ function renderMcpRegistry() {
       <td><span class="mono">${escapeHtml(server.id || server.name || "mcp")}</span><div class="small">${escapeHtml(server.description || server.name || "")}</div></td>
       <td><span class="pill">${escapeHtml(server.transport || "unknown")}</span></td>
       <td>${server.enabled === false ? "false" : "true"}</td>
-      <td><span class="pill risk ${server.valid ? "low" : "high"}">${escapeHtml(server.valid ? "valid" : `${findingCount} issue${findingCount === 1 ? "" : "s"}`)}</span></td>
+      <td><span class="pill risk ${server.valid ? "low" : "high"}">${escapeHtml(server.valid ? `valid · ${server.tool_count ?? 0} tools` : `${findingCount} issue${findingCount === 1 ? "" : "s"}`)}</span></td>
       <td class="mono">${escapeHtml(server.path || "")}</td>
     `;
     row.addEventListener("click", () => {
       setStatus("mcpStatus", server.valid ? "selected" : "invalid", server.valid ? "ok" : "failed");
       printOutput("mcpOutput", server);
+    });
+    container.appendChild(row);
+  }
+}
+
+function renderMcpTools() {
+  setText("mcpToolCount", String(state.mcpTools.length));
+  const container = $("mcpToolCatalog");
+  if (!container) return;
+  container.innerHTML = "";
+  if (!state.mcpTools.length) {
+    const row = document.createElement("tr");
+    row.innerHTML = '<td colspan="4">暂无 MCP tools。点击“加载工具”后会对有效且启用的 server 执行 tools/list。</td>';
+    container.appendChild(row);
+    return;
+  }
+  for (const tool of state.mcpTools) {
+    const row = document.createElement("tr");
+    row.className = "clickable";
+    const schema = tool.inputSchema && Object.keys(tool.inputSchema).length ? JSON.stringify(tool.inputSchema) : "{}";
+    row.innerHTML = `
+      <td><span class="mono">${escapeHtml(tool.ref || `${tool.server_id || "mcp"}/${tool.name || "tool"}`)}</span><div class="small">${escapeHtml(tool.server_name || tool.server_id || "")}</div></td>
+      <td><span class="pill">${escapeHtml(tool.transport || "unknown")}</span></td>
+      <td>${escapeHtml(tool.description || "")}</td>
+      <td class="mono">${escapeHtml(schema)}</td>
+    `;
+    row.addEventListener("click", () => {
+      setStatus("mcpStatus", "tool selected", "ok");
+      printOutput("mcpOutput", tool);
     });
     container.appendChild(row);
   }
@@ -3189,6 +3241,7 @@ function bindActions() {
   on("scriptCancelBtn", "click", () => safeAction(cancelScript));
   on("skillsValidateBtn", "click", () => safeAction(validateSkills));
   on("mcpReloadBtn", "click", () => safeAction(loadMcpRegistry));
+  on("mcpToolsBtn", "click", () => safeAction(loadMcpTools));
   on("mcpValidateBtn", "click", () => safeAction(validateMcp));
   on("newSkillBtn", "click", startNewSkill);
   on("editPlanBtn", "click", () => safeAction(planEdit));

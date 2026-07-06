@@ -22,7 +22,8 @@ function payloadOf(event) {
 }
 
 function stepName(payload) {
-  return payload?.step?.title || payload?.step?.id || payload?.step?.skill_script || payload?.step?.command_preview || "步骤";
+  const mcpRef = payload?.step?.mcp_server && payload?.step?.mcp_tool ? `${payload.step.mcp_server}/${payload.step.mcp_tool}` : "";
+  return payload?.step?.title || payload?.step?.id || payload?.step?.skill_script || mcpRef || payload?.step?.command_preview || "步骤";
 }
 
 function resultSummary(detail = {}) {
@@ -115,6 +116,7 @@ export function auditEventDisplay(event, pretty = (value) => JSON.stringify(valu
     summary = stepName(payload);
     if (payload.step?.executor_type) badges.push(payload.step.executor_type);
     if (payload.step?.skill_script) details.push(`调用 Skill：${payload.step.skill_script}`);
+    if (payload.step?.mcp_server && payload.step?.mcp_tool) details.push(`调用 MCP：${payload.step.mcp_server}/${payload.step.mcp_tool}`);
     if (payload.step?.command_preview) details.push(`调用命令：${payload.step.command_preview}`);
     const result = resultSummary(detail);
     if (result) details.push(result);

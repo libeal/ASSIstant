@@ -15,6 +15,7 @@ export function createInitialState() {
     skillTree: null,
     skillFiles: { markdown: [], scripts: [] },
     mcpServers: [],
+    mcpTools: [],
     mcpFindings: [],
     mcpRoot: "",
     activeWorkJobId: "",

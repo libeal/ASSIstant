@@ -225,6 +225,7 @@ linux_agent_api_work_prepare_response() {
 
     request_context="$(linux_agent_build_request_context "${user_input}" "${context_json}" "work")"
     request_context="$(linux_agent_add_agent_loop_context "${request_context}")"
+    request_context="$(linux_agent_add_mcp_context "${request_context}" "work")"
     linux_agent_log_event "request_context_built" "${request_context}"
 
     linux_agent_record_ai_request_files "${request_context}"
@@ -494,6 +495,7 @@ linux_agent_api_edit_plan() {
     linux_agent_log_event "received" "$(jq -cn --arg input "${user_input}" '{input:$input, mode:"edit"}')"
     context_json="$(jq -cn '{edit_mode:true}')"
     request_context="$(linux_agent_build_request_context "${user_input}" "${context_json}" "edit")"
+    request_context="$(linux_agent_add_mcp_context "${request_context}" "edit")"
     linux_agent_record_ai_request_files "${request_context}"
     edit_json="$(linux_agent_call_ai_with_context "${user_input}" "${request_context}" "edit" "${context_json}")"
     if linux_agent_ai_response_is_error "${edit_json}"; then
@@ -609,6 +611,9 @@ linux_agent_api_dispatch() {
             ;;
         mcp:validate)
             jq -cn --argjson validation "$(linux_agent_validate_mcp)" '{ok:($validation.ok // false), status:"validated", validation:$validation}'
+            ;;
+        mcp:tools)
+            linux_agent_mcp_tool_catalog
             ;;
         policy:validate)
             jq -cn --argjson validation "$(linux_agent_api_policy_validate "${payload}")" '{ok:($validation.ok // false), status:($validation.status // "invalid"), validation:$validation}'

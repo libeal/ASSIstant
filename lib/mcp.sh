@@ -6,11 +6,38 @@ linux_agent_mcp_dir() {
     printf '%s\n' "${LINUX_AGENT_MCP_DIR:-${LINUX_AGENT_ROOT}/mcp}"
 }
 
+linux_agent_mcp_client_path() {
+    local path="${LINUX_AGENT_ROOT}/lib/mcp_client.py"
+    if [[ -f "${path}" ]]; then
+        printf '%s\n' "${path}"
+        return 0
+    fi
+    path="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/mcp_client.py"
+    [[ -f "${path}" ]] || return 1
+    printf '%s\n' "${path}"
+}
+
 linux_agent_mcp_manifest_paths() {
     local mcp_dir
     mcp_dir="$(linux_agent_mcp_dir)"
     mkdir -p "${mcp_dir}"
     find "${mcp_dir}" -mindepth 2 -maxdepth 2 -type f -name 'mcp.json' 2>/dev/null | sort
+}
+
+linux_agent_mcp_manifest_path_by_id() {
+    local server_id="$1"
+    local path manifest_id
+
+    [[ "${server_id}" =~ ^[a-z0-9][a-z0-9_.-]*$ ]] || return 1
+    while IFS= read -r path; do
+        [[ -n "${path}" ]] || continue
+        manifest_id="$(jq -r 'if type == "object" and (.id | type) == "string" then .id else "" end' "${path}" 2>/dev/null || true)"
+        if [[ "${manifest_id}" == "${server_id}" ]]; then
+            printf '%s\n' "${path}"
+            return 0
+        fi
+    done < <(linux_agent_mcp_manifest_paths)
+    return 1
 }
 
 linux_agent_mcp_append_finding() {
@@ -245,4 +272,291 @@ linux_agent_mcp_list() {
             servers:$servers,
             findings:($validation.findings // [])
         }'
+}
+
+linux_agent_mcp_python_client_error() {
+    local status="$1"
+    local raw="$2"
+    jq -cn \
+        --arg status "${status}" \
+        --arg raw "$(linux_agent_sanitize_text "${raw}" 2000)" \
+        '{ok:false, status:$status, error:$raw}'
+}
+
+linux_agent_mcp_server_tools_from_path() {
+    local path="$1"
+    local validation output client
+
+    validation="$(linux_agent_mcp_validate_manifest_path "${path}")"
+    if [[ "$(jq -r '.ok // false' <<<"${validation}")" != "true" ]]; then
+        jq -cn --argjson validation "${validation}" \
+            '{ok:false, status:"invalid_manifest", validation:$validation, tools:[]}'
+        return 0
+    fi
+    if ! client="$(linux_agent_mcp_client_path)"; then
+        jq -cn '{ok:false, status:"mcp_client_unavailable", error:"lib/mcp_client.py 不存在。", tools:[]}'
+        return 0
+    fi
+    if output="$(python3 "${client}" list-tools "${path}" 2>&1)"; then
+        if jq -e 'type == "object"' >/dev/null 2>&1 <<<"${output}"; then
+            printf '%s\n' "${output}"
+        else
+            linux_agent_mcp_python_client_error "mcp_client_invalid_output" "${output}"
+        fi
+    else
+        if jq -e 'type == "object"' >/dev/null 2>&1 <<<"${output}"; then
+            printf '%s\n' "${output}"
+        else
+            linux_agent_mcp_python_client_error "mcp_client_failed" "${output}"
+        fi
+    fi
+}
+
+linux_agent_mcp_tool_list_finding() {
+    local findings="$1"
+    local server_id="$2"
+    local path="$3"
+    local error="$4"
+    linux_agent_mcp_append_finding \
+        "${findings}" \
+        "medium" \
+        "MCP_TOOL_LIST_FAILED" \
+        "${path}" \
+        "MCP server tools/list 失败：${error}" \
+        "${server_id}"
+}
+
+linux_agent_mcp_tool_catalog() {
+    local mcp_dir servers tools findings path server enabled valid tools_result server_tools server_info error
+    mcp_dir="$(linux_agent_mcp_dir)"
+    mkdir -p "${mcp_dir}"
+    servers='[]'
+    tools='[]'
+    findings='[]'
+
+    while IFS= read -r path; do
+        [[ -n "${path}" ]] || continue
+        server="$(linux_agent_mcp_server_summary "${path}")"
+        findings="$(jq -cn \
+            --argjson prior "${findings}" \
+            --argjson next "$(jq -c '.findings // []' <<<"${server}")" \
+            '$prior + $next')"
+        enabled="$(jq -r '.enabled // true' <<<"${server}")"
+        valid="$(jq -r '.valid // false' <<<"${server}")"
+        server_tools='[]'
+        server_info='{}'
+
+        if [[ "${enabled}" == "true" && "${valid}" == "true" ]]; then
+            tools_result="$(linux_agent_mcp_server_tools_from_path "${path}")"
+            if [[ "$(jq -r '.ok // false' <<<"${tools_result}")" == "true" ]]; then
+                server_tools="$(jq -c '.tools // [] | if type == "array" then . else [] end' <<<"${tools_result}")"
+                server_tools="$(linux_agent_mcp_public_manifest "${server_tools}")"
+                server_info="$(jq -c '.server_info // {} | if type == "object" then . else {} end' <<<"${tools_result}")"
+            else
+                error="$(jq -r '.error // .status // "unknown"' <<<"${tools_result}")"
+                findings="$(linux_agent_mcp_tool_list_finding \
+                    "${findings}" \
+                    "$(jq -r '.id // ""' <<<"${server}")" \
+                    "$(jq -r '.path // ""' <<<"${server}")" \
+                    "${error}")"
+            fi
+        fi
+
+        server="$(jq -c \
+            --argjson tool_list "${server_tools}" \
+            --argjson server_info "${server_info}" \
+            '. + {tools:$tool_list, tool_count:($tool_list | length), server_info:$server_info}' \
+            <<<"${server}")"
+        tools="$(jq -cn \
+            --argjson prior "${tools}" \
+            --argjson server "${server}" \
+            --argjson tool_list "${server_tools}" \
+            '
+            $prior + [
+              $tool_list[]?
+              | {
+                  server_id:($server.id // ""),
+                  server_name:($server.name // ""),
+                  transport:($server.transport // ""),
+                  name:(.name // ""),
+                  ref:(($server.id // "") + "/" + (.name // "")),
+                  description:(.description // ""),
+                  inputSchema:(.inputSchema // {}),
+                  annotations:(.annotations // {}),
+                  outputSchema:(.outputSchema // null)
+                }
+              | with_entries(select(.value != null))
+            ]')"
+        servers="$(jq -cn --argjson prior "${servers}" --argjson server "${server}" '$prior + [$server]')"
+    done < <(linux_agent_mcp_manifest_paths)
+
+    findings="$(jq -c 'unique_by([.code, (.server_id // ""), (.path // ""), (.message // "")])' <<<"${findings}")"
+    jq -cn \
+        --arg root "${mcp_dir}" \
+        --argjson servers "${servers}" \
+        --argjson tools "${tools}" \
+        --argjson findings "${findings}" \
+        '{
+            ok:true,
+            status:"listed",
+            root:$root,
+            server_count:($servers | length),
+            tool_count:($tools | length),
+            servers:$servers,
+            tools:$tools,
+            findings:$findings
+        }'
+}
+
+linux_agent_mcp_tool_metadata() {
+    local server_id="$1"
+    local tool_name="$2"
+    local path result
+
+    if ! path="$(linux_agent_mcp_manifest_path_by_id "${server_id}")"; then
+        jq -cn --arg server_id "${server_id}" --arg tool "${tool_name}" \
+            '{ok:false, status:"server_not_found", server_id:$server_id, tool:$tool}'
+        return 0
+    fi
+    result="$(linux_agent_mcp_server_tools_from_path "${path}")"
+    if [[ "$(jq -r '.ok // false' <<<"${result}")" != "true" ]]; then
+        jq -c --arg server_id "${server_id}" --arg tool "${tool_name}" \
+            '. + {server_id:$server_id, tool:$tool}' <<<"${result}"
+        return 0
+    fi
+    jq -cn \
+        --arg server_id "${server_id}" \
+        --arg tool "${tool_name}" \
+        --argjson result "${result}" \
+        '
+        ($result.tools // [])
+        | map(select(.name == $tool))
+        | first as $found
+        | if $found == null then
+            {ok:false, status:"tool_not_found", server_id:$server_id, tool:$tool}
+          else
+            {ok:true, status:"found", server_id:$server_id, tool:$tool, metadata:$found}
+          end'
+}
+
+linux_agent_mcp_tool_is_available() {
+    local server_id="$1"
+    local tool_name="$2"
+    local metadata
+
+    metadata="$(linux_agent_mcp_tool_metadata "${server_id}" "${tool_name}")"
+    [[ "$(jq -r '.ok // false' <<<"${metadata}")" == "true" ]]
+}
+
+linux_agent_mcp_call_tool() {
+    local server_id="$1"
+    local tool_name="$2"
+    local args_json="${3:-}"
+    local path args client tmp_dir args_file output status
+    [[ -n "${args_json}" ]] || args_json='{}'
+
+    if ! path="$(linux_agent_mcp_manifest_path_by_id "${server_id}")"; then
+        jq -cn --arg server_id "${server_id}" --arg tool "${tool_name}" \
+            '{ok:false, status:"server_not_found", error:"MCP server 未安装或未启用。", server_id:$server_id, tool:$tool}'
+        return 0
+    fi
+    if ! linux_agent_mcp_tool_is_available "${server_id}" "${tool_name}"; then
+        jq -cn --arg server_id "${server_id}" --arg tool "${tool_name}" \
+            '{ok:false, status:"tool_not_found", error:"MCP tool 未在该 server tools/list 中声明。", server_id:$server_id, tool:$tool}'
+        return 0
+    fi
+    if ! args="$(linux_agent_normalize_json_object_argument "${args_json}")"; then
+        jq -cn --arg server_id "${server_id}" --arg tool "${tool_name}" \
+            '{ok:false, status:"invalid_arguments", error:"MCP tool arguments 必须是 JSON object。", server_id:$server_id, tool:$tool}'
+        return 0
+    fi
+    if ! client="$(linux_agent_mcp_client_path)"; then
+        jq -cn '{ok:false, status:"mcp_client_unavailable", error:"lib/mcp_client.py 不存在。"}'
+        return 0
+    fi
+
+    tmp_dir="${LINUX_AGENT_TMP_DIR:-/tmp}"
+    mkdir -p "${tmp_dir}"
+    args_file="$(mktemp "${tmp_dir}/mcp.args.XXXXXX")"
+    chmod 600 "${args_file}" 2>/dev/null || true
+    printf '%s\n' "${args}" > "${args_file}"
+    status=0
+    output="$(python3 "${client}" call-tool "${path}" "${tool_name}" "${args_file}" 2>&1)" || status=$?
+    rm -f "${args_file}"
+    if [[ "${status}" -eq 0 || "$(jq -r '.ok // false' <<<"${output}" 2>/dev/null || printf false)" == "false" ]]; then
+        if jq -e 'type == "object"' >/dev/null 2>&1 <<<"${output}"; then
+            printf '%s\n' "${output}"
+        else
+            linux_agent_mcp_python_client_error "mcp_client_invalid_output" "${output}"
+        fi
+    else
+        linux_agent_mcp_python_client_error "mcp_client_failed" "${output}"
+    fi
+    return 0
+}
+
+linux_agent_mcp_step_review_material() {
+    local step_json="$1"
+    local server_id tool_name args metadata
+    server_id="$(jq -r '.mcp_server // empty' <<<"${step_json}")"
+    tool_name="$(jq -r '.mcp_tool // empty' <<<"${step_json}")"
+    args="$(linux_agent_step_arguments_json "${step_json}")"
+    metadata="$(linux_agent_mcp_tool_metadata "${server_id}" "${tool_name}")"
+    jq -nr \
+        --arg server_id "${server_id}" \
+        --arg tool "${tool_name}" \
+        --argjson arguments "${args}" \
+        --argjson metadata "${metadata}" \
+        '"mcp_tool=\($server_id)/\($tool)\narguments=\($arguments | tojson)\nmetadata=\($metadata | tojson)"'
+}
+
+linux_agent_mcp_context_json() {
+    local mode="${1:-work}"
+    local catalog
+
+    case "${mode}" in
+        work|work_revision|work_reflect|edit|edit_revision)
+            ;;
+        *)
+            jq -cn '{enabled:false, reason:"mcp is exposed only in work/edit modes", tools:[], findings:[]}'
+            return 0
+            ;;
+    esac
+
+    catalog="$(linux_agent_mcp_tool_catalog)"
+    jq -c '
+        {
+            enabled:true,
+            root:(.root // ""),
+            server_count:(.server_count // 0),
+            tool_count:(.tool_count // 0),
+            servers:[(.servers // [])[] | {
+                id:(.id // ""),
+                name:(.name // ""),
+                description:(.description // ""),
+                transport:(.transport // ""),
+                enabled:(.enabled // true),
+                valid:(.valid // false),
+                tool_count:(.tool_count // 0),
+                findings:(.findings // [])
+            }],
+            tools:[(.tools // [])[] | {
+                ref:(.ref // ""),
+                server_id:(.server_id // ""),
+                server_name:(.server_name // ""),
+                transport:(.transport // ""),
+                name:(.name // ""),
+                description:(.description // ""),
+                inputSchema:(.inputSchema // {}),
+                annotations:(.annotations // {})
+            }],
+            findings:(.findings // [])
+        }' <<<"${catalog}"
+}
+
+linux_agent_add_mcp_context() {
+    local request_context="$1"
+    local mode="${2:-work}"
+    jq -c --argjson mcp "$(linux_agent_mcp_context_json "${mode}")" \
+        '. + {mcp:$mcp}' <<<"${request_context}"
 }

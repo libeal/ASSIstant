@@ -24,6 +24,8 @@ source "${ROOT_DIR}/lib/audit.sh"
 source "${ROOT_DIR}/lib/context.sh"
 # shellcheck source=../lib/skills.sh
 source "${ROOT_DIR}/lib/skills.sh"
+# shellcheck source=../lib/mcp.sh
+source "${ROOT_DIR}/lib/mcp.sh"
 # shellcheck source=../lib/ai.sh
 source "${ROOT_DIR}/lib/ai.sh"
 # shellcheck source=../lib/policy.sh
@@ -254,6 +256,51 @@ LINUX_AGENT_CONFIG_JSON="$(jq '.approvals.auto.skill_readonly=false | .approvals
 linux_agent_should_auto_execute_step "${file_match_step}" "${low_review}"
 ! linux_agent_should_auto_execute_step "${file_patch_step}" "${low_review}"
 LINUX_AGENT_CONFIG_JSON="${auto_config}"
+
+mcp_exec_root="$(mktemp -d)"
+original_mcp_dir="${LINUX_AGENT_MCP_DIR}"
+LINUX_AGENT_MCP_DIR="${mcp_exec_root}"
+mkdir -p "${mcp_exec_root}/stdio-tools"
+cat > "${mcp_exec_root}/stdio-tools/mcp.json" <<JSON
+{
+  "id": "stdio-tools",
+  "name": "Fake stdio tools",
+  "transport": "stdio",
+  "command": "python3",
+  "args": ["${ROOT_DIR}/tests/fake_mcp_server.py", "stdio"]
+}
+JSON
+mcp_work_plan="$(jq -cn '{
+    response_type:"work_plan",
+    summary:"mcp tool execution",
+    continue_decision:{should_continue:false, reason:"test"},
+    steps:[{
+        id:"mcp-1",
+        title:"call fake mcp echo",
+        executor_type:"mcp_tool",
+        mcp_server:"stdio-tools",
+        mcp_tool:"echo",
+        arguments:{text:"hello"},
+        reason:"test mcp execution",
+        expected_effect:"echoes text through MCP",
+        risk_level:"low",
+        rollback_hint:"read-only fake tool"
+    }]
+}')"
+linux_agent_validate_work_response "${mcp_work_plan}"
+LINUX_AGENT_API_MODE=1
+LINUX_AGENT_API_INPUT_JSON='["y"]'
+mcp_execution="$(linux_agent_execute_work_plan "${mcp_work_plan}" "call mcp echo" "{}")"
+jq -e '.status == "executed"
+    and (.results | length) == 1
+    and .results[0].step.executor_type == "mcp_tool"
+    and .results[0].result.ok == true
+    and .results[0].result.output.tool == "mcp.stdio-tools.echo"
+    and .results[0].result.output.structuredContent.echo == "hello"' <<<"${mcp_execution}" >/dev/null
+LINUX_AGENT_API_MODE=0
+LINUX_AGENT_API_INPUT_JSON='[]'
+LINUX_AGENT_MCP_DIR="${original_mcp_dir}"
+rm -rf "${mcp_exec_root}"
 
 linux_agent_download_remote_script() {
     printf '\000\001' > "$2"

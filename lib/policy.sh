@@ -69,7 +69,7 @@ linux_agent_policy_ast_findings() {
     local guard="${LINUX_AGENT_ROOT}/lib/command_guard.py"
     local review_text
 
-    if [[ "${text}" == skill_script=* ]]; then
+    if [[ "${text}" == skill_script=* || "${text}" == mcp_tool=* ]]; then
         printf '[]\n'
         return 0
     fi
@@ -175,6 +175,17 @@ linux_agent_policy_review_step() {
         | if $mode == "remote" then
             .approval_required = true
             | .risk_level = (if .risk_level == "critical" then "critical" else "high" end)
+          elif $mode == "mcp" then
+            .findings = (.findings + [{
+                severity:"medium",
+                code:"MCP_TOOL_REQUIRES_APPROVAL",
+                source:"mcp",
+                category:"external_tool",
+                action:"approve",
+                message:"MCP tool 调用会执行项目安装的外部能力，必须经过人工审批。"
+            }])
+            | .approval_required = true
+            | .risk_level = (if .risk_level == "critical" then "critical" elif .risk_level == "high" then "high" else "medium" end)
           else . end
     ' <<<"${review}"
 }

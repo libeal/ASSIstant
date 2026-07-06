@@ -39,13 +39,13 @@ jq -e '.ok == true and ([.scripts[].ref] | index("ops-basic/resource-inspect"))'
 mcp_project="${tmp_root}/project-mcp-api"
 copy_project "${mcp_project}"
 mkdir -p "${mcp_project}/mcp/stdio-api" "${mcp_project}/mcp/http-api" "${mcp_project}/mcp/sse-api"
-cat > "${mcp_project}/mcp/stdio-api/mcp.json" <<'JSON'
+cat > "${mcp_project}/mcp/stdio-api/mcp.json" <<JSON
 {
   "id": "stdio-api",
   "name": "API stdio server",
   "transport": "stdio",
   "command": "python3",
-  "args": ["server.py"],
+  "args": ["${ROOT_DIR}/tests/fake_mcp_server.py", "stdio"],
   "env": {"SECRET_TOKEN": "api-secret-value"}
 }
 JSON
@@ -53,6 +53,7 @@ cat > "${mcp_project}/mcp/http-api/mcp.json" <<'JSON'
 {
   "id": "http-api",
   "name": "API streamable HTTP server",
+  "enabled": false,
   "transport": "streamable_http",
   "url": "https://example.com/mcp",
   "headers": {"Authorization": "Bearer api-secret-value"}
@@ -62,6 +63,7 @@ cat > "${mcp_project}/mcp/sse-api/mcp.json" <<'JSON'
 {
   "id": "sse-api",
   "name": "API SSE server",
+  "enabled": false,
   "transport": "sse",
   "url": "https://example.com/sse",
   "message_url": "https://example.com/messages"
@@ -78,6 +80,15 @@ if grep -q 'api-secret-value' <<<"${mcp_list}"; then
 fi
 mcp_validate="$(cd "${mcp_project}" && bash bin/agent api mcp validate)"
 jq -e '.ok == true and .status == "validated" and (.validation.findings | length) == 0' <<<"${mcp_validate}" >/dev/null
+mcp_tools="$(cd "${mcp_project}" && bash bin/agent api mcp tools)"
+jq -e '.ok == true and .status == "listed"
+    and .tool_count == 1
+    and ([.tools[] | select(.server_id == "stdio-api" and .name == "echo") | .ref] | first) == "stdio-api/echo"
+    and ([.servers[] | select(.id == "stdio-api") | .tool_count] | first) == 1' <<<"${mcp_tools}" >/dev/null
+if grep -q 'api-secret-value' <<<"${mcp_tools}"; then
+    printf 'mcp api tools leaked secret material\n' >&2
+    exit 1
+fi
 
 project_work="${tmp_root}/project-work-api"
 copy_project "${project_work}"

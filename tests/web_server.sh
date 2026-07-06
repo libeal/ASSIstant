@@ -50,14 +50,14 @@ jq --arg token "${token}" --argjson port "${port}" \
     "${project}/config/config.json" > "${tmp_config}"
 mv "${tmp_config}" "${project}/config/config.json"
 mkdir -p "${project}/mcp/stdio-web" "${project}/mcp/http-web" "${project}/mcp/sse-web"
-cat > "${project}/mcp/stdio-web/mcp.json" <<'JSON'
+cat > "${project}/mcp/stdio-web/mcp.json" <<JSON
 {
   "id": "stdio-web",
   "name": "Web stdio server",
   "description": "Stdio transport fixture",
   "transport": "stdio",
-  "command": "node",
-  "args": ["server.js"],
+  "command": "python3",
+  "args": ["${ROOT_DIR}/tests/fake_mcp_server.py", "stdio"],
   "env": {"WEB_TOKEN": "web-secret-value"}
 }
 JSON
@@ -65,6 +65,7 @@ cat > "${project}/mcp/http-web/mcp.json" <<'JSON'
 {
   "id": "http-web",
   "name": "Web streamable server",
+  "enabled": false,
   "transport": "streamable_http",
   "url": "https://example.com/mcp",
   "headers": {"Authorization": "Bearer web-secret-value"}
@@ -74,6 +75,7 @@ cat > "${project}/mcp/sse-web/mcp.json" <<'JSON'
 {
   "id": "sse-web",
   "name": "Web SSE server",
+  "enabled": false,
   "transport": "sse",
   "url": "https://example.com/sse",
   "message_url": "https://example.com/messages"
@@ -97,6 +99,8 @@ grep -q '结束进程' <<<"${index_html}"
 grep -q 'id="senseTopicSelect"' <<<"${index_html}"
 grep -q 'id="skillsValidateBtn"' <<<"${index_html}"
 grep -q 'id="mcpValidateBtn"' <<<"${index_html}"
+grep -q 'id="mcpToolsBtn"' <<<"${index_html}"
+grep -q 'id="mcpToolCount"' <<<"${index_html}"
 grep -q 'id="policyValidateBtn"' <<<"${index_html}"
 grep -q 'id="auditRestoreTimelineBtn"' <<<"${index_html}"
 grep -q 'id="sessionLeaveBtn"' <<<"${index_html}"
@@ -242,6 +246,15 @@ if grep -q 'web-secret-value' <<<"${mcp_state}"; then
 fi
 mcp_validate="$(curl --noproxy '*' -sS -H "Authorization: Bearer ${token}" "${base_url}/api/mcp/validate")"
 jq -e '.ok == true and .status == "validated" and .validation.ok == true' <<<"${mcp_validate}" >/dev/null
+mcp_tools="$(curl --noproxy '*' -sS -H "Authorization: Bearer ${token}" "${base_url}/api/mcp/tools")"
+jq -e '.ok == true and .status == "listed"
+    and .tool_count == 1
+    and ([.tools[] | select(.server_id == "stdio-web" and .name == "echo") | .ref] | first) == "stdio-web/echo"
+    and ([.servers[] | select(.id == "stdio-web") | .tool_count] | first) == 1' <<<"${mcp_tools}" >/dev/null
+if grep -q 'web-secret-value' <<<"${mcp_tools}"; then
+    printf 'web mcp tools response leaked secret material\n' >&2
+    exit 1
+fi
 
 skill_read_payload="$(jq -cn '{path:"ops-basic/scripts/resource-inspect.sh"}')"
 skill_read="$(curl --noproxy '*' -sS \

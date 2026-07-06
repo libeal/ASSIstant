@@ -2157,6 +2157,7 @@ class Handler(SimpleHTTPRequestHandler):
             "/api/skills/validate": ("skills", "validate"),
             "/api/mcp": ("mcp", "list"),
             "/api/mcp/validate": ("mcp", "validate"),
+            "/api/mcp/tools": ("mcp", "tools"),
             "/api/audit/list": ("audit", "list"),
         }
         if path == "/api/policies":

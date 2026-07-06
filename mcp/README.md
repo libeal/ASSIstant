@@ -6,9 +6,12 @@ Place external MCP server manifests under this directory as:
 mcp/<server-id>/mcp.json
 ```
 
-The project reads these manifests as capability metadata. It validates and
-displays them in the CLI/Web registry, but it does not execute external MCP
-servers directly from the browser.
+The project reads these manifests as external capability metadata. It validates
+and displays them in the CLI/Web registry, can discover `tools/list`, and exposes
+the resulting MCP tools to work/edit model context. Actual `tools/call`
+execution is only allowed through a `work_plan` step with
+`executor_type: "mcp_tool"`; it goes through policy review, manual approval,
+observer, and audit. The browser never calls external MCP tools directly.
 
 Supported transports:
 
@@ -49,3 +52,11 @@ Example `streamable_http` manifest:
 
 Secret-like fields such as `Authorization`, `token`, `password`, `secret` and
 `api_key` are redacted from API/Web responses.
+
+Useful commands:
+
+```bash
+bash bin/agent mcp list
+bash bin/agent mcp validate
+bash bin/agent mcp tools
+```

@@ -276,13 +276,15 @@
                     <div><h2>MCP</h2><p>读取项目根目录 mcp/ 下的外部 MCP server manifest，覆盖 stdio、SSE 和 Streamable HTTP。</p></div>
                     <div class="toolbar action-gap">
                       <button class="btn secondary" id="mcpReloadBtn" type="button">刷新 MCP</button>
+                      <button class="btn secondary" id="mcpToolsBtn" type="button">加载工具</button>
                       <button class="btn" id="mcpValidateBtn" type="button">校验 MCP</button>
                     </div>
                   </div>
-                  <div class="grid-3">
+                  <div class="grid-4">
                     <div class="metric"><div class="label">root</div><div class="value compact-value" id="mcpRoot">--</div><div class="hint">manifest 根目录</div></div>
                     <div class="metric"><div class="label">servers</div><div class="value" id="mcpCount">0</div><div class="hint">已发现配置</div></div>
                     <div class="metric"><div class="label">valid</div><div class="value" id="mcpValidCount">0</div><div class="hint">校验通过</div></div>
+                    <div class="metric"><div class="label">tools</div><div class="value" id="mcpToolCount">0</div><div class="hint">work/edit 可见</div></div>
                   </div>
                 </div>
 
@@ -292,6 +294,16 @@
                     <thead><tr><th>Server</th><th>Transport</th><th>Enabled</th><th>Status</th><th>Manifest</th></tr></thead>
                     <tbody id="mcpCatalog">
                       <tr><td colspan="5">连接后加载 MCP registry。</td></tr>
+                    </tbody>
+                  </table>
+                </div>
+
+                <div class="panel">
+                  <div class="panel-header"><div><h3>MCP tools</h3><p>这些工具会注入 work/edit 的 request_context；实际调用仍需要工作计划和审批。</p></div></div>
+                  <table class="table">
+                    <thead><tr><th>Ref</th><th>Transport</th><th>Description</th><th>Input schema</th></tr></thead>
+                    <tbody id="mcpToolCatalog">
+                      <tr><td colspan="4">点击“加载工具”后读取 tools/list。</td></tr>
                     </tbody>
                   </table>
                 </div>

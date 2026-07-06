@@ -128,7 +128,7 @@ rm -rf "${broken_skills_root}"
 mcp_root="$(mktemp -d)"
 original_mcp_dir="${LINUX_AGENT_MCP_DIR}"
 LINUX_AGENT_MCP_DIR="${mcp_root}"
-mkdir -p "${mcp_root}/stdio-sample" "${mcp_root}/streamable-sample" "${mcp_root}/sse-sample" "${mcp_root}/broken-sample" "${mcp_root}/array-sample"
+mkdir -p "${mcp_root}/stdio-sample" "${mcp_root}/streamable-sample" "${mcp_root}/sse-sample" "${mcp_root}/broken-sample" "${mcp_root}/array-sample" "${mcp_root}/stdio-tools"
 cat > "${mcp_root}/stdio-sample/mcp.json" <<'JSON'
 {
   "id": "stdio-sample",
@@ -171,6 +171,15 @@ cat > "${mcp_root}/array-sample/mcp.json" <<'JSON'
   {"id": "array-sample", "transport": "stdio", "command": "node"}
 ]
 JSON
+cat > "${mcp_root}/stdio-tools/mcp.json" <<JSON
+{
+  "id": "stdio-tools",
+  "name": "Fake stdio tools",
+  "transport": "stdio",
+  "command": "python3",
+  "args": ["${ROOT_DIR}/tests/fake_mcp_server.py", "stdio"]
+}
+JSON
 mcp_list="$(linux_agent_mcp_list)"
 jq -e '.ok == true
     and .status == "listed"
@@ -187,6 +196,17 @@ mcp_validate="$(linux_agent_validate_mcp)"
 jq -e '.ok == false
     and ([.findings[]?.code] | index("MCP_STDIO_COMMAND_MISSING"))
     and ([.findings[]?.code] | index("MCP_MANIFEST_NOT_OBJECT"))' <<<"${mcp_validate}" >/dev/null
+mcp_tools="$(linux_agent_mcp_tool_catalog)"
+jq -e '.ok == true
+    and ([.servers[] | select(.id == "stdio-tools") | .tools[].name] | index("echo"))
+    and ([.tools[] | select(.server_id == "stdio-tools" and .name == "echo") | .ref] | first) == "stdio-tools/echo"' <<<"${mcp_tools}" >/dev/null
+mcp_call="$(linux_agent_mcp_call_tool "stdio-tools" "echo" '{"text":"hello"}')"
+jq -e '.ok == true
+    and .status == "executed"
+    and .server_id == "stdio-tools"
+    and .tool == "echo"
+    and .result.structuredContent.echo == "hello"
+    and ([.result.content[]? | select(.type == "text") | .text] | first) == "echo:hello"' <<<"${mcp_call}" >/dev/null
 LINUX_AGENT_MCP_DIR="${original_mcp_dir}"
 rm -rf "${mcp_root}"
 

@@ -357,6 +357,8 @@ linux_agent_audit_safe_summary() {
                 title:($s.title // null),
                 executor_type:($s.executor_type // null),
                 skill_script:($s.skill_script // null),
+                mcp_server:($s.mcp_server // null),
+                mcp_tool:($s.mcp_tool // null),
                 risk_level:($s.risk_level // null),
                 has_command:($s | has("command")),
                 command_preview:(.command // "" | preview),
@@ -787,7 +789,13 @@ linux_agent_show_audit() {
             elif ($s | startswith("observer_")) then "Observer 事件"
             elif ($s | startswith("agent_")) then "Agent 循环"
             else $s end;
-        def step_name($p): ($p.step.title // $p.step.id // $p.step.skill_script // $p.step.command_preview // "");
+        def step_name($p):
+            ($p.step.title
+             // $p.step.id
+             // $p.step.skill_script
+             // (if (($p.step.mcp_server // "") != "" and ($p.step.mcp_tool // "") != "") then ($p.step.mcp_server + "/" + $p.step.mcp_tool) else null end)
+             // $p.step.command_preview
+             // "");
         def result_text($d):
             [
                 (if ($d.status // "") != "" then "状态=" + ($d.status | tostring) else empty end),
