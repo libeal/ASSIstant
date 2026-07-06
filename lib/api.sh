@@ -604,6 +604,12 @@ linux_agent_api_dispatch() {
         skills:validate)
             jq -cn --argjson validation "$(linux_agent_validate_skills)" '{ok:($validation.ok // false), status:"validated", validation:$validation}'
             ;;
+        mcp:|mcp:list)
+            linux_agent_mcp_list
+            ;;
+        mcp:validate)
+            jq -cn --argjson validation "$(linux_agent_validate_mcp)" '{ok:($validation.ok // false), status:"validated", validation:$validation}'
+            ;;
         policy:validate)
             jq -cn --argjson validation "$(linux_agent_api_policy_validate "${payload}")" '{ok:($validation.ok // false), status:($validation.status // "invalid"), validation:$validation}'
             ;;

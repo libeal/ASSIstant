@@ -29,6 +29,7 @@ copy_project() {
         "${ROOT_DIR}/policies" \
         "${ROOT_DIR}/prompts" \
         "${ROOT_DIR}/skills" \
+        "${ROOT_DIR}/mcp" \
         "${ROOT_DIR}/web" \
         "${target}/"
 }
@@ -43,10 +44,41 @@ jq --arg token "${token}" --argjson port "${port}" \
     '.web = {enabled:true, host:"127.0.0.1", port:$port, token:$token, job_retention_hours:1}
     | .api_key = "test-web-initial-config-key"
     | del(.api_key_file)
+    | del(.observer.privilege)
     | .agent_loop.auto_execute_low_risk = false
     | .agent_loop.auto_execute_shell_low_risk = true' \
     "${project}/config/config.json" > "${tmp_config}"
 mv "${tmp_config}" "${project}/config/config.json"
+mkdir -p "${project}/mcp/stdio-web" "${project}/mcp/http-web" "${project}/mcp/sse-web"
+cat > "${project}/mcp/stdio-web/mcp.json" <<'JSON'
+{
+  "id": "stdio-web",
+  "name": "Web stdio server",
+  "description": "Stdio transport fixture",
+  "transport": "stdio",
+  "command": "node",
+  "args": ["server.js"],
+  "env": {"WEB_TOKEN": "web-secret-value"}
+}
+JSON
+cat > "${project}/mcp/http-web/mcp.json" <<'JSON'
+{
+  "id": "http-web",
+  "name": "Web streamable server",
+  "transport": "streamable_http",
+  "url": "https://example.com/mcp",
+  "headers": {"Authorization": "Bearer web-secret-value"}
+}
+JSON
+cat > "${project}/mcp/sse-web/mcp.json" <<'JSON'
+{
+  "id": "sse-web",
+  "name": "Web SSE server",
+  "transport": "sse",
+  "url": "https://example.com/sse",
+  "message_url": "https://example.com/messages"
+}
+JSON
 
 (cd "${project}" && bash bin/agent-web >"${tmp_root}/server.out" 2>"${tmp_root}/server.err") &
 server_pid="$!"
@@ -64,6 +96,7 @@ grep -q 'ASSIstant 前端外壳' <<<"${index_html}"
 grep -q '结束进程' <<<"${index_html}"
 grep -q 'id="senseTopicSelect"' <<<"${index_html}"
 grep -q 'id="skillsValidateBtn"' <<<"${index_html}"
+grep -q 'id="mcpValidateBtn"' <<<"${index_html}"
 grep -q 'id="policyValidateBtn"' <<<"${index_html}"
 grep -q 'id="auditRestoreTimelineBtn"' <<<"${index_html}"
 grep -q 'id="sessionLeaveBtn"' <<<"${index_html}"
@@ -78,8 +111,15 @@ grep -q 'work-plan-preview' "${project}/web/static/app.js"
 grep -q 'prepareNewWorkRun' "${project}/web/static/app.js"
 grep -q 'execution_state' "${project}/web/static/app.js"
 grep -q 'data-config-model-fetch' "${project}/web/static/app.js"
+grep -q 'loadMcpRegistry' "${project}/web/static/app.js"
 grep -q 'type: "provider"' "${project}/web/static/modules/policy-config.js"
 grep -q 'type: "model"' "${project}/web/static/modules/policy-config.js"
+grep -q 'agent_loop_iteration_started' "${project}/web/static/modules/audit.js"
+grep -q 'Agent 循环迭代开始' "${project}/web/static/modules/audit.js"
+mcp_nav_line="$(grep -n 'data-screen="mcp"' "${project}/web/static/index.html" | cut -d: -f1)"
+skills_nav_line="$(grep -n 'data-screen="skills"' "${project}/web/static/index.html" | cut -d: -f1)"
+policy_nav_line="$(grep -n 'data-screen="policy"' "${project}/web/static/index.html" | cut -d: -f1)"
+[[ "${skills_nav_line}" -lt "${mcp_nav_line}" && "${mcp_nav_line}" -lt "${policy_nav_line}" ]]
 
 unauth_body="${tmp_root}/unauth.json"
 unauth_code="$(curl --noproxy '*' -sS -o "${unauth_body}" -w '%{http_code}' "${base_url}/api/health" || true)"
@@ -113,6 +153,7 @@ config_state="$(curl --noproxy '*' -sS -H "Authorization: Bearer ${token}" "${ba
 jq -e '.ok == true and (.config.agent_loop.thinking_trace_enabled | type == "boolean") and .config.api_key_configured == true and .config.api_key_source == "config" and .config.api_key_configured_in_config == true and .config.web.token_configured == true and (.config | has("api_key") | not) and (.config | has("api_key_file") | not) and (.config | has("api_key_file_configured") | not) and (.config | has("api_key_migration_recommended") | not)
     and (.config.agent_loop | has("auto_execute_low_risk") | not)
     and (.config.agent_loop | has("auto_execute_shell_low_risk") | not)
+    and .config.observer.privilege == "sudo_interactive"
     and .config.approvals.auto.skill_readonly == true
     and .config.approvals.auto.shell_readonly == false
     and .config.approvals.auto.file_patch == false' <<<"${config_state}" >/dev/null
@@ -189,6 +230,18 @@ jq -e '.ok == true and (.markdown_files | index("INDEX.md")) and (.script_files 
 
 skills_validate="$(curl --noproxy '*' -sS -H "Authorization: Bearer ${token}" "${base_url}/api/skills/validate")"
 jq -e '.ok == true and .status == "validated" and .validation.ok == true' <<<"${skills_validate}" >/dev/null
+
+mcp_state="$(curl --noproxy '*' -sS -H "Authorization: Bearer ${token}" "${base_url}/api/mcp")"
+jq -e '.ok == true and .status == "listed"
+    and ([.servers[].id] | index("stdio-web"))
+    and ([.servers[].transport] | unique | sort) == ["sse","stdio","streamable_http"]
+    and ([.servers[] | select(.id == "stdio-web") | .config.env.WEB_TOKEN] | first) == "[REDACTED]"' <<<"${mcp_state}" >/dev/null
+if grep -q 'web-secret-value' <<<"${mcp_state}"; then
+    printf 'web mcp response leaked secret material\n' >&2
+    exit 1
+fi
+mcp_validate="$(curl --noproxy '*' -sS -H "Authorization: Bearer ${token}" "${base_url}/api/mcp/validate")"
+jq -e '.ok == true and .status == "validated" and .validation.ok == true' <<<"${mcp_validate}" >/dev/null
 
 skill_read_payload="$(jq -cn '{path:"ops-basic/scripts/resource-inspect.sh"}')"
 skill_read="$(curl --noproxy '*' -sS \

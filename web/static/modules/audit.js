@@ -58,6 +58,13 @@ export function auditStageLabel(stage) {
   if (stage === "script_executed") return "Skill 执行";
   if (stage === "executed") return "工作流结果";
   if (stage === "finished") return "业务完成";
+  if (stage === "agent_loop_started") return "Agent 循环开始";
+  if (stage === "agent_loop_iteration_started") return "Agent 循环迭代开始";
+  if (stage === "agent_reflection_requested") return "Agent 反思请求";
+  if (stage === "agent_reflection_planned") return "Agent 反思计划";
+  if (stage === "agent_checkpoint_requested") return "Agent checkpoint 请求";
+  if (stage === "agent_checkpoint_decision") return "Agent checkpoint 决策";
+  if (stage === "agent_loop_finished") return "Agent 循环结束";
   if (String(stage).startsWith("observer_")) return "Observer";
   if (String(stage).startsWith("agent_")) return "Agent 循环";
   return stage || "事件";
@@ -124,6 +131,14 @@ export function auditEventDisplay(event, pretty = (value) => JSON.stringify(valu
     summary = `状态：${payload.status || "unknown"}，后端：${payload.backend || "auditd"}`;
     details.push(`exec=${payload.exec_count ?? 0}，file=${payload.file_event_count ?? 0}`);
     if (payload.reason_code || payload.diagnostic) details.push(payload.reason_code || payload.diagnostic);
+  } else if (String(stage).startsWith("agent_")) {
+    status = payload.status || status;
+    summary = payload.stopped_reason || payload.status || title;
+    if (payload.iteration != null) details.push(`迭代：${payload.iteration}`);
+    if (payload.iterations != null) details.push(`总轮数：${payload.iterations}`);
+    if (payload.plan_step_count != null) details.push(`计划步骤：${payload.plan_step_count}`);
+    if (payload.auto_executed_count != null) details.push(`自动执行：${payload.auto_executed_count}`);
+    if (payload.checkpoint_turns != null) details.push(`checkpoint 间隔：${payload.checkpoint_turns}`);
   } else {
     summary = payload.message || payload.status || payload.event || compactText(pretty(payload));
   }

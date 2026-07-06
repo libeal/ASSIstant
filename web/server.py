@@ -442,7 +442,7 @@ def config_public_state():
             "audit_text_limit": config.get("audit_text_limit", 1000),
             "observer": {
                 "enabled": observer.get("enabled", "auto"),
-                "privilege": observer.get("privilege", ""),
+                "privilege": observer.get("privilege", "sudo_interactive"),
                 "max_events": observer.get("max_events", 200),
             },
             "execution": {
@@ -2155,6 +2155,8 @@ class Handler(SimpleHTTPRequestHandler):
             "/api/doctor": ("doctor", "run"),
             "/api/tools": ("tools", "list"),
             "/api/skills/validate": ("skills", "validate"),
+            "/api/mcp": ("mcp", "list"),
+            "/api/mcp/validate": ("mcp", "validate"),
             "/api/audit/list": ("audit", "list"),
         }
         if path == "/api/policies":

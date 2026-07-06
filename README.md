@@ -18,6 +18,7 @@ Linux 运维 Agent 是一个以 Bash CLI 为核心的本机运维助手。它把
 | Sense | `bash bin/agent sense <topic>` | 按主题采集环境信息，支持 `all`、`disk`、`resource`、`process`、`network`、`service`、`logs`、`privilege`、`minimal`。 |
 | Tools | `bash bin/agent tools list` | 输出 `skills/INDEX.md` 中登记的可执行 skill 索引。 |
 | Skills | `bash bin/agent skills validate` | 校验 skill 目录、`SKILL.md`、脚本和索引登记一致性。 |
+| MCP | `bash bin/agent mcp list` / `bash bin/agent mcp validate` | 列出和校验 `mcp/` 下安装的外部 MCP server manifest。 |
 | Policy | `bash bin/agent policy validate [file]` | 校验 `policies/` 下策略 JSON、正则和审计边界。 |
 | Audit | `bash bin/agent audit <session-id>` | 读取历史 JSONL 审计会话并生成摘要报告。 |
 | API | `bash bin/agent api <resource> <action> [json]` | 给 Web 后端调用的机器可读 JSON 接口。 |
@@ -32,6 +33,7 @@ Web 视图包括：
 
 - Work 工作台：自然语言任务、terminal 命令、执行时间线、审批抽屉、环境主题刷新。
 - Skill 库：script 运行、script 审查、edit 生成、edit 审查、保存、skill 树、Markdown 预览、`skills validate`。
+- MCP：读取 `mcp/<id>/mcp.json` 外部 MCP server manifest，校验 stdio、legacy SSE 和 Streamable HTTP 三种传输配置。
 - Policy：查看、校验和编辑 `policies/` 下的 JSON 策略文件，保存前会先运行策略校验，写入前需要 sudo 校验。
 - Audit：查看 JSONL 审计 session、事件筛选、指标统计、报告导出，并可把审计事件恢复为 Web 工作台时间线。
 - Config：读取和保存白名单配置项，运行 Doctor，展示运行时配置快照。
@@ -76,6 +78,8 @@ bash bin/agent terminal "printf hello"
 bash bin/agent sense disk
 bash bin/agent tools list
 bash bin/agent skills validate
+bash bin/agent mcp list
+bash bin/agent mcp validate
 bash bin/agent policy validate
 bash bin/agent audit <session-id>
 ```
@@ -94,21 +98,21 @@ bash bin/agent api terminal run '{"command":"printf api-ok"}' | jq '.timeline, .
 
 ## 项目架构
 
-项目按“入口层 -> 核心 Bash 层 -> Web 外壳层 -> 策略与提示层 -> Skill 能力层 -> 配置层 -> 测试层 -> 运行时产物层”组织。CLI 是项目核心，Web 通过同一套 CLI/API 能力提供浏览器体验，测试层使用 fake AI 和脚本验证主流程，不参与项目主体运行。
+项目按“入口层 -> 核心 Bash 层 -> Web 外壳层 -> 策略与提示层 -> 能力层 -> 配置层 -> 测试层 -> 运行时产物层”组织。CLI 是项目核心，Web 通过同一套 CLI/API 能力提供浏览器体验，测试层使用 fake AI 和脚本验证主流程，不参与项目主体运行。
 
 从演进角度看，项目应始终保持“核心引擎 + 多入口适配器 + 可扩展能力系统”的边界：
 
 - 入口层：`bin/agent`、`bin/agent-web`、Web API，以及未来可能出现的官方 remote bootstrap。
 - 编排层：任务解析、上下文采集、AI 调用、响应校验、work/edit/script/terminal 调度。
 - 执行层：shell、skill_script、remote_script、文件编辑等执行器，以及 policy、approval、observer、audit。
-- 能力层：skills、policies、prompts、config、audit、context 等可替换或可扩展资源。
+- 能力层：skills、mcp、policies、prompts、config、audit、context 等可替换或可扩展资源。
 
 不同入口共享同一套核心能力，AI 只提出计划，执行层独立审查、确认、执行和审计。整体设计见 [`docs/design.md`](docs/design.md)，更详细的架构记录见 [`docs/architecture.md`](docs/architecture.md)，CLI/Web 机器协议见 [`docs/api-protocol.md`](docs/api-protocol.md)。
 
 ```text
 Linux 运维 Agent
 ├─ 入口层
-│  ├─ bin/agent              CLI 主入口，加载 lib 并路由 work/edit/script/terminal/doctor/sense/tools/skills/api/audit
+│  ├─ bin/agent              CLI 主入口，加载 lib 并路由 work/edit/script/terminal/doctor/sense/tools/skills/mcp/api/audit
 │  └─ bin/agent-web          Web 启动入口，读取 Web 配置并启动 Python 后端
 ├─ 核心 Bash 层 lib/
 │  ├─ 基础设施
@@ -120,6 +124,7 @@ Linux 运维 Agent
 │  │  ├─ sense.sh            环境采集
 │  │  ├─ doctor.sh           本地健康检查
 │  │  ├─ skills.sh           skill 解析、登记和校验
+│  │  ├─ mcp.sh              MCP manifest 发现、脱敏和校验
 │  │  └─ policy.sh           风险规则审查
 │  ├─ AI 与编排
 │  │  ├─ ai.sh               模型请求、响应规范化和 schema 校验
@@ -150,6 +155,8 @@ Linux 运维 Agent
 │  ├─ ops-basic/             基础巡检、日志、备份和安全清理 skill
 │  ├─ os-deep-inspect/       深度系统、网络、FD 和 journal 检查 skill
 │  └─ controlled-tools/      受控文件匹配、补丁、下载和本地文本分析 skill
+├─ MCP 能力层 mcp/
+│  └─ <server-id>/mcp.json    外部 MCP server manifest，支持 stdio、sse、streamable_http
 ├─ 配置层
 │  ├─ config/config.example.json 模板配置
 │  ├─ config/ai-providers.json AI 厂商预设、鉴权方式和模型列表规则
@@ -171,6 +178,7 @@ Linux 运维 Agent
 - Web 外壳层负责浏览器交互、HTTP API、job 状态和静态资源，不复制核心执行逻辑。
 - 策略与提示层把模型约束、风险规则和观察边界外置，便于审计和独立调整。
 - Skill 能力层提供经过登记的运维能力扩展，脚本通过白名单被 CLI 和 Web 间接使用。
+- MCP 能力层提供外部 MCP server manifest registry；当前只发现、校验和脱敏展示，不直接执行外部 server。
 - 配置层保存模板和本地运行配置，本地敏感配置不进入版本库。
 - 测试层包含 fake AI 和回归脚本，只服务验证流程，不应被主流程依赖。
 - 运行时产物层保存日志、临时状态和缓存，均为本地生成内容。
@@ -180,6 +188,18 @@ Linux 运维 Agent
 当前 skill registry 是本地目录实现，`skills/INDEX.md`、`skills/<name>/SKILL.md` 和 `skills/<name>/scripts/*.sh` 必须互相一致。调用方应通过 `lib/skills.sh` 提供的函数列出、检查、读取和执行 skill，而不是绕过 registry 直接拼路径。
 
 未来如果引入远程 skill 索引或按需加载，仍应保持相同语义：首次只加载索引摘要，执行前 materialize 目标脚本，校验来源和摘要后再交给现有 policy、approval、observer 和 audit 流程。
+
+### MCP Registry 边界
+
+`mcp/` 是外部 MCP server manifest 目录，推荐形态是 `mcp/<server-id>/mcp.json`。当前 registry 只负责发现、校验和脱敏展示，不直接执行外部 MCP server。
+
+支持的 manifest transport：
+
+- `stdio`：本地子进程 stdin/stdout JSON-RPC。
+- `sse`：兼容旧版 HTTP + Server-Sent Events 双端点模式。
+- `streamable_http`：新版单一 HTTP endpoint，响应可为 JSON 或 SSE stream。
+
+Web MCP 页和 `agent api mcp list|validate` 会隐藏 Authorization、token、secret、password、api_key 等敏感字段。后续若接入 MCP tool 执行，应作为新的执行类型进入 policy、approval、observer 和 audit 链路。
 
 ### 核心调用关系
 

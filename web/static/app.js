@@ -24,6 +24,7 @@ let auditListReloadTimer = 0;
 const titles = {
   workbench: "工作台",
   skills: "Skill 库",
+  mcp: "MCP",
   policy: "策略",
   audit: "审计与回放",
   config: "配置中心",
@@ -1627,6 +1628,7 @@ async function connect() {
   await loadSense();
   await loadTools();
   await loadSkillTree();
+  await loadMcpRegistry();
   await loadAuditList();
   await loadPolicies();
   showToast("Connected");
@@ -2100,6 +2102,58 @@ async function validateSkills() {
   const data = await api("/api/skills/validate");
   $("skillCodeOutput").textContent = pretty(data);
   showToast(data.ok ? "Skill 校验通过" : "Skill 校验发现问题");
+}
+
+async function loadMcpRegistry() {
+  const data = await api("/api/mcp");
+  state.mcpRoot = data.root || "";
+  state.mcpServers = Array.isArray(data.servers) ? data.servers : [];
+  state.mcpFindings = Array.isArray(data.findings) ? data.findings : [];
+  renderMcpRegistry();
+  setStatus("mcpStatus", data.status || "listed", state.mcpFindings.length ? "medium" : "ok");
+  printOutput("mcpOutput", data);
+}
+
+async function validateMcp() {
+  setStatus("mcpStatus", "validating", "medium");
+  const data = await api("/api/mcp/validate");
+  state.mcpFindings = Array.isArray(data.validation?.findings) ? data.validation.findings : [];
+  await loadMcpRegistry();
+  setStatus("mcpStatus", data.ok ? "validated" : "invalid", data.ok ? "ok" : "failed");
+  printOutput("mcpOutput", data);
+  showToast(data.ok ? "MCP 校验通过" : "MCP 校验发现问题");
+}
+
+function renderMcpRegistry() {
+  setText("mcpRoot", state.mcpRoot || "--");
+  setText("mcpCount", String(state.mcpServers.length));
+  setText("mcpValidCount", String(state.mcpServers.filter((server) => server.valid).length));
+  const container = $("mcpCatalog");
+  if (!container) return;
+  container.innerHTML = "";
+  if (!state.mcpServers.length) {
+    const row = document.createElement("tr");
+    row.innerHTML = '<td colspan="5">暂无 MCP manifest。可在项目根目录 mcp/&lt;id&gt;/mcp.json 安装外部 MCP 能力。</td>';
+    container.appendChild(row);
+    return;
+  }
+  for (const server of state.mcpServers) {
+    const findingCount = Array.isArray(server.findings) ? server.findings.length : 0;
+    const row = document.createElement("tr");
+    row.className = "clickable";
+    row.innerHTML = `
+      <td><span class="mono">${escapeHtml(server.id || server.name || "mcp")}</span><div class="small">${escapeHtml(server.description || server.name || "")}</div></td>
+      <td><span class="pill">${escapeHtml(server.transport || "unknown")}</span></td>
+      <td>${server.enabled === false ? "false" : "true"}</td>
+      <td><span class="pill risk ${server.valid ? "low" : "high"}">${escapeHtml(server.valid ? "valid" : `${findingCount} issue${findingCount === 1 ? "" : "s"}`)}</span></td>
+      <td class="mono">${escapeHtml(server.path || "")}</td>
+    `;
+    row.addEventListener("click", () => {
+      setStatus("mcpStatus", server.valid ? "selected" : "invalid", server.valid ? "ok" : "failed");
+      printOutput("mcpOutput", server);
+    });
+    container.appendChild(row);
+  }
 }
 
 function renderToolCatalog() {
@@ -3134,6 +3188,8 @@ function bindActions() {
   on("scriptRunBtn", "click", () => safeAction(runScript));
   on("scriptCancelBtn", "click", () => safeAction(cancelScript));
   on("skillsValidateBtn", "click", () => safeAction(validateSkills));
+  on("mcpReloadBtn", "click", () => safeAction(loadMcpRegistry));
+  on("mcpValidateBtn", "click", () => safeAction(validateMcp));
   on("newSkillBtn", "click", startNewSkill);
   on("editPlanBtn", "click", () => safeAction(planEdit));
   on("editReviewBtn", "click", () => safeAction(reviewEdit));
@@ -3190,7 +3246,7 @@ function bindActions() {
   window.addEventListener("keydown", (event) => {
     if (event.altKey || event.metaKey || event.ctrlKey) return;
     if (["INPUT", "TEXTAREA", "SELECT"].includes(document.activeElement.tagName)) return;
-    const map = { "1": "workbench", "2": "skills", "3": "policy", "4": "audit", "5": "config" };
+    const map = { "1": "workbench", "2": "skills", "3": "mcp", "4": "policy", "5": "audit", "6": "config" };
     if (map[event.key]) showScreen(map[event.key]);
   });
 }

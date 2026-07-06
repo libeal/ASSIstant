@@ -95,6 +95,7 @@ source "${ROOT_DIR}/lib/common.sh"
 source "${ROOT_DIR}/lib/config.sh"
 source "${ROOT_DIR}/lib/policy.sh"
 source "${ROOT_DIR}/lib/skills.sh"
+source "${ROOT_DIR}/lib/mcp.sh"
 source "${ROOT_DIR}/lib/doctor.sh"
 linux_agent_init_env "${ROOT_DIR}"
 linux_agent_load_config
@@ -123,5 +124,70 @@ grep -q 'SKILL_SCRIPT_FILE_MISSING' <<<"${broken_skills_json}"
 grep -q 'SKILL_INDEX_BROKEN_REF' <<<"${broken_skills_json}"
 LINUX_AGENT_CONFIG_JSON="${original_config_json}"
 rm -rf "${broken_skills_root}"
+
+mcp_root="$(mktemp -d)"
+original_mcp_dir="${LINUX_AGENT_MCP_DIR}"
+LINUX_AGENT_MCP_DIR="${mcp_root}"
+mkdir -p "${mcp_root}/stdio-sample" "${mcp_root}/streamable-sample" "${mcp_root}/sse-sample" "${mcp_root}/broken-sample" "${mcp_root}/array-sample"
+cat > "${mcp_root}/stdio-sample/mcp.json" <<'JSON'
+{
+  "id": "stdio-sample",
+  "name": "Stdio sample",
+  "description": "Local stdio MCP server",
+  "enabled": true,
+  "transport": "stdio",
+  "command": "node",
+  "args": ["server.js"],
+  "env": {"API_TOKEN": "should-not-leak"}
+}
+JSON
+cat > "${mcp_root}/streamable-sample/mcp.json" <<'JSON'
+{
+  "id": "streamable-sample",
+  "name": "Streamable HTTP sample",
+  "transport": "streamable_http",
+  "url": "http://127.0.0.1:9123/mcp",
+  "headers": {"Authorization": "Bearer should-not-leak"}
+}
+JSON
+cat > "${mcp_root}/sse-sample/mcp.json" <<'JSON'
+{
+  "id": "sse-sample",
+  "name": "Legacy SSE sample",
+  "transport": "sse",
+  "url": "http://127.0.0.1:9124/sse",
+  "message_url": "http://127.0.0.1:9124/messages"
+}
+JSON
+cat > "${mcp_root}/broken-sample/mcp.json" <<'JSON'
+{
+  "id": "broken-sample",
+  "transport": "stdio",
+  "args": ["missing-command"]
+}
+JSON
+cat > "${mcp_root}/array-sample/mcp.json" <<'JSON'
+[
+  {"id": "array-sample", "transport": "stdio", "command": "node"}
+]
+JSON
+mcp_list="$(linux_agent_mcp_list)"
+jq -e '.ok == true
+    and .status == "listed"
+    and .root != ""
+    and ([.servers[].transport] | index("stdio"))
+    and ([.servers[].transport] | index("streamable_http"))
+    and ([.servers[].transport] | index("sse"))
+    and ([.servers[] | select(.id == "stdio-sample") | .config.env.API_TOKEN] | first) == "[REDACTED]"' <<<"${mcp_list}" >/dev/null
+if grep -q 'should-not-leak' <<<"${mcp_list}"; then
+    printf 'mcp list leaked secret material\n' >&2
+    exit 1
+fi
+mcp_validate="$(linux_agent_validate_mcp)"
+jq -e '.ok == false
+    and ([.findings[]?.code] | index("MCP_STDIO_COMMAND_MISSING"))
+    and ([.findings[]?.code] | index("MCP_MANIFEST_NOT_OBJECT"))' <<<"${mcp_validate}" >/dev/null
+LINUX_AGENT_MCP_DIR="${original_mcp_dir}"
+rm -rf "${mcp_root}"
 
 printf 'tools: ok\n'

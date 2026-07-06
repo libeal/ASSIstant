@@ -6,6 +6,7 @@ LINUX_AGENT_ROOT=""
 LINUX_AGENT_LOG_DIR=""
 LINUX_AGENT_CONFIG_FILE=""
 LINUX_AGENT_SKILLS_DIR=""
+LINUX_AGENT_MCP_DIR=""
 LINUX_AGENT_TMP_ROOT=""
 LINUX_AGENT_TMP_DIR=""
 
@@ -15,12 +16,14 @@ linux_agent_init_env() {
     LINUX_AGENT_LOG_DIR="${root_dir}/logs"
     LINUX_AGENT_CONFIG_FILE="${root_dir}/config/config.json"
     LINUX_AGENT_SKILLS_DIR="${root_dir}/skills"
+    LINUX_AGENT_MCP_DIR="${root_dir}/mcp"
     LINUX_AGENT_TMP_ROOT="${root_dir}/tmp"
     LINUX_AGENT_TMP_DIR="${LINUX_AGENT_TMP_ROOT}"
 
     mkdir -p \
         "${LINUX_AGENT_LOG_DIR}" \
         "${LINUX_AGENT_SKILLS_DIR}" \
+        "${LINUX_AGENT_MCP_DIR}" \
         "${LINUX_AGENT_TMP_ROOT}" \
         "${root_dir}/config"
 }
