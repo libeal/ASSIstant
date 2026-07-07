@@ -5,6 +5,7 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SCRIPT_DIR="${ROOT_DIR}/skills/ops-basic/scripts"
 CONTROLLED_SCRIPT_DIR="${ROOT_DIR}/skills/controlled-tools/scripts"
+NETWORK_SCRIPT_DIR="${ROOT_DIR}/skills/network-ops-tools/scripts"
 
 disk_result="$(bash "${SCRIPT_DIR}/disk-hotspots.sh" '{"path":"/var","top_n":3}')"
 resource_result="$(bash "${SCRIPT_DIR}/resource-inspect.sh" '{"top_n":3}')"
@@ -32,6 +33,40 @@ patch_symlink="$(bash "${CONTROLLED_SCRIPT_DIR}/file-patch.sh" "$(jq -cn --arg p
 analyze_symlink="$(bash "${CONTROLLED_SCRIPT_DIR}/local-analyze.sh" "$(jq -cn --arg path "${controlled_link}" '{path:$path}')")"
 download_unsafe="$(bash "${CONTROLLED_SCRIPT_DIR}/file-download.sh" '{"url":"http://example.com/file","output_path":"/tmp/linux-agent-download-test"}')"
 rm -f "${controlled_file}" "${controlled_link}" "${controlled_file}".bak.*
+
+run_network_tool() {
+    local script="$1"
+    local args="$2"
+    local result
+    result="$(bash "${NETWORK_SCRIPT_DIR}/${script}.sh" "${args}")"
+    jq -e --arg tool "network.ops.${script}" '
+        .ok == true
+        and .tool == $tool
+        and (.risk == "medium" or .risk == "high")
+    ' <<<"${result}" >/dev/null
+}
+
+run_network_tool ip-scanner "$(jq -cn '{cidr:"127.0.0.1/32", ports:[1], timeout_ms:200}')"
+run_network_tool port-scanner "$(jq -cn '{target:"127.0.0.1", ports:[1], timeout_ms:200}')"
+run_network_tool discovery-protocol "$(jq -cn '{interface:"lo", limit:5}')"
+run_network_tool wake-on-lan "$(jq -cn '{mac:"00:11:22:33:44:55", dry_run:true}')"
+run_network_tool network-interface "$(jq -cn '{interface:"lo"}')"
+run_network_tool wifi "$(jq -cn '{scan:false}')"
+run_network_tool connections "$(jq -cn '{limit:3}')"
+run_network_tool listeners "$(jq -cn '{limit:3}')"
+run_network_tool neighbor-table "$(jq -cn '{limit:3}')"
+run_network_tool ping-monitor "$(jq -cn '{target:"127.0.0.1", count:1, timeout_ms:500}')"
+run_network_tool traceroute "$(jq -cn '{target:"127.0.0.1"}')"
+run_network_tool dns-lookup "$(jq -cn '{query:"localhost", record_type:"A"}')"
+run_network_tool sntp-lookup "$(jq -cn '{server:"pool.ntp.org", dry_run:true}')"
+run_network_tool whois "$(jq -cn '{query:"example.com", server:"whois.iana.org", dry_run:true}')"
+run_network_tool ip-geolocation "$(jq -cn '{ip:"8.8.8.8", dry_run:true}')"
+run_network_tool hosts-file-editor "$(jq -cn '{action:"read"}')"
+run_network_tool lookup "$(jq -cn '{category:"port", query:"443", protocol:"tcp"}')"
+run_network_tool snmp "$(jq -cn '{host:"127.0.0.1", oid:".1.3.6.1.2.1.1.1.0", dry_run:true}')"
+run_network_tool firewall "$(jq -cn '{action:"status"}')"
+run_network_tool subnet-calculator "$(jq -cn '{cidr:"192.168.1.0/24", new_prefix:26, limit:2}')"
+run_network_tool bit-calculator "$(jq -cn '{values:["0b1010","0b1100"], operation:"and", width:8}')"
 
 cleanup_file="$(mktemp /tmp/linux-agent-tools-cleanup.XXXXXX)"
 printf '0123456789' > "${cleanup_file}"

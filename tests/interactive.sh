@@ -31,20 +31,20 @@ if grep -q '\[sudo\] password' <<<"${slash_output}"; then
     exit 1
 fi
 
-terminal_output="$(printf '/terminal\nprintf terminal-mode-ok\n/work\n/exit\n' | bash "${ROOT_DIR}/bin/agent" 2>&1)"
+terminal_output="$(printf '/terminal\nprintf terminal-mode-ok\ny\n/work\n/exit\n' | bash "${ROOT_DIR}/bin/agent" 2>&1)"
 grep -q 'terminal-mode-ok' <<<"${terminal_output}"
 grep -q '终端执行结果: 成功' <<<"${terminal_output}"
 grep -q '终端输出' <<<"${terminal_output}"
 grep -q '已切换到终端模式' <<<"${terminal_output}"
 
-terminal_json_output="$(bash "${ROOT_DIR}/bin/agent" terminal "printf '%s\n' '{\"ok\":true,\"tool\":\"demo.terminal\",\"summary\":\"json-ok\",\"count\":2}'" 2>&1)"
+terminal_json_output="$(printf 'y\n' | bash "${ROOT_DIR}/bin/agent" terminal "printf '%s\n' '{\"ok\":true,\"tool\":\"demo.terminal\",\"summary\":\"json-ok\",\"count\":2}'" 2>&1)"
 grep -q '终端执行结果: 成功' <<<"${terminal_json_output}"
 grep -q '摘要' <<<"${terminal_json_output}"
 grep -q 'json-ok' <<<"${terminal_json_output}"
 grep -q 'count: 2' <<<"${terminal_json_output}"
 ! grep -q '"tool"' <<<"${terminal_json_output}"
 
-terminal_machine_json="$(LINUX_AGENT_OUTPUT_JSON=1 bash "${ROOT_DIR}/bin/agent" terminal "printf terminal-json-mode" 2>/dev/null)"
+terminal_machine_json="$(printf 'y\n' | LINUX_AGENT_OUTPUT_JSON=1 bash "${ROOT_DIR}/bin/agent" terminal "printf terminal-json-mode" 2>/dev/null)"
 jq -e '.status == "executed" and ([.output_blocks[]? | select(.kind == "stdout") | .text] | first) == "terminal-json-mode"' <<<"${terminal_machine_json}" >/dev/null
 
 tmp_root="$(mktemp -d)"
@@ -68,7 +68,7 @@ if command -v script >/dev/null 2>&1; then
         "${backspace_project}/"
     configure_fake_ai "${backspace_project}"
     tmp_config="$(mktemp)"
-    jq '.observer.enabled="disabled"' "${backspace_project}/config/config.json" > "${tmp_config}"
+    jq '.observer.enabled="disabled" | .approvals.auto.shell_readonly=true' "${backspace_project}/config/config.json" > "${tmp_config}"
     mv "${tmp_config}" "${backspace_project}/config/config.json"
     backspace_typescript="${tmp_root}/backspace.typescript"
     (cd "${backspace_project}" && printf '/terminal\necho 中文AB\177\177CD\n/exit\n' | script -q -e -c "bash bin/agent" "${backspace_typescript}" >/dev/null)
@@ -94,7 +94,7 @@ copy_project() {
 
 project_session="${tmp_root}/project-session"
 copy_project "${project_session}"
-session_output="$(cd "${project_session}" && printf '/terminal\nprintf one\nprintf two\n/exit\n' | bash bin/agent 2>&1)"
+session_output="$(cd "${project_session}" && printf '/terminal\nprintf one\ny\nprintf two\ny\n/exit\n' | bash bin/agent 2>&1)"
 grep -q 'one' <<<"${session_output}"
 grep -q 'two' <<<"${session_output}"
 session_log_count="$(find "${project_session}/logs" -name '*.jsonl' | wc -l | tr -d ' ')"

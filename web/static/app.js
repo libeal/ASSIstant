@@ -2228,6 +2228,7 @@ function renderToolCatalog() {
     const parts = String(tool.ref || "").split("/");
     const name = parts[parts.length - 1] || tool.ref;
     const group = parts.length > 1 ? parts.slice(0, -1).join(" / ") : "skills";
+    const risk = tool.risk || "low";
     const row = document.createElement("tr");
     const scriptPath = `${group.replaceAll(" / ", "/")}/scripts/${name}.sh`;
     row.className = "clickable";
@@ -2236,7 +2237,7 @@ function renderToolCatalog() {
       <td class="mono">${escapeHtml(name)}</td>
       <td>${escapeHtml(group)}</td>
       <td class="mono">${escapeHtml(scriptPath)}</td>
-      <td><span class="pill risk low">low</span></td>
+      <td><span class="pill risk ${riskKind(risk)}">${escapeHtml(risk)}</span></td>
       <td>已登记</td>
     `;
     row.addEventListener("click", () => readSkillFile(scriptPath, "script"));

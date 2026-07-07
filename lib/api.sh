@@ -46,7 +46,7 @@ linux_agent_api_health() {
 }
 
 linux_agent_api_tools_list() {
-    local index_text scripts line ref description
+    local index_text scripts line ref description risk
     index_text="$(linux_agent_skill_index_text 2>/dev/null || true)"
     scripts='[]'
     while IFS= read -r line; do
@@ -54,13 +54,15 @@ linux_agent_api_tools_list() {
         [[ -n "${ref}" ]] || continue
         description="$(sed -n 's/^- `[^`]*`: \(.*\)$/\1/p' <<<"${line}")"
         ref="${ref%.sh}"
+        risk="$(linux_agent_skill_declared_risk "${ref}")"
         scripts="$(jq -cn \
             --argjson prior "${scripts}" \
             --arg ref "${ref}" \
             --arg skill "${ref%%/*}" \
             --arg script "${ref#*/}" \
             --arg description "${description}" \
-            '$prior + [{ref:$ref, skill:$skill, script:$script, description:$description}]')"
+            --arg risk "${risk}" \
+            '$prior + [{ref:$ref, skill:$skill, script:$script, description:$description, risk:$risk}]')"
     done <<<"${index_text}"
 
     jq -cn --arg index_text "${index_text}" --argjson scripts "${scripts}" \
@@ -374,6 +376,7 @@ linux_agent_api_script_review() {
     fi
     material="$(printf 'skill_script=%s\narguments=%s\n%s\n' "${ref}" "${args}" "$(linux_agent_skill_script_content "${ref}")")"
     review="$(linux_agent_policy_review_text "script:${ref}" "${material}")"
+    review="$(linux_agent_review_with_declared_skill_risk "${ref}" "${review}")"
     jq -cn --arg ref "${ref}" --argjson arguments "${args}" --argjson review "${review}" --argjson output_blocks "$(linux_agent_output_blocks_from_review "${review}")" \
         '{
             ok:(($review.approved // false) == true),

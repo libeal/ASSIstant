@@ -31,3 +31,27 @@
 ## session-history
 
 - `session-history/last-command-output`: 从审计 session 中读取上一轮或指定轮次的命令、步骤和 shell/stdout/stderr 输出预览。
+
+## network-ops-tools
+
+- `network-ops-tools/ip-scanner`: 有界扫描授权范围内的 IP/CIDR，支持 ping 与少量 TCP 探测。
+- `network-ops-tools/port-scanner`: 有界扫描单个目标主机的 TCP 端口。
+- `network-ops-tools/discovery-protocol`: 读取本机 LLDP/CDP 风格邻居发现信息。
+- `network-ops-tools/wake-on-lan`: 预览或发送 Wake-on-LAN magic packet。
+- `network-ops-tools/network-interface`: 查看网络接口、地址、路由、MTU、MAC 与 operstate。
+- `network-ops-tools/wifi`: 查看无线接口和可用 Wi-Fi 网络信息。
+- `network-ops-tools/connections`: 查看活动 TCP/UDP 连接。
+- `network-ops-tools/listeners`: 查看监听中的 TCP/UDP socket。
+- `network-ops-tools/neighbor-table`: 查看本机 ARP/NDP neighbor table。
+- `network-ops-tools/ping-monitor`: 执行有界 ping 监控并汇总丢包和延迟。
+- `network-ops-tools/traceroute`: 执行 traceroute/tracepath 或 loopback 安全回退。
+- `network-ops-tools/dns-lookup`: 执行 DNS 查询，优先使用本机解析器或可用 DNS 工具。
+- `network-ops-tools/sntp-lookup`: 执行或 dry-run SNTP 时间查询。
+- `network-ops-tools/whois`: 执行或 dry-run WHOIS 查询，并校验 WHOIS server 为公网地址。
+- `network-ops-tools/ip-geolocation`: 查询或 dry-run 公网 IP 地理位置。
+- `network-ops-tools/hosts-file-editor`: 读取、搜索、规划或确认修改 hosts 文件。
+- `network-ops-tools/lookup`: 查询端口/服务名和 MAC OUI 厂商。
+- `network-ops-tools/snmp`: dry-run 或执行有界 SNMP v2c GET。
+- `network-ops-tools/firewall`: 查看 firewall 状态、生成规则计划或确认应用 UFW 规则。
+- `network-ops-tools/subnet-calculator`: 计算 IPv4/IPv6 子网、可用地址和拆分子网。
+- `network-ops-tools/bit-calculator`: 转换二进制/十六进制/十进制并执行位运算。

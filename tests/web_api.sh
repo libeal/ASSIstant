@@ -41,6 +41,10 @@ jq -e '.ok == true and .web.host == "127.0.0.1"' <<<"${health}" >/dev/null
 
 tools="$(bash "${ROOT_DIR}/bin/agent" api tools list)"
 jq -e '.ok == true and ([.scripts[].ref] | index("ops-basic/resource-inspect"))' <<<"${tools}" >/dev/null
+jq -e '([.scripts[] | select(.skill == "network-ops-tools")] | length) == 21
+    and ([.scripts[] | select(.skill == "network-ops-tools" and .risk == "low")] | length) == 0
+    and ([.scripts[] | select(.ref == "network-ops-tools/ip-scanner") | .risk] | first) == "high"
+    and ([.scripts[] | select(.ref == "network-ops-tools/subnet-calculator") | .risk] | first) == "medium"' <<<"${tools}" >/dev/null
 
 mcp_project="${tmp_root}/project-mcp-api"
 copy_project "${mcp_project}"
@@ -138,6 +142,43 @@ approval_second="$(cd "${project_work}" && bash bin/agent api work run "${approv
 jq -e '.ok == true and .status == "executed" and .response.response_type == "work_plan"
     and ([.timeline[]? | select(.kind == "execution")] | length) == 2' <<<"${approval_second}" >/dev/null
 
+network_steps="$(jq -cn '[
+    {id:"net-ip-scanner", title:"IP scanner", executor_type:"skill_script", skill_script:"network-ops-tools/ip-scanner", arguments:{cidr:"127.0.0.1/32", ports:[1], timeout_ms:200}, reason:"regression", expected_effect:"scan loopback IP", risk_level:"low", rollback_hint:"none"},
+    {id:"net-port-scanner", title:"Port scanner", executor_type:"skill_script", skill_script:"network-ops-tools/port-scanner", arguments:{target:"127.0.0.1", ports:[1], timeout_ms:200}, reason:"regression", expected_effect:"scan loopback port", risk_level:"low", rollback_hint:"none"},
+    {id:"net-discovery", title:"Discovery protocol", executor_type:"skill_script", skill_script:"network-ops-tools/discovery-protocol", arguments:{interface:"lo", limit:5}, reason:"regression", expected_effect:"inspect discovery data", risk_level:"low", rollback_hint:"none"},
+    {id:"net-wol", title:"Wake on LAN", executor_type:"skill_script", skill_script:"network-ops-tools/wake-on-lan", arguments:{mac:"00:11:22:33:44:55", dry_run:true}, reason:"regression", expected_effect:"plan WOL packet", risk_level:"low", rollback_hint:"none"},
+    {id:"net-interface", title:"Network interface", executor_type:"skill_script", skill_script:"network-ops-tools/network-interface", arguments:{interface:"lo"}, reason:"regression", expected_effect:"inspect interface", risk_level:"low", rollback_hint:"none"},
+    {id:"net-wifi", title:"WiFi", executor_type:"skill_script", skill_script:"network-ops-tools/wifi", arguments:{scan:false}, reason:"regression", expected_effect:"inspect wifi", risk_level:"low", rollback_hint:"none"},
+    {id:"net-connections", title:"Connections", executor_type:"skill_script", skill_script:"network-ops-tools/connections", arguments:{limit:3}, reason:"regression", expected_effect:"inspect connections", risk_level:"low", rollback_hint:"none"},
+    {id:"net-listeners", title:"Listeners", executor_type:"skill_script", skill_script:"network-ops-tools/listeners", arguments:{limit:3}, reason:"regression", expected_effect:"inspect listeners", risk_level:"low", rollback_hint:"none"},
+    {id:"net-neighbor", title:"Neighbor table", executor_type:"skill_script", skill_script:"network-ops-tools/neighbor-table", arguments:{limit:3}, reason:"regression", expected_effect:"inspect neighbors", risk_level:"low", rollback_hint:"none"},
+    {id:"net-ping", title:"Ping monitor", executor_type:"skill_script", skill_script:"network-ops-tools/ping-monitor", arguments:{target:"127.0.0.1", count:1, timeout_ms:500}, reason:"regression", expected_effect:"ping loopback", risk_level:"low", rollback_hint:"none"},
+    {id:"net-traceroute", title:"Traceroute", executor_type:"skill_script", skill_script:"network-ops-tools/traceroute", arguments:{target:"127.0.0.1"}, reason:"regression", expected_effect:"trace loopback", risk_level:"low", rollback_hint:"none"},
+    {id:"net-dns", title:"DNS lookup", executor_type:"skill_script", skill_script:"network-ops-tools/dns-lookup", arguments:{query:"localhost", record_type:"A"}, reason:"regression", expected_effect:"resolve localhost", risk_level:"low", rollback_hint:"none"},
+    {id:"net-sntp", title:"SNTP lookup", executor_type:"skill_script", skill_script:"network-ops-tools/sntp-lookup", arguments:{server:"pool.ntp.org", dry_run:true}, reason:"regression", expected_effect:"plan SNTP lookup", risk_level:"low", rollback_hint:"none"},
+    {id:"net-whois", title:"Whois", executor_type:"skill_script", skill_script:"network-ops-tools/whois", arguments:{query:"example.com", server:"whois.iana.org", dry_run:true}, reason:"regression", expected_effect:"plan whois lookup", risk_level:"low", rollback_hint:"none"},
+    {id:"net-geo", title:"IP geolocation", executor_type:"skill_script", skill_script:"network-ops-tools/ip-geolocation", arguments:{ip:"8.8.8.8", dry_run:true}, reason:"regression", expected_effect:"plan IP geolocation", risk_level:"low", rollback_hint:"none"},
+    {id:"net-hosts", title:"Hosts file editor", executor_type:"skill_script", skill_script:"network-ops-tools/hosts-file-editor", arguments:{action:"read"}, reason:"regression", expected_effect:"read hosts file", risk_level:"low", rollback_hint:"none"},
+    {id:"net-lookup", title:"Lookup", executor_type:"skill_script", skill_script:"network-ops-tools/lookup", arguments:{category:"port", query:"443", protocol:"tcp"}, reason:"regression", expected_effect:"lookup port", risk_level:"low", rollback_hint:"none"},
+    {id:"net-snmp", title:"SNMP", executor_type:"skill_script", skill_script:"network-ops-tools/snmp", arguments:{host:"127.0.0.1", oid:".1.3.6.1.2.1.1.1.0", dry_run:true}, reason:"regression", expected_effect:"plan SNMP query", risk_level:"low", rollback_hint:"none"},
+    {id:"net-firewall", title:"Firewall", executor_type:"skill_script", skill_script:"network-ops-tools/firewall", arguments:{action:"status"}, reason:"regression", expected_effect:"inspect firewall", risk_level:"low", rollback_hint:"none"},
+    {id:"net-subnet", title:"Subnet calculator", executor_type:"skill_script", skill_script:"network-ops-tools/subnet-calculator", arguments:{cidr:"192.168.1.0/24", new_prefix:26, limit:2}, reason:"regression", expected_effect:"calculate subnet", risk_level:"low", rollback_hint:"none"},
+    {id:"net-bit", title:"Bit calculator", executor_type:"skill_script", skill_script:"network-ops-tools/bit-calculator", arguments:{values:["0b1010","0b1100"], operation:"and", width:8}, reason:"regression", expected_effect:"calculate bits", risk_level:"low", rollback_hint:"none"}
+]')"
+network_response="$(jq -cn --argjson steps "${network_steps}" '{
+    response_type:"work_plan",
+    summary:"network ops tools regression",
+    steps:$steps,
+    continue_decision:{should_continue:false, reason:"network ops regression complete"}
+}')"
+network_decisions="$(jq -cn '[range(0;21) | "y"]')"
+network_payload="$(jq -cn --argjson response "${network_response}" --argjson decisions "${network_decisions}" '{input:"执行 network ops tools 回归", response:$response, decisions:$decisions}')"
+network_work="$(cd "${project_work}" && bash bin/agent api work run "${network_payload}" 2>/dev/null)"
+jq -e '.ok == true and .status == "executed"
+    and ([.timeline[]? | select(.kind == "execution")] | length) == 21
+    and ([.timeline[]? | select(.kind == "execution") | .output_blocks[]? | select(.kind == "json") | .json.tool] | unique | length) == 21
+    and ([.output_blocks[]? | select(.kind == "meta" and .title == "工作流摘要") | .json.auto_executed_count] | first) == 0' <<<"${network_work}" >/dev/null
+
 project_missing="${tmp_root}/project-missing-ai"
 copy_project "${project_missing}"
 tmp_config="$(mktemp)"
@@ -153,6 +194,15 @@ script_run="$(bash "${ROOT_DIR}/bin/agent" api script run '{"ref":"ops-basic/res
 jq -e '.ok == true and .status == "executed"
     and ([.output_blocks[]? | select(.kind == "json") | .json | select(.tool == "system.resource.inspect")] | length) > 0
     and ([.output_blocks[]? | select(.kind == "meta" and .title == "执行代理") | .json.requested_privilege] | first) == "least"' <<<"${script_run}" >/dev/null
+
+network_script_review="$(bash "${ROOT_DIR}/bin/agent" api script review '{"ref":"network-ops-tools/subnet-calculator","arguments":{"cidr":"192.168.1.0/24"}}')"
+jq -e '.ok == true and .status == "approval_required"
+    and .review.risk_level == "medium"
+    and ([.review.findings[]? | select(.code == "SKILL_DECLARED_RISK")] | length) == 1' <<<"${network_script_review}" >/dev/null
+
+network_script_run="$(bash "${ROOT_DIR}/bin/agent" api script run '{"ref":"network-ops-tools/subnet-calculator","arguments":{"cidr":"192.168.1.0/24"},"approve":true}' 2>/dev/null)"
+jq -e '.ok == true and .status == "executed"
+    and ([.output_blocks[]? | select(.kind == "json") | .json | select(.tool == "network.ops.subnet-calculator")] | length) > 0' <<<"${network_script_run}" >/dev/null
 
 terminal_review_low="$(bash "${ROOT_DIR}/bin/agent" api terminal review '{"command":"printf api-ok"}')"
 jq -e '.ok == true and .status == "approval_required" and .review.risk_level == "low"

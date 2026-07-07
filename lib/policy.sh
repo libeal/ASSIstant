@@ -159,12 +159,13 @@ linux_agent_policy_review_step() {
     local step_json="$1"
     local text="$2"
     local mode="${3:-local}"
-    local subject review step_risk
+    local subject review step_risk executor_type ref
 
     subject="$(jq -r '.id // .title // "step"' <<<"${step_json}")"
     step_risk="$(jq -r '.risk_level // "low"' <<<"${step_json}")"
+    executor_type="$(jq -r '.executor_type // empty' <<<"${step_json}")"
     review="$(linux_agent_policy_review_text "${subject}" "${text}" "${mode}")"
-    jq -c --arg step_risk "${step_risk}" --arg mode "${mode}" '
+    review="$(jq -c --arg step_risk "${step_risk}" --arg mode "${mode}" '
         .approval_required = (.approval_required or ($step_risk == "medium") or ($step_risk == "high") or ($step_risk == "critical"))
         | .risk_level = (
             if .risk_level == "critical" or $step_risk == "critical" then "critical"
@@ -187,7 +188,14 @@ linux_agent_policy_review_step() {
             | .approval_required = true
             | .risk_level = (if .risk_level == "critical" then "critical" elif .risk_level == "high" then "high" else "medium" end)
           else . end
-    ' <<<"${review}"
+    ' <<<"${review}")"
+
+    if [[ "${executor_type}" == "skill_script" ]] && declare -F linux_agent_review_with_declared_skill_risk >/dev/null 2>&1; then
+        ref="$(jq -r '.skill_script // empty' <<<"${step_json}")"
+        review="$(linux_agent_review_with_declared_skill_risk "${ref}" "${review}")"
+    fi
+
+    printf '%s\n' "${review}"
 }
 
 linux_agent_policy_add_validation_finding() {

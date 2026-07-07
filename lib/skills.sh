@@ -95,6 +95,89 @@ linux_agent_skill_manifest_declared_script_names_at() {
         | sort -u
 }
 
+linux_agent_risk_is_valid() {
+    case "${1:-}" in
+        low|medium|high|critical) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+linux_agent_skill_declared_risk_at() {
+    local ref="$1"
+    local skill_md="$2"
+    local script_name line risk
+    script_name="$(linux_agent_skill_script_name_from_ref "${ref}")"
+
+    [[ -f "${skill_md}" ]] || {
+        printf 'low\n'
+        return 0
+    }
+
+    line="$(grep -E "scripts/${script_name}(\`|[[:space:]):,-])" "${skill_md}" 2>/dev/null | head -n 1 || true)"
+    risk="$(sed -nE 's/.*risk:[[:space:]]*`?(low|medium|high|critical)`?.*/\1/p' <<<"${line}" | head -n 1)"
+    if linux_agent_risk_is_valid "${risk}"; then
+        printf '%s\n' "${risk}"
+    else
+        printf 'low\n'
+    fi
+}
+
+linux_agent_skill_declared_risk() {
+    local ref="$1"
+    local skill_name skill_md
+    if ! linux_agent_skill_ref_is_valid "${ref}"; then
+        printf 'low\n'
+        return 0
+    fi
+    skill_name="$(linux_agent_skill_name_from_ref "${ref}")"
+    skill_md="$(linux_agent_skill_manifest_path "${skill_name}")"
+    linux_agent_skill_declared_risk_at "${ref}" "${skill_md}"
+}
+
+linux_agent_review_with_declared_skill_risk() {
+    local ref="$1"
+    local review_json="$2"
+    local declared_risk severity action
+    declared_risk="$(linux_agent_skill_declared_risk "${ref}")"
+    if [[ "${declared_risk}" == "low" ]]; then
+        printf '%s\n' "${review_json}"
+        return 0
+    fi
+
+    severity="${declared_risk}"
+    if [[ "${declared_risk}" == "critical" ]]; then
+        action="block"
+    else
+        action="approve"
+    fi
+
+    jq -c \
+        --arg ref "${ref}" \
+        --arg declared_risk "${declared_risk}" \
+        --arg severity "${severity}" \
+        --arg action "${action}" '
+        def rank($risk):
+            if $risk == "critical" then 4
+            elif $risk == "high" then 3
+            elif $risk == "medium" then 2
+            else 1 end;
+        def max_risk($a; $b):
+            if rank($a) >= rank($b) then $a else $b end;
+        .findings = ((.findings // []) + [{
+            severity:$severity,
+            code:"SKILL_DECLARED_RISK",
+            source:"skill",
+            category:"declared_risk",
+            action:$action,
+            ref:$ref,
+            message:("Skill 声明该脚本最低风险为 " + $declared_risk + "，不能作为 low 风险自动执行。")
+        }])
+        | .approval_required = true
+        | .risk_level = max_risk((.risk_level // "low"); $declared_risk)
+        | .approved = ((.approved // false) and ($declared_risk != "critical"))
+    ' <<<"${review_json}"
+}
+
 linux_agent_index_declared_refs_at() {
     local index_path="$1"
     [[ -f "${index_path}" ]] || return 0
