@@ -709,6 +709,7 @@ button.event { cursor: pointer; }
 .config-control-row .select { min-width: 0; flex: 1 1 auto; }
 .compact-btn { flex: 0 0 auto; padding-inline: 10px; white-space: nowrap; }
 .config-comment { color: var(--text-4); line-height: 1.45; }
+.config-switch-effects { display: flex; flex-direction: column; gap: 3px; color: var(--text-4); line-height: 1.45; }
 .readonly-config-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
 .form-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
 .doctor-summary { margin-bottom: 14px; }

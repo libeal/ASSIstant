@@ -580,7 +580,24 @@ linux_agent_print_terminal_result() {
 
 linux_agent_terminal_review() {
     local command_text="$1"
-    linux_agent_policy_review_text "terminal" "${command_text}"
+    local review
+
+    review="$(linux_agent_policy_review_text "terminal" "${command_text}")"
+    if [[ "$(jq -r '(.approved // false) == true and (.approval_required // false) == false and (.risk_level // "unknown") == "low"' <<<"${review}")" == "true" ]] \
+        && [[ "$(linux_agent_auto_approval_enabled shell_readonly)" != "true" ]]; then
+        jq -c '
+            .approval_required = true
+            | .findings = ((.findings // []) + [{
+                severity:"low",
+                code:"SHELL_AUTO_APPROVAL_DISABLED",
+                source:"config",
+                message:"低风险 Shell 自动运行开关已关闭，低风险 shell 需要人工确认。"
+            }])
+        ' <<<"${review}"
+        return 0
+    fi
+
+    printf '%s\n' "${review}"
 }
 
 linux_agent_print_work_execution_status() {

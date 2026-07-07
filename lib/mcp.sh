@@ -191,7 +191,7 @@ linux_agent_mcp_server_summary() {
         transport="$(jq -r 'if (.transport | type) == "string" then .transport else "" end' <<<"${payload}")"
         name="$(jq -r 'if (.name | type) == "string" then .name elif (.id | type) == "string" then .id else "" end' <<<"${payload}")"
         description="$(jq -r 'if (.description | type) == "string" then .description else "" end' <<<"${payload}")"
-        enabled="$(jq -r '.enabled // true' <<<"${payload}")"
+        enabled="$(jq -r 'if (.enabled | type) == "boolean" then .enabled else true end' <<<"${payload}")"
     else
         server_id="${rel%/mcp.json}"
         transport=""
@@ -341,7 +341,7 @@ linux_agent_mcp_tool_catalog() {
             --argjson prior "${findings}" \
             --argjson next "$(jq -c '.findings // []' <<<"${server}")" \
             '$prior + $next')"
-        enabled="$(jq -r '.enabled // true' <<<"${server}")"
+        enabled="$(jq -r 'if (.enabled | type) == "boolean" then .enabled else true end' <<<"${server}")"
         valid="$(jq -r '.valid // false' <<<"${server}")"
         server_tools='[]'
         server_info='{}'

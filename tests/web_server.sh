@@ -21,6 +21,7 @@ start_fake_ai_server "$((24000 + RANDOM % 1000))" "${tmp_root}"
 
 copy_project() {
     local target="$1"
+    local tmp_manifest
     mkdir -p "${target}"
     cp -a \
         "${ROOT_DIR}/bin" \
@@ -32,6 +33,11 @@ copy_project() {
         "${ROOT_DIR}/mcp" \
         "${ROOT_DIR}/web" \
         "${target}/"
+    if [[ -f "${target}/mcp/context7/mcp.json" ]]; then
+        tmp_manifest="$(mktemp)"
+        jq '.enabled = false' "${target}/mcp/context7/mcp.json" > "${tmp_manifest}"
+        mv "${tmp_manifest}" "${target}/mcp/context7/mcp.json"
+    fi
 }
 
 project="${tmp_root}/project-web"
@@ -108,6 +114,13 @@ grep -q 'id="observerAuditDialog"' <<<"${index_html}"
 grep -q 'on("workInput", "keydown"' "${project}/web/static/app.js"
 grep -q 'event.shiftKey' "${project}/web/static/app.js"
 grep -q 'userOutputBlocks(blocks)' "${project}/web/static/app.js"
+grep -q '低风险 Skill 自动运行' "${project}/web/static/modules/policy-config.js"
+grep -q '低风险 Shell 自动运行' "${project}/web/static/modules/policy-config.js"
+grep -q 'Work 自动续写' "${project}/web/static/modules/policy-config.js"
+grep -q '文件匹配自动运行' "${project}/web/static/modules/policy-config.js"
+grep -q '最小权限代理' "${project}/web/static/modules/policy-config.js"
+grep -q '开：' "${project}/web/static/app.js"
+grep -q '关：' "${project}/web/static/app.js"
 grep -q 'state.terminalSubmitting' "${project}/web/static/app.js"
 grep -q 'session-turn' "${project}/web/static/app.js"
 grep -q 'renderSharedExecutionOutput' "${project}/web/static/app.js"
@@ -239,6 +252,8 @@ mcp_state="$(curl --noproxy '*' -sS -H "Authorization: Bearer ${token}" "${base_
 jq -e '.ok == true and .status == "listed"
     and ([.servers[].id] | index("stdio-web"))
     and ([.servers[].transport] | unique | sort) == ["sse","stdio","streamable_http"]
+    and ([.servers[] | select(.id == "context7") | .enabled] | first) == false
+    and ([.servers[] | select(.id == "http-web") | .enabled] | first) == false
     and ([.servers[] | select(.id == "stdio-web") | .config.env.WEB_TOKEN] | first) == "[REDACTED]"' <<<"${mcp_state}" >/dev/null
 if grep -q 'web-secret-value' <<<"${mcp_state}"; then
     printf 'web mcp response leaked secret material\n' >&2
@@ -545,7 +560,7 @@ left_work_audit="$(curl --noproxy '*' -sS \
 jq -e '[.events[]? | select(.stage == "request_context_built") | .payload.conversation_turns] as $turns
     | ($turns | length) >= 1 and $turns[0] == 0' <<<"${left_work_audit}" >/dev/null
 
-job_payload="$(jq -cn '{resource:"terminal", action:"run", payload:{command:"printf web-job-ok"}}')"
+job_payload="$(jq -cn '{resource:"terminal", action:"run", payload:{command:"printf web-job-ok", approve:true}}')"
 job="$(curl --noproxy '*' -sS \
     -H "Authorization: Bearer ${token}" \
     -H "Content-Type: application/json" \

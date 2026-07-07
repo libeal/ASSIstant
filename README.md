@@ -13,7 +13,7 @@ Linux 运维 Agent 是一个以 Bash CLI 为核心的本机运维助手。它把
 | Work | `bash bin/agent work "<需求>"` | 让模型返回 `answer` 或 `work_plan`，执行计划步骤，并按配置进行反思续写。 |
 | Edit | `bash bin/agent edit "<需求>"` | 生成或修改 skill，打开 `$EDITOR` 或 `vi` 让用户确认脚本内容，再写入 `skills/`。 |
 | Script | `bash bin/agent script <skill>/<script> [json]` | 执行已登记 skill 脚本，执行前校验登记、参数和策略。 |
-| Terminal | `bash bin/agent terminal "<命令>"` | 对本机 shell 命令做策略审查，低风险执行，高风险或提权命令请求确认。 |
+| Terminal | `bash bin/agent terminal "<命令>"` | 对本机 shell 命令做策略审查；低风险命令是否自动执行由 `approvals.auto.shell_readonly` 控制，高风险或提权命令请求确认。 |
 | Doctor | `bash bin/agent doctor` | 检查依赖、配置 JSON、skill 目录和基础运行环境。 |
 | Sense | `bash bin/agent sense <topic>` | 按主题采集环境信息，支持 `all`、`disk`、`resource`、`process`、`network`、`service`、`logs`、`privilege`、`minimal`。 |
 | Tools | `bash bin/agent tools list` | 输出 `skills/INDEX.md` 中登记的可执行 skill 索引。 |

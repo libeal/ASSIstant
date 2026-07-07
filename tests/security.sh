@@ -30,6 +30,8 @@ source "${ROOT_DIR}/lib/mcp.sh"
 source "${ROOT_DIR}/lib/ai.sh"
 # shellcheck source=../lib/policy.sh
 source "${ROOT_DIR}/lib/policy.sh"
+# shellcheck source=../lib/observer.sh
+source "${ROOT_DIR}/lib/observer.sh"
 # shellcheck source=../lib/executor.sh
 source "${ROOT_DIR}/lib/executor.sh"
 
@@ -255,6 +257,22 @@ LINUX_AGENT_CONFIG_JSON="$(jq '.approvals.auto.skill_readonly=false | .approvals
 ! linux_agent_should_auto_execute_step "${readonly_skill_step}" "${low_review}"
 linux_agent_should_auto_execute_step "${file_match_step}" "${low_review}"
 ! linux_agent_should_auto_execute_step "${file_patch_step}" "${low_review}"
+LINUX_AGENT_CONFIG_JSON="$(jq '.approvals.auto.skill_readonly=true | .approvals.auto.shell_readonly=false' <<<"${auto_config}")"
+linux_agent_should_auto_execute_step "${readonly_skill_step}" "${low_review}"
+! linux_agent_should_auto_execute_step "${shell_step}" "${low_review}"
+terminal_review_when_shell_disabled="$(linux_agent_terminal_review "printf ok")"
+jq -e '.approved == true
+    and .approval_required == true
+    and .risk_level == "low"
+    and ([.findings[]? | select(.code == "SHELL_AUTO_APPROVAL_DISABLED")] | length) == 1' <<<"${terminal_review_when_shell_disabled}" >/dev/null
+LINUX_AGENT_CONFIG_JSON="$(jq '.approvals.auto.skill_readonly=false | .approvals.auto.shell_readonly=true' <<<"${auto_config}")"
+! linux_agent_should_auto_execute_step "${readonly_skill_step}" "${low_review}"
+linux_agent_should_auto_execute_step "${shell_step}" "${low_review}"
+terminal_review_when_shell_enabled="$(linux_agent_terminal_review "printf ok")"
+jq -e '.approved == true
+    and .approval_required == false
+    and .risk_level == "low"
+    and ([.findings[]? | select(.code == "SHELL_AUTO_APPROVAL_DISABLED")] | length) == 0' <<<"${terminal_review_when_shell_enabled}" >/dev/null
 LINUX_AGENT_CONFIG_JSON="${auto_config}"
 
 mcp_exec_root="$(mktemp -d)"

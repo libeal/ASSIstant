@@ -1838,13 +1838,19 @@ function configFieldValue(config, field) {
 function renderConfigField(field, rawValue) {
   const value = normalizeConfigFieldValue(field, rawValue);
   if (field.type === "boolean") {
+    const help = field.onEffect || field.offEffect
+      ? `<div class="config-switch-effects small">
+          ${field.onEffect ? `<span>开：${escapeHtml(field.onEffect)}</span>` : ""}
+          ${field.offEffect ? `<span>关：${escapeHtml(field.offEffect)}</span>` : ""}
+        </div>`
+      : `<div class="small">${escapeHtml(field.comment)}</div>`;
     return `
       <div class="toggle-row config-field-row">
         <div>
           <strong class="white">${escapeHtml(field.label)}</strong>
-          <div class="small">${escapeHtml(field.comment)}</div>
+          ${help}
         </div>
-        <button class="switch config-switch${value ? " on" : ""}" id="${escapeHtml(configInputId(field.key))}" type="button" data-config-key="${escapeHtml(field.key)}" aria-pressed="${value ? "true" : "false"}"><span></span></button>
+        <button class="switch config-switch${value ? " on" : ""}" id="${escapeHtml(configInputId(field.key))}" type="button" data-config-key="${escapeHtml(field.key)}" aria-label="${escapeHtml(field.label)}" aria-pressed="${value ? "true" : "false"}"><span></span></button>
       </div>
     `;
   }

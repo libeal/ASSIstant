@@ -16,6 +16,7 @@ start_fake_ai_server "$((23000 + RANDOM % 1000))" "${tmp_root}"
 
 copy_project() {
     local target="$1"
+    local tmp_manifest
     mkdir -p "${target}"
     cp -a \
         "${ROOT_DIR}/bin" \
@@ -27,6 +28,11 @@ copy_project() {
         "${ROOT_DIR}/mcp" \
         "${ROOT_DIR}/web" \
         "${target}/"
+    if [[ -f "${target}/mcp/context7/mcp.json" ]]; then
+        tmp_manifest="$(mktemp)"
+        jq '.enabled = false' "${target}/mcp/context7/mcp.json" > "${tmp_manifest}"
+        mv "${tmp_manifest}" "${target}/mcp/context7/mcp.json"
+    fi
     configure_fake_ai "${target}"
 }
 
@@ -73,6 +79,8 @@ mcp_list="$(cd "${mcp_project}" && bash bin/agent api mcp list)"
 jq -e '.ok == true and .status == "listed"
     and ([.servers[].id] | index("stdio-api"))
     and ([.servers[].transport] | unique | sort) == ["sse","stdio","streamable_http"]
+    and ([.servers[] | select(.id == "context7") | .enabled] | first) == false
+    and ([.servers[] | select(.id == "http-api") | .enabled] | first) == false
     and ([.servers[] | select(.id == "stdio-api") | .config.env.SECRET_TOKEN] | first) == "[REDACTED]"' <<<"${mcp_list}" >/dev/null
 if grep -q 'api-secret-value' <<<"${mcp_list}"; then
     printf 'mcp api list leaked secret material\n' >&2
@@ -146,7 +154,16 @@ jq -e '.ok == true and .status == "executed"
     and ([.output_blocks[]? | select(.kind == "json") | .json | select(.tool == "system.resource.inspect")] | length) > 0
     and ([.output_blocks[]? | select(.kind == "meta" and .title == "执行代理") | .json.requested_privilege] | first) == "least"' <<<"${script_run}" >/dev/null
 
-terminal_run="$(bash "${ROOT_DIR}/bin/agent" api terminal run '{"command":"printf api-ok"}' 2>/dev/null)"
+terminal_review_low="$(bash "${ROOT_DIR}/bin/agent" api terminal review '{"command":"printf api-ok"}')"
+jq -e '.ok == true and .status == "approval_required" and .review.risk_level == "low"
+    and .review.approval_required == true
+    and ([.review.findings[]? | select(.code == "SHELL_AUTO_APPROVAL_DISABLED")] | length) == 1
+    and .approval_card.type == "terminal"' <<<"${terminal_review_low}" >/dev/null
+
+terminal_run_requires_approval="$(bash "${ROOT_DIR}/bin/agent" api terminal run '{"command":"printf api-ok"}' 2>/dev/null)"
+jq -e '.ok == false and .status == "approval_required" and .approval_card.type == "terminal"' <<<"${terminal_run_requires_approval}" >/dev/null
+
+terminal_run="$(bash "${ROOT_DIR}/bin/agent" api terminal run '{"command":"printf api-ok","approve":true}' 2>/dev/null)"
 jq -e '.ok == true
     and ([.output_blocks[]? | select(.kind == "stdout") | .text] | first) == "api-ok"
     and ([.output_blocks[]? | select(.kind == "meta" and .title == "执行代理") | .json.requested_privilege] | first) == "least"' <<<"${terminal_run}" >/dev/null
