@@ -12,6 +12,7 @@ import {
 import { normalizeApprovalCard } from "./modules/approval.js";
 import * as auditProtocol from "./modules/audit.js";
 import { CONFIG_GROUPS, CONFIG_READONLY_FIELDS } from "./modules/policy-config.js";
+import { renderMarkdown } from "./modules/markdown.js";
 
 const state = createInitialState();
 
@@ -2401,34 +2402,6 @@ async function readSkillFile(path, kind = "") {
   }
 }
 
-function renderMarkdown(markdown) {
-  const lines = String(markdown || "").split("\n");
-  const html = [];
-  let inCode = false;
-  for (const line of lines) {
-    if (line.startsWith("```")) {
-      html.push(inCode ? "</code></pre>" : "<pre><code>");
-      inCode = !inCode;
-      continue;
-    }
-    if (inCode) {
-      html.push(`${escapeHtml(line)}\n`);
-      continue;
-    }
-    if (line.startsWith("# ")) html.push(`<h1>${escapeHtml(line.slice(2))}</h1>`);
-    else if (line.startsWith("## ")) html.push(`<h2>${escapeHtml(line.slice(3))}</h2>`);
-    else if (line.startsWith("### ")) html.push(`<h3>${escapeHtml(line.slice(4))}</h3>`);
-    else if (line.startsWith("- ")) html.push(`<p>• ${inlineMarkdown(line.slice(2))}</p>`);
-    else if (line.trim()) html.push(`<p>${inlineMarkdown(line)}</p>`);
-  }
-  if (inCode) html.push("</code></pre>");
-  return html.join("");
-}
-
-function inlineMarkdown(value) {
-  return escapeHtml(value).replace(/`([^`]+)`/g, "<code>$1</code>");
-}
-
 async function runWork() {
   if (remoteSecretTransmissionBlocked()) {
     showToast("请先在配置中心允许远程传输 API Key");
@@ -3289,8 +3262,27 @@ function renderBoundaryRawSection(title, value, note) {
 
 function showScreen(name) {
   document.querySelectorAll(".screen").forEach((el) => el.classList.toggle("active", el.id === `screen-${name}`));
-  document.querySelectorAll(".nav button").forEach((el) => el.classList.toggle("active", el.dataset.screen === name));
+  let activeButton = null;
+  document.querySelectorAll(".nav button").forEach((el) => {
+    const active = el.dataset.screen === name;
+    el.classList.toggle("active", active);
+    if (active) {
+      el.setAttribute("aria-current", "page");
+      activeButton = el;
+    } else {
+      el.removeAttribute("aria-current");
+    }
+  });
   setText("screenTitle", titles[name] || name);
+  scrollActiveNavigationIntoView(activeButton);
+}
+
+function scrollActiveNavigationIntoView(button) {
+  if (!button || !window.matchMedia("(max-width: 760px)").matches) return;
+  const reducedMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+  window.requestAnimationFrame(() => {
+    button.scrollIntoView({ block: "nearest", inline: "nearest", behavior: reducedMotion ? "auto" : "smooth" });
+  });
 }
 
 function bindNavigation() {

@@ -8,8 +8,9 @@
     <link rel="stylesheet" href="/styles.css">
   </head>
   <body>
+    <a class="skip-link" href="#mainContent">跳到主要内容</a>
     <div class="app">
-      <aside class="sidebar" aria-label="ASSIstant navigation">
+      <aside class="sidebar" aria-label="主导航">
         <div class="window-control">
           <button class="shutdown-button" id="shutdownServerBtn" type="button" title="结束 agent-web 进程并关闭界面">
             <span class="shutdown-dot"></span>
@@ -17,16 +18,16 @@
           </button>
         </div>
         <div class="brand">
-          <h1>ASSIstant</h1>
+          <div class="brand-title">ASSIstant</div>
           <p>CLI 项目的桌面前端外壳</p>
         </div>
         <nav class="nav" id="nav">
-          <button class="active" data-screen="workbench"><span class="icon">⌘</span><span class="label">工作台</span><span class="key">1</span></button>
-          <button data-screen="skills"><span class="icon">◇</span><span class="label">Skill 库</span><span class="key">2</span></button>
-          <button data-screen="mcp"><span class="icon">⌁</span><span class="label">MCP</span><span class="key">3</span></button>
-          <button data-screen="policy"><span class="icon">▦</span><span class="label">策略</span><span class="key">4</span></button>
-          <button data-screen="audit"><span class="icon">◌</span><span class="label">审计与回放</span><span class="key">5</span></button>
-          <button data-screen="config"><span class="icon">⚙</span><span class="label">配置中心</span><span class="key">6</span></button>
+          <button class="active" data-screen="workbench" aria-current="page"><span class="icon" aria-hidden="true">⌘</span><span class="label">工作台</span><span class="key" aria-hidden="true">1</span></button>
+          <button data-screen="skills"><span class="icon" aria-hidden="true">◇</span><span class="label">Skill 库</span><span class="key" aria-hidden="true">2</span></button>
+          <button data-screen="mcp"><span class="icon" aria-hidden="true">⌁</span><span class="label">MCP</span><span class="key" aria-hidden="true">3</span></button>
+          <button data-screen="policy"><span class="icon" aria-hidden="true">▦</span><span class="label">策略</span><span class="key" aria-hidden="true">4</span></button>
+          <button data-screen="audit"><span class="icon" aria-hidden="true">◌</span><span class="label">审计与回放</span><span class="key" aria-hidden="true">5</span></button>
+          <button data-screen="config"><span class="icon" aria-hidden="true">⚙</span><span class="label">配置中心</span><span class="key" aria-hidden="true">6</span></button>
         </nav>
         <div class="side-card">
           <strong>运行会话</strong>
@@ -35,11 +36,11 @@
         </div>
       </aside>
 
-      <main class="main">
+      <main class="main" id="mainContent" tabindex="-1">
         <header class="titlebar">
           <div>
             <div class="crumb">libeal / ASSIstant / frontend-shell</div>
-            <strong id="screenTitle">工作台</strong>
+            <h1 id="screenTitle" aria-live="polite">工作台</h1>
           </div>
           <div class="status">
             <span class="pill" id="connectionState">offline</span>

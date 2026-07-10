@@ -1,3 +1,5 @@
+import { renderMarkdown } from "./markdown.js";
+
 function escapeHtml(value) {
   return String(value ?? "")
     .replace(/&/g, "&amp;")
@@ -123,6 +125,14 @@ export function tableFromText(text) {
 export function renderOutputBlocksHtml(blocks) {
   const sections = displayOutputBlocks(blocks).map((block) => {
     const title = block.title || block.kind || "输出";
+    if (block.kind === "markdown" && typeof block.text === "string") {
+      return `
+        <section class="output-section">
+          <h5>${escapeHtml(title)}</h5>
+          <div class="output-markdown">${renderMarkdown(block.text)}</div>
+        </section>
+      `;
+    }
     if (typeof block.text === "string") {
       return `
         <section class="output-section">
