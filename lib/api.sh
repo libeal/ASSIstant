@@ -40,13 +40,14 @@ linux_agent_api_web_config_json() {
 linux_agent_api_health() {
     jq -cn \
         --arg root "${LINUX_AGENT_ROOT}" \
-        --arg version "local" \
+        --arg version "$(linux_agent_config_get_default '.remote.release_version' 'local')" \
         --argjson web "$(linux_agent_api_web_config_json)" \
-        '{ok:true, status:"ok", app:"linux-agent", version:$version, root:$root, web:$web}'
+        --argjson remote "$(linux_agent_remote_state_json)" \
+        '{ok:true, status:"ok", app:"linux-agent", version:(if $version == "" then "local" else $version end), root:$root, web:$web, remote:$remote}'
 }
 
 linux_agent_api_tools_list() {
-    local index_text scripts line ref description risk
+    local index_text scripts line ref description risk materialization
     index_text="$(linux_agent_skill_index_text 2>/dev/null || true)"
     scripts='[]'
     while IFS= read -r line; do
@@ -55,6 +56,14 @@ linux_agent_api_tools_list() {
         description="$(sed -n 's/^- `[^`]*`: \(.*\)$/\1/p' <<<"${line}")"
         ref="${ref%.sh}"
         risk="$(linux_agent_skill_declared_risk "${ref}")"
+        materialization="local"
+        if linux_agent_remote_mode_enabled; then
+            if linux_agent_remote_skill_ready "${ref%%/*}"; then
+                materialization="ready"
+            else
+                materialization="available"
+            fi
+        fi
         scripts="$(jq -cn \
             --argjson prior "${scripts}" \
             --arg ref "${ref}" \
@@ -62,11 +71,12 @@ linux_agent_api_tools_list() {
             --arg script "${ref#*/}" \
             --arg description "${description}" \
             --arg risk "${risk}" \
-            '$prior + [{ref:$ref, skill:$skill, script:$script, description:$description, risk:$risk}]')"
+            --arg materialization "${materialization}" \
+            '$prior + [{ref:$ref, skill:$skill, script:$script, description:$description, risk:$risk, materialization:$materialization}]')"
     done <<<"${index_text}"
 
-    jq -cn --arg index_text "${index_text}" --argjson scripts "${scripts}" \
-        '{ok:true, status:"listed", index_text:$index_text, scripts:$scripts}'
+    jq -cn --arg index_text "${index_text}" --argjson scripts "${scripts}" --argjson remote "$(linux_agent_remote_state_json)" \
+        '{ok:true, status:"listed", index_text:$index_text, scripts:$scripts, remote:$remote}'
 }
 
 linux_agent_api_audit_list() {
@@ -567,7 +577,7 @@ linux_agent_api_needs_session() {
     local resource="${1:-}"
     local action="${2:-}"
     case "${resource}:${action}" in
-        work:run|script:run|terminal:run|edit:plan|edit:apply)
+        work:run|script:run|terminal:run|edit:plan|edit:apply|skills:materialize)
             printf 'true\n'
             ;;
         *)
@@ -609,6 +619,11 @@ linux_agent_api_dispatch() {
         skills:validate)
             jq -cn --argjson validation "$(linux_agent_validate_skills)" '{ok:($validation.ok // false), status:"validated", validation:$validation}'
             ;;
+        skills:materialize)
+            local skill_name
+            skill_name="$(jq -r '.skill // empty' <<<"${payload}")"
+            linux_agent_materialize_skill "${skill_name}"
+            ;;
         mcp:|mcp:list)
             linux_agent_mcp_list
             ;;
@@ -628,7 +643,11 @@ linux_agent_api_dispatch() {
             linux_agent_api_audit_read "${payload}"
             ;;
         work:run)
-            linux_agent_api_work_run "${payload}"
+            if ! linux_agent_remote_api_key_transmission_allowed; then
+                linux_agent_api_error "secret_transmission_disabled" "Remote runtime 未允许向 AI Provider 传输 API key。"
+            else
+                linux_agent_api_work_run "${payload}"
+            fi
             ;;
         script:review)
             linux_agent_api_script_review "${payload}"
@@ -643,7 +662,11 @@ linux_agent_api_dispatch() {
             linux_agent_api_terminal_run "${payload}"
             ;;
         edit:plan)
-            linux_agent_api_edit_plan "${payload}"
+            if ! linux_agent_remote_api_key_transmission_allowed; then
+                linux_agent_api_error "secret_transmission_disabled" "Remote runtime 未允许向 AI Provider 传输 API key。"
+            else
+                linux_agent_api_edit_plan "${payload}"
+            fi
             ;;
         edit:review)
             linux_agent_api_edit_review "${payload}"

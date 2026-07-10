@@ -7,6 +7,10 @@ set -euo pipefail
 # registration, content and execution semantics.
 linux_agent_skills_dir() {
     local configured
+    if [[ "${LINUX_AGENT_REMOTE_MODE:-0}" == "1" ]]; then
+        printf '%s\n' "${LINUX_AGENT_SKILLS_DIR}"
+        return 0
+    fi
     configured="$(linux_agent_config_get '.skills_dir')"
     if [[ -n "${configured}" ]]; then
         printf '%s\n' "${configured}"
@@ -23,6 +27,234 @@ linux_agent_skill_index_text() {
     local index_path
     index_path="$(linux_agent_skill_index_path)"
     [[ -f "${index_path}" ]] && cat "${index_path}"
+}
+
+linux_agent_remote_mode_enabled() {
+    [[ "${LINUX_AGENT_REMOTE_MODE:-0}" == "1" \
+        && -n "${LINUX_AGENT_REMOTE_MANIFEST:-}" \
+        && -f "${LINUX_AGENT_REMOTE_MANIFEST}" ]]
+}
+
+linux_agent_remote_release_base() {
+    printf '%s\n' "${LINUX_AGENT_REMOTE_RELEASE_BASE:-}"
+}
+
+linux_agent_remote_skill_is_known() {
+    local skill_name="$1"
+    linux_agent_remote_mode_enabled || return 1
+    jq -e --arg skill "${skill_name}" '.skills[$skill] | type == "object"' "${LINUX_AGENT_REMOTE_MANIFEST}" >/dev/null 2>&1
+}
+
+linux_agent_remote_ref_is_registered() {
+    local ref="${1%.sh}"
+    linux_agent_remote_mode_enabled || return 1
+    jq -e --arg ref "${ref}" '[.skills[].refs[]? | select(.ref == $ref)] | length == 1' "${LINUX_AGENT_REMOTE_MANIFEST}" >/dev/null 2>&1
+}
+
+linux_agent_remote_skill_ready() {
+    local skill_name="$1"
+    local marker="$(linux_agent_skills_dir)/${skill_name}/.remote-verified.json"
+    [[ -f "${marker}" ]] || return 1
+    local expected_sha expected_version
+    expected_sha="$(jq -r --arg skill "${skill_name}" '.skills[$skill].asset.sha256 // empty' "${LINUX_AGENT_REMOTE_MANIFEST}")"
+    expected_version="$(jq -r '.version // empty' "${LINUX_AGENT_REMOTE_MANIFEST}")"
+    jq -e --arg skill "${skill_name}" --arg sha256 "${expected_sha}" --arg version "${expected_version}" \
+        '.skill == $skill and .sha256 == $sha256 and .release_version == $version' \
+        "${marker}" >/dev/null 2>&1
+}
+
+linux_agent_remote_skill_result() {
+    local ok="$1" status="$2" skill="$3" error="${4:-}" files="${5:-[]}"
+    jq -cn --argjson ok "${ok}" --arg status "${status}" --arg skill "${skill}" --arg error "${error}" --argjson files "${files}" '
+        {ok:$ok, status:$status, skill:$skill, files:$files}
+        + (if $error == "" then {} else {error:$error} end)
+    '
+}
+
+linux_agent_remote_validate_archive() {
+    local archive_path="$1" skill_name="$2"
+    python3 - "${archive_path}" "${skill_name}" <<'PY'
+import pathlib
+import sys
+import tarfile
+
+archive_path = pathlib.Path(sys.argv[1])
+skill = sys.argv[2]
+required_prefix = ("skills", skill)
+with tarfile.open(archive_path, "r:gz") as archive:
+    members = archive.getmembers()
+    if not members or len(members) > 10000:
+        raise SystemExit("invalid archive member count")
+    seen = set()
+    total_size = 0
+    for member in members:
+        path = pathlib.PurePosixPath(member.name)
+        if path.is_absolute() or ".." in path.parts:
+            raise SystemExit("unsafe archive path")
+        parts = tuple(part for part in path.parts if part not in ("", "."))
+        normalized = "/".join(parts)
+        if not normalized or normalized in seen:
+            raise SystemExit("empty or duplicate archive path")
+        seen.add(normalized)
+        if parts in (("skills",), required_prefix):
+            if not member.isdir():
+                raise SystemExit("archive parent path must be a directory")
+            continue
+        if len(parts) < 3 or parts[:2] != required_prefix:
+            raise SystemExit("archive contains files outside the requested skill")
+        if not (member.isfile() or member.isdir()):
+            raise SystemExit("unsafe archive member type")
+        if member.isfile():
+            total_size += member.size
+            if member.size > 32 * 1024 * 1024 or total_size > 128 * 1024 * 1024:
+                raise SystemExit("skill archive expands beyond the allowed size")
+PY
+}
+
+linux_agent_materialize_skill() {
+    local skill_name="$1"
+    local skills_dir lock_root lock_dir attempt lock_acquired asset_name expected_sha expected_size max_size
+    local release_base archive_path download_ok actual_size actual_sha stage_root staged_skill validation files marker_tmp
+    local manifest_refs index_refs actual_refs
+
+    if ! linux_agent_remote_mode_enabled; then
+        linux_agent_remote_skill_result false skill_package_invalid "${skill_name}" "当前不是 remote runtime。"
+        return 0
+    fi
+    if [[ ! "${skill_name}" =~ ^[a-z0-9][a-z0-9-]*$ ]] || ! linux_agent_remote_skill_is_known "${skill_name}"; then
+        linux_agent_remote_skill_result false skill_package_invalid "${skill_name}" "Skill 不在远程登记表中。"
+        return 0
+    fi
+    if linux_agent_remote_skill_ready "${skill_name}"; then
+        files="$(find "$(linux_agent_skills_dir)/${skill_name}" -type f ! -name .remote-verified.json -printf '%P\n' | sort | jq -R -s --arg skill "${skill_name}" 'split("\n") | map(select(length > 0) | "skills/" + $skill + "/" + .)')"
+        linux_agent_remote_skill_result true skill_materialized "${skill_name}" "" "${files}"
+        return 0
+    fi
+
+    skills_dir="$(linux_agent_skills_dir)"
+    if [[ -e "${skills_dir}/${skill_name}" || -L "${skills_dir}/${skill_name}" ]]; then
+        linux_agent_remote_skill_result false skill_package_invalid "${skill_name}" "目标 Skill 目录已存在但没有有效的远程校验标记。"
+        return 0
+    fi
+    lock_root="${LINUX_AGENT_TMP_ROOT:-${LINUX_AGENT_ROOT}/tmp}/skill-locks"
+    lock_dir="${lock_root}/${skill_name}.lock"
+    mkdir -p "${lock_root}"
+    lock_acquired=false
+    for attempt in $(seq 1 200); do
+        if mkdir "${lock_dir}" 2>/dev/null; then
+            lock_acquired=true
+            break
+        fi
+        if linux_agent_remote_skill_ready "${skill_name}"; then
+            linux_agent_materialize_skill "${skill_name}"
+            return 0
+        fi
+        sleep 0.05
+    done
+    if [[ "${lock_acquired}" != "true" ]]; then
+        linux_agent_remote_skill_result false skill_download_failed "${skill_name}" "等待 Skill 下载锁超时。"
+        return 0
+    fi
+
+    asset_name="$(jq -r --arg skill "${skill_name}" '.skills[$skill].asset.name // empty' "${LINUX_AGENT_REMOTE_MANIFEST}")"
+    expected_sha="$(jq -r --arg skill "${skill_name}" '.skills[$skill].asset.sha256 // empty' "${LINUX_AGENT_REMOTE_MANIFEST}")"
+    expected_size="$(jq -r --arg skill "${skill_name}" '.skills[$skill].asset.size_bytes // 0' "${LINUX_AGENT_REMOTE_MANIFEST}")"
+    max_size="$(jq -r --arg skill "${skill_name}" '.skills[$skill].asset.max_size_bytes // 0' "${LINUX_AGENT_REMOTE_MANIFEST}")"
+    release_base="$(linux_agent_remote_release_base)"
+    archive_path="${LINUX_AGENT_TMP_ROOT:-${LINUX_AGENT_ROOT}/tmp}/${asset_name}.$$"
+    stage_root="${LINUX_AGENT_TMP_ROOT:-${LINUX_AGENT_ROOT}/tmp}/skill-stage.${skill_name}.$$"
+
+    if [[ ! "${asset_name}" =~ ^linux-agent-skill-[a-z0-9-]+\.tar\.gz$ \
+        || ! "${expected_sha}" =~ ^[0-9a-f]{64}$ \
+        || ! "${expected_size}" =~ ^[0-9]+$ \
+        || ! "${max_size}" =~ ^[0-9]+$ \
+        || "${expected_size}" -le 0 \
+        || "${expected_size}" -gt "${max_size}" \
+        || -z "${release_base}" ]]; then
+        rmdir "${lock_dir}" 2>/dev/null || true
+        linux_agent_remote_skill_result false skill_package_invalid "${skill_name}" "远程 Skill manifest 字段非法。"
+        return 0
+    fi
+
+    download_ok=true
+    if [[ "${LINUX_AGENT_ALLOW_INSECURE_TEST_URL:-0}" == "1" ]]; then
+        curl -fsSL --max-time 120 --max-filesize "${max_size}" "${release_base}/${asset_name}" -o "${archive_path}" || download_ok=false
+    else
+        curl -fsSL --proto '=https' --tlsv1.2 --max-time 120 --max-filesize "${max_size}" "${release_base}/${asset_name}" -o "${archive_path}" || download_ok=false
+    fi
+    if [[ "${download_ok}" != "true" || ! -f "${archive_path}" ]]; then
+        rm -f "${archive_path}"
+        rmdir "${lock_dir}" 2>/dev/null || true
+        linux_agent_remote_skill_result false skill_download_failed "${skill_name}" "Skill 包下载失败。"
+        return 0
+    fi
+
+    actual_size="$(stat -c '%s' "${archive_path}" 2>/dev/null || printf '0')"
+    actual_sha="$(sha256sum "${archive_path}" | awk '{print $1}')"
+    if [[ "${actual_size}" != "${expected_size}" || "${actual_sha}" != "${expected_sha}" ]]; then
+        rm -f "${archive_path}"
+        rmdir "${lock_dir}" 2>/dev/null || true
+        linux_agent_remote_skill_result false skill_digest_mismatch "${skill_name}" "Skill 包摘要或大小不匹配。"
+        return 0
+    fi
+    if ! linux_agent_remote_validate_archive "${archive_path}" "${skill_name}"; then
+        rm -f "${archive_path}"
+        rmdir "${lock_dir}" 2>/dev/null || true
+        linux_agent_remote_skill_result false skill_package_invalid "${skill_name}" "Skill 包含不安全路径或文件类型。"
+        return 0
+    fi
+
+    rm -rf "${stage_root}"
+    mkdir -p "${stage_root}"
+    tar --no-same-owner --no-same-permissions -xzf "${archive_path}" -C "${stage_root}"
+    staged_skill="${stage_root}/skills/${skill_name}"
+    manifest_refs="$(jq -c --arg skill "${skill_name}" '[.skills[$skill].refs[].ref] | sort | unique' "${LINUX_AGENT_REMOTE_MANIFEST}")"
+    index_refs="$(linux_agent_index_declared_refs_at "$(linux_agent_skill_index_path)" \
+        | sed 's/\.sh$//' \
+        | awk -v prefix="${skill_name}/" 'index($0, prefix) == 1' \
+        | jq -R -s -c 'split("\n") | map(select(length > 0)) | sort | unique')"
+    actual_refs="$(find "${staged_skill}/scripts" -maxdepth 1 -type f -name '*.sh' -printf '%f\n' 2>/dev/null \
+        | sed 's/\.sh$//' \
+        | awk -v prefix="${skill_name}/" '{print prefix $0}' \
+        | jq -R -s -c 'split("\n") | map(select(length > 0)) | sort | unique')"
+    if [[ "${manifest_refs}" != "${index_refs}" || "${manifest_refs}" != "${actual_refs}" ]]; then
+        rm -rf "${stage_root}" "${archive_path}"
+        rmdir "${lock_dir}" 2>/dev/null || true
+        linux_agent_remote_skill_result false skill_package_invalid "${skill_name}" "Skill 包、INDEX 与远程登记引用不一致。"
+        return 0
+    fi
+    validation="$(linux_agent_validate_skill_at "${skill_name}" "${staged_skill}" "$(linux_agent_skill_index_path)")"
+    if [[ "$(jq -r '.ok // false' <<<"${validation}")" != "true" ]]; then
+        rm -rf "${stage_root}" "${archive_path}"
+        rmdir "${lock_dir}" 2>/dev/null || true
+        linux_agent_remote_skill_result false skill_package_invalid "${skill_name}" "Skill 登记或策略校验失败。"
+        return 0
+    fi
+
+    mkdir -p "${skills_dir}"
+    marker_tmp="${staged_skill}/.remote-verified.json.tmp"
+    jq -cn --arg skill "${skill_name}" --arg sha256 "${actual_sha}" --arg version "$(jq -r '.version' "${LINUX_AGENT_REMOTE_MANIFEST}")" \
+        '{skill:$skill, sha256:$sha256, release_version:$version}' > "${marker_tmp}"
+    mv "${marker_tmp}" "${staged_skill}/.remote-verified.json"
+    mv "${staged_skill}" "${skills_dir}/${skill_name}"
+    files="$(find "${skills_dir}/${skill_name}" -type f ! -name .remote-verified.json -printf '%P\n' | sort | jq -R -s --arg skill "${skill_name}" 'split("\n") | map(select(length > 0) | "skills/" + $skill + "/" + .)')"
+    rm -rf "${stage_root}" "${archive_path}"
+    rmdir "${lock_dir}" 2>/dev/null || true
+    if declare -F linux_agent_log_event >/dev/null 2>&1; then
+        linux_agent_log_event "skill_materialized" "$(jq -cn --arg skill "${skill_name}" --arg sha256 "${actual_sha}" '{skill:$skill, sha256:$sha256, status:"skill_materialized"}')"
+    fi
+    linux_agent_remote_skill_result true skill_materialized "${skill_name}" "" "${files}"
+}
+
+linux_agent_ensure_skill_materialized() {
+    local ref="$1" skill_name result
+    linux_agent_remote_mode_enabled || return 0
+    skill_name="$(linux_agent_skill_name_from_ref "${ref}")"
+    result="$(linux_agent_materialize_skill "${skill_name}")"
+    if [[ "$(jq -r '.ok // false' <<<"${result}")" != "true" ]]; then
+        linux_agent_print_error "$(jq -r '.error // .status' <<<"${result}")"
+        return 1
+    fi
 }
 
 linux_agent_skill_ref_is_valid() {
@@ -59,6 +291,10 @@ linux_agent_skill_is_registered() {
     local ref="$1"
     local skill_name script_name skill_md index_path script_path
     linux_agent_skill_ref_is_valid "${ref}" || return 1
+    if linux_agent_remote_mode_enabled && ! linux_agent_remote_skill_ready "$(linux_agent_skill_name_from_ref "${ref}")"; then
+        linux_agent_remote_ref_is_registered "${ref}"
+        return $?
+    fi
     skill_name="$(linux_agent_skill_name_from_ref "${ref}")"
     script_name="$(linux_agent_skill_script_name_from_ref "${ref}")"
     skill_md="$(linux_agent_skill_manifest_path "${skill_name}")"
@@ -129,6 +365,10 @@ linux_agent_skill_declared_risk() {
         printf 'low\n'
         return 0
     fi
+    if linux_agent_remote_mode_enabled && ! linux_agent_remote_skill_ready "$(linux_agent_skill_name_from_ref "${ref}")"; then
+        jq -r --arg ref "${ref%.sh}" '[.skills[].refs[]? | select(.ref == $ref) | .risk][0] // "low"' "${LINUX_AGENT_REMOTE_MANIFEST}"
+        return 0
+    fi
     skill_name="$(linux_agent_skill_name_from_ref "${ref}")"
     skill_md="$(linux_agent_skill_manifest_path "${skill_name}")"
     linux_agent_skill_declared_risk_at "${ref}" "${skill_md}"
@@ -190,6 +430,7 @@ linux_agent_index_declared_refs_at() {
 linux_agent_skill_script_content() {
     local ref="$1"
     local script_path
+    linux_agent_ensure_skill_materialized "${ref}" || return 1
     script_path="$(linux_agent_skill_script_path "${ref}")"
     [[ -f "${script_path}" ]] || return 1
     cat "${script_path}"
@@ -211,6 +452,10 @@ linux_agent_run_skill_script() {
         return 1
     fi
 
+    linux_agent_ensure_skill_materialized "${ref}" || {
+        jq -cn --arg ref "${ref}" '{ok:false, error:"skill package could not be materialized", ref:$ref}'
+        return 1
+    }
     script_path="$(linux_agent_skill_script_path "${ref}")"
     if [[ ! -r "${script_path}" ]]; then
         jq -cn --arg ref "${ref}" '{ok:false, error:"skill script is not readable", ref:$ref}'
@@ -285,6 +530,20 @@ linux_agent_validate_skills() {
         findings="$(jq -cn --argjson prior "${findings}" '$prior + [{severity:"critical", code:"SKILL_INDEX_MISSING", message:"skills/INDEX.md 不存在。"}]')"
     fi
 
+    if linux_agent_remote_mode_enabled; then
+        if ! jq -e '.schema_version == 1 and (.skills | type == "object")' "${LINUX_AGENT_REMOTE_MANIFEST}" >/dev/null 2>&1; then
+            ok="false"
+            findings="$(jq -cn --argjson prior "${findings}" '$prior + [{severity:"critical", code:"REMOTE_SKILL_MANIFEST_INVALID", message:"远程 Skill manifest 非法。"}]')"
+        fi
+        while IFS= read -r ref; do
+            [[ -n "${ref}" ]] || continue
+            if ! linux_agent_remote_ref_is_registered "${ref}"; then
+                ok="false"
+                findings="$(jq -cn --argjson prior "${findings}" --arg ref "${ref%.sh}" '$prior + [{severity:"critical", code:"REMOTE_SKILL_INDEX_MISMATCH", ref:$ref, message:"INDEX.md 与远程 Skill manifest 不一致。"}]')"
+            fi
+        done < <(linux_agent_index_declared_refs_at "${index_path}")
+    fi
+
     while IFS= read -r skill_dir; do
         [[ -z "${skill_dir}" ]] && continue
         local skill_name skill_result
@@ -295,6 +554,12 @@ linux_agent_validate_skills() {
             findings="$(jq -cn --argjson prior "${findings}" --argjson next "$(jq '.findings' <<<"${skill_result}")" '$prior + $next')"
         fi
     done < <(find "${skills_dir}" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | sort)
+
+    if linux_agent_remote_mode_enabled; then
+        jq -cn --argjson ok "${ok}" --arg skills_dir "${skills_dir}" --argjson remote true --argjson findings "${findings}" \
+            '{ok:$ok, skills_dir:$skills_dir, remote:$remote, findings:$findings}'
+        return 0
+    fi
 
     while IFS= read -r ref; do
         [[ -n "${ref}" ]] || continue

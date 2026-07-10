@@ -78,6 +78,7 @@
                       <button class="btn secondary" id="workSuspendBtn" type="button" disabled>挂起</button>
                       <button class="btn secondary" id="sessionLeaveBtn" type="button">离开</button>
                     </div>
+                    <p class="small" id="workRemoteTransmissionNotice" role="status" hidden></p>
                   </div>
                   <div id="terminalModePanel" hidden>
                     <label class="small" for="terminalCommand">bash -lc 命令</label>
@@ -220,6 +221,7 @@
                       <button class="btn secondary" id="editApplyBtn" type="button" disabled>保存</button>
                       <span class="pill risk low" id="editJobStatus">idle</span>
                     </div>
+                    <p class="small" id="editRemoteTransmissionNotice" role="status" hidden></p>
                     <div class="list action-gap" id="editScripts"></div>
                     <div class="terminal action-gap">
                       <div class="terminal-head"><span class="status-dot ok"></span><span>编辑输出</span></div>
@@ -234,17 +236,17 @@
                     <button class="btn secondary" id="skillsValidateBtn" type="button">校验 Skill</button>
                   </div>
                   <table class="table">
-                    <thead><tr><th>Skill</th><th>分类</th><th>脚本</th><th>风险</th><th>INDEX</th></tr></thead>
+                    <thead><tr><th>Skill</th><th>分类</th><th>脚本</th><th>风险</th><th>INDEX</th><th>远程状态</th></tr></thead>
                     <tbody id="skillsCatalog">
-                      <tr><td class="mono">disk-hotspots</td><td>ops-basic / disk</td><td class="mono">scripts/disk-hotspots.sh</td><td><span class="pill risk low">low</span></td><td>已登记</td></tr>
-                      <tr><td class="mono">resource-inspect</td><td>ops-basic / resource</td><td class="mono">scripts/resource-inspect.sh</td><td><span class="pill risk low">low</span></td><td>已登记</td></tr>
-                      <tr><td class="mono">process-inspect</td><td>ops-basic / process</td><td class="mono">scripts/process-inspect.sh</td><td><span class="pill risk low">low</span></td><td>已登记</td></tr>
-                      <tr><td class="mono">service-inspect</td><td>ops-basic / service</td><td class="mono">scripts/service-inspect.sh</td><td><span class="pill risk medium">medium</span></td><td>已登记</td></tr>
-                      <tr><td class="mono">service-restart-plan</td><td>ops-basic / service</td><td class="mono">scripts/service-restart-plan.sh</td><td><span class="pill risk high">plan</span></td><td>已登记</td></tr>
-                      <tr><td class="mono">log-search</td><td>ops-basic / logs</td><td class="mono">scripts/log-search.sh</td><td><span class="pill risk medium">medium</span></td><td>已登记</td></tr>
-                      <tr><td class="mono">log-cleanup-plan</td><td>ops-basic / logs</td><td class="mono">scripts/log-cleanup-plan.sh</td><td><span class="pill risk medium">medium</span></td><td>已登记</td></tr>
-                      <tr><td class="mono">safe-log-cleanup</td><td>ops-basic / safety</td><td class="mono">scripts/safe-log-cleanup.sh</td><td><span class="pill risk high">high</span></td><td>已登记</td></tr>
-                      <tr><td class="mono">config-backup</td><td>ops-basic / backup</td><td class="mono">scripts/config-backup.sh</td><td><span class="pill risk high">high</span></td><td>已登记</td></tr>
+                      <tr><td class="mono">disk-hotspots</td><td>ops-basic / disk</td><td class="mono">scripts/disk-hotspots.sh</td><td><span class="pill risk low">low</span></td><td>已登记</td><td><span class="pill">local</span></td></tr>
+                      <tr><td class="mono">resource-inspect</td><td>ops-basic / resource</td><td class="mono">scripts/resource-inspect.sh</td><td><span class="pill risk low">low</span></td><td>已登记</td><td><span class="pill">local</span></td></tr>
+                      <tr><td class="mono">process-inspect</td><td>ops-basic / process</td><td class="mono">scripts/process-inspect.sh</td><td><span class="pill risk low">low</span></td><td>已登记</td><td><span class="pill">local</span></td></tr>
+                      <tr><td class="mono">service-inspect</td><td>ops-basic / service</td><td class="mono">scripts/service-inspect.sh</td><td><span class="pill risk medium">medium</span></td><td>已登记</td><td><span class="pill">local</span></td></tr>
+                      <tr><td class="mono">service-restart-plan</td><td>ops-basic / service</td><td class="mono">scripts/service-restart-plan.sh</td><td><span class="pill risk high">plan</span></td><td>已登记</td><td><span class="pill">local</span></td></tr>
+                      <tr><td class="mono">log-search</td><td>ops-basic / logs</td><td class="mono">scripts/log-search.sh</td><td><span class="pill risk medium">medium</span></td><td>已登记</td><td><span class="pill">local</span></td></tr>
+                      <tr><td class="mono">log-cleanup-plan</td><td>ops-basic / logs</td><td class="mono">scripts/log-cleanup-plan.sh</td><td><span class="pill risk medium">medium</span></td><td>已登记</td><td><span class="pill">local</span></td></tr>
+                      <tr><td class="mono">safe-log-cleanup</td><td>ops-basic / safety</td><td class="mono">scripts/safe-log-cleanup.sh</td><td><span class="pill risk high">high</span></td><td>已登记</td><td><span class="pill">local</span></td></tr>
+                      <tr><td class="mono">config-backup</td><td>ops-basic / backup</td><td class="mono">scripts/config-backup.sh</td><td><span class="pill risk high">high</span></td><td>已登记</td><td><span class="pill">local</span></td></tr>
                     </tbody>
                   </table>
                   <div class="terminal action-gap">
@@ -419,7 +421,7 @@
                 <div class="panel">
                   <div class="panel-header">
                     <div><h2>审计与回放</h2><p>从真实 session 文件读取审计报告，前端筛选只影响当前列表显示，不改写日志。</p></div>
-                    <button class="btn" id="auditExportBtn" type="button">导出回放报告</button>
+                    <div class="toolbar"><button class="btn" id="auditExportBtn" type="button">导出回放报告</button><button class="btn secondary" id="runtimeBackupBtn" type="button" hidden>下载运行时备份</button></div>
                   </div>
                   <div class="form-grid">
                     <label class="small">session 筛选<input class="field" id="auditSessionFilter" placeholder="按 session_id / 状态 / 日期过滤"></label>

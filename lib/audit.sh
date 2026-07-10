@@ -42,6 +42,9 @@ linux_agent_audit_boundary_default_config() {
       "repair_*",
       "step_*",
       "script_*",
+      "skill_*",
+      "remote_*",
+      "runtime_backup_*",
       "script_manual_edit",
       "terminal_executed",
       "edit_*",
@@ -110,6 +113,9 @@ linux_agent_audit_boundary_default_config() {
       "repair_*",
       "step_*",
       "script_*",
+      "skill_*",
+      "remote_*",
+      "runtime_backup_*",
       "terminal_executed",
       "edit_*",
       "script_manual_edit",
@@ -610,6 +616,9 @@ linux_agent_start_session() {
         fi
         LINUX_AGENT_SESSION_ACTIVE=1
         LINUX_AGENT_SESSION_FINISHED=0
+        if [[ -n "${LINUX_AGENT_REMOTE_PREFLIGHT:-}" ]] && jq -e 'type == "object"' <<<"${LINUX_AGENT_REMOTE_PREFLIGHT}" >/dev/null 2>&1; then
+            linux_agent_log_event "remote_bootstrap_verified" "${LINUX_AGENT_REMOTE_PREFLIGHT}"
+        fi
         if declare -F linux_agent_observer_session_start >/dev/null 2>&1; then
             linux_agent_observer_session_start "session" "$(jq -cn --arg request "${user_input}" '{request:$request}')"
         fi
@@ -637,6 +646,9 @@ linux_agent_start_session() {
         --arg audit_mode "$(linux_agent_audit_mode)" \
         --argjson audit_boundary "${boundary_summary}" \
         '{request:$request, entrypoint:$entrypoint, audit_mode:$audit_mode, audit_boundary:$audit_boundary}')"
+    if [[ -n "${LINUX_AGENT_REMOTE_PREFLIGHT:-}" ]] && jq -e 'type == "object"' <<<"${LINUX_AGENT_REMOTE_PREFLIGHT}" >/dev/null 2>&1; then
+        linux_agent_log_event "remote_bootstrap_verified" "${LINUX_AGENT_REMOTE_PREFLIGHT}"
+    fi
     if declare -F linux_agent_observer_session_start >/dev/null 2>&1; then
         linux_agent_observer_session_start "session" "$(jq -cn --arg request "${user_input}" '{request:$request}')"
     fi

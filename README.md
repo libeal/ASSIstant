@@ -48,6 +48,28 @@ Web 视图包括：
 
 ## 快速开始
 
+### 远程临时运行
+
+CLI 版本：
+
+```bash
+curl -fsSL https://github.com/libeal/ASSIstant/releases/latest/download/linux-agent-cli.sh | bash
+```
+
+Web 版本：
+
+```bash
+curl -fsSL https://github.com/libeal/ASSIstant/releases/latest/download/linux-agent-web.sh | bash
+```
+
+两条命令都只从同一个 GitHub Release 获取 manifest 和已登记资产。Bootstrap 不保存到本机；core、Web 和按需加载的完整 skill 包优先物化到 `$XDG_RUNTIME_DIR` 或 `/dev/shm`，必要时回退权限为 `0700` 的 `/tmp` 子目录，并在退出或收到信号时清理。
+
+Remote CLI 会从 `/dev/tty` 读取审批和可选 API key，密钥不写入配置文件。Remote Web 强制监听 `127.0.0.1`，从其他机器访问时使用终端输出的 SSH 转发命令。固定版本可把 URL 中的 `latest/download` 替换为 `download/<tag>`，并在管道右侧设置相同的 `LINUX_AGENT_VERSION=<tag>`。
+
+Remote 模式默认禁止向 AI Provider 传输 API key。CLI 会在需要 AI 时询问；Web 需在配置中心开启“允许远程传输 API Key”。Terminal、Doctor、Audit 和不需要模型的 Skill 不受此开关影响。运行日志、脱敏配置和用户生成的 skill 可通过 `agent backup <output.tar.gz>` 或 Web“下载运行时备份”按钮显式保存。
+
+### 本地运行
+
 ```bash
 cp config/config.example.json config/config.json
 bash test_config.sh
@@ -105,7 +127,7 @@ bash bin/agent api terminal run '{"command":"printf api-ok"}' | jq '.timeline, .
 
 从演进角度看，项目应始终保持“核心引擎 + 多入口适配器 + 可扩展能力系统”的边界：
 
-- 入口层：`bin/agent`、`bin/agent-web`、Web API，以及未来可能出现的官方 remote bootstrap。
+- 入口层：`bin/agent`、`bin/agent-web`、Web API，以及 GitHub Release 中的 CLI/Web 官方 remote bootstrap。
 - 编排层：任务解析、上下文采集、AI 调用、响应校验、work/edit/script/terminal 调度。
 - 执行层：shell、skill_script、remote_script、文件编辑等执行器，以及 policy、approval、observer、audit。
 - 能力层：skills、mcp、policies、prompts、config、audit、context 等可替换或可扩展资源。
@@ -190,9 +212,9 @@ Linux 运维 Agent
 
 ### Skill Registry 边界
 
-当前 skill registry 是本地目录实现，`skills/INDEX.md`、`skills/<name>/SKILL.md` 和 `skills/<name>/scripts/*.sh` 必须互相一致。调用方应通过 `lib/skills.sh` 提供的函数列出、检查、读取和执行 skill，而不是绕过 registry 直接拼路径。
+skill registry 同时支持本地目录和 Remote Release manifest；`skills/INDEX.md`、`skills/<name>/SKILL.md`、包内脚本与 manifest refs 必须互相一致。调用方应通过 `lib/skills.sh` 提供的函数列出、检查、物化、读取和执行 skill，而不是绕过 registry 直接拼路径。
 
-未来如果引入远程 skill 索引或按需加载，仍应保持相同语义：首次只加载索引摘要，执行前 materialize 目标脚本，校验来源和摘要后再交给现有 policy、approval、observer 和 audit 流程。
+Remote runtime 首次只加载索引与 Release manifest 元数据，执行前按一级 skill 整包 materialize，校验来源、大小、摘要、归档边界、INDEX/包内脚本集合和 policy 后，再交给现有 approval、observer 与 audit 流程。
 
 ### MCP Registry 边界
 
@@ -295,19 +317,11 @@ Web 版 edit 使用浏览器内联编辑器，但保存前仍调用同一套 `ed
 4. 风险等级提升为 high 或 critical。
 5. 用户审批后才执行下载后的脚本。
 
-### 未来远程运行设想（未实现）
+### 官方 Remote Bootstrap
 
-项目未来可以增加 remote bootstrap，使其他服务器通过受控入口临时加载 Agent。该能力当前尚未实现，README 中的这一段只记录架构方向，不代表现在可以使用 `curl | bash` 运行本项目。
+官方 `curl | bash` 是独立入口适配器，不会放宽 Agent 对第三方远程管道的阻断。Release manifest 固定声明 core、Web 和每个一级 skill 的文件名、大小与 SHA256；下载地址只能从当前 `libeal/ASSIstant` Release 派生。
 
-预留设计原则：
-
-- 官方 bootstrap 是新的入口适配器，必须复用现有 core、policy、executor 和 audit。
-- 首次加载只包含最小核心模块、manifest、策略和 skill 索引摘要，不完整下载全部 skill。
-- 远程模块和 skill 由 manifest 描述，并用 SHA256 校验后再加载。
-- skill 按需下载、校验、审查和执行。
-- 运行期默认使用临时目录保存已校验内容，退出后清理。
-- API key、token、私钥和本地密钥不写入 bootstrap、manifest 或 skill 包。
-- 任意第三方远程脚本仍然只能走当前 `remote_script` 的下载审查流程。
+启动时只获取 core、策略、prompt 和 skill 索引。首次执行或在 Web 中点击加载某个 skill 时，resolver 才下载该 skill 的完整归档，拒绝路径穿越、链接、设备文件、摘要错误和登记不一致，再原子加入运行时 registry。`skills validate` 只校验目录和已经物化的包，不会偷偷下载全部 skill。
 
 ## 配置
 
@@ -343,6 +357,7 @@ Web 版 edit 使用浏览器内联编辑器，但保存前仍调用同一套 `ed
 | `execution.least_privilege_user` | 降权执行使用的目标用户。 |
 | `skills_dir` | 自定义 skill 根目录，空值使用项目内 `skills/`。 |
 | `remote_script_policy` | 远程脚本策略，支持 `download_review` 和 `disabled`。 |
+| `remote.allow_api_key_transmission` | Remote runtime 是否允许向配置的 AI Provider 发送 API key；默认 `false`，本地模式不受影响。 |
 | `web.enabled` | 是否允许启动 Web。 |
 | `web.host` | Web 监听地址。 |
 | `web.port` | Web 监听端口。 |
@@ -396,6 +411,10 @@ bash tests/observer.sh
 bash tests/interactive.sh
 bash tests/web_api.sh
 bash tests/web_server.sh
+bash tests/remote_release.sh
+bash tests/remote_runtime.sh
+bash tests/remote_web_security.sh
+bash tests/backup.sh
 ```
 
 完整回归：
@@ -410,7 +429,11 @@ for test in \
   tests/observer.sh \
   tests/interactive.sh \
   tests/web_api.sh \
-  tests/web_server.sh
+  tests/web_server.sh \
+  tests/remote_release.sh \
+  tests/remote_runtime.sh \
+  tests/remote_web_security.sh \
+  tests/backup.sh
 do
   bash "$test"
 done

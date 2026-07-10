@@ -58,6 +58,33 @@ linux_agent_config_positive_int_default() {
     printf '%s\n' "${value}"
 }
 
+linux_agent_remote_mode() {
+    [[ "${LINUX_AGENT_REMOTE_MODE:-0}" == "1" ]]
+}
+
+linux_agent_remote_api_key_transmission_allowed() {
+    if ! linux_agent_remote_mode; then
+        return 0
+    fi
+    [[ "$(linux_agent_config_bool_default '.remote.allow_api_key_transmission' 'false')" == "true" ]]
+}
+
+linux_agent_remote_state_json() {
+    local enabled=false
+    linux_agent_remote_mode && enabled=true
+    jq -cn \
+        --argjson enabled "${enabled}" \
+        --arg release_version "$(linux_agent_config_get_default '.remote.release_version' '')" \
+        --arg storage_backend "$(linux_agent_config_get_default '.remote.storage_backend' 'local')" \
+        --argjson allow_api_key_transmission "$(linux_agent_config_bool_default '.remote.allow_api_key_transmission' 'false')" \
+        '{
+            enabled:$enabled,
+            release_version:$release_version,
+            storage_backend:$storage_backend,
+            allow_api_key_transmission:$allow_api_key_transmission
+        }'
+}
+
 linux_agent_config_api_key_placeholder() {
     local value="$1"
     [[ -z "${value}" || "${value}" == "please-set-your-api-key" ]]

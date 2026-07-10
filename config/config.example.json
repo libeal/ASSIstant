@@ -35,6 +35,12 @@
   },
   "skills_dir": "",
   "remote_script_policy": "download_review",
+  "remote": {
+    "enabled": false,
+    "release_version": "",
+    "storage_backend": "local",
+    "allow_api_key_transmission": false
+  },
   "web": {
     "enabled": true,
     "host": "127.0.0.1",

@@ -18,6 +18,7 @@ const state = createInitialState();
 const $ = (id) => document.getElementById(id);
 const LAYOUT_STORAGE_PREFIX = "assistant.panelLayout.v1";
 const THINKING_TRACE_KEY = "agent_loop.thinking_trace_enabled";
+const REMOTE_API_KEY_TRANSMISSION_KEY = "remote.allow_api_key_transmission";
 let sessionTurnCounter = 0;
 let auditListReloadTimer = 0;
 
@@ -824,9 +825,35 @@ function updateWorkActionLabel() {
   if (!button) return;
   const running = Boolean((state.activeWorkJobId && !state.workSuspended) || state.workApprovalSubmitting);
   button.textContent = state.awaitingWorkApproval ? "等待审批选择" : (running ? "运行中" : (state.workSuspended ? "继续" : (state.workSubmitting ? "发送中" : "发送")));
-  button.disabled = state.awaitingWorkApproval || state.workSubmitting || running;
+  const remoteBlocked = remoteSecretTransmissionBlocked();
+  button.disabled = state.awaitingWorkApproval || state.workSubmitting || running || remoteBlocked;
+  button.title = remoteBlocked ? "Remote runtime 尚未允许向 AI Provider 传输 API Key" : "";
   if ($("workCancelBtn")) $("workCancelBtn").disabled = !state.activeWorkJobId;
   if ($("workSuspendBtn")) $("workSuspendBtn").disabled = !state.activeWorkJobId || state.workSuspended;
+}
+
+function remoteSecretTransmissionBlocked() {
+  const remote = state.configSnapshot?.remote || {};
+  return remote.enabled === true && remote.allow_api_key_transmission !== true;
+}
+
+function updateRemoteActionState() {
+  const blocked = remoteSecretTransmissionBlocked();
+  const blockedReason = "Remote runtime 尚未允许向 AI Provider 传输 API Key；请在配置中心明确开启后再使用。";
+  updateWorkActionLabel();
+  const editButton = $("editPlanBtn");
+  if (editButton) {
+    editButton.disabled = blocked;
+    editButton.title = blocked ? "Remote runtime 尚未允许向 AI Provider 传输 API Key" : "";
+  }
+  const backupButton = $("runtimeBackupBtn");
+  if (backupButton) backupButton.hidden = state.configSnapshot?.remote?.enabled !== true;
+  for (const id of ["workRemoteTransmissionNotice", "editRemoteTransmissionNotice"]) {
+    const notice = $(id);
+    if (!notice) continue;
+    notice.hidden = !blocked;
+    notice.textContent = blocked ? blockedReason : "";
+  }
 }
 
 function updateTerminalActionState() {
@@ -1654,6 +1681,7 @@ async function loadConfig() {
   renderThinkingSummary();
   renderSessionTimeline();
   setConfigDirtyState(false);
+  updateRemoteActionState();
 }
 
 async function loadConfigProviders() {
@@ -1894,7 +1922,7 @@ function renderConfigField(field, rawValue) {
         <span>${escapeHtml(field.label)}</span>
         <div class="config-control-row">
           ${control}
-          <button class="btn secondary compact-btn" type="button" data-config-model-fetch>获取模型</button>
+          <button class="btn secondary compact-btn" type="button" data-config-model-fetch${remoteSecretTransmissionBlocked() ? ' disabled title="请先允许远程传输 API Key"' : ""}>获取模型</button>
         </div>
         <span class="config-comment">${escapeHtml(state.configModelStatus || field.comment)}</span>
       </label>
@@ -1929,6 +1957,10 @@ function updateConfigDraftFromControl(control) {
   if (!field) return;
   if (field.type === "boolean") {
     const next = !control.classList.contains("on");
+    if (key === REMOTE_API_KEY_TRANSMISSION_KEY && next && state.configSnapshot?.remote?.enabled === true) {
+      const confirmed = window.confirm("开启后，当前 remote runtime 可将 API Key 发送到配置的 AI Provider。密钥不会写入远程配置文件。确认开启？");
+      if (!confirmed) return;
+    }
     control.classList.toggle("on", next);
     control.setAttribute("aria-pressed", next ? "true" : "false");
     state.configDraft[key] = next;
@@ -1966,6 +1998,10 @@ function applyProviderPreset(providerId) {
 }
 
 async function fetchConfigModels() {
+  if (remoteSecretTransmissionBlocked()) {
+    showToast("请先在配置中心允许远程传输 API Key");
+    return;
+  }
   const provider = currentProviderId();
   const apiKeyControl = $(configInputId("api_key"));
   const body = {
@@ -2220,7 +2256,7 @@ function renderToolCatalog() {
   container.innerHTML = "";
   if (!state.tools.length) {
     const row = document.createElement("tr");
-    row.innerHTML = '<td colspan="5">暂无已登记 skill</td>';
+    row.innerHTML = '<td colspan="6">暂无已登记 skill</td>';
     container.appendChild(row);
     return;
   }
@@ -2231,6 +2267,14 @@ function renderToolCatalog() {
     const risk = tool.risk || "low";
     const row = document.createElement("tr");
     const scriptPath = `${group.replaceAll(" / ", "/")}/scripts/${name}.sh`;
+    const materialization = tool.materialization || "local";
+    const remoteCell = materialization === "local"
+      ? '<span class="pill">local</span>'
+      : materialization === "ready"
+        ? '<span class="pill risk low">ready</span>'
+        : materialization === "materializing"
+          ? '<button class="btn secondary compact-btn" type="button" disabled aria-busy="true">加载中</button>'
+          : `<button class="btn secondary compact-btn" type="button" data-materialize-skill="${escapeHtml(tool.skill || group)}">${materialization === "failed" ? "重试加载" : "加载 Skill"}</button>`;
     row.className = "clickable";
     row.dataset.path = scriptPath;
     row.innerHTML = `
@@ -2239,10 +2283,43 @@ function renderToolCatalog() {
       <td class="mono">${escapeHtml(scriptPath)}</td>
       <td><span class="pill risk ${riskKind(risk)}">${escapeHtml(risk)}</span></td>
       <td>已登记</td>
+      <td>${remoteCell}</td>
     `;
-    row.addEventListener("click", () => readSkillFile(scriptPath, "script"));
+    row.addEventListener("click", (event) => {
+      const button = event.target.closest("[data-materialize-skill]");
+      if (button) {
+        event.stopPropagation();
+        safeAction(() => materializeSkill(button.dataset.materializeSkill));
+        return;
+      }
+      if (materialization === "available") {
+        safeAction(() => materializeSkill(tool.skill || group));
+        return;
+      }
+      readSkillFile(scriptPath, "script");
+    });
     container.appendChild(row);
   }
+}
+
+async function materializeSkill(skill) {
+  if (!skill) return;
+  state.tools.forEach((tool) => {
+    if (tool.skill === skill) tool.materialization = "materializing";
+  });
+  renderToolCatalog();
+  const data = await api("/api/skills/materialize", { method: "POST", body: { skill } });
+  if (!data.ok) {
+    state.tools.forEach((tool) => {
+      if (tool.skill === skill) tool.materialization = "failed";
+    });
+    renderToolCatalog();
+    showToast(data.error || data.status || "Skill 加载失败");
+    return;
+  }
+  await loadTools();
+  await loadSkillTree();
+  showToast(`${skill} 已完成整包校验与加载`);
 }
 
 function renderSkillTree() {
@@ -2353,6 +2430,10 @@ function inlineMarkdown(value) {
 }
 
 async function runWork() {
+  if (remoteSecretTransmissionBlocked()) {
+    showToast("请先在配置中心允许远程传输 API Key");
+    return;
+  }
   if (state.workSubmitting || (state.activeWorkJobId && !state.workSuspended)) {
     showToast("Work job is already running.");
     return;
@@ -2558,6 +2639,10 @@ function gatherEditPackage() {
 }
 
 async function planEdit() {
+  if (remoteSecretTransmissionBlocked()) {
+    showToast("请先在配置中心允许远程传输 API Key");
+    return;
+  }
   const input = $("editInput").value.trim();
   if (!input) return showToast("Edit input required");
   const folder = $("editFolderSelect")?.value || "skills";
@@ -2851,6 +2936,36 @@ function exportAuditReport() {
   link.click();
   link.remove();
   URL.revokeObjectURL(url);
+}
+
+async function downloadRuntimeBackup() {
+  const response = await fetch("/api/runtime/backup", {
+    headers: { Authorization: `Bearer ${state.token}` },
+    cache: "no-store",
+  });
+  if (!response.ok) {
+    let message = `运行时备份失败 (${response.status})`;
+    try {
+      const error = await response.json();
+      message = error.error || error.status || message;
+    } catch (_error) {
+      // Binary endpoint may fail before a JSON body is available.
+    }
+    showToast(message);
+    return;
+  }
+  const blob = await response.blob();
+  const disposition = response.headers.get("Content-Disposition") || "";
+  const filename = disposition.match(/filename="([^"]+)"/)?.[1] || `linux-agent-runtime-backup-${Date.now()}.tar.gz`;
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = filename;
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  URL.revokeObjectURL(url);
+  showToast("运行时脱敏备份已下载");
 }
 
 function toggleAuditPause() {
@@ -3289,6 +3404,7 @@ function bindActions() {
   on("policyEditBoundaryBtn", "click", () => safeAction(() => openPolicyFile("audit-boundaries.json")));
   on("thinkingTraceSwitch", "click", () => safeAction(toggleThinkingTraceFromWorkbench));
   on("auditExportBtn", "click", exportAuditReport);
+  on("runtimeBackupBtn", "click", () => safeAction(downloadRuntimeBackup));
   on("auditPauseBtn", "click", toggleAuditPause);
   on("auditFindFailureBtn", "click", findAuditFailure);
   on("editInput", "input", markEditDirty);

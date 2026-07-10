@@ -114,7 +114,7 @@ validate_config() {
     print_ok "config/config.json JSON 格式合法"
 
     local api_url api_key api_key_src model timeout context_turns audit_mode audit_text_limit remote_policy skills_dir
-    local web_enabled web_host web_port web_token web_retention
+    local web_enabled web_host web_port web_token web_retention remote_api_key_transmission
     local loop_enabled observation_limit thinking_trace checkpoint_turns
     local approval_skill approval_shell approval_file_match approval_file_patch approval_file_download approval_local_analyze approval_remote_script
     api_url="$(json_get '.api_url')"
@@ -143,6 +143,7 @@ validate_config() {
     approval_file_download="$(json_get '.approvals.auto.file_download')"
     approval_local_analyze="$(json_get '.approvals.auto.local_analyze')"
     approval_remote_script="$(json_get '.approvals.auto.remote_script')"
+    remote_api_key_transmission="$(json_get '.remote.allow_api_key_transmission')"
 
     validate_non_empty "api_url" "${api_url}" || failures=$((failures + 1))
     validate_non_empty "api_key" "${api_key}" || failures=$((failures + 1))
@@ -228,7 +229,8 @@ validate_config() {
         "approvals.auto.file_patch:${approval_file_patch}" \
         "approvals.auto.file_download:${approval_file_download}" \
         "approvals.auto.local_analyze:${approval_local_analyze}" \
-        "approvals.auto.remote_script:${approval_remote_script}"; do
+        "approvals.auto.remote_script:${approval_remote_script}" \
+        "remote.allow_api_key_transmission:${remote_api_key_transmission}"; do
         local field_name field_value
         field_name="${bool_field%%:*}"
         field_value="${bool_field#*:}"

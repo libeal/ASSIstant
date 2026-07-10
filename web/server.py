@@ -53,6 +53,9 @@ OBSERVER_BOOTSTRAP_STATE = {
     "diagnostic": "",
     "updated_at": SERVER_STARTED_AT,
 }
+REMOTE_MODE = os.environ.get("LINUX_AGENT_REMOTE_MODE", "0") == "1"
+RUNTIME_SECRET_LOCK = threading.RLock()
+RUNTIME_API_KEY = ""
 
 
 def read_config():
@@ -167,10 +170,14 @@ def secret_value_configured(value):
 
 
 def api_key_state(config):
+    with RUNTIME_SECRET_LOCK:
+        runtime_configured = secret_value_configured(RUNTIME_API_KEY)
     env_configured = secret_value_configured(os.environ.get("LINUX_AGENT_API_KEY", ""))
-    config_configured = secret_value_configured(config.get("api_key", ""))
+    config_configured = not REMOTE_MODE and secret_value_configured(config.get("api_key", ""))
 
-    if env_configured:
+    if runtime_configured:
+        source = "runtime"
+    elif env_configured:
         source = "env"
     elif config_configured:
         source = "config"
@@ -188,10 +195,14 @@ def configured_api_key(config, override=None):
     override_value = str(override or "")
     if secret_value_configured(override_value):
         return override_value, "request"
+    with RUNTIME_SECRET_LOCK:
+        runtime_value = RUNTIME_API_KEY
+    if secret_value_configured(runtime_value):
+        return runtime_value, "runtime"
     env_value = os.environ.get("LINUX_AGENT_API_KEY", "")
     if secret_value_configured(env_value):
         return env_value, "env"
-    config_value = str(config.get("api_key", ""))
+    config_value = "" if REMOTE_MODE else str(config.get("api_key", ""))
     if secret_value_configured(config_value):
         return config_value, "config"
     return "", "missing"
@@ -351,6 +362,14 @@ def extract_model_ids(payload, parser):
 
 def list_provider_models(body):
     config = read_config()
+    remote = config.get("remote") if isinstance(config.get("remote"), dict) else {}
+    if REMOTE_MODE and not bool(remote.get("allow_api_key_transmission", False)):
+        return {
+            "ok": False,
+            "status": "secret_transmission_disabled",
+            "models": [],
+            "error": "Remote runtime has not allowed API key transmission.",
+        }
     provider_id = normalize_provider_id(body.get("provider") or config.get("provider") or config_provider_id(config))
     provider = provider_by_id(provider_id)
     provider_id = normalize_provider_id(provider.get("id") or provider_id)
@@ -406,6 +425,7 @@ def config_public_state():
     observer = config.get("observer") if isinstance(config.get("observer"), dict) else {}
     execution = config.get("execution") if isinstance(config.get("execution"), dict) else {}
     web = config.get("web") if isinstance(config.get("web"), dict) else {}
+    remote = config.get("remote") if isinstance(config.get("remote"), dict) else {}
     key_state = api_key_state(config)
     provider_id = config_provider_id(config)
     return {
@@ -451,6 +471,12 @@ def config_public_state():
             },
             "skills_dir": config.get("skills_dir", ""),
             "remote_script_policy": config.get("remote_script_policy", "download_review"),
+            "remote": {
+                "enabled": REMOTE_MODE,
+                "release_version": str(remote.get("release_version") or os.environ.get("LINUX_AGENT_REMOTE_RELEASE_VERSION", "")),
+                "storage_backend": str(remote.get("storage_backend") or os.environ.get("LINUX_AGENT_REMOTE_STORAGE_BACKEND", "local")),
+                "allow_api_key_transmission": bool(remote.get("allow_api_key_transmission", False)),
+            },
             "web": {
                 "enabled": bool(web.get("enabled", True)),
                 "host": web.get("host", HOST),
@@ -488,6 +514,7 @@ CONFIG_WRITABLE_FIELDS = {
     "execution.least_privilege_user": {"type": "str", "min": 1},
     "skills_dir": {"type": "str", "min": 0},
     "remote_script_policy": {"type": "enum", "values": {"download_review", "disabled"}},
+    "remote.allow_api_key_transmission": {"type": "bool"},
 }
 CONFIG_SECRET_FIELDS = {"api_key"}
 
@@ -535,8 +562,17 @@ def write_nested_config_value(config, key, value):
 
 
 def write_api_key_secret(value):
+    global RUNTIME_API_KEY
     secret = str(value or "")
     config = read_config()
+
+    if REMOTE_MODE:
+        with RUNTIME_SECRET_LOCK:
+            RUNTIME_API_KEY = secret
+        result = config_public_state()
+        result["status"] = "updated"
+        result["updated"] = {"api_key": "configured" if secret else "cleared"}
+        return result
 
     if not secret:
         config.pop("api_key", None)
@@ -557,6 +593,12 @@ def write_api_key_secret(value):
 def update_config_value(key, value):
     if key == "api_key":
         return write_api_key_secret(value)
+    if REMOTE_MODE and key == "skills_dir":
+        return {
+            "ok": False,
+            "status": "remote_config_read_only",
+            "error": "Remote runtime always keeps skills inside its ephemeral runtime root.",
+        }
     normalized, error = normalize_config_value(key, value)
     if error:
         return {"ok": False, "status": "invalid_config_value", "error": error}
@@ -574,6 +616,80 @@ def configured_token():
         return TOKEN
     web = read_config().get("web", {})
     return str(web.get("token") or "")
+
+
+def agent_subprocess_env(include_api_key=False):
+    env = os.environ.copy()
+    env.setdefault("LINUX_AGENT_WEB", "1")
+    if REMOTE_MODE:
+        remote = read_config().get("remote", {})
+        transmission_allowed = isinstance(remote, dict) and bool(remote.get("allow_api_key_transmission", False))
+        with RUNTIME_SECRET_LOCK:
+            runtime_key = RUNTIME_API_KEY
+        if include_api_key and transmission_allowed and secret_value_configured(runtime_key):
+            env["LINUX_AGENT_API_KEY"] = runtime_key
+        else:
+            env.pop("LINUX_AGENT_API_KEY", None)
+    return env
+
+
+def create_runtime_backup():
+    if not REMOTE_MODE:
+        return {"ok": False, "status": "backup_unavailable", "error": "Runtime backup is only available in remote mode."}
+    output_path = ROOT.parent / f"linux-agent-runtime-backup-{uuid.uuid4().hex}.tar.gz"
+    backup_env = agent_subprocess_env()
+    try:
+        process = subprocess.run(
+            ["bash", str(AGENT), "backup", str(output_path)],
+            cwd=str(ROOT),
+            env=backup_env,
+            text=True,
+            capture_output=True,
+            timeout=180,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        output_path.unlink(missing_ok=True)
+        return {"ok": False, "status": "backup_timeout", "error": "Runtime backup timed out."}
+    try:
+        result = json.loads(process.stdout.strip()) if process.stdout.strip() else {}
+    except json.JSONDecodeError:
+        result = {}
+    if process.returncode != 0 or not result.get("ok") or not output_path.is_file():
+        output_path.unlink(missing_ok=True)
+        return {
+            "ok": False,
+            "status": str(result.get("status") or "backup_failed"),
+            "error": str(result.get("error") or redacted_text(process.stderr) or "Runtime backup failed."),
+        }
+    return {
+        "ok": True,
+        "status": "backup_ready",
+        "path": str(output_path),
+        "filename": output_path.name,
+        "size_bytes": output_path.stat().st_size,
+        "sha256": str(result.get("sha256") or ""),
+    }
+
+
+def send_runtime_backup(handler):
+    result = create_runtime_backup()
+    if not result.get("ok"):
+        json_response(handler, HTTPStatus.CONFLICT, result)
+        return
+    path = Path(result["path"])
+    try:
+        handler.send_response(HTTPStatus.OK)
+        handler.send_header("Content-Type", "application/gzip")
+        handler.send_header("Content-Disposition", f'attachment; filename="{result["filename"]}"')
+        handler.send_header("Content-Length", str(result["size_bytes"]))
+        handler.send_header("Cache-Control", "no-store")
+        handler.send_header("X-Content-Type-Options", "nosniff")
+        handler.end_headers()
+        with path.open("rb") as handle:
+            shutil.copyfileobj(handle, handler.wfile, length=1024 * 1024)
+    finally:
+        path.unlink(missing_ok=True)
 
 
 AUTH_TOKEN = configured_token()
@@ -1450,8 +1566,7 @@ def run_agent_api(resource, action="", payload=None, timeout=None, job_id=None):
     if action:
         command.append(action)
     command.append(json.dumps(payload, ensure_ascii=False, separators=(",", ":")))
-    env = os.environ.copy()
-    env.setdefault("LINUX_AGENT_WEB", "1")
+    env = agent_subprocess_env(include_api_key=(resource, action) in {("work", "run"), ("edit", "plan")})
     with WEB_AGENT_LOCK:
         session_id = WEB_AGENT_SESSION_ID
         audit_log = str(WEB_AGENT_AUDIT_LOG)
@@ -2160,6 +2275,9 @@ class Handler(SimpleHTTPRequestHandler):
             "/api/mcp/tools": ("mcp", "tools"),
             "/api/audit/list": ("audit", "list"),
         }
+        if path == "/api/runtime/backup":
+            send_runtime_backup(self)
+            return
         if path == "/api/policies":
             json_response(self, HTTPStatus.OK, {"ok": True, "status": "listed", "files": list_policy_files(), "requires_sudo_to_edit": True})
             return
@@ -2210,6 +2328,7 @@ class Handler(SimpleHTTPRequestHandler):
             "/api/edit/plan": ("edit", "plan"),
             "/api/edit/review": ("edit", "review"),
             "/api/audit/read": ("audit", "read"),
+            "/api/skills/materialize": ("skills", "materialize"),
         }
         if path == "/api/policies/read":
             try:

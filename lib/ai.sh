@@ -355,6 +355,11 @@ linux_agent_call_ai_with_context() {
     local runtime_context
     local safe_current_request safe_request_context payload_context
 
+    if ! linux_agent_remote_api_key_transmission_allowed; then
+        linux_agent_ai_error "secret_transmission_disabled" "Remote runtime 未允许向 AI Provider 传输 API key。"
+        return 0
+    fi
+
     if [[ $# -gt 3 && -n "${4:-}" ]]; then
         runtime_context="$4"
     else

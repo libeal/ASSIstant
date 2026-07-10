@@ -13,6 +13,8 @@ source "${ROOT_DIR}/lib/common.sh"
 source "${ROOT_DIR}/lib/config.sh"
 # shellcheck source=../lib/audit.sh
 source "${ROOT_DIR}/lib/audit.sh"
+# shellcheck source=../lib/backup.sh
+source "${ROOT_DIR}/lib/backup.sh"
 # shellcheck source=../lib/context.sh
 source "${ROOT_DIR}/lib/context.sh"
 # shellcheck source=../lib/sense.sh
@@ -120,6 +122,7 @@ linux_agent_usage() {
   agent api <resource> <action> [json]
                                 机器可读 JSON API，供 Web 前端调用
   agent audit <session-id>      查看审计摘要
+  agent backup <output.tar.gz>  导出 remote runtime 脱敏备份
 
 REPL 命令:
   /work                         切换到工作模式
@@ -340,6 +343,14 @@ main() {
                 exit 1
             fi
             linux_agent_show_audit "$1"
+            ;;
+        backup)
+            shift || true
+            if [[ $# -ne 1 ]]; then
+                linux_agent_print_error "请提供一个未存在的 .tar.gz 输出路径。"
+                exit 1
+            fi
+            linux_agent_backup_runtime "$1"
             ;;
         -h|--help|help)
             linux_agent_usage

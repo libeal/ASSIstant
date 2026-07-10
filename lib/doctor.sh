@@ -19,7 +19,7 @@ linux_agent_doctor() {
     local optional_missing='[]'
     local config_ok="false"
     local skills_ok="false"
-    local command_result
+    local command_result remote_json
 
     while IFS= read -r command_name; do
         required_results="$(jq -cn \
@@ -50,16 +50,20 @@ linux_agent_doctor() {
         skills_ok="true"
     fi
 
+    remote_json="$(linux_agent_remote_state_json)"
+
     jq -cn \
         --argjson required "${required_results}" \
         --argjson optional_available "${optional_available}" \
         --argjson optional_missing "${optional_missing}" \
         --argjson config_ok "${config_ok}" \
         --argjson skills_ok "${skills_ok}" \
+        --argjson remote "${remote_json}" \
         --arg root "${LINUX_AGENT_ROOT}" \
         '{
             ok:(($required | map(.ok) | all) and $config_ok and $skills_ok),
             root:$root,
+            remote:$remote,
             required_commands:$required,
             optional_available:$optional_available,
             optional_missing:$optional_missing,

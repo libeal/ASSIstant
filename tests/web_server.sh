@@ -104,6 +104,9 @@ grep -q 'ASSIstant 前端外壳' <<<"${index_html}"
 grep -q '结束进程' <<<"${index_html}"
 grep -q 'id="senseTopicSelect"' <<<"${index_html}"
 grep -q 'id="skillsValidateBtn"' <<<"${index_html}"
+grep -q 'id="runtimeBackupBtn"' <<<"${index_html}"
+grep -q 'id="workRemoteTransmissionNotice"' <<<"${index_html}"
+grep -q 'id="editRemoteTransmissionNotice"' <<<"${index_html}"
 grep -q 'id="mcpValidateBtn"' <<<"${index_html}"
 grep -q 'id="mcpToolsBtn"' <<<"${index_html}"
 grep -q 'id="mcpToolCount"' <<<"${index_html}"
@@ -113,12 +116,17 @@ grep -q 'id="sessionLeaveBtn"' <<<"${index_html}"
 grep -q 'id="observerAuditDialog"' <<<"${index_html}"
 grep -q 'on("workInput", "keydown"' "${project}/web/static/app.js"
 grep -q 'event.shiftKey' "${project}/web/static/app.js"
+grep -q 'overscroll-behavior-inline: contain' "${project}/web/static/styles.css"
+grep -q 'grid-template-columns: 180px minmax(0, 1fr)' "${project}/web/static/styles.css"
 grep -q 'userOutputBlocks(blocks)' "${project}/web/static/app.js"
 grep -q '低风险 Skill 自动运行' "${project}/web/static/modules/policy-config.js"
 grep -q '低风险 Shell 自动运行' "${project}/web/static/modules/policy-config.js"
 grep -q 'Work 自动续写' "${project}/web/static/modules/policy-config.js"
 grep -q '文件匹配自动运行' "${project}/web/static/modules/policy-config.js"
 grep -q '最小权限代理' "${project}/web/static/modules/policy-config.js"
+grep -q '允许远程传输 API Key' "${project}/web/static/modules/policy-config.js"
+grep -q 'materializeSkill' "${project}/web/static/app.js"
+grep -q 'downloadRuntimeBackup' "${project}/web/static/app.js"
 grep -q '开：' "${project}/web/static/app.js"
 grep -q '关：' "${project}/web/static/app.js"
 grep -q 'state.terminalSubmitting' "${project}/web/static/app.js"
@@ -173,7 +181,8 @@ jq -e '.ok == true and (.config.agent_loop.thinking_trace_enabled | type == "boo
     and .config.observer.privilege == "sudo_interactive"
     and .config.approvals.auto.skill_readonly == true
     and .config.approvals.auto.shell_readonly == false
-    and .config.approvals.auto.file_patch == false' <<<"${config_state}" >/dev/null
+    and .config.approvals.auto.file_patch == false
+    and .config.remote.allow_api_key_transmission == false' <<<"${config_state}" >/dev/null
 
 providers_state="$(curl --noproxy '*' -sS -H "Authorization: Bearer ${token}" "${base_url}/api/config/providers")"
 jq -e '.ok == true and .status == "listed"

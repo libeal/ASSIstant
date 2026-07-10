@@ -112,6 +112,13 @@ export const CONFIG_GROUPS = [
       },
       { key: "execution.least_privilege_user", label: "least_privilege_user", type: "text", comment: "低权限代理使用的系统用户。" },
       { key: "remote_script_policy", label: "remote_script_policy", type: "select", options: ["download_review", "disabled"], comment: "远程脚本默认先下载审查；disabled 直接禁用。" },
+      {
+        key: "remote.allow_api_key_transmission",
+        label: "允许远程传输 API Key",
+        type: "boolean",
+        onEffect: "仅在 remote runtime 中允许 Work、Edit 和模型列表向已配置的 AI Provider 发送 API key。",
+        offEffect: "Remote 模式阻断所有需要向 AI Provider 外发 API key 的操作；本地模式不受影响。",
+      },
       { key: "skills_dir", label: "skills_dir", type: "text", comment: "自定义 skill 根目录；空值表示使用项目默认 skills。" },
     ],
   },
