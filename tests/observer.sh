@@ -77,6 +77,10 @@ AUDIT
 EOF
 chmod +x "${fake_bin}/ausearch"
 
+linux_agent_observer_audit_uid() {
+    printf '1234\n'
+}
+
 LINUX_AGENT_CONFIG_JSON="$(jq '.observer.enabled="auto" | .observer.max_events=5' <<<"${LINUX_AGENT_CONFIG_JSON}")"
 PATH="${fake_bin}:${PATH}" linux_agent_start_session "observer mock auditd test"
 mock_stdout="${tmp_root}/mock.stdout"
@@ -102,13 +106,14 @@ grep -q 'second-ok' "${second_stdout}"
 grep -q '"status":"recorded"' <<<"$(jq -c '.observer' <<<"${mock_meta}")"
 grep -q '"session_status":"running"' <<<"$(jq -c '.observer' <<<"${mock_meta}")"
 grep -q -- '-a always,exit' "${audit_calls}"
+grep -q -- '-F auid=1234' "${audit_calls}"
 grep -q '"stage":"observer_session_started"' "${LINUX_AGENT_AUDIT_LOG}"
 [[ "$(jq -r 'select(.stage=="execution_finished") | .stage' "${LINUX_AGENT_AUDIT_LOG}" | wc -l | tr -d ' ')" -eq 2 ]]
 PATH="${fake_bin}:${PATH}" linux_agent_finish_session "tested"
 grep -q -- '-d always,exit' "${audit_calls}"
 grep -q '"stage":"observer_session_finished"' "${LINUX_AGENT_AUDIT_LOG}"
-[[ "$(jq -r 'select(.stage=="observer_session_finished") | .payload.exec_count // 0' "${LINUX_AGENT_AUDIT_LOG}" | tail -1)" -ge 1 ]]
-[[ "$(jq -r 'select(.stage=="observer_session_finished") | .payload.file_event_count // 0' "${LINUX_AGENT_AUDIT_LOG}" | tail -1)" -ge 1 ]]
+[[ "$(jq -r 'select(.stage=="observer_session_finished") | .payload.exec_count // 0' "${LINUX_AGENT_AUDIT_LOG}" | tail -1)" -eq 1 ]]
+[[ "$(jq -r 'select(.stage=="observer_session_finished") | .payload.file_event_count // 0' "${LINUX_AGENT_AUDIT_LOG}" | tail -1)" -eq 1 ]]
 
 fail_bin="${tmp_root}/fail-bin"
 mkdir -p "${fail_bin}"

@@ -167,24 +167,36 @@ linux_agent_observer_key() {
         "${RANDOM}"
 }
 
+linux_agent_observer_audit_uid() {
+    local uid login_uid
+    uid="$(id -u)"
+    if [[ -r /proc/self/loginuid ]] && read -r login_uid < /proc/self/loginuid; then
+        if [[ "${login_uid}" =~ ^[0-9]+$ && "${login_uid}" != "4294967295" ]]; then
+            printf '%s\n' "${login_uid}"
+            return 0
+        fi
+    fi
+    printf '%s\n' "${uid}"
+}
+
 linux_agent_observer_install_syscall_rule() {
-    local uid="$1"
+    local audit_uid="$1"
     local key="$2"
     local syscall="$3"
-    linux_agent_observer_auditctl -a always,exit -F arch=b64 -S "${syscall}" -F "auid=${uid}" -k "${key}" >/dev/null 2>&1
+    linux_agent_observer_auditctl -a always,exit -F arch=b64 -S "${syscall}" -F "auid=${audit_uid}" -k "${key}" >/dev/null 2>&1
 }
 
 linux_agent_observer_remove_syscall_rule() {
-    local uid="$1"
+    local audit_uid="$1"
     local key="$2"
     local syscall="$3"
-    linux_agent_observer_auditctl -d always,exit -F arch=b64 -S "${syscall}" -F "auid=${uid}" -k "${key}" >/dev/null 2>&1
+    linux_agent_observer_auditctl -d always,exit -F arch=b64 -S "${syscall}" -F "auid=${audit_uid}" -k "${key}" >/dev/null 2>&1
 }
 
 linux_agent_observer_session_start() {
     local scope="${1:-session}"
     local subject_json="${2:-}"
-    local preflight key uid start_time installed='[]' notes='[]' selected_syscalls boundary_summary
+    local preflight key uid audit_uid start_time installed='[]' notes='[]' selected_syscalls boundary_summary
     [[ -n "${subject_json}" ]] || subject_json='{}'
 
     boundary_summary="$(linux_agent_audit_boundary_runtime_summary)"
@@ -214,6 +226,7 @@ linux_agent_observer_session_start() {
     fi
 
     uid="$(id -u)"
+    audit_uid="$(linux_agent_observer_audit_uid)"
     key="$(linux_agent_observer_key "${scope}")"
     start_time="$(linux_agent_now_iso)"
 
@@ -221,7 +234,7 @@ linux_agent_observer_session_start() {
 
     while IFS= read -r syscall; do
         [[ -z "${syscall}" ]] && continue
-        if linux_agent_observer_install_syscall_rule "${uid}" "${key}" "${syscall}"; then
+        if linux_agent_observer_install_syscall_rule "${audit_uid}" "${key}" "${syscall}"; then
             installed="$(jq -cn --argjson prior "${installed}" --arg syscall "${syscall}" '$prior + [$syscall]')"
         else
             notes="$(jq -cn --argjson prior "${notes}" --arg syscall "${syscall}" '$prior + ["failed to install syscall rule: " + $syscall]')"
@@ -246,11 +259,12 @@ linux_agent_observer_session_start() {
         --argjson subject "${subject_json}" \
         --arg audit_key "${key}" \
         --arg uid "${uid}" \
+        --arg audit_uid "${audit_uid}" \
         --arg start_time "${start_time}" \
         --argjson installed_syscalls "${installed}" \
         --argjson notes "${notes}" \
         --argjson audit_boundary "${boundary_summary}" \
-        '{status:"running", backend:"auditd", lifecycle:"session", scope:$scope, subject:$subject, audit_key:$audit_key, uid:($uid|tonumber), start_time:$start_time, installed_syscalls:$installed_syscalls, audit_boundary:$audit_boundary, notes:$notes}')"
+        '{status:"running", backend:"auditd", lifecycle:"session", scope:$scope, subject:$subject, audit_key:$audit_key, uid:($uid|tonumber), audit_uid:($audit_uid|tonumber), identity_filter:"auid", start_time:$start_time, installed_syscalls:$installed_syscalls, audit_boundary:$audit_boundary, notes:$notes}')"
     linux_agent_observer_log_event "observer_session_started" "${LINUX_AGENT_OBSERVER_SESSION_CONTEXT}"
 }
 
@@ -283,8 +297,28 @@ linux_agent_observer_parse_ausearch() {
             | if . == null then null else gsub("^\"|\"$"; "") end;
         def event_type:
             (try capture("^type=(?<t>[^[:space:]]+)").t catch null) // "UNKNOWN";
+        def record_id:
+            (try capture("msg=audit\\([^:]+:(?<id>[0-9]+)\\)").id catch null);
+        def event_key($prefix):
+            if .record_id != null then .record_id
+            else ([$prefix, .raw_type, .pid, .ppid, .syscall, .name, .comm, .exe] | map(. // "") | join(":"))
+            end;
+        def is_exec_syscall:
+            .syscall == "59" or .syscall == "322" or .syscall == "execve" or .syscall == "execveat";
+        def is_file_syscall:
+            (.syscall // "") as $syscall
+            | [
+                "2", "257", "437", "85", "76", "77", "82", "264", "316",
+                "87", "263", "90", "91", "268", "92", "93", "260", "83",
+                "258", "84", "88", "266", "86", "265",
+                "open", "openat", "openat2", "creat", "truncate", "ftruncate",
+                "rename", "renameat", "renameat2", "unlink", "unlinkat",
+                "chmod", "fchmod", "fchmodat", "chown", "fchown", "fchownat",
+                "mkdir", "mkdirat", "rmdir", "symlink", "symlinkat", "link", "linkat"
+              ] | index($syscall);
         [inputs | select(length > 0) | {
             raw_type:event_type,
+            record_id:record_id,
             pid:(field("pid") // null),
             ppid:(field("ppid") // null),
             comm:(field("comm") // null),
@@ -294,14 +328,14 @@ linux_agent_observer_parse_ausearch() {
             name:(field("name") // null),
             key:(field("key") // $audit_key)
         }] as $events
-        | ($events | map(select(.raw_type == "EXECVE" or (.raw_type == "SYSCALL" and (.syscall == "59" or .syscall == "execve" or .syscall == "execveat"))))) as $exec_events
-        | ($events | map(select(.name != null or (.syscall != null and (.raw_type == "PATH" or .raw_type == "SYSCALL"))))) as $file_events
+        | ($events | map(select(.raw_type == "EXECVE" or (.raw_type == "SYSCALL" and is_exec_syscall)))) as $exec_events
+        | ($events | map(select(.name != null or .raw_type == "PATH" or (.raw_type == "SYSCALL" and is_file_syscall)))) as $file_events
         | {
             status:"observed",
             backend:"auditd",
             audit_key:$audit_key,
-            exec_count:(if $include_exec_count then ($exec_events | length) else null end),
-            file_event_count:(if $include_file_event_count then ($file_events | length) else null end),
+            exec_count:(if $include_exec_count then ($exec_events | map(event_key("exec")) | unique | length) else null end),
+            file_event_count:(if $include_file_event_count then ($file_events | map(event_key("file")) | unique | length) else null end),
             processes:(if $include_processes then ($events
                 | map(select(.pid != null) | {pid:(.pid|tonumber?), ppid:(.ppid|tonumber?), comm, exe})
                 | unique_by(.pid, .comm, .exe)
@@ -317,7 +351,7 @@ linux_agent_observer_parse_ausearch() {
 linux_agent_observer_session_finish() {
     local final_status="${1:-unknown}"
     local context_json="${LINUX_AGENT_OBSERVER_SESSION_CONTEXT:-}"
-    local status end_time audit_key uid installed cleanup_notes notes raw parsed query_status
+    local status end_time audit_key audit_uid installed cleanup_notes notes raw parsed query_status
     [[ -n "${context_json}" ]] || return 0
 
     status="$(jq -r '.status // "unknown"' <<<"${context_json}")"
@@ -332,13 +366,13 @@ linux_agent_observer_session_finish() {
     fi
 
     audit_key="$(jq -r '.audit_key' <<<"${context_json}")"
-    uid="$(jq -r '.uid' <<<"${context_json}")"
+    audit_uid="$(jq -r '.audit_uid // .uid' <<<"${context_json}")"
     installed="$(jq -c '.installed_syscalls // []' <<<"${context_json}")"
     cleanup_notes='[]'
 
     while IFS= read -r syscall; do
         [[ -z "${syscall}" ]] && continue
-        if ! linux_agent_observer_remove_syscall_rule "${uid}" "${audit_key}" "${syscall}"; then
+        if ! linux_agent_observer_remove_syscall_rule "${audit_uid}" "${audit_key}" "${syscall}"; then
             cleanup_notes="$(jq -cn --argjson prior "${cleanup_notes}" --arg syscall "${syscall}" '$prior + ["failed to remove syscall rule: " + $syscall]')"
         fi
     done < <(jq -r '.[]' <<<"${installed}")

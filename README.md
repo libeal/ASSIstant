@@ -43,6 +43,8 @@ Web 视图包括：
 - `ops-basic`: 常用只读巡检、日志搜索、清理计划、备份和安全日志截断。
 - `os-deep-inspect`: 更深入的系统快照、网络、文件描述符和 journal 检查。
 - `controlled-tools`: 受控文件匹配、字面量补丁、安全下载和本地文本分析；自由 shell 文件修改会被审查拒绝，应使用这些脚本。
+- `session-history`: 只读回看审计 session 中上一轮或指定轮次的命令、计划步骤和输出预览。
+- `network-ops-tools`: 运维/网络工程工具箱，覆盖 IP Scanner、Port Scanner、Discovery Protocol、Wake on LAN、Network Interface、WiFi、Connections、Listeners、Neighbor Table、Ping Monitor、Traceroute、DNS Lookup、SNTP Lookup、Whois、IP Geolocation、Hosts File Editor、Lookup、SNMP、Firewall、Subnet Calculator 和 Bit Calculator；所有脚本声明为 `medium` 或 `high`，不能作为 low 风险自动执行。
 
 ## 快速开始
 
@@ -108,7 +110,7 @@ bash bin/agent api terminal run '{"command":"printf api-ok"}' | jq '.timeline, .
 - 执行层：shell、skill_script、remote_script、文件编辑等执行器，以及 policy、approval、observer、audit。
 - 能力层：skills、mcp、policies、prompts、config、audit、context 等可替换或可扩展资源。
 
-不同入口共享同一套核心能力，AI 只提出计划，执行层独立审查、确认、执行和审计。整体设计见 [`docs/design.md`](docs/design.md)，更详细的架构记录见 [`docs/architecture.md`](docs/architecture.md)，CLI/Web 机器协议见 [`docs/api-protocol.md`](docs/api-protocol.md)。
+不同入口共享同一套核心能力，AI 只提出计划，执行层独立审查、确认、执行和审计。整体设计见 [`docs/design.md`](docs/design.md)，更详细的架构记录见 [`docs/architecture.md`](docs/architecture.md)，CLI/Web 机器协议见 [`docs/api-protocol.md`](docs/api-protocol.md)，审计与内核 observer 运行细节见 [`docs/observer-audit.md`](docs/observer-audit.md)。
 
 ```text
 Linux 运维 Agent
@@ -155,7 +157,9 @@ Linux 运维 Agent
 │  ├─ INDEX.md               可执行 skill 白名单
 │  ├─ ops-basic/             基础巡检、日志、备份和安全清理 skill
 │  ├─ os-deep-inspect/       深度系统、网络、FD 和 journal 检查 skill
-│  └─ controlled-tools/      受控文件匹配、补丁、下载和本地文本分析 skill
+│  ├─ controlled-tools/      受控文件匹配、补丁、下载和本地文本分析 skill
+│  ├─ session-history/       只读审计 session 历史输出回看 skill
+│  └─ network-ops-tools/     运维/网络工程常用诊断、查询、扫描和计算 skill
 ├─ MCP 能力层 mcp/
 │  └─ <server-id>/mcp.json    外部 MCP server manifest，支持 stdio、sse、streamable_http
 ├─ 配置层
@@ -363,6 +367,7 @@ Web 版 edit 使用浏览器内联编辑器，但保存前仍调用同一套 `ed
 - Terminal 也会执行策略审查，高风险命令需要确认。
 - 保护路径覆盖 `/`、`/etc`、`/boot`、`/usr`、`/var/lib`、`/root` 和用户 `.ssh`。
 - 自由 shell 文件修改默认阻断；文件匹配、补丁、下载和本地文本分析应通过 `controlled-tools` 登记脚本执行。
+- `network-ops-tools` 中的扫描、SNMP、WOL、hosts/firewall 等工具即使由 work 模式调用，也按 `SKILL.md` 声明提升为 `medium` 或 `high` 风险，不能作为 low 风险自动执行。
 - Remote script 只能 HTTPS 下载后审查，不允许流式管道执行。
 - Web `/api/` 全部需要 Bearer token。
 - Web 启动后会在浏览器中申请一次服务器权限以启用 auditd observer；未启用会记录审计日志。
@@ -431,6 +436,7 @@ done
 | `docs/design.md` | 项目设计文档，说明设计目标、非目标、核心组件、运行时数据流、策略模型、审批模型、API 协议、Web 设计、扩展规则和测试策略。 |
 | `docs/architecture.md` | 架构边界说明，记录 rssh 借鉴点、core/adapter 分层、skill registry 契约、安全执行模型和未来远程运行方向。 |
 | `docs/api-protocol.md` | CLI/Web API 机器协议，定义通用响应、timeline、approval_card、output_blocks、review、job 和 secret 配置状态。 |
+| `docs/observer-audit.md` | 审计与内核 observer 运行说明，记录 lifecycle、auditd 权限、`auid` 过滤、事件汇总、边界配置和验证入口。 |
 
 ### `bin/`
 
@@ -520,6 +526,31 @@ done
 | `skills/controlled-tools/scripts/file-patch.sh` | 在匹配次数符合预期时生成 diff、可备份并原子替换文件。 |
 | `skills/controlled-tools/scripts/file-download.sh` | 仅允许 HTTPS 公网下载到本机路径，限制大小并可校验 sha256。 |
 | `skills/controlled-tools/scripts/local-analyze.sh` | 对文本或本地文件做只读关键词和错误样本分析。 |
+| `skills/session-history/SKILL.md` | `session-history` skill 说明，用于只读回看审计 session 中上一轮或指定轮次的执行上下文。 |
+| `skills/session-history/scripts/last-command-output.sh` | 从 JSONL 审计 session 读取命令、计划步骤和 stdout/stderr 输出预览。 |
+| `skills/network-ops-tools/SKILL.md` | `network-ops-tools` skill 说明和安全边界，所有脚本声明为 `medium` 或 `high` 风险。 |
+| `skills/network-ops-tools/scripts/_network_tool.py` | 网络工具集共享实现，负责参数校验、范围限制、dry-run、扫描、查询和计算逻辑。 |
+| `skills/network-ops-tools/scripts/ip-scanner.sh` | 有界扫描授权范围内的 IP/CIDR，支持 ping 和可选 TCP 探测。 |
+| `skills/network-ops-tools/scripts/port-scanner.sh` | 有界扫描单个目标主机的 TCP 端口。 |
+| `skills/network-ops-tools/scripts/discovery-protocol.sh` | 读取本机 LLDP/CDP 风格邻居发现信息。 |
+| `skills/network-ops-tools/scripts/wake-on-lan.sh` | 预览或发送 Wake-on-LAN magic packet。 |
+| `skills/network-ops-tools/scripts/network-interface.sh` | 查看网络接口、地址、路由、MTU、MAC 和 operstate。 |
+| `skills/network-ops-tools/scripts/wifi.sh` | 查看无线接口和 Wi-Fi 网络信息。 |
+| `skills/network-ops-tools/scripts/connections.sh` | 查看活动 TCP/UDP 连接。 |
+| `skills/network-ops-tools/scripts/listeners.sh` | 查看监听中的 TCP/UDP socket。 |
+| `skills/network-ops-tools/scripts/neighbor-table.sh` | 查看本机 ARP/NDP neighbor table。 |
+| `skills/network-ops-tools/scripts/ping-monitor.sh` | 执行有界 ping 监控并汇总丢包和延迟。 |
+| `skills/network-ops-tools/scripts/traceroute.sh` | 执行 traceroute/tracepath 或 loopback 安全回退。 |
+| `skills/network-ops-tools/scripts/dns-lookup.sh` | 执行 DNS 查询。 |
+| `skills/network-ops-tools/scripts/sntp-lookup.sh` | 执行或 dry-run SNTP 时间查询。 |
+| `skills/network-ops-tools/scripts/whois.sh` | 执行或 dry-run WHOIS 查询。 |
+| `skills/network-ops-tools/scripts/ip-geolocation.sh` | 查询或 dry-run 公网 IP 地理位置。 |
+| `skills/network-ops-tools/scripts/hosts-file-editor.sh` | 读取、搜索、规划或确认修改 hosts 文件。 |
+| `skills/network-ops-tools/scripts/lookup.sh` | 查询端口/服务名和 MAC OUI 厂商。 |
+| `skills/network-ops-tools/scripts/snmp.sh` | dry-run 或执行有界 SNMP v2c GET，输出不回显 community。 |
+| `skills/network-ops-tools/scripts/firewall.sh` | 查看 firewall 状态、生成规则计划或确认应用 UFW 规则。 |
+| `skills/network-ops-tools/scripts/subnet-calculator.sh` | 计算 IPv4/IPv6 子网、可用地址和拆分子网。 |
+| `skills/network-ops-tools/scripts/bit-calculator.sh` | 转换二进制/十六进制/十进制并执行位运算。 |
   
 ### `tests/`
 

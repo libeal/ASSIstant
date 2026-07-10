@@ -26,6 +26,7 @@
       "repair_*",
       "step_*",
       "script_*",
+      "script_manual_edit",
       "terminal_executed",
       "edit_*",
       "ai_files_manifest",
