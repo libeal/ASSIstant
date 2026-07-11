@@ -23,6 +23,7 @@ export const CONFIG_GROUPS = [
         offEffect: "work 只执行当前一轮结果，不再自动反思续写。",
       },
       { key: "agent_loop.observation_text_limit", label: "observation_text_limit", type: "number", min: 200, comment: "回传给模型的命令输出摘要上限。" },
+      { key: "agent_loop.max_iterations", label: "max_iterations", type: "number", min: 1, max: 100, comment: "Agent 反思续写的不可绕过总轮数上限，默认 12。" },
       { key: "agent_loop.checkpoint_turns", label: "checkpoint_turns", type: "number", min: 0, comment: "每隔多少轮强制 checkpoint；0 表示使用 context_turns。" },
       {
         key: "agent_loop.thinking_trace_enabled",
@@ -103,6 +104,7 @@ export const CONFIG_GROUPS = [
     title: "执行策略与 Skill",
     note: "控制最小权限代理、远程脚本策略和 skill 根目录。",
     fields: [
+      { key: "execution.timeout_sec", label: "execution_timeout_sec", type: "number", min: 1, max: 3600, comment: "单个 shell、skill、MCP 或远程脚本最长执行秒数；超时后 TERM 并在 5 秒后强制结束。" },
       {
         key: "execution.min_privilege_proxy",
         label: "最小权限代理",

@@ -5,6 +5,7 @@
 - current_request: 用户当前输入。
 - agent_loop: 迭代执行相关开关，例如是否允许 thinking_summary。
 - mcp: 仅在 work/edit 相关模式出现的 MCP 能力目录。mcp.tools 中的 ref 形如 server_id/tool_name，并包含 inputSchema。
+- skills: Skill 渐进式披露状态。始终先从系统提示附录的 INDEX 做发现；仅被当前请求触发的完整 SKILL.md 会出现在 skills.disclosed[].instructions，参数必须以这些已披露说明为准，不得猜测未披露参数。
 
 最终请求体还会按需附加：
 - environment_context: 已脱敏的运行时环境信息。
@@ -82,6 +83,6 @@ continue_decision 是必填字段：
   "notes": "可选说明"
 }
 
-skill 必须遵循渐进式披露：SKILL.md 保持精简，复杂说明放 references；脚本必须接受 JSON 字符串作为第一个参数并输出 JSON。
+skill 必须遵循渐进式披露：INDEX 只放名称与触发摘要，SKILL.md 明确参数的类型、必填性、默认值、约束和示例，复杂说明再放 references；脚本必须接受 JSON object 字符串作为唯一位置参数并向 stdout 输出单个 JSON object，诊断信息写 stderr。
 
 修复模式 purpose=repair 时，只返回建议性的 work_plan，不假设会自动执行。

@@ -340,6 +340,7 @@ Web 版 edit 使用浏览器内联编辑器，但保存前仍调用同一套 `ed
 | `agent_loop.enabled_for_work` | 是否启用 work 反思续写循环。 |
 | `agent_loop.observation_text_limit` | observation 文本摘要上限。 |
 | `agent_loop.thinking_trace_enabled` | 是否保存并展示简短 `thinking_summary`。 |
+| `agent_loop.max_iterations` | Work 反思续写的硬上限，默认 12，范围 1–100；达到后停止而不是继续占用资源。 |
 | `agent_loop.checkpoint_turns` | 强制 checkpoint 轮次，`0` 表示使用默认窗口。 |
 | `approvals.auto.skill_readonly` | 是否自动执行低风险且策略干净的普通只读 skill。 |
 | `approvals.auto.shell_readonly` | 是否自动执行低风险且策略干净的 shell，默认关闭。 |
@@ -355,6 +356,7 @@ Web 版 edit 使用浏览器内联编辑器，但保存前仍调用同一套 `ed
 | `observer.max_events` | observer 汇总事件上限。 |
 | `execution.min_privilege_proxy` | root 运行时是否尽量降权执行普通命令。 |
 | `execution.least_privilege_user` | 降权执行使用的目标用户。 |
+| `execution.timeout_sec` | 单个执行步骤的硬超时，范围 1–3600 秒，默认 300 秒；超时会记录 `timed_out`。 |
 | `skills_dir` | 自定义 skill 根目录，空值使用项目内 `skills/`。 |
 | `remote_script_policy` | 远程脚本策略，支持 `download_review` 和 `disabled`。 |
 | `remote.allow_api_key_transmission` | Remote runtime 是否允许向配置的 AI Provider 发送 API key；默认 `false`，本地模式不受影响。 |

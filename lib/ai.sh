@@ -94,11 +94,15 @@ linux_agent_build_system_prompt() {
 linux_agent_record_ai_request_files() {
     local request_context="$1"
     local prompt_file="${LINUX_AGENT_ROOT}/prompts/system.txt"
-    local skill_index_path
+    local skill_index_path relative_path
 
     linux_agent_record_ai_file "${prompt_file}" "system_prompt" "system_message"
     skill_index_path="$(linux_agent_skill_index_path 2>/dev/null || true)"
     [[ -n "${skill_index_path}" ]] && linux_agent_record_ai_file "${skill_index_path}" "skill_index" "system_prompt_appendix"
+    while IFS= read -r relative_path; do
+        [[ -n "${relative_path}" ]] || continue
+        linux_agent_record_ai_file "${LINUX_AGENT_ROOT}/${relative_path}" "skill_instructions" "request_context.skills.disclosed"
+    done < <(jq -r '.skills.disclosed[]?.relative_path // empty' <<<"${request_context}" 2>/dev/null || true)
 }
 
 linux_agent_ai_error() {

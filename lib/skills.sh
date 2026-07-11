@@ -29,6 +29,98 @@ linux_agent_skill_index_text() {
     [[ -f "${index_path}" ]] && cat "${index_path}"
 }
 
+linux_agent_skill_disclosure_candidates() {
+    local request="${1:-}"
+    local mode="${2:-work}"
+    local lowered skill_name
+    lowered="${request,,}"
+
+    case "${mode}" in
+        work|work_revision|work_reflect|edit|edit_revision) ;;
+        *) return 0 ;;
+    esac
+
+    if [[ "${lowered}" =~ (磁盘|日志|cpu|内存|进程|服务|disk|log|resource|memory|process|service) ]]; then
+        printf 'ops-basic\n'
+    fi
+    if [[ "${lowered}" =~ (端口|连接|句柄|journal|系统快照|network|socket|port|connection|fd|snapshot) ]]; then
+        printf 'os-deep-inspect\n'
+    fi
+    if [[ "${lowered}" =~ (文件|补丁|下载|字面量|file|patch|download|replace) ]]; then
+        printf 'controlled-tools\n'
+    fi
+    if [[ "${lowered}" =~ (上一轮|历史会话|审计会话|session.history|last.command|previous.turn) ]]; then
+        printf 'session-history\n'
+    fi
+    if [[ "${lowered}" =~ (网络|网卡|路由|dns|端口扫描|防火墙|子网|network|route|firewall|subnet|traceroute|whois|snmp) ]]; then
+        printf 'network-ops-tools\n'
+    fi
+
+    while IFS= read -r skill_name; do
+        [[ -n "${skill_name}" ]] || continue
+        if [[ "${lowered}" == *"${skill_name}"* ]]; then
+            printf '%s\n' "${skill_name}"
+        fi
+    done < <(sed -n 's/^##[[:space:]]\+//p' "$(linux_agent_skill_index_path)" 2>/dev/null | sort -u)
+}
+
+linux_agent_skill_context_json() {
+    local request="${1:-}"
+    local mode="${2:-work}"
+    local disclosed='[]' unavailable='[]' candidates skill_name skill_md instructions relative_path total_count
+
+    case "${mode}" in
+        work|work_revision|work_reflect|edit|edit_revision) ;;
+        *)
+            jq -cn '{enabled:false, disclosure:"not_available_in_mode", disclosed:[], unavailable:[]}'
+            return 0
+            ;;
+    esac
+
+    candidates="$(linux_agent_skill_disclosure_candidates "${request}" "${mode}" | awk 'NF && !seen[$0]++')"
+    while IFS= read -r skill_name; do
+        [[ -n "${skill_name}" ]] || continue
+        skill_md="$(linux_agent_skills_dir)/${skill_name}/SKILL.md"
+        if [[ ! -r "${skill_md}" ]]; then
+            unavailable="$(jq -cn --argjson prior "${unavailable}" --arg name "${skill_name}" '$prior + [$name]')"
+            continue
+        fi
+        instructions="$(linux_agent_sanitize_text "$(cat "${skill_md}")" 20000)"
+        relative_path="skills/${skill_name}/SKILL.md"
+        disclosed="$(jq -cn \
+            --argjson prior "${disclosed}" \
+            --arg name "${skill_name}" \
+            --arg relative_path "${relative_path}" \
+            --arg instructions "${instructions}" \
+            '$prior + [{name:$name, relative_path:$relative_path, materialization:"local_ready", instructions:$instructions}]')"
+    done <<<"${candidates}"
+
+    total_count="$(find "$(linux_agent_skills_dir)" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l | tr -d ' ')"
+    [[ "${total_count}" =~ ^[0-9]+$ ]] || total_count=0
+    jq -cn \
+        --argjson disclosed "${disclosed}" \
+        --argjson unavailable "${unavailable}" \
+        --argjson total_count "${total_count}" \
+        '{
+            enabled:true,
+            disclosure:"triggered_instructions",
+            discovery_source:"skills/INDEX.md",
+            total_skill_count:$total_count,
+            disclosed_count:($disclosed | length),
+            disclosed:$disclosed,
+            unavailable:$unavailable
+        }'
+}
+
+linux_agent_add_skill_context() {
+    local request_context="$1"
+    local mode="${2:-work}"
+    local current_request
+    current_request="$(jq -r '.current_request // empty' <<<"${request_context}")"
+    jq -c --argjson skills "$(linux_agent_skill_context_json "${current_request}" "${mode}")" \
+        '. + {skills:$skills}' <<<"${request_context}"
+}
+
 linux_agent_remote_mode_enabled() {
     [[ "${LINUX_AGENT_REMOTE_MODE:-0}" == "1" \
         && -n "${LINUX_AGENT_REMOTE_MANIFEST:-}" \
@@ -349,7 +441,7 @@ linux_agent_skill_declared_risk_at() {
         return 0
     }
 
-    line="$(grep -E "scripts/${script_name}(\`|[[:space:]):,-])" "${skill_md}" 2>/dev/null | head -n 1 || true)"
+    line="$(grep -E "scripts/${script_name}(\`|[[:space:]):,-]).*risk:[[:space:]]*\`?(low|medium|high|critical)\`?" "${skill_md}" 2>/dev/null | head -n 1 || true)"
     risk="$(sed -nE 's/.*risk:[[:space:]]*`?(low|medium|high|critical)`?.*/\1/p' <<<"${line}" | head -n 1)"
     if linux_agent_risk_is_valid "${risk}"; then
         printf '%s\n' "${risk}"
@@ -485,6 +577,10 @@ linux_agent_validate_skill_at() {
     if [[ ! -f "${skill_md}" ]] || ! sed -n '1,30p' "${skill_md}" | grep -Eq '^description:[[:space:]]*'; then
         ok="false"
         findings="$(jq -cn --argjson prior "${findings}" --arg skill "${skill_name}" '$prior + [{severity:"critical", code:"SKILL_DESCRIPTION_MISSING", skill:$skill, message:"SKILL.md 缺少 description frontmatter。"}]')"
+    fi
+    if [[ ! -f "${skill_md}" ]] || ! grep -Eq '^## .*(传参|参数契约|参数规范|[Aa]rguments|[Pp]arameters)' "${skill_md}"; then
+        ok="false"
+        findings="$(jq -cn --argjson prior "${findings}" --arg skill "${skill_name}" '$prior + [{severity:"critical", code:"SKILL_ARGUMENT_CONTRACT_MISSING", skill:$skill, message:"SKILL.md 缺少参数类型、必填性、默认值和约束说明。"}]')"
     fi
 
     while IFS= read -r script_path; do

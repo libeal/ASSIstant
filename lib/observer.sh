@@ -416,10 +416,29 @@ linux_agent_run_observed_process() {
     shift 4
     [[ "${1:-}" == "--" ]] && shift
 
-    local pid exit_code start_time end_time observer_marker
+    local pid exit_code start_time end_time observer_marker timeout_sec timed_out observer_status
+    local -a execution_command
     start_time="$(linux_agent_now_iso)"
+    timeout_sec="$(linux_agent_execution_timeout_sec)"
+    timed_out=false
+    observer_status="recorded"
+    if ! command -v timeout >/dev/null 2>&1; then
+        end_time="$(linux_agent_now_iso)"
+        printf 'execution timeout guard is unavailable; refusing unbounded execution\n' >"${stderr_file}"
+        observer_marker="$(jq -cn \
+            --arg scope "${scope}" \
+            --argjson subject "${subject_json}" \
+            --arg start_time "${start_time}" \
+            --arg end_time "${end_time}" \
+            --argjson timeout_sec "${timeout_sec}" \
+            '{status:"guard_unavailable", backend:"auditd", lifecycle:"execution", scope:$scope, subject:$subject, start_time:$start_time, end_time:$end_time, root_pid:null, exit_code:127, timed_out:false, timeout_sec:$timeout_sec}')"
+        linux_agent_observer_log_event "execution_finished" "${observer_marker}"
+        jq -cn --argjson observer "${observer_marker}" '{exit_code:127, root_pid:null, timed_out:false, observer:$observer}'
+        return 0
+    fi
+    execution_command=(timeout -s TERM -k 5s "${timeout_sec}s" "$@")
     set +e
-    "$@" >"${stdout_file}" 2>"${stderr_file}" &
+    "${execution_command[@]}" >"${stdout_file}" 2>"${stderr_file}" &
     pid=$!
     linux_agent_observer_log_event "execution_started" "$(jq -cn \
         --arg scope "${scope}" \
@@ -430,20 +449,28 @@ linux_agent_run_observed_process() {
     wait "${pid}"
     exit_code=$?
     set -e
+    if [[ "${exit_code}" -eq 124 ]]; then
+        timed_out=true
+        observer_status="timed_out"
+    fi
     end_time="$(linux_agent_now_iso)"
     observer_marker="$(jq -cn \
         --arg scope "${scope}" \
         --argjson subject "${subject_json}" \
+        --arg status "${observer_status}" \
         --arg start_time "${start_time}" \
         --arg end_time "${end_time}" \
         --argjson root_pid "${pid}" \
         --argjson exit_code "${exit_code}" \
+        --argjson timed_out "${timed_out}" \
+        --argjson timeout_sec "${timeout_sec}" \
         --argjson session_observer "${LINUX_AGENT_OBSERVER_SESSION_CONTEXT:-null}" \
-        '{status:"recorded", backend:"auditd", lifecycle:"execution", scope:$scope, subject:$subject, start_time:$start_time, end_time:$end_time, root_pid:$root_pid, exit_code:$exit_code, session_audit_key:($session_observer.audit_key // null), session_status:($session_observer.status // null)}')"
+        '{status:$status, backend:"auditd", lifecycle:"execution", scope:$scope, subject:$subject, start_time:$start_time, end_time:$end_time, root_pid:$root_pid, exit_code:$exit_code, timed_out:$timed_out, timeout_sec:$timeout_sec, session_audit_key:($session_observer.audit_key // null), session_status:($session_observer.status // null)}')"
     linux_agent_observer_log_event "execution_finished" "${observer_marker}"
     jq -cn \
         --argjson exit_code "${exit_code}" \
         --argjson root_pid "${pid}" \
+        --argjson timed_out "${timed_out}" \
         --argjson observer "${observer_marker}" \
-        '{exit_code:$exit_code, root_pid:$root_pid, observer:$observer}'
+        '{exit_code:$exit_code, root_pid:$root_pid, timed_out:$timed_out, observer:$observer}'
 }

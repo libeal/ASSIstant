@@ -31,6 +31,15 @@ linux_agent_agent_checkpoint_turns() {
     fi
 }
 
+linux_agent_agent_max_iterations() {
+    local value
+    value="$(linux_agent_config_positive_int_default '.agent_loop.max_iterations' '12')"
+    if [[ "${value}" -gt 100 ]]; then
+        value=100
+    fi
+    printf '%s\n' "${value}"
+}
+
 linux_agent_agent_loop_context_json() {
     jq -cn \
         --argjson thinking_trace_enabled "$(linux_agent_thinking_trace_enabled)" \
@@ -182,6 +191,7 @@ linux_agent_request_agent_reflection() {
             current_request:$current_request,
             agent_loop:$agent_loop
         }')"
+    reflection_context="$(linux_agent_add_skill_context "${reflection_context}" "work_reflect")"
     reflection_context="$(linux_agent_add_mcp_context "${reflection_context}" "work_reflect")"
 
     status="$(jq -r '.agent_observation.execution.status // "unknown"' <<<"${observation_json}")"
@@ -257,7 +267,7 @@ linux_agent_run_agent_loop() {
     local initial_plan="$4"
     local resume_state="${5:-}"
     local current_plan execution_json iteration_results all_results iteration status final_status final_answer stopped_reason
-    local observation_json reflection_json checkpoint_turns auto_executed_count checkpoint_required final_review final_approval_step
+    local observation_json reflection_json checkpoint_turns max_iterations auto_executed_count checkpoint_required final_review final_approval_step
     local execution_user sudo_probe
     [[ -n "${resume_state}" ]] || resume_state='{}'
 
@@ -274,12 +284,14 @@ linux_agent_run_agent_loop() {
     execution_user=""
     sudo_probe=""
     checkpoint_turns="$(linux_agent_agent_checkpoint_turns)"
+    max_iterations="$(linux_agent_agent_max_iterations)"
 
     linux_agent_log_event "agent_loop_started" "$(jq -cn \
         --arg mode "${mode}" \
         --argjson checkpoint_turns "${checkpoint_turns}" \
+        --argjson max_iterations "${max_iterations}" \
         --argjson agent_loop "$(linux_agent_agent_loop_context_json)" \
-        '{mode:$mode, checkpoint_turns:$checkpoint_turns, agent_loop:$agent_loop}')"
+        '{mode:$mode, checkpoint_turns:$checkpoint_turns, max_iterations:$max_iterations, agent_loop:$agent_loop}')"
 
     while true; do
         iteration=$((iteration + 1))
@@ -328,6 +340,13 @@ linux_agent_run_agent_loop() {
 
         if [[ "$(jq -r '.response_type' <<<"${reflection_json}")" != "work_plan" ]]; then
             stopped_reason="continue_without_work_plan"
+            linux_agent_record_agent_loop_iteration_turn "${user_input}" "${mode}" "${iteration}" "${current_plan}" "${execution_json}" "${reflection_json}" "${stopped_reason}" "${final_status}"
+            break
+        fi
+
+        if (( iteration >= max_iterations )); then
+            final_status="iteration_limit_stopped"
+            stopped_reason="max_iterations_reached"
             linux_agent_record_agent_loop_iteration_turn "${user_input}" "${mode}" "${iteration}" "${current_plan}" "${execution_json}" "${reflection_json}" "${stopped_reason}" "${final_status}"
             break
         fi
@@ -393,6 +412,7 @@ linux_agent_process_work_request() {
 
     request_context="$(linux_agent_build_request_context "${user_input}" "${context_json}" "work")"
     request_context="$(linux_agent_add_agent_loop_context "${request_context}")"
+    request_context="$(linux_agent_add_skill_context "${request_context}" "work")"
     request_context="$(linux_agent_add_mcp_context "${request_context}" "work")"
     linux_agent_log_event "request_context_built" "${request_context}"
 
@@ -636,7 +656,10 @@ linux_agent_process_terminal_request() {
 
     stdout_text="$(head -c 4000 "${stdout_file}" || true)"
     stderr_text="$(head -c 4000 "${stderr_file}" || true)"
-    if [[ "${exit_code}" -eq 0 ]]; then
+    if [[ "$(jq -r '.timed_out // false' <<<"${run_meta}")" == "true" ]]; then
+        final_status="timed_out"
+        [[ -n "${stderr_text}" ]] || stderr_text="执行超过配置的 execution.timeout_sec，已终止。"
+    elif [[ "${exit_code}" -eq 0 ]]; then
         final_status="executed"
     else
         final_status="failed"
@@ -648,10 +671,11 @@ linux_agent_process_terminal_request() {
         --arg stderr_text "${stderr_text}" \
         --arg status "${final_status}" \
         --argjson exit_code "${exit_code}" \
+        --argjson timed_out "$(jq -r '.timed_out // false' <<<"${run_meta}")" \
         --argjson observer "${observer}" \
         --argjson review "${review}" \
         --argjson proxy "${proxy_meta}" \
-        '{ok:($exit_code == 0), status:$status, command:$command, exit_code:$exit_code, stdout:$stdout_text, stderr:$stderr_text, review:$review, observer:$observer, execution_proxy:$proxy}')"
+        '{ok:($exit_code == 0), status:$status, command:$command, exit_code:$exit_code, timed_out:$timed_out, stdout:$stdout_text, stderr:$stderr_text, review:$review, observer:$observer, execution_proxy:$proxy}')"
 
     linux_agent_log_event "terminal_executed" "${result}"
     if linux_agent_output_json_enabled; then

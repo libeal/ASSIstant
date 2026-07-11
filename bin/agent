@@ -365,7 +365,7 @@ main() {
 
 linux_agent_run() {
     local command="${1:-interactive}"
-    local args_summary="$*"
+    local argument_count="$#"
 
     if [[ "${command}" == "audit" ]]; then
         main "$@"
@@ -377,8 +377,8 @@ linux_agent_run() {
     fi
 
     LINUX_AGENT_MAIN_COMMAND="${command}"
-    linux_agent_start_session "agent ${args_summary:-interactive}"
-    linux_agent_log_command_started "${command}" "${args_summary}"
+    linux_agent_start_session "agent ${command}"
+    linux_agent_log_command_started "${command}" "argument_count=${argument_count}"
 
     trap linux_agent_on_exit EXIT
     trap linux_agent_on_int INT

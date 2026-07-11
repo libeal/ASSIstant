@@ -46,6 +46,26 @@ free_cp_result="$(linux_agent_policy_review_text "shell" "cp /tmp/source /tmp/de
 grep -q '"approved": false' <<<"$(jq . <<<"${free_cp_result}")"
 grep -q 'AST_FILE_MUTATION_REQUIRES_SKILL' <<<"${free_cp_result}"
 
+command_cp_result="$(linux_agent_policy_review_text "shell" "command cp source dest")"
+grep -q '"approved": false' <<<"$(jq . <<<"${command_cp_result}")"
+grep -q 'AST_FILE_MUTATION_REQUIRES_SKILL' <<<"${command_cp_result}"
+
+builtin_touch_result="$(linux_agent_policy_review_text "shell" "builtin touch target")"
+grep -q '"approved": false' <<<"$(jq . <<<"${builtin_touch_result}")"
+grep -q 'AST_FILE_MUTATION_REQUIRES_SKILL' <<<"${builtin_touch_result}"
+
+command_shell_result="$(linux_agent_policy_review_text "shell" "command sh -c 'rm target'")"
+grep -q '"approved": false' <<<"$(jq . <<<"${command_shell_result}")"
+grep -q 'AST_FILE_MUTATION_REQUIRES_SKILL' <<<"${command_shell_result}"
+
+forwarder_write_result="$(linux_agent_policy_review_text "shell" "nice cp source dest")"
+grep -q '"approved": false' <<<"$(jq . <<<"${forwarder_write_result}")"
+grep -q 'AST_COMMAND_FORWARDER' <<<"${forwarder_write_result}"
+
+timeout_wrapper_result="$(linux_agent_policy_review_text "shell" "timeout 5 sh -c 'rm target'")"
+grep -q '"approved": false' <<<"$(jq . <<<"${timeout_wrapper_result}")"
+grep -q 'AST_COMMAND_FORWARDER' <<<"${timeout_wrapper_result}"
+
 free_rm_result="$(linux_agent_policy_review_text "shell" "rm /tmp/agent-free-write-test")"
 grep -q '"approved": false' <<<"$(jq . <<<"${free_rm_result}")"
 grep -q 'AST_FILE_MUTATION_REQUIRES_SKILL' <<<"${free_rm_result}"
@@ -55,12 +75,23 @@ grep -q '"approval_required": true' <<<"$(jq . <<<"${substitution_result}")"
 grep -q 'AST_COMMAND_SUBSTITUTION' <<<"${substitution_result}"
 
 wrapper_result="$(linux_agent_policy_review_text "shell" "bash -c 'rm -rf /tmp/demo'")"
+grep -q '"approved": false' <<<"$(jq . <<<"${wrapper_result}")"
 grep -q '"approval_required": true' <<<"$(jq . <<<"${wrapper_result}")"
 grep -q 'AST_WRAPPER_EXEC' <<<"${wrapper_result}"
+grep -q 'AST_FILE_MUTATION_REQUIRES_SKILL' <<<"${wrapper_result}"
+
+combined_shell_flags_result="$(linux_agent_policy_review_text "shell" "bash -lc 'cp source dest'")"
+grep -q '"approved": false' <<<"$(jq . <<<"${combined_shell_flags_result}")"
+grep -q 'AST_FILE_MUTATION_REQUIRES_SKILL' <<<"${combined_shell_flags_result}"
 
 source_result="$(linux_agent_policy_review_text "shell" "source /tmp/install.sh")"
+grep -q '"approved": false' <<<"$(jq . <<<"${source_result}")"
 grep -q '"approval_required": true' <<<"$(jq . <<<"${source_result}")"
 grep -q 'AST_WRAPPER_EXEC' <<<"${source_result}"
+
+find_exec_result="$(linux_agent_policy_review_text "shell" "find . -type f -exec cp {} backup \\;")"
+grep -q '"approved": false' <<<"$(jq . <<<"${find_exec_result}")"
+grep -q 'AST_FIND_EXEC' <<<"${find_exec_result}"
 
 tee_result="$(linux_agent_policy_review_text "shell" "printf bad | sudo tee /etc/hosts")"
 grep -q '"approved": false' <<<"$(jq . <<<"${tee_result}")"
@@ -121,5 +152,29 @@ jq -e '.ok == false and ([.findings[]?.code] | index("POLICY_REGEX_INVALID"))' <
 
 zero_width_redaction="$(linux_agent_validate_policy_content "redaction-rules.json" '{"rules":[{"id":"bad","pattern":".*","replacement":"x"}],"sensitive_key_pattern":"(?i)token"}')"
 jq -e '.ok == false and ([.findings[]?.code] | index("POLICY_REGEX_ZERO_WIDTH"))' <<<"${zero_width_redaction}" >/dev/null
+
+invalid_audit_selection="$(linux_agent_validate_policy_content "audit-boundaries.json" '{
+  "observing": {
+    "audit_payload_mode": "safe_summary",
+    "application_events": ["received", "secret_event"],
+    "observer_syscalls": ["execve", "ptrace"],
+    "observer_result_fields": ["processes", "raw_arguments"]
+  },
+  "allowed_to_observe": {
+    "audit_payload_modes": ["safe_summary"],
+    "application_events": ["received"],
+    "observer_syscalls": ["execve"],
+    "observer_result_fields": ["processes"]
+  }
+}')"
+jq -e '.ok == false
+    and ([.findings[] | select(.code == "POLICY_AUDIT_SELECTION_NOT_ALLOWED")] | length) == 3' <<<"${invalid_audit_selection}" >/dev/null
+
+missing_audit_arrays="$(linux_agent_validate_policy_content "audit-boundaries.json" '{
+  "observing":{"audit_payload_mode":"safe_summary"},
+  "allowed_to_observe":{"audit_payload_modes":["safe_summary"]}
+}')"
+jq -e '.ok == false
+    and ([.findings[] | select(.code == "POLICY_AUDIT_ARRAY_INVALID")] | length) == 6' <<<"${missing_audit_arrays}" >/dev/null
 
 printf 'policy: ok\n'

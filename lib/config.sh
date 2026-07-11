@@ -58,6 +58,15 @@ linux_agent_config_positive_int_default() {
     printf '%s\n' "${value}"
 }
 
+linux_agent_execution_timeout_sec() {
+    local value
+    value="$(linux_agent_config_positive_int_default '.execution.timeout_sec' '300')"
+    if [[ "${value}" -gt 3600 ]]; then
+        value=3600
+    fi
+    printf '%s\n' "${value}"
+}
+
 linux_agent_remote_mode() {
     [[ "${LINUX_AGENT_REMOTE_MODE:-0}" == "1" ]]
 }

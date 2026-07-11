@@ -445,6 +445,7 @@ def config_public_state():
                 "enabled_for_work": bool(agent_loop.get("enabled_for_work", True)),
                 "observation_text_limit": int(agent_loop.get("observation_text_limit", 4000) or 4000),
                 "thinking_trace_enabled": bool(agent_loop.get("thinking_trace_enabled", False)),
+                "max_iterations": safe_int(agent_loop.get("max_iterations", 12) or 12, 12),
                 "checkpoint_turns": int(agent_loop.get("checkpoint_turns", 0) or 0),
             },
             "approvals": {
@@ -466,6 +467,7 @@ def config_public_state():
                 "max_events": observer.get("max_events", 200),
             },
             "execution": {
+                "timeout_sec": safe_int(execution.get("timeout_sec", 300) or 300, 300),
                 "min_privilege_proxy": bool(execution.get("min_privilege_proxy", True)),
                 "least_privilege_user": execution.get("least_privilege_user", "nobody"),
             },
@@ -497,6 +499,7 @@ CONFIG_WRITABLE_FIELDS = {
     "agent_loop.enabled_for_work": {"type": "bool"},
     "agent_loop.observation_text_limit": {"type": "int", "min": 200, "max": 200000},
     "agent_loop.thinking_trace_enabled": {"type": "bool"},
+    "agent_loop.max_iterations": {"type": "int", "min": 1, "max": 100},
     "agent_loop.checkpoint_turns": {"type": "int", "min": 0, "max": 100},
     "approvals.auto.skill_readonly": {"type": "bool"},
     "approvals.auto.shell_readonly": {"type": "bool"},
@@ -511,6 +514,7 @@ CONFIG_WRITABLE_FIELDS = {
     "observer.privilege": {"type": "enum", "values": {"sudo_interactive", "passwordless", "none"}},
     "observer.max_events": {"type": "int", "min": 1, "max": 100000},
     "execution.min_privilege_proxy": {"type": "bool"},
+    "execution.timeout_sec": {"type": "int", "min": 1, "max": 3600},
     "execution.least_privilege_user": {"type": "str", "min": 1},
     "skills_dir": {"type": "str", "min": 0},
     "remote_script_policy": {"type": "enum", "values": {"download_review", "disabled"}},

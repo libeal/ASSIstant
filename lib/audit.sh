@@ -457,10 +457,14 @@ linux_agent_audit_safe_summary() {
         elif $stage == "request_context_built" then
             {
                 mode:(.mode // null),
-                current_request_preview:(.current_request // "" | preview),
                 conversation_turns:(if (.conversation_context? | type) == "array" then (.conversation_context | length) else 0 end),
                 environment_keys:(if (.environment_context? | type) == "object" then (.environment_context | keys) else [] end),
-                skill_index_chars:(.skill_index // "" | length),
+                disclosed_skill_count:(if (.skills.disclosed? | type) == "array" then (.skills.disclosed | length) else 0 end),
+                disclosed_skills:[.skills.disclosed[]?.name],
+                unavailable_skills:(.skills.unavailable // []),
+                mcp_server_count:(.mcp.server_count // 0),
+                mcp_tool_count:(.mcp.tool_count // 0),
+                mcp_finding_count:(if (.mcp.findings? | type) == "array" then (.mcp.findings | length) else 0 end),
                 fixed_context_excluded:(has("skill_index") | not),
                 runtime_context_excluded:(has("environment_context") | not)
             }
@@ -484,6 +488,7 @@ linux_agent_audit_safe_summary() {
                 iteration:(.iteration // null),
                 iterations:(.iterations // null),
                 checkpoint_turns:(.checkpoint_turns // null),
+                max_iterations:(.max_iterations // null),
                 approved:(.approved // null),
                 status:(.status // null),
                 stopped_reason:(.stopped_reason // null),
@@ -555,6 +560,8 @@ linux_agent_audit_safe_summary() {
                 root_pid:(.root_pid // null),
                 start_time:(.start_time // null),
                 end_time:(.end_time // null),
+                timed_out:(.timed_out // null),
+                timeout_sec:(.timeout_sec // null),
                 exec_count:(.exec_count // null),
                 file_event_count:(.file_event_count // null),
                 process_count:(if (.processes? | type) == "array" then (.processes | length) else 0 end),

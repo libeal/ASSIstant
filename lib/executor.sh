@@ -763,7 +763,7 @@ linux_agent_execute_observed_command_output() {
     shift 2
     [[ "${1:-}" == "--" ]] && shift
 
-    local stdout_file stderr_file run_meta exit_code observer stdout_text stderr_text combined
+    local stdout_file stderr_file run_meta exit_code observer stdout_text stderr_text combined timed_out
     local requested_privilege proxy_meta proxy_error
     local -a prepared_command
 
@@ -788,6 +788,7 @@ linux_agent_execute_observed_command_output() {
 
     run_meta="$(linux_agent_run_observed_process "${scope}" "${subject_json}" "${stdout_file}" "${stderr_file}" -- "${prepared_command[@]}")"
     exit_code="$(jq -r '.exit_code' <<<"${run_meta}")"
+    timed_out="$(jq -r '.timed_out // false' <<<"${run_meta}")"
     observer="$(jq -c '.observer' <<<"${run_meta}")"
     stdout_text="$(cat "${stdout_file}" 2>/dev/null || true)"
     stderr_text="$(cat "${stderr_file}" 2>/dev/null || true)"
@@ -806,16 +807,18 @@ linux_agent_execute_observed_command_output() {
         jq -cn \
             --argjson output "$(printf '%s' "${combined}" | jq -c .)" \
             --argjson exit_code "${exit_code}" \
+            --argjson timed_out "${timed_out}" \
             --argjson observer "${observer}" \
             --argjson proxy "${proxy_meta}" \
-            '{ok:($exit_code == 0), exit_code:$exit_code, output:$output, observer:$observer, execution_proxy:$proxy}'
+            '{ok:($exit_code == 0), exit_code:$exit_code, timed_out:$timed_out, output:$output, observer:$observer, execution_proxy:$proxy} + (if $timed_out then {status:"timed_out"} else {} end)'
     else
         jq -cn \
             --arg output "${combined}" \
             --argjson exit_code "${exit_code}" \
+            --argjson timed_out "${timed_out}" \
             --argjson observer "${observer}" \
             --argjson proxy "${proxy_meta}" \
-            '{ok:($exit_code == 0), exit_code:$exit_code, output:{raw:$output}, observer:$observer, execution_proxy:$proxy}'
+            '{ok:($exit_code == 0), exit_code:$exit_code, timed_out:$timed_out, output:{raw:(if $timed_out and $output == "" then "执行超过配置的 execution.timeout_sec，已终止。" else $output end)}, observer:$observer, execution_proxy:$proxy} + (if $timed_out then {status:"timed_out"} else {} end)'
     fi
 }
 
@@ -1044,6 +1047,7 @@ linux_agent_request_revised_work_plan() {
             conversation_context:$conversation_context,
             current_request:$current_request
         }')"
+    request_context="$(linux_agent_add_skill_context "${request_context}" "work_revision")"
     request_context="$(linux_agent_add_mcp_context "${request_context}" "work_revision")"
 
     linux_agent_log_event "work_revision_requested" "${revision_context}"

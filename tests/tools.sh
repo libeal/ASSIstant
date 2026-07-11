@@ -138,6 +138,16 @@ doctor_json="$(linux_agent_doctor)"
 grep -q '"skills_ok": true' <<<"$(jq . <<<"${doctor_json}")"
 skills_json="$(linux_agent_validate_skills)"
 grep -q '"ok": true' <<<"$(jq . <<<"${skills_json}")"
+disk_skill_context="$(linux_agent_skill_context_json "检查磁盘和日志占用" work)"
+jq -e '(.disclosed | map(.name)) == ["ops-basic"]
+    and .disclosure == "triggered_instructions"
+    and (.disclosed[0].instructions | contains("# Ops Basic"))' <<<"${disk_skill_context}" >/dev/null
+network_skill_context="$(linux_agent_skill_context_json "检查网络连接与端口" work)"
+jq -e '([.disclosed[].name] | index("network-ops-tools"))
+    and ([.disclosed[].name] | index("os-deep-inspect"))
+    and ([.disclosed[].name] | index("ops-basic") | not)' <<<"${network_skill_context}" >/dev/null
+file_skill_context="$(linux_agent_skill_context_json "用 controlled-tools/file-patch 修改文件" work)"
+jq -e '([.disclosed[].name] | index("controlled-tools"))' <<<"${file_skill_context}" >/dev/null
 resource_skill_result="$(linux_agent_run_skill_script ops-basic/resource-inspect '{"top_n":3}')"
 resource_skill_string_arg_result="$(linux_agent_run_skill_script ops-basic/resource-inspect "$(jq -cn --arg args '{"top_n":2}' '$args')")"
 process_skill_result="$(linux_agent_run_skill_script ops-basic/process-inspect '{"pattern":"systemd"}')"
@@ -151,12 +161,15 @@ broken_skills_root="$(mktemp -d)"
 cp -a "${ROOT_DIR}/skills" "${broken_skills_root}/skills"
 printf '\n- `ops-basic/ghost-script`: bogus\n' >> "${broken_skills_root}/skills/INDEX.md"
 printf '\n- `scripts/ghost-script.sh`: bogus\n' >> "${broken_skills_root}/skills/ops-basic/SKILL.md"
+awk '!/^## .*传参/ && !/^## 参数契约/' "${broken_skills_root}/skills/ops-basic/SKILL.md" > "${broken_skills_root}/skills/ops-basic/SKILL.md.tmp"
+mv "${broken_skills_root}/skills/ops-basic/SKILL.md.tmp" "${broken_skills_root}/skills/ops-basic/SKILL.md"
 original_config_json="${LINUX_AGENT_CONFIG_JSON}"
 LINUX_AGENT_CONFIG_JSON="$(jq --arg skills_dir "${broken_skills_root}/skills" '.skills_dir=$skills_dir' <<<"${LINUX_AGENT_CONFIG_JSON}")"
 broken_skills_json="$(linux_agent_validate_skills)"
 grep -q '"ok": false' <<<"$(jq . <<<"${broken_skills_json}")"
 grep -q 'SKILL_SCRIPT_FILE_MISSING' <<<"${broken_skills_json}"
 grep -q 'SKILL_INDEX_BROKEN_REF' <<<"${broken_skills_json}"
+grep -q 'SKILL_ARGUMENT_CONTRACT_MISSING' <<<"${broken_skills_json}"
 LINUX_AGENT_CONFIG_JSON="${original_config_json}"
 rm -rf "${broken_skills_root}"
 

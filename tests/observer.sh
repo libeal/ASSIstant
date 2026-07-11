@@ -39,6 +39,18 @@ grep -q '"stage":"observer_unavailable"' "${LINUX_AGENT_AUDIT_LOG}"
 linux_agent_finish_session "tested"
 grep -q '"stage":"observer_session_finished"' "${ROOT_DIR}/logs/${safe_session_id:-${LINUX_AGENT_SESSION_ID}}.jsonl" 2>/dev/null || grep -q '"stage":"observer_session_finished"' "${LINUX_AGENT_AUDIT_LOG}"
 
+LINUX_AGENT_CONFIG_JSON="$(jq '.execution.timeout_sec=1' <<<"${LINUX_AGENT_CONFIG_JSON}")"
+timeout_stdout="${tmp_root}/timeout.stdout"
+timeout_stderr="${tmp_root}/timeout.stderr"
+timeout_meta="$(linux_agent_run_observed_process \
+    "observer_timeout" \
+    '{"kind":"timeout-test"}' \
+    "${timeout_stdout}" \
+    "${timeout_stderr}" \
+    -- bash -c 'sleep 2')"
+jq -e '.exit_code == 124 and .timed_out == true and .observer.status == "timed_out"' <<<"${timeout_meta}" >/dev/null
+LINUX_AGENT_CONFIG_JSON="$(jq '.execution.timeout_sec=300' <<<"${LINUX_AGENT_CONFIG_JSON}")"
+
 fake_bin="${tmp_root}/fake-bin"
 mkdir -p "${fake_bin}"
 audit_calls="${tmp_root}/audit.calls"

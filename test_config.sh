@@ -115,7 +115,7 @@ validate_config() {
 
     local api_url api_key api_key_src model timeout context_turns audit_mode audit_text_limit remote_policy skills_dir
     local web_enabled web_host web_port web_token web_retention remote_api_key_transmission
-    local loop_enabled observation_limit thinking_trace checkpoint_turns
+    local loop_enabled observation_limit thinking_trace checkpoint_turns max_iterations execution_timeout
     local approval_skill approval_shell approval_file_match approval_file_patch approval_file_download approval_local_analyze approval_remote_script
     api_url="$(json_get '.api_url')"
     api_key="$(api_key_value)"
@@ -136,6 +136,8 @@ validate_config() {
     observation_limit="$(json_get '.agent_loop.observation_text_limit')"
     thinking_trace="$(json_get '.agent_loop.thinking_trace_enabled')"
     checkpoint_turns="$(json_get '.agent_loop.checkpoint_turns')"
+    max_iterations="$(json_get '.agent_loop.max_iterations')"
+    execution_timeout="$(json_get '.execution.timeout_sec')"
     approval_skill="$(json_get '.approvals.auto.skill_readonly')"
     approval_shell="$(json_get '.approvals.auto.shell_readonly')"
     approval_file_match="$(json_get '.approvals.auto.file_match')"
@@ -264,6 +266,24 @@ validate_config() {
         fi
     else
         print_warn "agent_loop.checkpoint_turns 未配置，将默认使用 context_turns"
+    fi
+
+    if [[ -z "${execution_timeout}" ]]; then
+        print_warn "execution.timeout_sec 未配置，将默认使用 300"
+    elif [[ "${execution_timeout}" =~ ^[0-9]+$ && "${execution_timeout}" -gt 0 && "${execution_timeout}" -le 3600 ]]; then
+        print_ok "execution.timeout_sec 合法: ${execution_timeout}"
+    else
+        print_error "execution.timeout_sec 必须是 1-3600 的整数"
+        failures=$((failures + 1))
+    fi
+
+    if [[ -z "${max_iterations}" ]]; then
+        print_warn "agent_loop.max_iterations 未配置，将默认使用 12"
+    elif [[ "${max_iterations}" =~ ^[0-9]+$ && "${max_iterations}" -gt 0 && "${max_iterations}" -le 100 ]]; then
+        print_ok "agent_loop.max_iterations 合法: ${max_iterations}"
+    else
+        print_error "agent_loop.max_iterations 必须是 1-100 的整数"
+        failures=$((failures + 1))
     fi
 
     if [[ -n "${skills_dir}" ]]; then

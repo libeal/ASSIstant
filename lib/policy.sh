@@ -349,6 +349,7 @@ linux_agent_policy_validate_audit_boundaries() {
     local path="$1"
     local json="$2"
     local findings='[]'
+    local pointer entry
 
     if ! jq -e '.observing | type == "object"' <<<"${json}" >/dev/null 2>&1; then
         findings="$(linux_agent_policy_add_validation_finding "${findings}" "critical" "POLICY_REQUIRED_OBJECT_MISSING" "${path}" "observing 必须是对象。" "observing")"
@@ -359,6 +360,52 @@ linux_agent_policy_validate_audit_boundaries() {
     if ! jq -e '. as $root | (.observing.audit_payload_mode | type == "string") and ([($root.allowed_to_observe.audit_payload_modes // [])[]] | index($root.observing.audit_payload_mode))' <<<"${json}" >/dev/null 2>&1; then
         findings="$(linux_agent_policy_add_validation_finding "${findings}" "critical" "POLICY_AUDIT_MODE_NOT_ALLOWED" "${path}" "observing.audit_payload_mode 必须存在于 allowed_to_observe.audit_payload_modes。" "observing.audit_payload_mode")"
     fi
+
+    for pointer in \
+        '.observing.application_events' \
+        '.observing.observer_syscalls' \
+        '.observing.observer_result_fields' \
+        '.allowed_to_observe.application_events' \
+        '.allowed_to_observe.observer_syscalls' \
+        '.allowed_to_observe.observer_result_fields'; do
+        if ! jq -e "${pointer} | type == \"array\" and all(.[]; type == \"string\" and length > 0)" <<<"${json}" >/dev/null 2>&1; then
+            findings="$(linux_agent_policy_add_validation_finding \
+                "${findings}" \
+                "critical" \
+                "POLICY_AUDIT_ARRAY_INVALID" \
+                "${path}" \
+                "${pointer#.} 必须是非空字符串数组。" \
+                "${pointer#.}")"
+        fi
+    done
+
+    while IFS=$'\t' read -r pointer entry; do
+        [[ -n "${pointer}" && -n "${entry}" ]] || continue
+        findings="$(linux_agent_policy_add_validation_finding \
+            "${findings}" \
+            "critical" \
+            "POLICY_AUDIT_SELECTION_NOT_ALLOWED" \
+            "${path}" \
+            "${pointer} 中的 ${entry} 不在对应 allowed_to_observe 边界内，运行时会被静默丢弃。" \
+            "${pointer}")"
+    done < <(jq -r '
+        def allowed($entry; $rules):
+          any($rules[]?; . as $rule |
+            ($rule == "all") or
+            (if ($entry | endswith("*")) then
+               $rule == $entry
+             else
+               ($rule == $entry) or (($rule | endswith("*")) and ($entry | startswith($rule[0:-1])))
+             end));
+        [
+          ["observing.application_events", (.observing.application_events // []), (.allowed_to_observe.application_events // [])],
+          ["observing.observer_syscalls", (.observing.observer_syscalls // []), (.allowed_to_observe.observer_syscalls // [])],
+          ["observing.observer_result_fields", (.observing.observer_result_fields // []), (.allowed_to_observe.observer_result_fields // [])]
+        ][] as $group
+        | $group[1][]? as $entry
+        | select(($entry | type) == "string" and (allowed($entry; $group[2]) | not))
+        | [$group[0], $entry] | @tsv
+    ' <<<"${json}" 2>/dev/null || true)
 
     printf '%s\n' "${findings}"
 }

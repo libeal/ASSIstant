@@ -25,6 +25,12 @@ from typing import Any
 
 
 PROTOCOL_VERSION = "2025-11-25"
+SUPPORTED_PROTOCOL_VERSIONS = {
+    "2024-11-05",
+    "2025-03-26",
+    "2025-06-18",
+    "2025-11-25",
+}
 DEFAULT_TIMEOUT_SEC = 15
 
 
@@ -99,6 +105,7 @@ class BaseClient:
         self.timeout = manifest_timeout(manifest)
         self.next_id = 1
         self.negotiated_protocol = PROTOCOL_VERSION
+        self.initialize_result: dict[str, Any] = {}
 
     def next_message_id(self) -> int:
         value = self.next_id
@@ -135,14 +142,19 @@ class BaseClient:
             },
         )
         protocol = result.get("protocolVersion")
-        if isinstance(protocol, str) and protocol:
-            self.negotiated_protocol = protocol
+        if not isinstance(protocol, str) or protocol not in SUPPORTED_PROTOCOL_VERSIONS:
+            raise McpError(f"server selected unsupported protocol version: {protocol!r}")
+        self.negotiated_protocol = protocol
+        self.initialize_result = result
         self.notification("notifications/initialized")
         return result
 
     def list_tools(self) -> dict[str, Any]:
         self.initialize()
-        return self.request("tools/list")
+        result = self.request("tools/list")
+        if isinstance(self.initialize_result.get("serverInfo"), dict):
+            result["serverInfo"] = self.initialize_result["serverInfo"]
+        return result
 
     def call_tool(self, tool_name: str, arguments: dict[str, Any]) -> dict[str, Any]:
         self.initialize()
@@ -333,8 +345,8 @@ class LegacySseClient(BaseClient):
         if not self.message_url:
             raise McpError("legacy sse manifest requires message_url or endpoint event")
 
-    def _headers(self) -> dict[str, str]:
-        headers = {"Accept": "application/json"}
+    def _headers(self, accept: str = "application/json") -> dict[str, str]:
+        headers = {"Accept": accept}
         manifest_headers = self.manifest.get("headers")
         if isinstance(manifest_headers, dict):
             for key, value in manifest_headers.items():
@@ -343,7 +355,7 @@ class LegacySseClient(BaseClient):
         return headers
 
     def _read_stream(self) -> None:
-        request = urllib.request.Request(self.url, headers={"Accept": "text/event-stream"}, method="GET")
+        request = urllib.request.Request(self.url, headers=self._headers("text/event-stream"), method="GET")
         try:
             with urllib.request.urlopen(request, timeout=self.timeout) as response:
                 event_name = "message"

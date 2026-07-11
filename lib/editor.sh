@@ -16,6 +16,8 @@ linux_agent_render_skill_md() {
         printf '%s\n\n' "${description}"
         printf '## Scripts\n\n'
         jq -r '.[] | "- `scripts/\(.name)`: \(.description)"' <<<"${scripts_json}"
+        printf '\n## 参数规范\n\n'
+        printf '调用形式为 `bash scripts/<name>.sh '\''<json-object>'\''`。唯一位置参数必须是 JSON object；每个脚本条目中的 description 必须说明字段类型、必填性、默认值和约束。stdout 只输出一个 JSON object，调用方依据 `ok`、`status` 和 `error` 判断业务结果。\n'
         printf '\n## Workflow\n\n'
         printf '按脚本文档选择最小必要脚本执行。脚本接收 JSON 字符串作为第一个参数，并输出 JSON。\n'
     }
@@ -248,6 +250,7 @@ linux_agent_request_revised_edit_package() {
             conversation_context:$conversation_context,
             current_request:$current_request
         }')"
+    request_context="$(linux_agent_add_skill_context "${request_context}" "edit_revision")"
     request_context="$(linux_agent_add_mcp_context "${request_context}" "edit_revision")"
 
     linux_agent_log_event "edit_revision_requested" "${revision_context}"
@@ -591,6 +594,7 @@ linux_agent_process_edit_request() {
 
     context_json="$(jq -cn '{edit_mode:true}')"
     request_context="$(linux_agent_build_request_context "${user_input}" "${context_json}" "edit")"
+    request_context="$(linux_agent_add_skill_context "${request_context}" "edit")"
     request_context="$(linux_agent_add_mcp_context "${request_context}" "edit")"
     linux_agent_record_ai_request_files "${request_context}"
     edit_json="$(linux_agent_call_ai_with_context "${user_input}" "${request_context}" "edit" "${context_json}")"

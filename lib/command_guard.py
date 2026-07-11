@@ -36,7 +36,7 @@ REDIRECT_OPERATORS = {
     "<<<",
 }
 SHELLS = {"bash", "sh", "zsh", "dash", "ksh", "mksh", "ash"}
-WRAPPERS = {"sudo", "doas", "env", "busybox"}
+WRAPPERS = {"sudo", "doas", "env", "busybox", "command", "builtin"}
 SUDO_FLAGS_WITH_ARG = {"-u", "-g", "-U", "-C", "-h", "-T", "-D", "-p", "-r", "-t"}
 ENV_FLAGS_WITH_ARG = {"-u", "--unset", "-C", "--chdir"}
 FORWARDERS = {
@@ -475,6 +475,11 @@ def strip_wrappers(raw_head: str, argv: list[str], findings: list[dict]) -> tupl
     args = argv[:]
     wrappers: list[str] = []
     while head in WRAPPERS and args:
+        # `command` and `builtin` are execution wrappers, not opaque commands.
+        # Keep command lookup (`command -v/-V`) as a read-only query, but unwrap
+        # every execution form so the real command receives the normal rules.
+        if head == "command" and any(t in {"-v", "-V"} for t in args):
+            break
         wrappers.append(head)
         if head in {"sudo", "doas"}:
             findings.append(
@@ -502,6 +507,9 @@ def strip_wrappers(raw_head: str, argv: list[str], findings: list[dict]) -> tupl
                 )
                 return head, args, wrappers
             if t.startswith("-"):
+                if t == "--":
+                    i += 1
+                    break
                 i += 1
                 if head in {"sudo", "doas"} and t in SUDO_FLAGS_WITH_ARG and i < len(args):
                     i += 1
@@ -619,6 +627,31 @@ def xargs_subcommand(argv: list[str]) -> tuple[str, list[str]] | None:
     return canonical(argv[i]), argv[i + 1 :]
 
 
+def timeout_subcommand(argv: list[str]) -> list[str]:
+    """Return the command portion of GNU timeout arguments."""
+    options_with_arg = {"-s", "--signal", "-k", "--kill-after"}
+    i = 0
+    while i < len(argv):
+        arg = argv[i]
+        if arg == "--":
+            i += 1
+            break
+        if arg in options_with_arg:
+            i += 2
+            continue
+        if arg.startswith("--signal=") or arg.startswith("--kill-after="):
+            i += 1
+            continue
+        if arg.startswith("-"):
+            i += 1
+            continue
+        break
+    if i >= len(argv):
+        return []
+    # The first positional operand is DURATION; the rest is COMMAND [ARG]...
+    return argv[i + 1 :]
+
+
 def has_curl_upload(argv: list[str]) -> bool:
     for idx, arg in enumerate(argv):
         if arg in {"-T", "--upload-file", "--data-binary", "--data-raw", "--data"} and idx + 1 < len(argv):
@@ -663,7 +696,7 @@ def check_command_rules(cmd: CommandNode, findings: list[dict]) -> None:
         )
         return
 
-    if head in SHELLS and any(t == "-c" or t == "--command" or t.startswith("-c") for t in argv):
+    if head in SHELLS and any(t == "--command" or (t.startswith("-") and not t.startswith("--") and "c" in t[1:]) for t in argv):
         findings.append(
             finding(
                 "high",
@@ -678,9 +711,9 @@ def check_command_rules(cmd: CommandNode, findings: list[dict]) -> None:
     if head in DEFERRED_EXEC:
         findings.append(
             finding(
-                "high",
+                "critical",
                 "AST_WRAPPER_EXEC",
-                "Deferred execution hides additional shell text.",
+                "Deferred execution is blocked because it can hide arbitrary mutation.",
                 category="wrapper",
                 command_head=head,
                 text=text,
@@ -690,9 +723,11 @@ def check_command_rules(cmd: CommandNode, findings: list[dict]) -> None:
     if head in FORWARDERS:
         findings.append(
             finding(
-                "high",
+                "high" if head == "timeout" else "critical",
                 "AST_COMMAND_FORWARDER",
-                "Command forwarder passes the real command as arguments.",
+                "Command forwarder requires review; opaque forwarders are blocked because they can hide mutation."
+                if head == "timeout"
+                else "Opaque command forwarders are blocked because they can hide file mutation or nested execution.",
                 category="wrapper",
                 command_head=head,
                 text=text,
@@ -795,7 +830,7 @@ def check_command_rules(cmd: CommandNode, findings: list[dict]) -> None:
     if head == "find" and any(t in {"-exec", "-execdir", "-delete"} for t in argv):
         findings.append(
             finding(
-                "critical" if "-delete" in argv else "high",
+                "critical",
                 "AST_FILE_MUTATION_REQUIRES_SKILL" if "-delete" in argv else "AST_FIND_EXEC",
                 "File modifications must use a registered controlled skill instead of free-form shell."
                 if "-delete" in argv
@@ -1052,6 +1087,15 @@ def analyze(text: str, mode: str = "local", depth: int = 0, syntax_check: bool =
     commands = split_commands(tokens, findings)
     for cmd in commands:
         check_command_rules(cmd, findings)
+        if depth < 3 and cmd.head == "timeout":
+            forwarded = timeout_subcommand(cmd.argv)
+            if forwarded:
+                findings.extend(analyze(shlex.join(forwarded), mode=mode, depth=depth + 1, syntax_check=False))
+        if depth < 3 and cmd.head in SHELLS:
+            for index, arg in enumerate(cmd.argv):
+                if (arg == "--command" or (arg.startswith("-") and not arg.startswith("--") and "c" in arg[1:])) and index + 1 < len(cmd.argv):
+                    findings.extend(analyze(cmd.argv[index + 1], mode=mode, depth=depth + 1, syntax_check=False))
+                    break
     check_remote_pipe(commands, findings)
 
     if mode == "remote" and not any(f["severity"] == "critical" for f in findings):

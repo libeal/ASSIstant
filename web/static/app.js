@@ -1932,7 +1932,7 @@ function renderConfigField(field, rawValue) {
   return `
     <label class="small config-field-label" for="${escapeHtml(configInputId(field.key))}">
       <span>${escapeHtml(field.label)}</span>
-      <input class="field" id="${escapeHtml(configInputId(field.key))}" data-config-key="${escapeHtml(field.key)}" type="${field.type === "number" ? "number" : field.type === "secret" ? "password" : "text"}" ${field.min !== undefined ? `min="${escapeHtml(field.min)}"` : ""} ${field.writeOnly ? 'autocomplete="new-password"' : ""} ${field.placeholder ? `placeholder="${escapeHtml(field.placeholder)}"` : ""} value="${escapeHtml(value)}">
+      <input class="field" id="${escapeHtml(configInputId(field.key))}" data-config-key="${escapeHtml(field.key)}" type="${field.type === "number" ? "number" : field.type === "secret" ? "password" : "text"}" ${field.min !== undefined ? `min="${escapeHtml(field.min)}"` : ""} ${field.max !== undefined ? `max="${escapeHtml(field.max)}"` : ""} ${field.writeOnly ? 'autocomplete="new-password"' : ""} ${field.placeholder ? `placeholder="${escapeHtml(field.placeholder)}"` : ""} value="${escapeHtml(value)}">
       <span class="config-comment">${escapeHtml(field.comment)}</span>
     </label>
   `;

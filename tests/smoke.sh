@@ -54,6 +54,11 @@ assert_ai_file_manifest() {
     log_file="$(find "${project}/logs" -name '*.jsonl' -print -quit)"
     grep -q '"stage":"ai_files_manifest"' "${log_file}"
     grep -q '"relative_path":"skills/INDEX.md"' "${log_file}"
+    grep -q '"relative_path":"skills/ops-basic/SKILL.md"' "${log_file}"
+    ! grep -q '"relative_path":"skills/network-ops-tools/SKILL.md"' "${log_file}"
+    grep -q '"disclosed_skill_count":1' "${log_file}"
+    grep -q '"disclosed_skills":\["ops-basic"\]' "${log_file}"
+    [[ "$(grep -o '查看cpu占用,内存环境' "${log_file}" | wc -l | tr -d ' ')" -eq 1 ]]
     grep -q '"sha256":"' "${log_file}"
     ai_files_line="$(jq -r '.stage' "${log_file}" | awk '$0=="ai_files_manifest" {print NR; exit}')"
     session_finished_line="$(jq -r '.stage' "${log_file}" | awk '$0=="session_finished" {print NR; exit}')"
@@ -116,6 +121,22 @@ assert_checkpoint_stop() {
     grep -q '工作流执行完成: status=checkpoint_stopped' <<<"${output}"
 }
 
+assert_iteration_limit_stop() {
+    local project="${tmp_root}/iteration-limit-stop"
+    local output
+    copy_project "${project}"
+    output="$(
+        cd "${project}"
+        tmp_config="$(mktemp)"
+        jq '.agent_loop.max_iterations=1 | .agent_loop.checkpoint_turns=10' config/config.json > "${tmp_config}"
+        mv "${tmp_config}" config/config.json
+        bash bin/agent work "查看cpu继续深入" 2>&1
+    )"
+    grep -q '工作流执行完成: status=iteration_limit_stopped' <<<"${output}"
+    log_file="$(find "${project}/logs" -name '*.jsonl' -print -quit)"
+    grep -q '"stopped_reason":"max_iterations_reached"' "${log_file}"
+}
+
 project_main="${tmp_root}/main-work"
 copy_project "${project_main}"
 output="$(cd "${project_main}" && bash bin/agent work "帮我检查磁盘空间是否异常" <<< $'y\ny\n' 2>&1)"
@@ -149,5 +170,6 @@ assert_simple_plan_skips_reflection
 assert_no_default_thinking_trace
 assert_thinking_trace
 assert_checkpoint_stop
+assert_iteration_limit_stop
 
 printf 'smoke: ok\n'

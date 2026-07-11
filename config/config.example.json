@@ -9,6 +9,7 @@
     "enabled_for_work": true,
     "observation_text_limit": 4000,
     "thinking_trace_enabled": false,
+    "max_iterations": 12,
     "checkpoint_turns": 0
   },
   "approvals": {
@@ -30,6 +31,7 @@
     "max_events": 200
   },
   "execution": {
+    "timeout_sec": 300,
     "min_privilege_proxy": true,
     "least_privilege_user": "nobody"
   },

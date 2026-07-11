@@ -192,6 +192,8 @@ jq -e '.ok == true and (.config.agent_loop.thinking_trace_enabled | type == "boo
     and .config.approvals.auto.skill_readonly == true
     and .config.approvals.auto.shell_readonly == false
     and .config.approvals.auto.file_patch == false
+    and .config.agent_loop.max_iterations == 12
+    and .config.execution.timeout_sec == 300
     and .config.remote.allow_api_key_transmission == false' <<<"${config_state}" >/dev/null
 
 providers_state="$(curl --noproxy '*' -sS -H "Authorization: Bearer ${token}" "${base_url}/api/config/providers")"
@@ -230,6 +232,22 @@ config_update="$(curl --noproxy '*' -sS \
     -d "${config_update_payload}" \
     "${base_url}/api/config/update")"
 jq -e '.ok == true and .status == "updated" and .config.agent_loop.thinking_trace_enabled == true' <<<"${config_update}" >/dev/null
+
+iteration_limit_payload="$(jq -cn '{key:"agent_loop.max_iterations", value:20}')"
+iteration_limit_update="$(curl --noproxy '*' -sS \
+    -H "Authorization: Bearer ${token}" \
+    -H "Content-Type: application/json" \
+    -d "${iteration_limit_payload}" \
+    "${base_url}/api/config/update")"
+jq -e '.ok == true and .updated["agent_loop.max_iterations"] == 20 and .config.agent_loop.max_iterations == 20' <<<"${iteration_limit_update}" >/dev/null
+
+execution_timeout_payload="$(jq -cn '{key:"execution.timeout_sec", value:120}')"
+execution_timeout_update="$(curl --noproxy '*' -sS \
+    -H "Authorization: Bearer ${token}" \
+    -H "Content-Type: application/json" \
+    -d "${execution_timeout_payload}" \
+    "${base_url}/api/config/update")"
+jq -e '.ok == true and .updated["execution.timeout_sec"] == 120 and .config.execution.timeout_sec == 120' <<<"${execution_timeout_update}" >/dev/null
 
 api_key_value="test-web-updated-key-12345"
 api_key_payload="$(jq -cn --arg value "${api_key_value}" '{key:"api_key", value:$value}')"
