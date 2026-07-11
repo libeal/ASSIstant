@@ -132,7 +132,7 @@ bash bin/agent api terminal run '{"command":"printf api-ok"}' | jq '.timeline, .
 - 执行层：shell、skill_script、remote_script、文件编辑等执行器，以及 policy、approval、observer、audit。
 - 能力层：skills、mcp、policies、prompts、config、audit、context 等可替换或可扩展资源。
 
-不同入口共享同一套核心能力，AI 只提出计划，执行层独立审查、确认、执行和审计。整体设计见 [`docs/design.md`](docs/design.md)，更详细的架构记录见 [`docs/architecture.md`](docs/architecture.md)，CLI/Web 机器协议见 [`docs/api-protocol.md`](docs/api-protocol.md)，审计与内核 observer 运行细节见 [`docs/observer-audit.md`](docs/observer-audit.md)。
+不同入口共享同一套核心能力，AI 只提出计划，执行层独立审查、确认、执行和审计。
 
 ```text
 Linux 运维 Agent
@@ -454,14 +454,6 @@ done
 | `README.md` | 项目说明文档。 |
 | `test_config.sh` | 本地配置校验脚本，默认不访问网络，`--live` 才发送最小模型请求。 |
 
-### `docs/`
-
-| 文件 | 功能 |
-| --- | --- |
-| `docs/design.md` | 项目设计文档，说明设计目标、非目标、核心组件、运行时数据流、策略模型、审批模型、API 协议、Web 设计、扩展规则和测试策略。 |
-| `docs/architecture.md` | 架构边界说明，记录 rssh 借鉴点、core/adapter 分层、skill registry 契约、安全执行模型和未来远程运行方向。 |
-| `docs/api-protocol.md` | CLI/Web API 机器协议，定义通用响应、timeline、approval_card、output_blocks、review、job 和 secret 配置状态。 |
-| `docs/observer-audit.md` | 审计与内核 observer 运行说明，记录 lifecycle、auditd 权限、`auid` 过滤、事件汇总、边界配置和验证入口。 |
 
 ### `bin/`
 
