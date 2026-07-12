@@ -56,7 +56,7 @@ fi
 extract_root="${tmp_root}/extract"
 mkdir -p "${extract_root}"
 tar -xzf "${backup_path}" -C "${extract_root}"
-if rg -q 'backup-secret-api-key|backup-secret-web-token|job-secret-should-not-export|audit-secret-should-redact' "${extract_root}"; then
+if grep -R -Eq -- 'backup-secret-api-key|backup-secret-web-token|job-secret-should-not-export|audit-secret-should-redact' "${extract_root}"; then
     printf 'backup leaked secret or raw job output\n' >&2
     exit 1
 fi
@@ -74,6 +74,6 @@ if (cd "${project}" && LINUX_AGENT_REMOTE_MODE=1 bash bin/agent backup "${backup
     printf 'backup unexpectedly overwrote an existing file\n' >&2
     exit 1
 fi
-rg -q '"stage":"runtime_backup_created"' "${project}/logs"
+grep -R -Eq -- '"stage":"runtime_backup_created"' "${project}/logs"
 
 printf 'backup: ok\n'

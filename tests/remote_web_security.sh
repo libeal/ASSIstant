@@ -89,7 +89,7 @@ resolved_skills_dir="$(
 [[ "${resolved_skills_dir}" == "${tmp_root}/skills" ]]
 [[ ! -e "${outside_skills}" ]]
 
-if rg -q 'memory-only-secret|request-secret' "${tmp_root}"; then
+if grep -R -Eq -- 'memory-only-secret|request-secret' "${tmp_root}"; then
     printf 'remote web secret was persisted to disk\n' >&2
     exit 1
 fi

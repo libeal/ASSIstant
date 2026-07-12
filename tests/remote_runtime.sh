@@ -89,12 +89,12 @@ tar -tzf "${web_backup}" >/dev/null
 web_backup_extract="${tmp_root}/remote-web-backup"
 mkdir -p "${web_backup_extract}"
 tar -xzf "${web_backup}" -C "${web_backup_extract}"
-if rg -Fq "${web_token}" "${web_backup_extract}"; then
+if grep -R -Fq -- "${web_token}" "${web_backup_extract}"; then
     printf 'remote Web backup contains the Web token\n' >&2
     exit 1
 fi
-rg -q '"stage":"remote_bootstrap_verified"' "${web_backup_extract}/logs"
-rg -q '"stage":"skill_materialized"' "${web_backup_extract}/logs"
+grep -R -Eq -- '"stage":"remote_bootstrap_verified"' "${web_backup_extract}/logs"
+grep -R -Eq -- '"stage":"skill_materialized"' "${web_backup_extract}/logs"
 curl -fsS -X POST -H "Authorization: Bearer ${web_token}" -H 'Content-Type: application/json' \
     -d '{}' http://127.0.0.1:8765/api/server/shutdown >/dev/null
 wait "${web_pid}"
