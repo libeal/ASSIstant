@@ -1,6 +1,6 @@
 ---
 name: network-ops-tools
-description: 面向运维工程师和网络工程师的常用网络工具集，参考 NETworkManager 的工具边界；所有脚本同时登记给 script 模式和 work 模式，且最低声明为 medium 风险，避免主动网络行为被当作 low 风险自动执行。
+description: 面向运维工程师和网络工程师的常用网络工具集；所有脚本同时登记给 script 模式和 work 模式，且最低声明为 medium 风险，避免主动网络行为被当作 low 风险自动执行。
 ---
 
 # 网络运维工具集
