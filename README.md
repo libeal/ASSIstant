@@ -410,6 +410,7 @@ bash tests/workflow.sh
 bash tests/policy.sh
 bash tests/tools.sh
 bash tests/observer.sh
+bash tests/mcp.sh
 bash tests/interactive.sh
 bash tests/web_api.sh
 bash tests/web_server.sh
@@ -429,6 +430,7 @@ for test in \
   tests/policy.sh \
   tests/tools.sh \
   tests/observer.sh \
+  tests/mcp.sh \
   tests/interactive.sh \
   tests/web_api.sh \
   tests/web_server.sh \

@@ -61,10 +61,16 @@ linux_agent_response_without_thinking() {
     jq -c 'del(.thinking_summary)' <<<"${response_json}"
 }
 
+linux_agent_thinking_trace_root() {
+    local root="${LINUX_AGENT_THINKING_TRACE_DIR:-/tmp}"
+    [[ -n "${root}" ]] || root="/tmp"
+    printf '%s\n' "${root}"
+}
+
 linux_agent_store_thinking_summary() {
     local response_json="$1"
     local iteration="$2"
-    local summary safe_session dir path limit
+    local summary safe_session root dir path limit
 
     [[ "$(linux_agent_thinking_trace_enabled)" == "true" ]] || return 0
     summary="$(jq -r '.thinking_summary // empty' <<<"${response_json}")"
@@ -73,7 +79,8 @@ linux_agent_store_thinking_summary() {
     limit="$(linux_agent_agent_observation_limit)"
     safe_session="$(printf '%s' "${LINUX_AGENT_SESSION_ID:-session}" | tr -c 'A-Za-z0-9_.-' '_' | cut -c 1-80)"
     [[ -n "${safe_session}" ]] || safe_session="session"
-    dir="/tmp/${safe_session}/thinking"
+    root="$(linux_agent_thinking_trace_root)"
+    dir="${root}/${safe_session}/thinking"
     mkdir -p "${dir}"
     path="${dir}/iteration-${iteration}.txt"
     {

@@ -31,6 +31,7 @@ jobs:
             tests/workflow.sh \
             tests/observer.sh \
             tests/smoke.sh \
+            tests/mcp.sh \
             tests/web_api.sh \
             tests/web_server.sh \
             tests/interactive.sh \
@@ -38,7 +39,12 @@ jobs:
             tests/remote_runtime.sh \
             tests/remote_web_security.sh \
             tests/backup.sh; do
-            bash "${test_file}"
+            echo "::group::${test_file}"
+            if ! bash "${test_file}"; then
+              echo "::error title=Regression failed::${test_file} failed"
+              exit 1
+            fi
+            echo "::endgroup::"
           done
 
       - name: Build deterministic remote assets
@@ -49,7 +55,12 @@ jobs:
       - name: Publish immutable tag assets
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: gh release create "${GITHUB_REF_NAME}" dist/remote/* --verify-tag --generate-notes --latest
+        run: |
+          if gh release view "${GITHUB_REF_NAME}" >/dev/null 2>&1; then
+            echo "::error title=Release already exists::${GITHUB_REF_NAME} already has a Release; publish a new tag instead of overwriting immutable assets"
+            exit 1
+          fi
+          gh release create "${GITHUB_REF_NAME}" dist/remote/* --verify-tag --generate-notes --latest
 
       - name: Smoke test published CLI entrypoint
         run: |

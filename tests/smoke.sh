@@ -9,9 +9,6 @@ source "${ROOT_DIR}/tests/helpers.sh"
 tmp_root="$(mktemp -d)"
 cleanup() {
     stop_fake_ai_server
-    if [[ -n "${THINKING_SESSION_ID:-}" ]]; then
-        rm -rf "/tmp/${THINKING_SESSION_ID}"
-    fi
     rm -rf "${tmp_root}"
 }
 trap cleanup EXIT
@@ -67,19 +64,20 @@ assert_ai_file_manifest() {
 
 assert_thinking_trace() {
     local project="${tmp_root}/thinking-trace"
-    local log_file session_id thinking_file
+    local log_file session_id thinking_file thinking_root
+    thinking_root="${tmp_root}/thinking-traces"
     copy_project "${project}"
     (
         cd "${project}"
         tmp_config="$(mktemp)"
         jq '.agent_loop.thinking_trace_enabled=true' config/config.json > "${tmp_config}"
         mv "${tmp_config}" config/config.json
-        bash bin/agent work "查看cpu继续深入" >/dev/null 2>&1
+        LINUX_AGENT_THINKING_TRACE_DIR="${thinking_root}" \
+            bash bin/agent work "查看cpu继续深入" >/dev/null 2>&1
     )
     log_file="$(find "${project}/logs" -name '*.jsonl' -print -quit)"
     session_id="$(basename "${log_file}" .jsonl)"
-    THINKING_SESSION_ID="${session_id}"
-    thinking_file="/tmp/${session_id}/thinking/iteration-1.txt"
+    thinking_file="${thinking_root}/${session_id}/thinking/iteration-1.txt"
     [[ -f "${thinking_file}" ]]
     grep -q '第一轮结果不足以完成测试场景' "${thinking_file}"
     ! grep -R -q '第一轮结果不足以完成测试场景' "${project}/logs"
@@ -98,12 +96,15 @@ assert_simple_plan_skips_reflection() {
 
 assert_no_default_thinking_trace() {
     local project="${tmp_root}/thinking-default-off"
-    local log_file session_id
+    local log_file session_id thinking_root
+    thinking_root="${tmp_root}/thinking-traces"
     copy_project "${project}"
-    (cd "${project}" && bash bin/agent work "查看cpu占用,内存环境" >/dev/null 2>&1)
+    (cd "${project}" && \
+        LINUX_AGENT_THINKING_TRACE_DIR="${thinking_root}" \
+            bash bin/agent work "查看cpu占用,内存环境" >/dev/null 2>&1)
     log_file="$(find "${project}/logs" -name '*.jsonl' -print -quit)"
     session_id="$(basename "${log_file}" .jsonl)"
-    [[ ! -e "/tmp/${session_id}/thinking" ]]
+    [[ ! -e "${thinking_root}/${session_id}/thinking" ]]
 }
 
 assert_checkpoint_stop() {

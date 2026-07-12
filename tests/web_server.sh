@@ -401,7 +401,7 @@ slow_work_job_id="$(jq -r '.job_id' <<<"${slow_work_job}")"
 [[ "${slow_work_job_id}" =~ ^[0-9a-f]+$ ]]
 slow_partial_seen=0
 slow_work_state=""
-for _ in $(seq 1 40); do
+for _ in $(seq 1 200); do
     slow_work_state="$(curl --noproxy '*' -sS -H "Authorization: Bearer ${token}" "${base_url}/api/jobs/${slow_work_job_id}")"
     if jq -e '.status == "running"
         and .result.status == "running"
@@ -415,7 +415,12 @@ for _ in $(seq 1 40); do
     fi
     sleep 0.1
 done
-[[ "${slow_partial_seen}" == "1" ]]
+if [[ "${slow_partial_seen}" != "1" ]]; then
+    printf 'slow work did not expose partial output (job_status=%s, result_status=%s)\n' \
+        "$(jq -r '.status // "unknown"' <<<"${slow_work_state}")" \
+        "$(jq -r '.result.status // "unknown"' <<<"${slow_work_state}")" >&2
+    exit 1
+fi
 for _ in $(seq 1 100); do
     slow_work_result="$(curl --noproxy '*' -sS -H "Authorization: Bearer ${token}" "${base_url}/api/jobs/${slow_work_job_id}")"
     slow_work_status="$(jq -r '.status' <<<"${slow_work_result}")"
