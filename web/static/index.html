@@ -16,6 +16,9 @@
             <span class="shutdown-dot"></span>
             <span>结束进程</span>
           </button>
+          <button class="sidebar-toggle" id="sidebarToggle" type="button" aria-label="收起主侧栏" aria-expanded="true" title="收起主侧栏">
+            <span class="sidebar-toggle-icon" aria-hidden="true">‹</span>
+          </button>
         </div>
         <div class="brand">
           <div class="brand-title">ASSIstant</div>
@@ -90,16 +93,11 @@
                   </div>
                 </div>
 
-                <div class="panel timeline-panel">
-                  <div class="panel-header">
-                    <div>
-                      <h3>执行时间线</h3>
-                      <p>倒序展示当前会话轮次；点击轮次展开步骤，再查看对应输出。</p>
-                    </div>
-                    <span class="pill risk low" id="workJobStatus">idle</span>
-                  </div>
-                  <div class="timeline-list" id="workPlan"></div>
+                <div class="terminal shared-output">
+                  <div class="terminal-head"><span class="status-dot ok"></span><span>共享执行输出</span><span class="pill risk low" id="terminalJobStatus">idle</span></div>
+                  <pre id="terminalOutput">等待 work、terminal 或 skill 输出。</pre>
                 </div>
+
               </div>
 
               <aside class="stack workbench-side">
@@ -135,6 +133,17 @@
                   </details>
                 </div>
 
+                <div class="panel timeline-panel">
+                  <div class="panel-header">
+                    <div>
+                      <h3>执行时间线</h3>
+                      <p>倒序展示当前会话轮次；点击轮次展开步骤，再查看对应输出。</p>
+                    </div>
+                    <span class="pill risk low" id="workJobStatus">idle</span>
+                  </div>
+                  <div class="timeline-list" id="workPlan"></div>
+                </div>
+
                 <div class="panel tight detail-panel">
                   <div class="panel-header">
                     <div><h3>选中轮次/步骤详情</h3><p>轮次展示本轮所有步骤输出；步骤展示单步终端返回。</p></div>
@@ -145,19 +154,15 @@
 
                 <div class="panel tight summary-panel">
                   <div class="panel-header">
-                    <div><h3>思考过程</h3><p>开启开关后，只展示模型返回的 thinking_summary。</p></div>
+                    <div><h3>思考过程</h3><p>开启开关后，按段落、列表和代码块展示模型返回的简短 thinking_summary。</p></div>
                   </div>
                   <div class="toggle-row">
                     <div><strong class="white">显示模型思考摘要</strong><div class="small">仅用于简短摘要，不承载命令输出或配置回显。</div></div>
                     <button class="switch" id="thinkingTraceSwitch" type="button" aria-label="toggle thinking summary" aria-pressed="false"><span></span></button>
                   </div>
-                  <div class="summary-output" id="workOutput">thinking_summary 未开启。开启开关后，新请求会在这里显示模型返回的简短思考摘要。</div>
+                  <div class="summary-output summary-empty" id="workOutput" role="status" aria-live="polite">thinking_summary 未开启。开启开关后，新请求会在这里显示模型返回的简短思考摘要。</div>
                 </div>
 
-                <div class="terminal shared-output">
-                  <div class="terminal-head"><span class="status-dot ok"></span><span>共享执行输出</span><span class="pill risk low" id="terminalJobStatus">idle</span></div>
-                  <pre id="terminalOutput">等待 work、terminal 或 skill 输出。</pre>
-                </div>
               </aside>
             </div>
 
@@ -233,23 +238,25 @@
 
                 <div class="panel">
                   <div class="panel-header">
-                    <div><h3>已有 Skill 列表</h3><p>表格同时展示分类、脚本入口、风险等级与索引状态。</p></div>
+                    <div><h3>已有 Skill 列表</h3><p>表格展示分类、风险等级与索引状态；点击行可查看对应脚本。</p></div>
                     <button class="btn secondary" id="skillsValidateBtn" type="button">校验 Skill</button>
                   </div>
-                  <table class="table">
-                    <thead><tr><th>Skill</th><th>分类</th><th>脚本</th><th>风险</th><th>INDEX</th><th>远程状态</th></tr></thead>
+                  <div class="table-scroll" role="region" aria-label="Skill 列表，可左右滑动查看完整信息" tabindex="0">
+                    <table class="table">
+                    <thead><tr><th>Skill</th><th>分类</th><th>风险</th><th>INDEX</th><th>远程状态</th></tr></thead>
                     <tbody id="skillsCatalog">
-                      <tr><td class="mono">disk-hotspots</td><td>ops-basic / disk</td><td class="mono">scripts/disk-hotspots.sh</td><td><span class="pill risk low">low</span></td><td>已登记</td><td><span class="pill">local</span></td></tr>
-                      <tr><td class="mono">resource-inspect</td><td>ops-basic / resource</td><td class="mono">scripts/resource-inspect.sh</td><td><span class="pill risk low">low</span></td><td>已登记</td><td><span class="pill">local</span></td></tr>
-                      <tr><td class="mono">process-inspect</td><td>ops-basic / process</td><td class="mono">scripts/process-inspect.sh</td><td><span class="pill risk low">low</span></td><td>已登记</td><td><span class="pill">local</span></td></tr>
-                      <tr><td class="mono">service-inspect</td><td>ops-basic / service</td><td class="mono">scripts/service-inspect.sh</td><td><span class="pill risk medium">medium</span></td><td>已登记</td><td><span class="pill">local</span></td></tr>
-                      <tr><td class="mono">service-restart-plan</td><td>ops-basic / service</td><td class="mono">scripts/service-restart-plan.sh</td><td><span class="pill risk high">plan</span></td><td>已登记</td><td><span class="pill">local</span></td></tr>
-                      <tr><td class="mono">log-search</td><td>ops-basic / logs</td><td class="mono">scripts/log-search.sh</td><td><span class="pill risk medium">medium</span></td><td>已登记</td><td><span class="pill">local</span></td></tr>
-                      <tr><td class="mono">log-cleanup-plan</td><td>ops-basic / logs</td><td class="mono">scripts/log-cleanup-plan.sh</td><td><span class="pill risk medium">medium</span></td><td>已登记</td><td><span class="pill">local</span></td></tr>
-                      <tr><td class="mono">safe-log-cleanup</td><td>ops-basic / safety</td><td class="mono">scripts/safe-log-cleanup.sh</td><td><span class="pill risk high">high</span></td><td>已登记</td><td><span class="pill">local</span></td></tr>
-                      <tr><td class="mono">config-backup</td><td>ops-basic / backup</td><td class="mono">scripts/config-backup.sh</td><td><span class="pill risk high">high</span></td><td>已登记</td><td><span class="pill">local</span></td></tr>
+                      <tr><td class="mono">disk-hotspots</td><td>ops-basic / disk</td><td><span class="pill risk low">low</span></td><td>已登记</td><td><span class="pill">local</span></td></tr>
+                      <tr><td class="mono">resource-inspect</td><td>ops-basic / resource</td><td><span class="pill risk low">low</span></td><td>已登记</td><td><span class="pill">local</span></td></tr>
+                      <tr><td class="mono">process-inspect</td><td>ops-basic / process</td><td><span class="pill risk low">low</span></td><td>已登记</td><td><span class="pill">local</span></td></tr>
+                      <tr><td class="mono">service-inspect</td><td>ops-basic / service</td><td><span class="pill risk medium">medium</span></td><td>已登记</td><td><span class="pill">local</span></td></tr>
+                      <tr><td class="mono">service-restart-plan</td><td>ops-basic / service</td><td><span class="pill risk high">plan</span></td><td>已登记</td><td><span class="pill">local</span></td></tr>
+                      <tr><td class="mono">log-search</td><td>ops-basic / logs</td><td><span class="pill risk medium">medium</span></td><td>已登记</td><td><span class="pill">local</span></td></tr>
+                      <tr><td class="mono">log-cleanup-plan</td><td>ops-basic / logs</td><td><span class="pill risk medium">medium</span></td><td>已登记</td><td><span class="pill">local</span></td></tr>
+                      <tr><td class="mono">safe-log-cleanup</td><td>ops-basic / safety</td><td><span class="pill risk high">high</span></td><td>已登记</td><td><span class="pill">local</span></td></tr>
+                      <tr><td class="mono">config-backup</td><td>ops-basic / backup</td><td><span class="pill risk high">high</span></td><td>已登记</td><td><span class="pill">local</span></td></tr>
                     </tbody>
-                  </table>
+                    </table>
+                  </div>
                   <div class="terminal action-gap">
                     <div class="terminal-head"><span class="status-dot ok"></span><span id="skillCodeTitle">skill script detail</span></div>
                     <pre id="skillCodeOutput">点击已有 Skill 列表中的脚本查看 .sh 代码。</pre>
@@ -293,22 +300,26 @@
 
                 <div class="panel">
                   <div class="panel-header"><div><h3>MCP manifest</h3><p>用户可将外部 MCP 能力安装为 mcp/&lt;id&gt;/mcp.json；敏感 header/env 只展示脱敏状态。</p></div></div>
-                  <table class="table">
+                  <div class="table-scroll" role="region" aria-label="MCP manifest 列表，可左右滑动查看完整信息" tabindex="0">
+                    <table class="table">
                     <thead><tr><th>Server</th><th>Transport</th><th>Enabled</th><th>Status</th><th>Manifest</th></tr></thead>
                     <tbody id="mcpCatalog">
                       <tr><td colspan="5">连接后加载 MCP registry。</td></tr>
                     </tbody>
-                  </table>
+                    </table>
+                  </div>
                 </div>
 
                 <div class="panel">
                   <div class="panel-header"><div><h3>MCP tools</h3><p>这些工具会注入 work/edit 的 request_context；实际调用仍需要工作计划和审批。</p></div></div>
-                  <table class="table">
+                  <div class="table-scroll" role="region" aria-label="MCP 工具列表，可左右滑动查看完整信息" tabindex="0">
+                    <table class="table">
                     <thead><tr><th>Ref</th><th>Transport</th><th>Description</th><th>Input schema</th></tr></thead>
                     <tbody id="mcpToolCatalog">
                       <tr><td colspan="4">点击“加载工具”后读取 tools/list。</td></tr>
                     </tbody>
-                  </table>
+                    </table>
+                  </div>
                 </div>
               </div>
 
@@ -376,7 +387,8 @@
               <div class="split-wide">
                 <div class="panel">
                   <div class="panel-header"><div><h3>正则审查表</h3><p>阻断规则、警告规则和原因一屏可查；解锁后可编辑。</p></div><button class="btn secondary policy-edit" id="policyAddRuleBtn" type="button" disabled>新增规则</button></div>
-                  <table class="table">
+                  <div class="table-scroll" role="region" aria-label="正则审查规则列表，可左右滑动查看完整信息" tabindex="0">
+                    <table class="table">
                     <thead><tr><th>级别</th><th>正则 / 关键词</th><th>动作</th><th>原因</th></tr></thead>
                     <tbody id="riskRulesSummary">
                       <tr><td><span class="pill risk high">block</span></td><td class="mono">rm\s+-rf\s+/</td><td>禁止执行</td><td>阻止根目录递归删除。</td></tr>
@@ -386,7 +398,8 @@
                       <tr><td><span class="pill risk medium">warn</span></td><td class="mono">kill\s+-9</td><td>人工审批</td><td>强制结束进程需要确认。</td></tr>
                       <tr><td><span class="pill risk medium">warn</span></td><td class="mono">sudo\s+</td><td>升级风险</td><td>涉及提权操作。</td></tr>
                     </tbody>
-                  </table>
+                    </table>
+                  </div>
                 </div>
 
                 <div class="panel">
@@ -445,12 +458,14 @@
               <aside class="stack">
                 <div class="panel tight">
                   <div class="panel-header"><div><h3>Observer 状态提取</h3><p>只提取 observer 相关事件，方便确认审计后端是否记录成功。</p></div></div>
-                  <table class="table">
+                  <div class="table-scroll" role="region" aria-label="Observer 状态列表，可左右滑动查看完整信息" tabindex="0">
+                    <table class="table">
                     <thead><tr><th>状态</th><th>来源</th><th>说明</th></tr></thead>
                     <tbody id="auditObserverSummary">
                       <tr><td colspan="3">尚未选择 session。</td></tr>
                     </tbody>
-                  </table>
+                    </table>
+                  </div>
                 </div>
                 <div class="panel tight">
                   <div class="panel-header"><div><h3>回放摘要</h3><p>用于快速还原这次会话到底做了什么。</p></div></div>

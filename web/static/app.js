@@ -18,6 +18,7 @@ const state = createInitialState();
 
 const $ = (id) => document.getElementById(id);
 const LAYOUT_STORAGE_PREFIX = "assistant.panelLayout.v1";
+const SIDEBAR_STORAGE_KEY = "assistant.sidebarCollapsed.v1";
 const THINKING_TRACE_KEY = "agent_loop.thinking_trace_enabled";
 const REMOTE_API_KEY_TRANSMISSION_KEY = "remote.allow_api_key_transmission";
 let sessionTurnCounter = 0;
@@ -104,6 +105,39 @@ function showToast(message) {
   window.setTimeout(() => toast.classList.remove("show"), 2600);
 }
 
+function setSidebarCollapsed(collapsed, persist = true) {
+  const app = document.querySelector(".app");
+  const toggle = $("sidebarToggle");
+  if (!app || !toggle) return;
+  const next = Boolean(collapsed);
+  app.classList.toggle("sidebar-collapsed", next);
+  toggle.setAttribute("aria-expanded", next ? "false" : "true");
+  toggle.setAttribute("aria-label", next ? "展开主侧栏" : "收起主侧栏");
+  toggle.title = next ? "展开主侧栏" : "收起主侧栏";
+  const icon = toggle.querySelector(".sidebar-toggle-icon");
+  if (icon) icon.textContent = next ? "›" : "‹";
+  if (persist) {
+    try {
+      localStorage.setItem(SIDEBAR_STORAGE_KEY, next ? "1" : "0");
+    } catch {
+      // localStorage 受限时仍保留本次页面内的交互状态。
+    }
+  }
+}
+
+function initSidebarToggle() {
+  const toggle = $("sidebarToggle");
+  if (!toggle) return;
+  let collapsed = false;
+  try {
+    collapsed = localStorage.getItem(SIDEBAR_STORAGE_KEY) === "1";
+  } catch {
+    collapsed = false;
+  }
+  setSidebarCollapsed(collapsed, false);
+  toggle.addEventListener("click", () => setSidebarCollapsed(!document.querySelector(".app")?.classList.contains("sidebar-collapsed")));
+}
+
 function setText(id, value) {
   const el = $(id);
   if (el) el.textContent = value;
@@ -144,11 +178,18 @@ function renderThinkingSummary(summary = state.lastThinkingSummary) {
   const el = $("workOutput");
   if (!el) return;
   if (!thinkingTraceEnabled()) {
+    el.classList.add("summary-empty");
     el.textContent = "thinking_summary 未开启。开启开关后，新请求会在这里显示模型返回的简短思考摘要。";
     return;
   }
   const text = String(summary || "").trim();
-  el.textContent = text || "已开启 thinking_summary；本轮尚未返回模型思考摘要。";
+  if (!text) {
+    el.classList.add("summary-empty");
+    el.textContent = "已开启 thinking_summary；本轮尚未返回模型思考摘要。";
+    return;
+  }
+  el.classList.remove("summary-empty");
+  el.innerHTML = `<div class="summary-markdown">${renderMarkdown(text)}</div>`;
 }
 
 function firstLine(value) {
@@ -2257,7 +2298,7 @@ function renderToolCatalog() {
   container.innerHTML = "";
   if (!state.tools.length) {
     const row = document.createElement("tr");
-    row.innerHTML = '<td colspan="6">暂无已登记 skill</td>';
+    row.innerHTML = '<td colspan="5">暂无已登记 skill</td>';
     container.appendChild(row);
     return;
   }
@@ -2281,7 +2322,6 @@ function renderToolCatalog() {
     row.innerHTML = `
       <td class="mono">${escapeHtml(name)}</td>
       <td>${escapeHtml(group)}</td>
-      <td class="mono">${escapeHtml(scriptPath)}</td>
       <td><span class="pill risk ${riskKind(risk)}">${escapeHtml(risk)}</span></td>
       <td>已登记</td>
       <td>${remoteCell}</td>
@@ -2339,7 +2379,7 @@ function renderSkillTree() {
 function renderTreeNode(node) {
   if (node.type === "dir") {
     const details = document.createElement("details");
-    details.open = true;
+    details.open = false;
     const summary = document.createElement("summary");
     summary.textContent = `${node.name}/`;
     details.appendChild(summary);
@@ -3434,6 +3474,7 @@ function init() {
   updateTerminalActionState();
   updatePolicyEditState();
   initPanelLayout();
+  initSidebarToggle();
   bindNavigation();
   bindModeTabs();
   bindSwitches();
