@@ -41,10 +41,12 @@ jq -e '.ok == true and .web.host == "127.0.0.1"' <<<"${health}" >/dev/null
 
 tools="$(bash "${ROOT_DIR}/bin/agent" api tools list)"
 jq -e '.ok == true and ([.scripts[].ref] | index("ops-basic/resource-inspect"))' <<<"${tools}" >/dev/null
-jq -e '([.scripts[] | select(.skill == "network-ops-tools")] | length) == 21
+jq -e '([.scripts[] | select(.skill == "network-ops-tools")] | length) == 25
     and ([.scripts[] | select(.skill == "network-ops-tools" and .risk == "low")] | length) == 0
     and ([.scripts[] | select(.ref == "network-ops-tools/ip-scanner") | .risk] | first) == "high"
-    and ([.scripts[] | select(.ref == "network-ops-tools/subnet-calculator") | .risk] | first) == "medium"' <<<"${tools}" >/dev/null
+    and ([.scripts[] | select(.ref == "network-ops-tools/subnet-calculator") | .risk] | first) == "medium"
+    and ([.scripts[] | select(.ref == "network-ops-tools/tls-inspect") | .risk] | first) == "medium"
+    and ([.scripts[] | select(.ref == "network-ops-tools/service-discovery") | .risk] | first) == "medium"' <<<"${tools}" >/dev/null
 
 mcp_project="${tmp_root}/project-mcp-api"
 copy_project "${mcp_project}"

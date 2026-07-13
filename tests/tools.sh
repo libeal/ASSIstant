@@ -7,6 +7,8 @@ SCRIPT_DIR="${ROOT_DIR}/skills/ops-basic/scripts"
 CONTROLLED_SCRIPT_DIR="${ROOT_DIR}/skills/controlled-tools/scripts"
 NETWORK_SCRIPT_DIR="${ROOT_DIR}/skills/network-ops-tools/scripts"
 
+python3 "${ROOT_DIR}/tests/network_ops_unit.py"
+
 disk_result="$(bash "${SCRIPT_DIR}/disk-hotspots.sh" '{"path":"/var","top_n":3}')"
 resource_result="$(bash "${SCRIPT_DIR}/resource-inspect.sh" '{"top_n":3}')"
 process_result="$(bash "${SCRIPT_DIR}/process-inspect.sh" '{"pattern":"systemd"}')"
@@ -67,6 +69,62 @@ run_network_tool snmp "$(jq -cn '{host:"127.0.0.1", oid:".1.3.6.1.2.1.1.1.0", dr
 run_network_tool firewall "$(jq -cn '{action:"status"}')"
 run_network_tool subnet-calculator "$(jq -cn '{cidr:"192.168.1.0/24", new_prefix:26, limit:2}')"
 run_network_tool bit-calculator "$(jq -cn '{values:["0b1010","0b1100"], operation:"and", width:8}')"
+run_network_tool tls-inspect "$(jq -cn '{host:"127.0.0.1", dry_run:true}')"
+run_network_tool http-check "$(jq -cn '{url:"https://example.com", dry_run:true}')"
+run_network_tool public-ip "$(jq -cn '{method:"stun", dry_run:true}')"
+run_network_tool service-discovery "$(jq -cn '{protocol:"ssdp", dry_run:true}')"
+
+# Field-level assertions (offline: dry-run / pure-compute / loopback) guarding the
+# structured output — these fail if parsing or calculation regresses, unlike the
+# envelope-only run_network_tool checks above.
+assert_network_field() {
+    local script="$1" args="$2" filter="$3" result
+    result="$(bash "${NETWORK_SCRIPT_DIR}/${script}.sh" "${args}")"
+    if ! jq -e "${filter}" <<<"${result}" >/dev/null; then
+        printf 'network field assertion failed: %s %s\n  filter: %s\n  result: %s\n' "${script}" "${args}" "${filter}" "${result}" >&2
+        exit 1
+    fi
+}
+
+# subnet-calculator: true supernet (was a silent no-op), aggregation, membership, wildcard, reverse zone
+assert_network_field subnet-calculator '{"cidr":"10.0.0.0/24","new_prefix":22}' '.result.operation == "supernet" and .result.supernet == "10.0.0.0/22"'
+assert_network_field subnet-calculator '{"aggregate":["10.0.0.0/24","10.0.1.0/24"]}' '.status == "aggregated" and .aggregated == ["10.0.0.0/23"]'
+assert_network_field subnet-calculator '{"cidr":"192.168.1.0/24","contains":"192.168.1.9"}' '.result.wildcard == "0.0.0.255" and .result.contains.in_network == true and .result.reverse_zone == "1.168.192.in-addr.arpa" and .result.ip_class == "C"'
+# bit-calculator: rotate, bit test, signed/popcount
+assert_network_field bit-calculator '{"value":"0x81","operation":"rol","shift":1,"width":8}' '.result.decimal == 3 and .result.hex == "0x03"'
+assert_network_field bit-calculator '{"value":255,"operation":"testbit","index":0,"width":8}' '.bit_set == true'
+assert_network_field bit-calculator '{"value":255,"width":8}' '.inputs[0].signed == -1 and .inputs[0].popcount == 8'
+# snmp: named-OID resolution, walk action, v3 auth level, authPriv rejection
+assert_network_field snmp '{"host":"127.0.0.1","version":"3","user":"u","auth_password":"p","action":"walk","oids":["sysName"],"dry_run":true}' '.action == "walk" and .oids == [".1.3.6.1.2.1.1.5.0"] and .v3_level == "authNoPriv"'
+assert_network_field snmp '{"host":"127.0.0.1","version":"3","user":"u","priv_password":"x","dry_run":true}' '.ok == false and .status == "unsupported"'
+# lookup: protocol number and ICMP type tables
+assert_network_field lookup '{"category":"protocol","query":"tcp"}' '.results[0].number == 6'
+assert_network_field lookup '{"category":"icmp","query":"0"}' '.results[0].name == "echo-reply"'
+# dns-lookup: multi record-type request shape
+assert_network_field dns-lookup '{"query":"localhost","record_types":["A"]}' '.record_types == ["A"] and (.records | type) == "array"'
+# traceroute loopback: structured hop
+assert_network_field traceroute '{"target":"127.0.0.1"}' '.hops[0].addresses == ["127.0.0.1"]'
+# ping-monitor: per-probe sample series present
+assert_network_field ping-monitor '{"target":"127.0.0.1","count":1,"timeout_ms":500}' '(.samples | type) == "array"'
+# connections/listeners: structured parse (address/port split + summary object)
+assert_network_field connections '{"limit":200}' '(.connections | type) == "array" and (.summary | type) == "object"'
+assert_network_field listeners '{"limit":200}' '(.listeners | type) == "array" and (.summary | type) == "object"'
+# firewall: multi-backend plan
+assert_network_field firewall '{"action":"plan","rule":{"decision":"allow","protocol":"tcp","port":8080}}' '(.commands.iptables | type) == "array" and (.commands.firewalld | type) == "array"'
+# wake-on-lan: SecureON extends the magic packet (102 + 6 bytes)
+assert_network_field wake-on-lan '{"mac":"001122334455","secure_on":"aabbccddeeff","dry_run":true}' '.packet_bytes == 108 and .secure_on == true'
+# whois: IP query routes to IANA as the referral entry point
+assert_network_field whois '{"query":"1.1.1.1","dry_run":true}' '.server == "whois.iana.org"'
+# new tools dry-run planning path
+assert_network_field tls-inspect '{"host":"example.com","dry_run":true}' '.status == "planned" and .port == 443'
+assert_network_field http-check '{"url":"https://example.com","dry_run":true}' '.status == "planned"'
+assert_network_field public-ip '{"method":"stun","dry_run":true}' '.status == "planned"'
+assert_network_field service-discovery '{"protocol":"mdns","dry_run":true}' '.status == "planned"'
+# hosts-file-editor: merge/dedupe on a temporary file (plan only, no apply)
+hosts_tmp="$(mktemp /tmp/linux-agent-hosts.XXXXXX)"
+printf '127.0.0.1\tlocalhost\n10.0.0.5\tapp\n' > "${hosts_tmp}"
+assert_network_field hosts-file-editor "$(jq -cn --arg p "${hosts_tmp}" '{path:$p, allow_custom_path:true, action:"plan-add", ip:"10.0.0.5", hostnames:["web"], merge:true}')" '.note == "merged into existing entry" and (.line | test("app web"))'
+rm -f "${hosts_tmp}"
 
 cleanup_file="$(mktemp /tmp/linux-agent-tools-cleanup.XXXXXX)"
 printf '0123456789' > "${cleanup_file}"

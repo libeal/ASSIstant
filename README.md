@@ -44,7 +44,7 @@ Web 视图包括：
 - `os-deep-inspect`: 更深入的系统快照、网络、文件描述符和 journal 检查。
 - `controlled-tools`: 受控文件匹配、字面量补丁、安全下载和本地文本分析；自由 shell 文件修改会被审查拒绝，应使用这些脚本。
 - `session-history`: 只读回看审计 session 中上一轮或指定轮次的命令、计划步骤和输出预览。
-- `network-ops-tools`: 运维/网络工程工具箱，覆盖 IP Scanner、Port Scanner、Discovery Protocol、Wake on LAN、Network Interface、WiFi、Connections、Listeners、Neighbor Table、Ping Monitor、Traceroute、DNS Lookup、SNTP Lookup、Whois、IP Geolocation、Hosts File Editor、Lookup、SNMP、Firewall、Subnet Calculator 和 Bit Calculator；所有脚本声明为 `medium` 或 `high`，不能作为 low 风险自动执行。
+- `network-ops-tools`: 运维/网络工程工具箱，覆盖 IP Scanner、Port Scanner、Discovery Protocol、Wake on LAN、Network Interface、WiFi、Connections、Listeners、Neighbor Table、Ping Monitor、Traceroute、DNS Lookup、SNTP Lookup、Whois、IP Geolocation、Hosts File Editor、Lookup、SNMP、Firewall、Subnet Calculator、Bit Calculator，以及 TLS Inspect、HTTP Check、Public IP 和 Service Discovery；SNMP 支持 v1/v2c/v3-auth 与 walk/bulk，DNS 内置纯 Python 解析器覆盖全部常见记录类型；所有脚本声明为 `medium` 或 `high`，不能作为 low 风险自动执行。
 
 ## 快速开始
 
@@ -549,6 +549,8 @@ done
 | `skills/session-history/scripts/last-command-output.sh` | 从 JSONL 审计 session 读取命令、计划步骤和 stdout/stderr 输出预览。 |
 | `skills/network-ops-tools/SKILL.md` | `network-ops-tools` skill 说明和安全边界，所有脚本声明为 `medium` 或 `high` 风险。 |
 | `skills/network-ops-tools/scripts/_network_tool.py` | 网络工具集共享实现，负责参数校验、范围限制、dry-run、扫描、查询和计算逻辑。 |
+| `skills/network-ops-tools/scripts/_snmp.py` | SNMP v1/v2c/v3 编解码与 get/getnext/walk/bulk 实现（标准库，不支持 authPriv）。 |
+| `skills/network-ops-tools/scripts/_dns.py` | 纯 Python DNS 解析器（UDP + TCP 回退），供 dns-lookup 在无 `dig` 时使用。 |
 | `skills/network-ops-tools/scripts/ip-scanner.sh` | 有界扫描授权范围内的 IP/CIDR，支持 ping 和可选 TCP 探测。 |
 | `skills/network-ops-tools/scripts/port-scanner.sh` | 有界扫描单个目标主机的 TCP 端口。 |
 | `skills/network-ops-tools/scripts/discovery-protocol.sh` | 读取本机 LLDP/CDP 风格邻居发现信息。 |
@@ -568,8 +570,12 @@ done
 | `skills/network-ops-tools/scripts/lookup.sh` | 查询端口/服务名和 MAC OUI 厂商。 |
 | `skills/network-ops-tools/scripts/snmp.sh` | dry-run 或执行有界 SNMP v2c GET，输出不回显 community。 |
 | `skills/network-ops-tools/scripts/firewall.sh` | 查看 firewall 状态、生成规则计划或确认应用 UFW 规则。 |
-| `skills/network-ops-tools/scripts/subnet-calculator.sh` | 计算 IPv4/IPv6 子网、可用地址和拆分子网。 |
-| `skills/network-ops-tools/scripts/bit-calculator.sh` | 转换二进制/十六进制/十进制并执行位运算。 |
+| `skills/network-ops-tools/scripts/subnet-calculator.sh` | 计算 IPv4/IPv6 子网、拆分、supernet、聚合、通配符掩码和反向 DNS 区域。 |
+| `skills/network-ops-tools/scripts/bit-calculator.sh` | 转换二进制/十六进制/十进制并执行位运算、移位、循环移位、置/清/翻位和字节序转换。 |
+| `skills/network-ops-tools/scripts/tls-inspect.sh` | 检查目标 TLS 端点的协议、加密套件与证书有效期、SAN 和颁发者。 |
+| `skills/network-ops-tools/scripts/http-check.sh` | 检查 HTTP(S) 端点的状态码、跳转链、响应头与耗时。 |
+| `skills/network-ops-tools/scripts/public-ip.sh` | 通过 STUN 或 HTTPS echo 查询本机公网/反射地址。 |
+| `skills/network-ops-tools/scripts/service-discovery.sh` | 通过 mDNS/SSDP 组播发现局域网服务。 |
   
 ### `tests/`
 
