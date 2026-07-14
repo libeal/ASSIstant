@@ -52,7 +52,7 @@ linux_agent_policy_match_patterns() {
 
     while IFS= read -r pattern; do
         [[ -z "${pattern}" ]] && continue
-        if printf '%s\n' "${text}" | grep -Eiq -- "${pattern}"; then
+        if printf '%s\n' "${text}" | grep -Eq -- "${pattern}"; then
             findings="$(linux_agent_policy_add_finding \
                 "${findings}" "${severity}" "${code}" "${pattern}" \
                 "命令或脚本文本命中自定义策略规则。" \

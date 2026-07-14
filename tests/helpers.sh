@@ -1,5 +1,12 @@
 #!/usr/bin/env bash
 
+# Keep the regression suite hermetic. An ambient LINUX_AGENT_API_KEY exported by
+# the caller's shell would flip api_key_source from "config" to "env" and cause
+# false failures in the config-source assertions of security.sh and the web
+# tests. Sub-tests that exercise the env-override path (e.g. security.sh) set
+# this variable explicitly and unset it afterwards, so clearing it here is safe.
+unset LINUX_AGENT_API_KEY 2>/dev/null || true
+
 start_fake_ai_server() {
     local port="${1:-$((21000 + RANDOM % 1000))}"
     local log_dir="${2:-${tmp_root:-/tmp}}"

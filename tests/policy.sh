@@ -60,7 +60,7 @@ grep -q 'AST_FILE_MUTATION_REQUIRES_SKILL' <<<"${command_shell_result}"
 
 forwarder_write_result="$(linux_agent_policy_review_text "shell" "nice cp source dest")"
 grep -q '"approved": false' <<<"$(jq . <<<"${forwarder_write_result}")"
-grep -q 'AST_COMMAND_FORWARDER' <<<"${forwarder_write_result}"
+grep -q 'AST_FILE_MUTATION_REQUIRES_SKILL' <<<"${forwarder_write_result}"
 
 timeout_wrapper_result="$(linux_agent_policy_review_text "shell" "timeout 5 sh -c 'rm target'")"
 grep -q '"approved": false' <<<"$(jq . <<<"${timeout_wrapper_result}")"
@@ -137,6 +137,67 @@ remote_result="$(linux_agent_policy_review_step "${remote_step}" "printf ok" "re
 grep -q '"approved": true' <<<"$(jq . <<<"${remote_result}")"
 grep -q '"approval_required": true' <<<"$(jq . <<<"${remote_result}")"
 grep -q '"risk_level": "high"' <<<"$(jq . <<<"${remote_result}")"
+
+ruby_encoding_result="$(linux_agent_policy_review_text "shell" "ruby -E UTF-8 script.rb")"
+jq -e '.approved == true and .approval_required == false and .risk_level == "low" and (.findings | length) == 0' <<<"${ruby_encoding_result}" >/dev/null
+
+php_config_result="$(linux_agent_policy_review_text "shell" "php -c /tmp/php.ini")"
+jq -e '.approved == true and .approval_required == false and .risk_level == "low" and (.findings | length) == 0' <<<"${php_config_result}" >/dev/null
+
+node_script_arg_result="$(linux_agent_policy_review_text "shell" "node app.js --eval")"
+jq -e '.approved == true and .approval_required == false and .risk_level == "low" and (.findings | length) == 0' <<<"${node_script_arg_result}" >/dev/null
+
+python_combined_flag_result="$(linux_agent_policy_review_text "shell" "python3 -Sc 'print(1)'")"
+jq -e '.approved == true and .approval_required == true and .risk_level == "high" and ([.findings[] | select(.code == "AST_WRAPPER_EXEC")] | length) == 1' <<<"${python_combined_flag_result}" >/dev/null
+
+node_print_result="$(linux_agent_policy_review_text "shell" "node -p '1+1'")"
+jq -e '.approved == false and ([.findings[] | select(.code == "REGEX_BLOCKED")] | length) == 1' <<<"${node_print_result}" >/dev/null
+
+kill_probe_result="$(linux_agent_policy_review_text "shell" "kill -0 12345")"
+jq -e '.approved == true and .approval_required == false and .risk_level == "low" and (.findings | length) == 0' <<<"${kill_probe_result}" >/dev/null
+
+kill_list_result="$(linux_agent_policy_review_text "shell" "kill -l 9")"
+jq -e '.approved == true and .approval_required == false and .risk_level == "low" and (.findings | length) == 0' <<<"${kill_list_result}" >/dev/null
+
+pkill_probe_result="$(linux_agent_policy_review_text "shell" "pkill -0 python")"
+jq -e '.approved == true and .approval_required == false and .risk_level == "low" and (.findings | length) == 0' <<<"${pkill_probe_result}" >/dev/null
+
+kill_group_result="$(linux_agent_policy_review_text "shell" "kill -- -0")"
+jq -e '.approved == true and .approval_required == true and .risk_level == "high" and ([.findings[] | select(.code == "AST_DESTRUCTIVE_COMMAND")] | length) == 1' <<<"${kill_group_result}" >/dev/null
+
+for readonly_wrapper_command in \
+    "nice ls" \
+    "time pwd" \
+    "nohup true" \
+    "stdbuf -oL cat /etc/hosts" \
+    "setsid ls" \
+    "ionice -c 3 ls" \
+    "taskset -c 0 ls" \
+    "chrt -o 0 ls"; do
+    readonly_wrapper_result="$(linux_agent_policy_review_text "shell" "${readonly_wrapper_command}")"
+    jq -e '.approved == true and .approval_required == false and .risk_level == "low" and (.findings | length) == 0' <<<"${readonly_wrapper_result}" >/dev/null
+done
+
+for help_command in \
+    "rm --help" \
+    "cp --help" \
+    "install --help" \
+    "truncate --version" \
+    "kill --help" \
+    "tar --help"; do
+    help_result="$(linux_agent_policy_review_text "shell" "${help_command}")"
+    jq -e '.approved == true and .approval_required == false and .risk_level == "low" and (.findings | length) == 0' <<<"${help_result}" >/dev/null
+done
+
+readonly_wrapper_danger_result="$(linux_agent_policy_review_text "shell" "nice rm /tmp/example")"
+jq -e '.approved == false and ([.findings[] | select(.code == "AST_FILE_MUTATION_REQUIRES_SKILL")] | length) == 1' <<<"${readonly_wrapper_danger_result}" >/dev/null
+
+for readonly_wrapper_danger_command in \
+    "taskset -c 0 rm /tmp/example" \
+    "chrt -o 0 rm /tmp/example"; do
+    readonly_wrapper_danger_result="$(linux_agent_policy_review_text "shell" "${readonly_wrapper_danger_command}")"
+    jq -e '.approved == false and ([.findings[] | select(.code == "AST_FILE_MUTATION_REQUIRES_SKILL")] | length) == 1' <<<"${readonly_wrapper_danger_result}" >/dev/null
+done
 
 policy_validation="$(linux_agent_validate_policy_file "")"
 jq -e '.ok == true and .status == "valid" and (.files | length) >= 3' <<<"${policy_validation}" >/dev/null

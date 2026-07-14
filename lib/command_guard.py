@@ -53,10 +53,85 @@ FORWARDERS = {
     "taskset",
     "chrt",
 }
+TRANSPARENT_FORWARDERS = {"nice", "time", "nohup", "stdbuf", "setsid", "ionice", "taskset", "chrt"}
+FORWARDER_OPTIONS_WITH_ARG = {
+    "nice": {"-n", "--adjustment"},
+    "time": {"-f", "--format", "-o", "--output"},
+    "nohup": set(),
+    "stdbuf": {"-i", "--input", "-o", "--output", "-e", "--error"},
+    "setsid": set(),
+    "ionice": {"-c", "--class", "-n", "--classdata"},
+    "taskset": {"-c", "--cpu-list"},
+    "chrt": set(),
+}
 INTERACTIVE = {"htop", "watch", "less", "more", "vi", "vim", "nano", "tmux", "screen", "iotop"}
 COUNTED_LOOP = {"vmstat", "iostat", "pidstat", "mpstat", "sar", "jstat"}
 DEFERRED_EXEC = {"eval", "source", "."}
 INTERPRETERS = {"python", "python2", "python3", "perl", "ruby", "node", "nodejs", "lua", "php"}
+# Inline-code-execution flags per interpreter. These run code supplied on the
+# command line (like `sh -c`) rather than from a file. Kept per-interpreter on
+# purpose to avoid false positives: ruby's -E is an encoding flag (not eval), and
+# node's --port must never be caught by a naive `-p` prefix match.
+INTERPRETER_EVAL_FLAGS = {
+    "python": ("-c",),
+    "python2": ("-c",),
+    "python3": ("-c",),
+    "perl": ("-e", "-E"),
+    "ruby": ("-e",),
+    "node": ("-e", "-p", "--eval", "--print"),
+    "nodejs": ("-e", "-p", "--eval", "--print"),
+    "lua": ("-e",),
+    "php": ("-r",),
+}
+INTERPRETER_OPTIONS_WITH_ARG = {
+    "python": {"-W", "-X", "-m", "--check-hash-based-pycs"},
+    "python2": {"-W", "-X", "-m", "--check-hash-based-pycs"},
+    "python3": {"-W", "-X", "-m", "--check-hash-based-pycs"},
+    "perl": {"-I", "-M", "-m", "-C", "-0", "-F", "-i"},
+    "ruby": {"-C", "-E", "-I", "-r", "-W"},
+    "node": {
+        "-r",
+        "--conditions",
+        "--env-file",
+        "--experimental-loader",
+        "--import",
+        "--inspect",
+        "--inspect-brk",
+        "--inspect-port",
+        "--loader",
+        "--port",
+        "--require",
+        "--title",
+    },
+    "nodejs": {
+        "-r",
+        "--conditions",
+        "--env-file",
+        "--experimental-loader",
+        "--import",
+        "--inspect",
+        "--inspect-brk",
+        "--inspect-port",
+        "--loader",
+        "--port",
+        "--require",
+        "--title",
+    },
+    "lua": {"-l"},
+    "php": {"-c", "-d", "-f", "-z", "--define", "--php-ini", "--zend-extension"},
+}
+INTERPRETER_SHORT_OPTIONS_WITH_ARG = {
+    "python": {"W", "X", "m"},
+    "python2": {"W", "X", "m"},
+    "python3": {"W", "X", "m"},
+    "perl": {"I", "M", "m", "C", "0", "F", "i"},
+    "ruby": {"C", "E", "I", "r", "W"},
+    "node": {"r"},
+    "nodejs": {"r"},
+    "lua": {"l"},
+    "php": {"c", "d", "f", "z"},
+}
+HELP_FLAGS = {"--help", "--usage", "--version", "-?"}
 DESTRUCTIVE = {
     "rm",
     "unlink",
@@ -676,10 +751,122 @@ def has_file_url(argv: list[str]) -> bool:
     return any(arg.startswith("file://") for arg in argv)
 
 
+def option_takes_value(token: str, options: set[str]) -> bool:
+    if token in options:
+        return True
+    return any(token.startswith(option + "=") for option in options if option.startswith("--"))
+
+
+def short_option_takes_value(token: str, option_chars: set[str]) -> bool:
+    if not token.startswith("-") or token.startswith("--") or len(token) < 2:
+        return False
+    return token[1] in option_chars
+
+
+def short_option_has_inline_exec(head: str, token: str) -> bool:
+    if not token.startswith("-") or token.startswith("--") or len(token) < 2:
+        return False
+    eval_chars = {flag[1] for flag in INTERPRETER_EVAL_FLAGS.get(head, ()) if len(flag) == 2 and flag.startswith("-")}
+    option_chars = INTERPRETER_SHORT_OPTIONS_WITH_ARG.get(head, set())
+    for char in token[1:]:
+        if char in eval_chars:
+            return True
+        if char in option_chars:
+            return False
+    return False
+
+
+def interpreter_inline_exec(head: str, argv: Iterable[str]) -> bool:
+    """True if an interpreter evaluates code before its script argument."""
+    flags = INTERPRETER_EVAL_FLAGS.get(head, ("-c",))
+    options_with_arg = INTERPRETER_OPTIONS_WITH_ARG.get(head, set())
+    option_chars_with_arg = INTERPRETER_SHORT_OPTIONS_WITH_ARG.get(head, set())
+    args = list(argv)
+    index = 0
+    while index < len(args):
+        token = args[index]
+        if token == "--" or not token.startswith("-") or token == "-":
+            break
+        if any(token == flag or token.startswith(flag + "=") for flag in flags if flag.startswith("--")):
+            return True
+        if short_option_has_inline_exec(head, token):
+            return True
+        if option_takes_value(token, options_with_arg):
+            index += 1 if token.startswith("--") and "=" in token else 2
+            continue
+        if short_option_takes_value(token, option_chars_with_arg):
+            index += 1 if len(token) > 2 else 2
+            continue
+        index += 1
+    return False
+
+
+def command_requests_help(argv: Iterable[str]) -> bool:
+    """True when a command requests informational output instead of doing work."""
+    for token in argv:
+        if token == "--":
+            return False
+        if token in HELP_FLAGS:
+            return True
+    return False
+
+
+def signal_command_is_non_mutating(argv: Iterable[str]) -> bool:
+    """True for signal-tool forms that only query or test a process."""
+    args = list(argv)
+    index = 0
+    while index < len(args):
+        token = args[index]
+        if token == "--":
+            return False
+        if token in {"-0", "--signal=0", "-l", "--list", "--table"}:
+            return True
+        if token in {"-s", "--signal"}:
+            return index + 1 < len(args) and args[index + 1] == "0"
+        if token.startswith("--signal="):
+            return token.split("=", 1)[1] == "0"
+        if not token.startswith("-") or token == "-":
+            return False
+        return False
+    return False
+
+
+def forwarder_subcommand(head: str, argv: Iterable[str]) -> list[str]:
+    """Return the wrapped command for a transparent forwarder."""
+    options_with_arg = FORWARDER_OPTIONS_WITH_ARG.get(head, set())
+    args = list(argv)
+    if head in {"ionice", "taskset", "chrt"} and any(
+        token == "-p" or token == "--pid" or token.startswith("--pid=") or token.startswith("-p")
+        for token in args
+    ):
+        return []
+    index = 0
+    while index < len(args):
+        token = args[index]
+        if token == "--":
+            index += 1
+            break
+        if not token.startswith("-") or token == "-":
+            break
+        if option_takes_value(token, options_with_arg):
+            index += 1 if token.startswith("--") and "=" in token else 2
+            continue
+        if any(token.startswith(option) and len(token) > len(option) for option in options_with_arg if option.startswith("-")):
+            index += 1
+            continue
+        index += 1
+    if head == "chrt" and index < len(args):
+        index += 1
+    return args[index:]
+
+
 def check_command_rules(cmd: CommandNode, findings: list[dict]) -> None:
     head = cmd.head
     argv = cmd.argv
     text = " ".join(cmd.tokens)
+
+    if head in DESTRUCTIVE | WRITE_VERBS | PERMISSION_VERBS and command_requests_help(argv):
+        return
 
     if head == "command":
         if any(t in {"-v", "-V"} for t in argv):
@@ -721,25 +908,27 @@ def check_command_rules(cmd: CommandNode, findings: list[dict]) -> None:
         )
 
     if head in FORWARDERS:
-        findings.append(
-            finding(
-                "high" if head == "timeout" else "critical",
-                "AST_COMMAND_FORWARDER",
-                "Command forwarder requires review; opaque forwarders are blocked because they can hide mutation."
-                if head == "timeout"
-                else "Opaque command forwarders are blocked because they can hide file mutation or nested execution.",
-                category="wrapper",
-                command_head=head,
-                text=text,
+        forwarded = forwarder_subcommand(head, argv) if head in TRANSPARENT_FORWARDERS else []
+        if not (head in TRANSPARENT_FORWARDERS and (forwarded or command_requests_help(argv))):
+            findings.append(
+                finding(
+                    "high" if head == "timeout" else "critical",
+                    "AST_COMMAND_FORWARDER",
+                    "Command forwarder requires review; opaque forwarders are blocked because they can hide mutation."
+                    if head == "timeout"
+                    else "Opaque command forwarders are blocked because they can hide file mutation or nested execution.",
+                    category="wrapper",
+                    command_head=head,
+                    text=text,
+                )
             )
-        )
 
-    if head in INTERPRETERS and any(t == "-c" or t.startswith("-c") for t in argv):
+    if head in INTERPRETERS and interpreter_inline_exec(head, argv):
         findings.append(
             finding(
                 "high",
                 "AST_WRAPPER_EXEC",
-                "Interpreter -c executes embedded code.",
+                "Interpreter inline-eval flag executes embedded code.",
                 category="wrapper",
                 command_head=head,
                 text=text,
@@ -757,7 +946,9 @@ def check_command_rules(cmd: CommandNode, findings: list[dict]) -> None:
                 text=text,
             )
         )
-    elif head in DESTRUCTIVE:
+    elif head in DESTRUCTIVE and not (
+        head in {"kill", "pkill", "killall"} and signal_command_is_non_mutating(argv)
+    ):
         severity = (
             "critical"
             if (
@@ -1087,6 +1278,10 @@ def analyze(text: str, mode: str = "local", depth: int = 0, syntax_check: bool =
     commands = split_commands(tokens, findings)
     for cmd in commands:
         check_command_rules(cmd, findings)
+        if depth < 3 and cmd.head in TRANSPARENT_FORWARDERS:
+            forwarded = forwarder_subcommand(cmd.head, cmd.argv)
+            if forwarded:
+                findings.extend(analyze(shlex.join(forwarded), mode=mode, depth=depth + 1, syntax_check=False))
         if depth < 3 and cmd.head == "timeout":
             forwarded = timeout_subcommand(cmd.argv)
             if forwarded:
