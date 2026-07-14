@@ -77,4 +77,9 @@ done < <(jq -r '.skills | keys[]' "${first}/release-manifest.json")
 grep -q 'LINUX_AGENT_REMOTE_ENTRYPOINT=cli' "${first}/linux-agent-cli.sh"
 grep -q 'LINUX_AGENT_REMOTE_ENTRYPOINT=web' "${first}/linux-agent-web.sh"
 
+bash -n "${ROOT_DIR}/scripts/publish-remote-release.sh"
+grep -q 'workflow_dispatch' "${ROOT_DIR}/.github/workflows/remote-release.yml"
+grep -q 'publish-remote-release.sh' "${ROOT_DIR}/.github/workflows/remote-release.yml"
+grep -q 'RUNNER_TEMP}/publish-remote-release.sh' "${ROOT_DIR}/.github/workflows/remote-release.yml"
+
 printf 'remote_release: ok\n'

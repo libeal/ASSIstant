@@ -332,6 +332,14 @@ Web 版 edit 使用浏览器内联编辑器，但保存前仍调用同一套 `ed
 
 官方 `curl | bash` 是独立入口适配器，不会放宽 Agent 对第三方远程管道的阻断。Release manifest 固定声明 core、Web 和每个一级 skill 的文件名、大小与 SHA256；下载地址只能从当前 `libeal/ASSIstant` Release 派生。
 
+发布 Remote 版本时，先把包含发布 workflow 的提交推送到 GitHub，再创建并推送新的 `v*` tag：
+
+    git push ASSIstant main
+    git tag -a vX.Y.Z -m "Release vX.Y.Z"
+    git push ASSIstant vX.Y.Z
+
+GitHub Actions 会构建、发布并实际执行 CLI/Web bootstrap smoke test。若某次发布已经创建了同名 Release 但运行中断，可以在 Actions 的 `Remote Release` workflow 中手动输入该 tag 重跑；流程会复用并校验已有资产，只补齐缺失文件，不覆盖内容不一致的资产。
+
 启动时只获取 core、策略、prompt 和 skill 索引。首次执行或在 Web 中点击加载某个 skill 时，resolver 才下载该 skill 的完整归档，拒绝路径穿越、链接、设备文件、摘要错误和登记不一致，再原子加入运行时 registry。`skills validate` 只校验目录和已经物化的包，不会偷偷下载全部 skill。
 
 ## 配置

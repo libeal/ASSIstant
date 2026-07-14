@@ -4,16 +4,47 @@ on:
   push:
     tags:
       - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "要发布或校验的 Git tag，例如 v0.1.4"
+        required: true
+        type: string
 
 permissions:
   contents: write
 
+concurrency:
+  group: remote-release-${{ inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
 jobs:
   build-and-release:
     runs-on: ubuntu-latest
+    env:
+      RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
     steps:
+      - name: Check out release tooling for manual reruns
+        if: ${{ github.event_name == 'workflow_dispatch' }}
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref }}
+
+      - name: Preserve release publisher for manual reruns
+        if: ${{ github.event_name == 'workflow_dispatch' }}
+        run: cp scripts/publish-remote-release.sh "${RUNNER_TEMP}/publish-remote-release.sh"
+
       - name: Check out tagged source
         uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref_name }}
+
+      - name: Validate release tag
+        run: |
+          if [[ ! "${RELEASE_TAG}" =~ ^v[0-9A-Za-z][0-9A-Za-z._-]*$ ]]; then
+            echo "::error title=Invalid release tag::${RELEASE_TAG}"
+            exit 1
+          fi
 
       - name: Run syntax checks
         run: |
@@ -50,22 +81,22 @@ jobs:
       - name: Build deterministic remote assets
         env:
           SOURCE_DATE_EPOCH: "0"
-        run: bash scripts/build-remote-release.sh "${GITHUB_REF_NAME}" dist/remote
+        run: bash scripts/build-remote-release.sh "${RELEASE_TAG}" dist/remote
 
-      - name: Publish immutable tag assets
+      - name: Publish and verify tag assets
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          if gh release view "${GITHUB_REF_NAME}" >/dev/null 2>&1; then
-            echo "::error title=Release already exists::${GITHUB_REF_NAME} already has a Release; publish a new tag instead of overwriting immutable assets"
-            exit 1
+          publisher="scripts/publish-remote-release.sh"
+          if [[ ! -f "${publisher}" ]]; then
+            publisher="${RUNNER_TEMP}/publish-remote-release.sh"
           fi
-          gh release create "${GITHUB_REF_NAME}" dist/remote/* --verify-tag --generate-notes --latest
+          bash "${publisher}" "${RELEASE_TAG}" dist/remote
 
       - name: Smoke test published CLI entrypoint
         run: |
-          curl -fsSL "https://github.com/${GITHUB_REPOSITORY}/releases/download/${GITHUB_REF_NAME}/linux-agent-cli.sh" \
-            | LINUX_AGENT_VERSION="${GITHUB_REF_NAME}" bash -s -- doctor \
+          curl -fsSL --proto '=https' --tlsv1.2 "https://github.com/${GITHUB_REPOSITORY}/releases/download/${RELEASE_TAG}/linux-agent-cli.sh" \
+            | LINUX_AGENT_VERSION="${RELEASE_TAG}" bash -s -- doctor \
             | jq -e '.ok == true and .remote.enabled == true'
 
       - name: Smoke test published Web entrypoint
@@ -73,8 +104,8 @@ jobs:
           web_stdout="${RUNNER_TEMP}/linux-agent-web.stdout"
           web_stderr="${RUNNER_TEMP}/linux-agent-web.stderr"
           (
-            curl -fsSL "https://github.com/${GITHUB_REPOSITORY}/releases/download/${GITHUB_REF_NAME}/linux-agent-web.sh" \
-              | LINUX_AGENT_VERSION="${GITHUB_REF_NAME}" bash
+            curl -fsSL --proto '=https' --tlsv1.2 "https://github.com/${GITHUB_REPOSITORY}/releases/download/${RELEASE_TAG}/linux-agent-web.sh" \
+              | LINUX_AGENT_VERSION="${RELEASE_TAG}" bash
           ) >"${web_stdout}" 2>"${web_stderr}" &
           web_pid="$!"
           trap 'kill -TERM "${web_pid}" 2>/dev/null || true; wait "${web_pid}" 2>/dev/null || true' EXIT
