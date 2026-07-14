@@ -54,6 +54,19 @@ assert source == "runtime"
 module.update_config_value("remote.allow_api_key_transmission", True)
 assert module.config_public_state()["config"]["remote"]["allow_api_key_transmission"] is True
 
+locked = module.update_config_value("providers_security.require_https", False)
+assert locked["ok"] is False, locked
+assert locked["status"] == "remote_security_policy_locked", locked
+config = module.read_config()
+config.setdefault("providers_security", {})["require_https"] = False
+module.write_config(config)
+blocked_http = module.list_provider_models({
+    "provider": "openai_compatible",
+    "api_url": "http://127.0.0.1:1234/v1/chat/completions",
+    "api_key": "request-secret",
+})
+assert blocked_http["status"] == "https_required", blocked_http
+
 skills_dir_update = module.update_config_value("skills_dir", "/tmp/remote-skills-escape")
 assert skills_dir_update["ok"] is False
 assert skills_dir_update["status"] == "remote_config_read_only"

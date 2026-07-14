@@ -161,6 +161,20 @@ unauth_code="$(curl --noproxy '*' -sS -o "${unauth_body}" -w '%{http_code}' "${b
 [[ "${unauth_code}" == "401" ]]
 grep -q 'unauthorized' "${unauth_body}"
 
+legacy_header_body="${tmp_root}/legacy-header.json"
+legacy_header_code="$(curl --noproxy '*' -sS -o "${legacy_header_body}" -w '%{http_code}' \
+    -H "X-Agent-Token: ${token}" "${base_url}/api/health" || true)"
+[[ "${legacy_header_code}" == "401" ]]
+grep -q 'unauthorized' "${legacy_header_body}"
+
+oversized_body="${tmp_root}/oversized-body.json"
+python3 -c 'import sys; sys.stdout.write("{\"command\":\"" + "a"*1100000 + "\"}")' > "${oversized_body}"
+oversized_code="$(curl --noproxy '*' -sS -o "${tmp_root}/oversized-resp.json" -w '%{http_code}' \
+    -X POST -H "Authorization: Bearer ${token}" -H "Content-Type: application/json" \
+    --data-binary "@${oversized_body}" "${base_url}/api/terminal/review" || true)"
+[[ "${oversized_code}" == "413" ]]
+jq -e '.status == "request_too_large"' "${tmp_root}/oversized-resp.json" >/dev/null
+
 health="$(curl --noproxy '*' -sS -H "Authorization: Bearer ${token}" "${base_url}/api/health")"
 jq -e '.ok == true and .root != "" and .web_server.run_id != "" and .web_server.started_at != ""' <<<"${health}" >/dev/null
 
@@ -211,6 +225,26 @@ models_payload="$(jq -cn \
     --arg api_url "${FAKE_AI_URL}" \
     --arg api_key "${model_key_value}" \
     '{provider:$provider, api_url:$api_url, api_key:$api_key}')"
+blocked_model_policy_payload="$(jq -cn '{key:"providers_security.allowed_hosts", value:[]}')"
+curl --noproxy '*' -sS \
+    -H "Authorization: Bearer ${token}" \
+    -H "Content-Type: application/json" \
+    -d "${blocked_model_policy_payload}" \
+    "${base_url}/api/config/update" >/dev/null
+models_state="$(curl --noproxy '*' -sS \
+    -H "Authorization: Bearer ${token}" \
+    -H "Content-Type: application/json" \
+    -d "${models_payload}" \
+    "${base_url}/api/config/models")"
+jq -e '.ok == false and .status == "blocked_internal_address"' <<<"${models_state}" >/dev/null
+
+allow_payload="$(jq -cn '{key:"providers_security.allowed_hosts", value:["127.0.0.1"]}')"
+curl --noproxy '*' -sS \
+    -H "Authorization: Bearer ${token}" \
+    -H "Content-Type: application/json" \
+    -d "${allow_payload}" \
+    "${base_url}/api/config/update" >/dev/null
+
 models_state="$(curl --noproxy '*' -sS \
     -H "Authorization: Bearer ${token}" \
     -H "Content-Type: application/json" \
@@ -225,6 +259,18 @@ if grep -q "${model_key_value}" <<<"${models_state}"; then
     printf 'model fetch response leaked the transient api_key\n' >&2
     exit 1
 fi
+
+metadata_payload="$(jq -cn \
+    --arg provider "openai_compatible" \
+    --arg api_url "http://169.254.169.254/latest/meta-data/" \
+    --arg api_key "${model_key_value}" \
+    '{provider:$provider, api_url:$api_url, api_key:$api_key}')"
+metadata_state="$(curl --noproxy '*' -sS \
+    -H "Authorization: Bearer ${token}" \
+    -H "Content-Type: application/json" \
+    -d "${metadata_payload}" \
+    "${base_url}/api/config/models")"
+jq -e '.ok == false and .status == "blocked_internal_address"' <<<"${metadata_state}" >/dev/null
 
 config_update_payload="$(jq -cn '{key:"agent_loop.thinking_trace_enabled", value:true}')"
 config_update="$(curl --noproxy '*' -sS \

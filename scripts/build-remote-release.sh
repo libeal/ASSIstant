@@ -91,10 +91,11 @@ asset_json() {
 }
 
 core_stage="${tmp_root}/core"
-mkdir -p "${core_stage}/bin" "${core_stage}/lib" "${core_stage}/config" "${core_stage}/skills"
+mkdir -p "${core_stage}/bin" "${core_stage}/lib" "${core_stage}/config" "${core_stage}/skills" "${core_stage}/schema"
 cp -a "${ROOT_DIR}/bin/agent" "${core_stage}/bin/agent"
 cp -a "${ROOT_DIR}/lib/"*.sh "${ROOT_DIR}/lib/"*.py "${core_stage}/lib/"
 cp -a "${ROOT_DIR}/config/config.example.json" "${ROOT_DIR}/config/ai-providers.json" "${core_stage}/config/"
+cp -a "${ROOT_DIR}/schema/domain.json" "${core_stage}/schema/domain.json"
 copy_tree_without_cache "${ROOT_DIR}/mcp" "${core_stage}/mcp"
 copy_tree_without_cache "${ROOT_DIR}/policies" "${core_stage}/policies"
 copy_tree_without_cache "${ROOT_DIR}/prompts" "${core_stage}/prompts"

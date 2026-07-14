@@ -205,6 +205,7 @@ jq --arg version "${RELEASE_VERSION}" --arg storage "${STORAGE_BACKEND}" --arg a
         storage_backend:$storage,
         allow_api_key_transmission:($allow | ascii_downcase | IN("true", "1", "yes", "on"))
     })
+    | .providers_security = ((.providers_security // {}) + {require_https:true})
 ' "${agent_root}/config/config.json" > "${config_tmp}"
 mv "${config_tmp}" "${agent_root}/config/config.json"
 

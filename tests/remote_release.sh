@@ -81,5 +81,7 @@ bash -n "${ROOT_DIR}/scripts/publish-remote-release.sh"
 grep -q 'workflow_dispatch' "${ROOT_DIR}/.github/workflows/remote-release.yml"
 grep -q 'publish-remote-release.sh' "${ROOT_DIR}/.github/workflows/remote-release.yml"
 grep -q 'RUNNER_TEMP}/publish-remote-release.sh' "${ROOT_DIR}/.github/workflows/remote-release.yml"
+! grep -q 'Authorization Bearer token:' "${ROOT_DIR}/.github/workflows/remote-release.yml"
+grep -q 'agent/tmp/web/auth-token' "${ROOT_DIR}/.github/workflows/remote-release.yml"
 
 printf 'remote_release: ok\n'

@@ -46,11 +46,17 @@ jobs:
             exit 1
           fi
 
-      - name: Run syntax checks
+      - name: Install lint tooling
         run: |
-          bash -n bin/agent bin/agent-web test_config.sh lib/*.sh remote/*.sh scripts/*.sh tests/*.sh skills/*/scripts/*.sh
-          python3 -m py_compile lib/command_guard.py lib/mcp_client.py web/server.py tests/fake_ai_server.py tests/fake_mcp_server.py
-          node --check web/static/app.js
+          sudo apt-get update
+          sudo apt-get install -y shellcheck
+          # shfmt via Go module cache is optional; skip if unavailable.
+          curl -fsSL https://github.com/mvdan/sh/releases/download/v3.8.0/shfmt_v3.8.0_linux_amd64 -o /usr/local/bin/shfmt \
+            && chmod +x /usr/local/bin/shfmt || echo "shfmt install skipped"
+          python3 -m pip install --quiet pyflakes || echo "pyflakes install skipped"
+
+      - name: Run syntax and lint checks
+        run: bash scripts/lint.sh
 
       - name: Run regression suite
         run: |
@@ -63,6 +69,7 @@ jobs:
             tests/observer.sh \
             tests/smoke.sh \
             tests/mcp.sh \
+            tests/contract.sh \
             tests/web_api.sh \
             tests/web_server.sh \
             tests/interactive.sh \
@@ -110,7 +117,16 @@ jobs:
           web_pid="$!"
           trap 'kill -TERM "${web_pid}" 2>/dev/null || true; wait "${web_pid}" 2>/dev/null || true' EXIT
           for _ in $(seq 1 100); do
-            token="$(sed -n 's/.*Authorization Bearer token: //p' "${web_stderr}" | tail -n 1)"
+            token_file=""
+            for runtime_base in "${XDG_RUNTIME_DIR:-}" /dev/shm /tmp; do
+              [[ -n "${runtime_base}" && -d "${runtime_base}" ]] || continue
+              token_file="$(find "${runtime_base}" -maxdepth 5 -type f -path '*/linux-agent-remote.*/agent/tmp/web/auth-token' -print -quit 2>/dev/null || true)"
+              [[ -n "${token_file}" ]] && break
+            done
+            token=""
+            if [[ -n "${token_file}" ]]; then
+              token="$(<"${token_file}")"
+            fi
             if [[ -n "${token}" ]] && curl -fsS -H "Authorization: Bearer ${token}" http://127.0.0.1:8765/api/health \
               | jq -e '.ok == true and .remote.enabled == true' >/dev/null; then
               curl -fsS -X POST -H "Authorization: Bearer ${token}" -H "Content-Type: application/json" \

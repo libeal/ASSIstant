@@ -174,6 +174,9 @@ class StdioClient(BaseClient):
         if not all(isinstance(item, str) for item in args):
             raise McpError("stdio manifest args must be strings")
         env = os.environ.copy()
+        # MCP stdio servers are untrusted; never leak agent AI secrets into them.
+        for secret_var in ("LINUX_AGENT_API_KEY", "LINUX_AGENT_API_KEY_SOURCE", "LINUX_AGENT_LAST_AI_PAYLOAD"):
+            env.pop(secret_var, None)
         manifest_env = manifest.get("env")
         if isinstance(manifest_env, dict):
             for key, value in manifest_env.items():

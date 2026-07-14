@@ -645,6 +645,10 @@ linux_agent_start_session() {
     fi
 
     LINUX_AGENT_SESSION_ID="$(linux_agent_new_session_id)"
+    if [[ -z "${LINUX_AGENT_REQUEST_ID:-}" ]]; then
+        LINUX_AGENT_REQUEST_ID="req_${LINUX_AGENT_SESSION_ID}"
+        export LINUX_AGENT_REQUEST_ID
+    fi
     if declare -F linux_agent_use_session_tmp_dir >/dev/null 2>&1; then
         linux_agent_use_session_tmp_dir "${LINUX_AGENT_SESSION_ID}"
     fi
@@ -685,13 +689,21 @@ linux_agent_log_event() {
     if ! linux_agent_audit_boundary_should_log_stage "${stage}"; then
         return 0
     fi
+    if [[ -z "${LINUX_AGENT_SYSTEM_USER:-}" ]]; then
+        LINUX_AGENT_SYSTEM_USER="$(id -un 2>/dev/null || printf 'unknown')"
+    fi
     safe_payload="$(linux_agent_audit_payload "${stage}" "${payload}")"
     jq -cn \
         --arg ts "$(linux_agent_now_iso)" \
         --arg session_id "${LINUX_AGENT_SESSION_ID}" \
         --arg stage "${stage}" \
+        --arg request_id "${LINUX_AGENT_REQUEST_ID:-}" \
+        --arg job_id "${LINUX_AGENT_JOB_ID:-}" \
+        --arg system_user "${LINUX_AGENT_SYSTEM_USER:-unknown}" \
         --argjson payload "${safe_payload}" \
-        '{timestamp:$ts, session_id:$session_id, stage:$stage, payload:$payload}' >> "${LINUX_AGENT_AUDIT_LOG}"
+        '{timestamp:$ts, session_id:$session_id, stage:$stage, system_user:$system_user, payload:$payload}
+         + (if $request_id != "" then {request_id:$request_id} else {} end)
+         + (if $job_id != "" then {job_id:$job_id} else {} end)' >> "${LINUX_AGENT_AUDIT_LOG}"
 }
 
 linux_agent_log_step_status() {

@@ -22,12 +22,7 @@ config_get() {
 }
 
 generate_token() {
-    {
-        date +%s%N
-        printf '%s\n' "$$"
-        printf '%s\n' "${RANDOM}${RANDOM}${RANDOM}"
-        uname -a 2>/dev/null || true
-    } | sha256sum | awk '{print $1}' | cut -c 1-32
+    python3 -c 'import secrets; print(secrets.token_hex(32))'
 }
 
 require_command jq
@@ -37,6 +32,11 @@ if [[ ! -f "${CONFIG_FILE}" ]]; then
     mkdir -p "$(dirname "${CONFIG_FILE}")"
     cp "${EXAMPLE_FILE}" "${CONFIG_FILE}"
     printf '[警告] 未找到 config/config.json，已根据示例生成；请补充真实 AI 配置。\n' >&2
+fi
+
+if ! chmod 600 "${CONFIG_FILE}" 2>/dev/null; then
+    printf '[错误] 无法将 config/config.json 权限收紧为 0600。\n' >&2
+    exit 1
 fi
 
 if ! jq -e . "${CONFIG_FILE}" >/dev/null 2>&1; then
@@ -72,7 +72,8 @@ if [[ ! "${retention}" =~ ^[0-9]+$ || "${retention}" -le 0 ]]; then
 fi
 if [[ -z "${token}" ]]; then
     token="$(generate_token)"
-    printf '[警告] web.token 未配置，已生成本次运行临时 token。\n' >&2
+    export LINUX_AGENT_WEB_TOKEN_EPHEMERAL=1
+    printf '[警告] web.token 未配置，已生成本次运行临时 token（写入 tmp/web/auth-token，不在终端回显）。\n' >&2
 fi
 
 export LINUX_AGENT_ROOT="${ROOT_DIR}"

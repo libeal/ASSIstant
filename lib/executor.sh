@@ -97,13 +97,19 @@ linux_agent_prepare_execution_command() {
     local -n output_command_ref="${output_var}"
     output_command_ref=()
 
+    # Strip AI secrets from every executed step. The key stays in this shell's
+    # environment (subsequent AI reflection iterations still need it) but must
+    # never reach skill / shell / MCP / remote-script child processes.
+    local -a scrub_env
+    scrub_env=(env -u LINUX_AGENT_API_KEY -u LINUX_AGENT_API_KEY_SOURCE -u LINUX_AGENT_LAST_AI_PAYLOAD --)
+
     if [[ "${requested_privilege}" != "least" ]] || [[ "$(linux_agent_min_privilege_proxy_enabled)" != "true" ]]; then
-        output_command_ref=("$@")
+        output_command_ref=("${scrub_env[@]}" "$@")
         return 0
     fi
 
     if [[ "$(id -u)" -ne 0 ]]; then
-        output_command_ref=("$@")
+        output_command_ref=("${scrub_env[@]}" "$@")
         return 0
     fi
 
@@ -113,14 +119,14 @@ linux_agent_prepare_execution_command() {
     fi
 
     if command -v runuser >/dev/null 2>&1; then
-        output_command_ref=(runuser -u "${target_user}" -- "$@")
+        output_command_ref=(runuser -u "${target_user}" -- "${scrub_env[@]}" "$@")
         return 0
     fi
 
     if command -v setpriv >/dev/null 2>&1; then
         target_uid="$(id -u "${target_user}")"
         target_gid="$(id -g "${target_user}")"
-        output_command_ref=(setpriv --reuid "${target_uid}" --regid "${target_gid}" --init-groups "$@")
+        output_command_ref=(setpriv --reuid "${target_uid}" --regid "${target_gid}" --init-groups "${scrub_env[@]}" "$@")
         return 0
     fi
 

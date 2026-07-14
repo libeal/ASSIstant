@@ -218,6 +218,17 @@ function normalizeProviderId(value) {
     .trim()
     .toLowerCase()
     .replace(/[-\s/]+/g, "_");
+  const rules = state.domainSchema?.provider_normalization;
+  if (rules) {
+    for (const rule of rules.prefix_rules || []) {
+      if (rule.prefix && normalized.startsWith(rule.prefix)) return rule.canonical || rule.prefix;
+    }
+    const aliases = rules.aliases || {};
+    if (normalized in aliases) return aliases[normalized];
+    if (!normalized) return aliases[""] || "openai_compatible";
+    return normalized;
+  }
+  // schema not loaded yet — inline fallback (mirrors schema/domain.json)
   if (!normalized || normalized.startsWith("openai_compatible")) return "openai_compatible";
   if (["zhipu", "zhipuai"].includes(normalized)) return "zhipu_ai";
   if (normalized === "sarvam") return "sarvam_ai";
@@ -1698,6 +1709,7 @@ async function connect() {
   setLayoutRunId(health.web_server?.run_id || "");
   setStatus("connectionState", "online", "ok");
   setText("rootPath", health.root || "connected");
+  await loadDomainSchema();
   await loadConfig();
   await loadSessionState();
   await loadObserverBootstrapStatus({ prompt: true });
@@ -1708,6 +1720,15 @@ async function connect() {
   await loadAuditList();
   await loadPolicies();
   showToast("Connected");
+}
+
+async function loadDomainSchema() {
+  try {
+    const data = await api("/api/schema");
+    if (data?.ok && data.schema) state.domainSchema = data.schema;
+  } catch (err) {
+    // Non-fatal: normalizeProviderId falls back to its inline rules.
+  }
 }
 
 async function loadConfig() {

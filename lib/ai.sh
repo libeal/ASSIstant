@@ -228,14 +228,30 @@ linux_agent_normalize_model_response() {
 }
 
 linux_agent_ai_provider_id() {
-    local provider
+    local provider normalized schema_file result
     provider="$(linux_agent_config_get '.provider')"
-    provider="${provider,,}"
-    provider="${provider//-/_}"
-    provider="${provider// /_}"
-    provider="${provider//\//_}"
-    case "${provider}" in
-        ""|openai_compatible|openai_compatible___custom|openai_compatible_custom)
+    normalized="$(printf '%s' "${provider,,}" | sed -E 's#[-[:space:]/]+#_#g')"
+
+    schema_file="${LINUX_AGENT_ROOT}/schema/domain.json"
+    if [[ -f "${schema_file}" ]]; then
+        result="$(jq -r --arg id "${normalized}" '
+            (.provider_normalization // {}) as $rules
+            | ([($rules.prefix_rules // [])[] | . as $rule | select(($rule.prefix // "") != "" and ($id | startswith($rule.prefix))) | .canonical] | first) as $prefix_hit
+            | ($rules.aliases // {}) as $aliases
+            | if $prefix_hit != null then $prefix_hit
+              elif ($aliases[$id] != null) then $aliases[$id]
+              elif ($id == "") then ($aliases[""] // "openai_compatible")
+              else $id end
+        ' "${schema_file}" 2>/dev/null || true)"
+        if [[ -n "${result}" ]]; then
+            printf '%s\n' "${result}"
+            return 0
+        fi
+    fi
+
+    # Fallback (schema unavailable): inline equivalent of schema/domain.json.
+    case "${normalized}" in
+        ""|openai_compatible*)
             printf 'openai_compatible\n'
             ;;
         zhipu|zhipuai|zhipu_ai)
@@ -251,9 +267,26 @@ linux_agent_ai_provider_id() {
             printf 'x_ai\n'
             ;;
         *)
-            printf '%s\n' "${provider}"
+            printf '%s\n' "${normalized}"
             ;;
     esac
+}
+
+linux_agent_ai_validate_provider_url() {
+    local api_url="$1"
+    local policy_json result
+    local security_script="${LINUX_AGENT_ROOT}/lib/provider_security.py"
+
+    if [[ "${LINUX_AGENT_REMOTE_MODE:-0}" == "1" ]]; then
+        policy_json="$(jq -c '(.providers_security // {}) + {require_https:true}' <<<"${LINUX_AGENT_CONFIG_JSON}")"
+    else
+        policy_json="$(jq -c '.providers_security // {}' <<<"${LINUX_AGENT_CONFIG_JSON}")"
+    fi
+    if [[ ! -f "${security_script}" ]] || ! result="$(python3 "${security_script}" validate "${api_url}" "${policy_json}" 2>/dev/null)"; then
+        jq -cn '{ok:false, status:"provider_security_unavailable", error:"Provider URL security validation is unavailable."}'
+        return 0
+    fi
+    printf '%s\n' "${result}"
 }
 
 linux_agent_ai_provider_json() {
@@ -380,11 +413,25 @@ linux_agent_call_ai_with_context() {
     request_format="$(jq -r '.request_format // "openai_chat"' <<<"${provider_json}")"
     auth_type="$(jq -r '.auth // "bearer"' <<<"${provider_json}")"
 
-    local api_url api_key model timeout_sec system_prompt payload response content
+    local api_url api_key model timeout_sec system_prompt payload response content provider_url_check resolve_entry
+    local -a provider_url_resolve_args
     api_url="$(linux_agent_config_get '.api_url')"
     if [[ -z "${api_url}" ]]; then
         api_url="$(jq -r '.api_url // empty' <<<"${provider_json}")"
     fi
+    provider_url_check="$(linux_agent_ai_validate_provider_url "${api_url}")"
+    if [[ "$(jq -r '.ok // false' <<<"${provider_url_check}")" != "true" ]]; then
+        linux_agent_ai_error \
+            "$(jq -r '.status // "provider_security_unavailable"' <<<"${provider_url_check}")" \
+            "$(jq -r '.error // "Provider URL is not allowed."' <<<"${provider_url_check}")"
+        return 0
+    fi
+    api_url="$(jq -r '.url' <<<"${provider_url_check}")"
+    provider_url_resolve_args=()
+    while IFS= read -r resolve_entry; do
+        [[ -n "${resolve_entry}" ]] || continue
+        provider_url_resolve_args+=(--resolve "${resolve_entry}")
+    done < <(jq -r '.curl_resolve[]? // empty' <<<"${provider_url_check}")
     api_key="$(linux_agent_config_api_key)"
     model="$(linux_agent_config_get '.model')"
     if [[ -z "${model}" ]]; then
@@ -415,8 +462,9 @@ linux_agent_call_ai_with_context() {
             ;;
     esac
 
-    if ! response="$(curl -sS --max-time "${timeout_sec:-90}" \
+    if ! response="$(curl -sS --noproxy '*' --max-time "${timeout_sec:-90}" \
         "${curl_headers[@]}" \
+        "${provider_url_resolve_args[@]}" \
         -d "${payload}" \
         "${api_url}" 2>&1)"; then
         linux_agent_ai_error "ai_request_failed" "模型请求失败。" "${response}"

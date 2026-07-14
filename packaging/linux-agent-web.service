@@ -1,0 +1,76 @@
+# Linux 运维 Agent — Web 控制台 systemd 单元（生产加固模板）
+#
+# 用途：把 Web 控制台作为长期服务运行在目标主机上，以专用非 root 用户执行，
+# 并施加 systemd 沙箱与 cgroup 资源约束。远程访问一律通过 SSH 端口转发到
+# 127.0.0.1:8765，不直接暴露到 LAN/公网。
+#
+# 安装步骤（示例）：
+#   sudo useradd --system --home-dir /opt/linux-agent --shell /usr/sbin/nologin linux-agent
+#   sudo mkdir -p /opt/linux-agent && sudo cp -a <repo>/. /opt/linux-agent/
+#   sudo chown -R linux-agent:linux-agent /opt/linux-agent
+#   sudo install -o linux-agent -g linux-agent -m 600 \
+#        /opt/linux-agent/config/config.example.json /opt/linux-agent/config/config.json
+#   # 在 config.json 写入 web.token、api_key，并确认 providers_security.require_https=true
+#   sudo cp <repo>/packaging/linux-agent-web.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now linux-agent-web
+#
+# 访问：ssh -L 8765:127.0.0.1:8765 <user>@<target-host>，然后浏览器打开 127.0.0.1:8765。
+
+[Unit]
+Description=Linux 运维 Agent Web 控制台
+Documentation=file:/opt/linux-agent/README.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# —— 身份边界：专用非 root 账户，禁止提权 ——
+User=linux-agent
+Group=linux-agent
+WorkingDirectory=/opt/linux-agent
+ExecStart=/usr/bin/env bash /opt/linux-agent/bin/agent-web
+Restart=on-failure
+RestartSec=3s
+
+# —— 进程/执行边界 ——
+NoNewPrivileges=yes
+# 该服务本身不需要提权；如需 auditd observer 提权，改由独立 privileged helper 承担。
+
+# —— 文件系统边界 ——
+ProtectSystem=strict
+ProtectHome=yes
+# 代码、Provider registry、schema 和提示词保持只读；仅开放运行时数据目录。
+ReadWritePaths=/opt/linux-agent/config /opt/linux-agent/logs /opt/linux-agent/tmp
+PrivateTmp=yes
+ProtectControlGroups=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectKernelLogs=yes
+ProtectClock=yes
+ProtectProc=invisible
+ProcSubset=pid
+LockPersonality=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+RestrictNamespaces=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources @mount @swap @reboot @raw-io
+
+# —— 网络出口边界：默认仅回环 + 出站到 AI Provider ——
+# Web 只监听 127.0.0.1（由 bin/agent-web 在 remote 模式强制）。
+# 如需限制出口到指定 Provider 网段，用 IPAddressAllow/Deny 配置。
+# IPAddressDeny=any
+# IPAddressAllow=localhost
+# IPAddressAllow=<provider-egress-cidr>
+
+# —— cgroup 资源硬上限 ——
+CPUQuota=200%
+MemoryMax=1G
+TasksMax=256
+# 单个服务实例的墙钟上限交由应用层 execution.timeout_sec 控制；
+# 若需服务级重启周期，可加 RuntimeMaxSec=。
+
+[Install]
+WantedBy=multi-user.target

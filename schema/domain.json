@@ -1,0 +1,50 @@
+{
+  "schema_version": 1,
+  "description": "Cross-language domain contract (single source of truth). Bash reads it via jq, Python via json, the web front-end via GET /api/schema. Keep provider normalization, status enums, and error codes here — do not fork per language.",
+  "provider_normalization": {
+    "note": "Normalize input: lowercase, then collapse runs of '-', whitespace, or '/' into a single '_'. Then apply prefix_rules (startswith) first, then exact aliases, then identity.",
+    "prefix_rules": [
+      { "prefix": "openai_compatible", "canonical": "openai_compatible" }
+    ],
+    "aliases": {
+      "": "openai_compatible",
+      "zhipu": "zhipu_ai",
+      "zhipuai": "zhipu_ai",
+      "zhipu_ai": "zhipu_ai",
+      "sarvam": "sarvam_ai",
+      "sarvam_ai": "sarvam_ai",
+      "moonshot": "moonshot_ai",
+      "moonshot_ai": "moonshot_ai",
+      "xai": "x_ai",
+      "x_ai": "x_ai"
+    }
+  },
+  "job_status": ["queued", "running", "succeeded", "failed", "cancelled"],
+  "step_status": [
+    "pending",
+    "policy_checked",
+    "approved",
+    "auto_approved",
+    "approval_required",
+    "blocked",
+    "rejected",
+    "running",
+    "succeeded",
+    "failed",
+    "skipped_user",
+    "skipped_unexecuted",
+    "terminated"
+  ],
+  "error_codes": {
+    "unauthorized": { "retryable": false, "http": 401 },
+    "invalid_json": { "retryable": false, "http": 400 },
+    "request_too_large": { "retryable": false, "http": 413 },
+    "too_many_jobs": { "retryable": true, "http": 429 },
+    "https_required": { "retryable": false, "http": 200 },
+    "blocked_internal_address": { "retryable": false, "http": 200 },
+    "url_too_long": { "retryable": false, "http": 200 },
+    "invalid_url": { "retryable": false, "http": 200 },
+    "secret_transmission_disabled": { "retryable": false, "http": 200 },
+    "provider_security_unavailable": { "retryable": false, "http": 200 }
+  }
+}

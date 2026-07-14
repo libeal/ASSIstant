@@ -48,6 +48,7 @@ export function createInitialState() {
     configModels: [],
     configModelsProvider: "",
     configModelStatus: "",
+    domainSchema: null,
     observerBootstrap: null,
     observerBootstrapPrompted: false,
     auditPaused: false,

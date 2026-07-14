@@ -12,6 +12,10 @@ linux_agent_load_config() {
         cp "${LINUX_AGENT_ROOT}/config/config.example.json" "${LINUX_AGENT_CONFIG_FILE}"
         linux_agent_print_warn "未找到 config/config.json，已根据示例生成，请补充真实配置。"
     fi
+    if ! chmod 600 "${LINUX_AGENT_CONFIG_FILE}" 2>/dev/null; then
+        linux_agent_print_error "无法将 config/config.json 权限收紧为 0600。"
+        return 1
+    fi
 
     LINUX_AGENT_CONFIG_JSON="$(cat "${LINUX_AGENT_CONFIG_FILE}")"
 }

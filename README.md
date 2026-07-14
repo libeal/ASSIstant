@@ -48,6 +48,21 @@ Web 视图包括：
 
 ## 快速开始
 
+### 部署语义说明：`remote` 是「本地 Runtime 分发」
+
+本项目是「单机 Agent + 远程运维客户端」模型，不是集中控制面。请区分两种含义：
+
+- **目标机本地执行**：Agent 的命令执行、审计、配置与 AI 调用都发生在运行它的那台主机本地。
+- **客户端控制目标机**：从机器 B 直接控制机器 A 上已运行的 Agent —— 当前版本**不提供**这种远程控制协议。
+
+因此 `curl | bash` 的 `remote` 指的是**把版本化 Runtime 分发（物化）到执行该命令的机器并本地启动**，而不是远程接管另一台已部署主机。支持的访问方式：
+
+1. SSH 登录目标主机后执行 `curl | bash`，Agent 在目标主机本地运行；
+2. 目标主机运行 Remote Web（强制 `127.0.0.1`），运维机器通过 SSH 端口转发访问；
+3. 在运维机器直接执行 `curl | bash`，则 Agent 运行在运维机器本身。
+
+若未来需要「机器 B 控制机器 A 上已运行的 Agent」，需另行新增经认证的 SSH/RPC 远程适配层（见路线图）。
+
 ### 远程临时运行
 
 CLI 版本：
@@ -64,7 +79,7 @@ curl -fsSL https://github.com/libeal/ASSIstant/releases/latest/download/linux-ag
 
 两条命令都只从同一个 GitHub Release 获取 manifest 和已登记资产。Bootstrap 不保存到本机；core、Web 和按需加载的完整 skill 包优先物化到 `$XDG_RUNTIME_DIR` 或 `/dev/shm`，必要时回退权限为 `0700` 的 `/tmp` 子目录，并在退出或收到信号时清理。
 
-Remote CLI 会从 `/dev/tty` 读取审批和可选 API key，密钥不写入配置文件。Remote Web 强制监听 `127.0.0.1`，从其他机器访问时使用终端输出的 SSH 转发命令。固定版本可把 URL 中的 `latest/download` 替换为 `download/<tag>`，并在管道右侧设置相同的 `LINUX_AGENT_VERSION=<tag>`。
+Remote CLI 会从 `/dev/tty` 读取审批和可选 API key，密钥不写入配置文件。Remote Web 强制监听 `127.0.0.1`，从其他机器访问时使用启动日志打印的 SSH 转发命令；本次运行的临时 token 写入运行时目录下权限 `0600` 的 `tmp/web/auth-token`（不在终端回显）。固定版本可把 URL 中的 `latest/download` 替换为 `download/<tag>`，并在管道右侧设置相同的 `LINUX_AGENT_VERSION=<tag>`。Remote 部署会自动把 `providers_security.require_https` 置为 `true`（仅允许 HTTPS Provider）。
 
 Remote 模式默认禁止向 AI Provider 传输 API key。CLI 会在需要 AI 时询问；Web 需在配置中心开启“允许远程传输 API Key”。Terminal、Doctor、Audit 和不需要模型的 Skill 不受此开关影响。运行日志、脱敏配置和用户生成的 skill 可通过 `agent backup <output.tar.gz>` 或 Web“下载运行时备份”按钮显式保存。
 
@@ -98,7 +113,7 @@ bash bin/agent policy validate file-vault.json
 bash bin/agent-web
 ```
 
-默认访问 `http://127.0.0.1:8765/`。静态页面不需要认证，所有 `/api/` 请求都需要 `Authorization: Bearer <token>`。如果 `web.token` 留空，启动时会生成本次运行的临时 token 并打印到终端。
+默认访问 `http://127.0.0.1:8765/`。静态页面不需要认证，所有 `/api/` 请求都需要 `Authorization: Bearer <token>`（认证使用常量时间比较，不再支持 `X-Agent-Token` 备用头）。如果 `web.token` 留空，启动时会用系统 CSPRNG 生成本次运行的临时 token，并写入权限 `0600` 的 `tmp/web/auth-token` 文件（不在终端回显），退出时清理；配置文件 `config/config.json` 写入时也会强制 `0600`。
 连接后 Web 会申请一次服务器权限以启用 auditd observer；用户跳过或启用失败都会写入 Web 审计日志，后续任务仍可继续运行并按 observer 降级事件记录。
 
 常用命令：

@@ -40,6 +40,11 @@
   },
   "skills_dir": "",
   "remote_script_policy": "download_review",
+  "providers_security": {
+    "require_https": false,
+    "block_internal_addresses": true,
+    "allowed_hosts": []
+  },
   "remote": {
     "enabled": false,
     "release_version": "",

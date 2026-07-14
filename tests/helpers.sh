@@ -46,6 +46,7 @@ configure_fake_ai() {
         | del(.api_key_file)
         | .model = "fake-chat-completions"
         | .request_timeout_sec = 10
+        | .providers_security.allowed_hosts = ["127.0.0.1"]
     ' "${project}/config/config.json" > "${tmp_config}"
     mv "${tmp_config}" "${project}/config/config.json"
 }

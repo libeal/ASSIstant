@@ -54,7 +54,12 @@ curl -fsSL "file://${release_dir}/linux-agent-web.sh" \
 web_pid="$!"
 web_token=""
 for _ in $(seq 1 100); do
-    web_token="$(sed -n 's/.*Authorization Bearer token: //p' "${web_stderr}" | tail -n 1)"
+    token_file="$(find "${runtime_base}" -maxdepth 5 -type f \
+        -path '*/linux-agent-remote.*/agent/tmp/web/auth-token' -print -quit 2>/dev/null || true)"
+    web_token=""
+    if [[ -n "${token_file}" ]]; then
+        web_token="$(<"${token_file}")"
+    fi
     if [[ -n "${web_token}" ]] && curl -fsS -H "Authorization: Bearer ${web_token}" \
         http://127.0.0.1:8765/api/health \
         | jq -e '.ok == true and .remote.enabled == true and .remote.release_version == "v0.0.0-test"' >/dev/null; then
@@ -63,6 +68,10 @@ for _ in $(seq 1 100); do
     sleep 0.1
 done
 [[ -n "${web_token}" ]]
+if grep -Fq -- "${web_token}" "${web_stdout}" "${web_stderr}"; then
+    printf 'remote Web token was echoed to stdout/stderr\n' >&2
+    exit 1
+fi
 tools_json="$(curl -fsS -H "Authorization: Bearer ${web_token}" http://127.0.0.1:8765/api/tools)"
 jq -e '[.scripts[].materialization] | all(. == "available")' <<<"${tools_json}" >/dev/null
 materialize_one="${tmp_root}/materialize-one.json"
@@ -112,7 +121,12 @@ curl -fsSL "file://${release_dir}/linux-agent-web.sh" \
 web_pid="$!"
 signal_token=""
 for _ in $(seq 1 100); do
-    signal_token="$(sed -n 's/.*Authorization Bearer token: //p' "${signal_stderr}" | tail -n 1)"
+    token_file="$(find "${runtime_base}" -maxdepth 5 -type f \
+        -path '*/linux-agent-remote.*/agent/tmp/web/auth-token' -print -quit 2>/dev/null || true)"
+    signal_token=""
+    if [[ -n "${token_file}" ]]; then
+        signal_token="$(<"${token_file}")"
+    fi
     if [[ -n "${signal_token}" ]] && curl -fsS -H "Authorization: Bearer ${signal_token}" \
         http://127.0.0.1:8765/api/health >/dev/null; then
         break

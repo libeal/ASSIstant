@@ -3,8 +3,11 @@
 import json
 import os
 import errno
+import http.client
+import secrets
 import signal
 import shutil
+import socket
 import subprocess
 import sys
 import threading
@@ -19,6 +22,15 @@ from urllib.parse import urlencode, unquote, urlparse, urlunparse
 
 
 ROOT = Path(os.environ.get("LINUX_AGENT_ROOT", Path(__file__).resolve().parents[1])).resolve()
+LIB_ROOT = ROOT / "lib"
+if str(LIB_ROOT) not in sys.path:
+    sys.path.insert(0, str(LIB_ROOT))
+from provider_security import (  # noqa: E402
+    inspect_provider_url,
+    provider_security_policy,
+    provider_url_error_message,
+    validate_provider_url,
+)
 STATIC_ROOT = ROOT / "web" / "static"
 JOBS_ROOT = ROOT / "tmp" / "web" / "jobs"
 POLICIES_ROOT = ROOT / "policies"
@@ -32,10 +44,21 @@ TOKEN = os.environ.get("LINUX_AGENT_WEB_TOKEN", "")
 JOB_RETENTION_HOURS = int(os.environ.get("LINUX_AGENT_WEB_JOB_RETENTION_HOURS", "24"))
 JOB_PROCESSES = {}
 JOB_PROCESSES_LOCK = threading.Lock()
+JOB_ADMISSION_LOCK = threading.Lock()
+JOB_RECORD_LOCKS = {}
+JOB_RECORD_LOCKS_GUARD = threading.Lock()
 WEB_AGENT_LOCK = threading.RLock()
 DEFAULT_STDERR_TEXT_LIMIT = 4000
 WORK_EXECUTION_FLOW_TEXT_LIMIT = 200000
 MODEL_LIST_RESPONSE_LIMIT = 1024 * 1024
+MAX_REQUEST_BODY_BYTES = 1024 * 1024
+MAX_ACTIVE_JOBS = int(os.environ.get("LINUX_AGENT_WEB_MAX_ACTIVE_JOBS", "4") or "4")
+
+
+class RequestBodyTooLarge(ValueError):
+    """Raised when an inbound request body exceeds MAX_REQUEST_BODY_BYTES."""
+
+
 SERVER_RUN_ID = uuid.uuid4().hex
 SERVER_STARTED_AT = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 WEB_AGENT_SESSION_ID = f"session_web_{SERVER_RUN_ID[:16]}"
@@ -43,6 +66,7 @@ WEB_AGENT_AUDIT_LOG = ROOT / "logs" / f"{WEB_AGENT_SESSION_ID}.jsonl"
 WEB_AGENT_HISTORY_FILE = ROOT / "tmp" / "web" / "sessions" / f"{WEB_AGENT_SESSION_ID}.history.json"
 WEB_AGENT_RESTORED_FROM = ""
 API_KEY_PLACEHOLDER = "please-set-your-api-key"
+EPHEMERAL_TOKEN_FILE = ROOT / "tmp" / "web" / "auth-token"
 WEB_AUDIT_SESSION_ID = f"web_{SERVER_RUN_ID[:16]}"
 WEB_AUDIT_LOG = ROOT / "logs" / f"{WEB_AUDIT_SESSION_ID}.jsonl"
 OBSERVER_BOOTSTRAP_STATE = {
@@ -76,32 +100,51 @@ def read_provider_registry():
     return providers if isinstance(providers, list) else []
 
 
+def load_domain_schema():
+    try:
+        with (ROOT / "schema" / "domain.json").open("r", encoding="utf-8") as handle:
+            data = json.load(handle)
+        if isinstance(data, dict):
+            return data
+    except (OSError, json.JSONDecodeError):
+        pass
+    return {}
+
+
+DOMAIN_SCHEMA = load_domain_schema()
+
+# Fallback used only if schema/domain.json is missing/unreadable.
+_FALLBACK_PROVIDER_ALIASES = {
+    "": "openai_compatible",
+    "zhipu": "zhipu_ai",
+    "zhipuai": "zhipu_ai",
+    "sarvam": "sarvam_ai",
+    "moonshot": "moonshot_ai",
+    "xai": "x_ai",
+}
+
+
 def normalize_provider_id(value):
     normalized = str(value or "").strip().lower()
-    normalized = normalized.replace("-", "_").replace(" ", "_")
-    normalized = normalized.replace("/", "_")
-    aliases = {
-        "": "openai_compatible",
-        "openai_compatible": "openai_compatible",
-        "openai_compatible_custom": "openai_compatible",
-        "openai-compatible": "openai_compatible",
-        "openai-compatible_custom": "openai_compatible",
-        "openai_compatible___custom": "openai_compatible",
-        "openai_compatible_/_custom": "openai_compatible",
-        "zhipu": "zhipu_ai",
-        "zhipuai": "zhipu_ai",
-        "zhipu_ai": "zhipu_ai",
-        "sarvam": "sarvam_ai",
-        "sarvam_ai": "sarvam_ai",
-        "moonshot": "moonshot_ai",
-        "moonshot_ai": "moonshot_ai",
-        "xai": "x_ai",
-        "x_ai": "x_ai",
-        "nvidia": "nvidia",
-        "mistral": "mistral",
-        "openai": "openai",
-    }
-    return aliases.get(normalized, normalized)
+    normalized = normalized.replace("-", "_").replace(" ", "_").replace("/", "_")
+    while "__" in normalized:
+        normalized = normalized.replace("__", "_")
+    rules = DOMAIN_SCHEMA.get("provider_normalization") if isinstance(DOMAIN_SCHEMA, dict) else None
+    if isinstance(rules, dict):
+        for rule in rules.get("prefix_rules") or []:
+            prefix = str(rule.get("prefix") or "")
+            if prefix and normalized.startswith(prefix):
+                return str(rule.get("canonical") or prefix)
+        aliases = rules.get("aliases") if isinstance(rules.get("aliases"), dict) else {}
+        if normalized in aliases:
+            return str(aliases[normalized])
+        if not normalized:
+            return str(aliases.get("", "openai_compatible"))
+        return normalized
+    # schema unavailable — inline fallback
+    if not normalized or normalized.startswith("openai_compatible"):
+        return "openai_compatible"
+    return _FALLBACK_PROVIDER_ALIASES.get(normalized, normalized)
 
 
 def provider_by_id(provider_id):
@@ -151,6 +194,8 @@ def write_config(config):
     with tmp_path.open("w", encoding="utf-8") as handle:
         json.dump(config, handle, ensure_ascii=False, indent=2)
         handle.write("\n")
+    # config.json may hold the API key; keep it owner-only.
+    os.chmod(tmp_path, 0o600)
     tmp_path.replace(CONFIG_PATH)
 
 
@@ -215,16 +260,6 @@ def redacted_text(value, secret=""):
     return text[:600]
 
 
-def validate_http_url(raw_url):
-    value = str(raw_url or "").strip()
-    if len(value) > 2048:
-        return "", "url_too_long"
-    parsed = urlparse(value)
-    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
-        return "", "invalid_url"
-    return value, ""
-
-
 def derive_models_url(api_url):
     parsed = urlparse(str(api_url or ""))
     path = parsed.path.rstrip("/")
@@ -268,9 +303,91 @@ def model_list_request_url(provider, api_url, api_key):
     return url, auth
 
 
-def fetch_json_url(url, headers, timeout, secret):
+def _pinned_socket(addresses, port, timeout):
+    last_error = None
+    for address in addresses:
+        try:
+            return socket.create_connection((address, port), timeout=timeout)
+        except OSError as exc:
+            last_error = exc
+    if last_error is not None:
+        raise last_error
+    raise OSError("Provider hostname did not resolve to a usable address.")
+
+
+class PinnedHTTPConnection(http.client.HTTPConnection):
+    def __init__(self, host, *args, resolved_addresses=None, **kwargs):
+        super().__init__(host, *args, **kwargs)
+        self.resolved_addresses = tuple(resolved_addresses or ())
+
+    def connect(self):
+        self.sock = _pinned_socket(self.resolved_addresses, self.port, self.timeout)
+        if self._tunnel_host:
+            self._tunnel()
+
+
+class PinnedHTTPSConnection(http.client.HTTPSConnection):
+    def __init__(self, host, *args, resolved_addresses=None, **kwargs):
+        super().__init__(host, *args, **kwargs)
+        self.resolved_addresses = tuple(resolved_addresses or ())
+
+    def connect(self):
+        self.sock = _pinned_socket(self.resolved_addresses, self.port, self.timeout)
+        if self._tunnel_host:
+            self._tunnel()
+        server_hostname = self._tunnel_host or self.host
+        self.sock = self._context.wrap_socket(self.sock, server_hostname=server_hostname)
+
+
+class PinnedHTTPHandler(urllib.request.HTTPHandler):
+    def __init__(self, resolved_addresses):
+        super().__init__()
+        self.resolved_addresses = tuple(resolved_addresses)
+
+    def http_open(self, request):
+        addresses = self.resolved_addresses
+
+        class Connection(PinnedHTTPConnection):
+            def __init__(self, host, *args, **kwargs):
+                super().__init__(host, *args, resolved_addresses=addresses, **kwargs)
+
+        return self.do_open(Connection, request)
+
+
+class PinnedHTTPSHandler(urllib.request.HTTPSHandler):
+    def __init__(self, resolved_addresses):
+        super().__init__()
+        self.resolved_addresses = tuple(resolved_addresses)
+
+    def https_open(self, request):
+        addresses = self.resolved_addresses
+
+        class Connection(PinnedHTTPSConnection):
+            def __init__(self, host, *args, **kwargs):
+                super().__init__(host, *args, resolved_addresses=addresses, **kwargs)
+
+        return self.do_open(
+            Connection,
+            request,
+            context=self._context,
+            check_hostname=self._check_hostname,
+        )
+
+
+def fetch_json_url(url, headers, timeout, secret, resolved_addresses=None):
     request = urllib.request.Request(url, headers=headers, method="GET")
-    opener = urllib.request.build_opener(NoRedirectHandler)
+    handlers = [NoRedirectHandler]
+    if resolved_addresses:
+        # Do not let an ambient HTTP proxy bypass the address pin selected by
+        # provider_security.inspect_provider_url().
+        handlers.extend(
+            [
+                urllib.request.ProxyHandler({}),
+                PinnedHTTPHandler(resolved_addresses),
+                PinnedHTTPSHandler(resolved_addresses),
+            ]
+        )
+    opener = urllib.request.build_opener(*handlers)
     try:
         with opener.open(request, timeout=timeout) as response:
             body = response.read(MODEL_LIST_RESPONSE_LIMIT + 1)
@@ -384,23 +501,26 @@ def list_provider_models(body):
         }
 
     api_url = str(body.get("api_url") or config.get("api_url") or provider.get("api_url") or "")
+    security = provider_security_policy(config)
+    if REMOTE_MODE:
+        security["require_https"] = True
     if models.get("derive_from_api_url") or not models.get("url"):
-        api_url, url_error = validate_http_url(api_url)
+        api_url, url_error = validate_provider_url(api_url, security)
         if url_error:
-            return {"ok": False, "status": url_error, "provider": provider_id, "models": [], "error": "api_url must be a valid http(s) URL."}
+            return {"ok": False, "status": url_error, "provider": provider_id, "models": [], "error": provider_url_error_message(url_error)}
 
     api_key, key_source = configured_api_key(config, body.get("api_key"))
     url, auth = model_list_request_url(provider, api_url, api_key)
-    url, url_error = validate_http_url(url)
+    url, url_error, resolved_addresses = inspect_provider_url(url, security)
     if url_error:
-        return {"ok": False, "status": url_error, "provider": provider_id, "models": [], "error": "model list URL must be a valid http(s) URL."}
+        return {"ok": False, "status": url_error, "provider": provider_id, "models": [], "error": provider_url_error_message(url_error)}
     if auth != "none" and not api_key:
         return {"ok": False, "status": "api_key_missing", "provider": provider_id, "models": [], "error": "API key is required to list models."}
 
     timeout = min(max(safe_int(config.get("request_timeout_sec", 30) or 30, 30), 1), 60)
     headers = {"Accept": "application/json"}
     headers.update(provider_auth_headers(auth, api_key))
-    payload, error = fetch_json_url(url, headers, timeout, api_key)
+    payload, error = fetch_json_url(url, headers, timeout, api_key, resolved_addresses)
     if error:
         error["provider"] = provider_id
         error["models"] = []
@@ -525,6 +645,9 @@ CONFIG_WRITABLE_FIELDS = {
     "execution.least_privilege_user": {"type": "str", "min": 1},
     "skills_dir": {"type": "str", "min": 0},
     "remote_script_policy": {"type": "enum", "values": {"download_review", "disabled"}},
+    "providers_security.require_https": {"type": "bool"},
+    "providers_security.block_internal_addresses": {"type": "bool"},
+    "providers_security.allowed_hosts": {"type": "host_list", "max_items": 64},
     "remote.allow_api_key_transmission": {"type": "bool"},
 }
 CONFIG_SECRET_FIELDS = {"api_key"}
@@ -554,6 +677,19 @@ def normalize_config_value(key, value):
         if normalized not in spec["values"]:
             return None, f"{key} must be one of: {', '.join(sorted(spec['values']))}."
         return normalized, ""
+    if value_type == "host_list":
+        if not isinstance(value, list):
+            return None, f"{key} must be a list of hostnames."
+        max_items = spec.get("max_items", 64)
+        if len(value) > max_items:
+            return None, f"{key} allows at most {max_items} entries."
+        normalized_list = []
+        for item in value:
+            host = str(item).strip().lower()
+            if not host or len(host) > 255 or any(ch.isspace() for ch in host):
+                return None, f"{key} contains an invalid hostname."
+            normalized_list.append(host)
+        return normalized_list, ""
     normalized = str(value)
     if len(normalized) < spec.get("min", 0):
         return None, f"{key} must not be empty."
@@ -604,6 +740,12 @@ def write_api_key_secret(value):
 def update_config_value(key, value):
     if key == "api_key":
         return write_api_key_secret(value)
+    if REMOTE_MODE and key == "providers_security.require_https" and value is not True:
+        return {
+            "ok": False,
+            "status": "remote_security_policy_locked",
+            "error": "Remote runtime always requires HTTPS Provider URLs.",
+        }
     if REMOTE_MODE and key == "skills_dir":
         return {
             "ok": False,
@@ -632,15 +774,27 @@ def configured_token():
 def agent_subprocess_env(include_api_key=False):
     env = os.environ.copy()
     env.setdefault("LINUX_AGENT_WEB", "1")
+    # Minimal-scope secret injection: strip the API key from every subprocess by
+    # default, then re-add it only for the dedicated AI-calling actions. This
+    # keeps the key out of skill / terminal / MCP / tools subprocesses in both
+    # remote and local modes.
+    env.pop("LINUX_AGENT_API_KEY", None)
+    env.pop("LINUX_AGENT_API_KEY_SOURCE", None)
+    if not include_api_key:
+        return env
     if REMOTE_MODE:
         remote = read_config().get("remote", {})
         transmission_allowed = isinstance(remote, dict) and bool(remote.get("allow_api_key_transmission", False))
         with RUNTIME_SECRET_LOCK:
             runtime_key = RUNTIME_API_KEY
-        if include_api_key and transmission_allowed and secret_value_configured(runtime_key):
+        if transmission_allowed and secret_value_configured(runtime_key):
             env["LINUX_AGENT_API_KEY"] = runtime_key
-        else:
-            env.pop("LINUX_AGENT_API_KEY", None)
+    else:
+        # Local mode: the Bash core reads the key from config.json when it is not
+        # in the environment, so we only forward an operator-supplied env key.
+        parent_key = os.environ.get("LINUX_AGENT_API_KEY", "")
+        if secret_value_configured(parent_key):
+            env["LINUX_AGENT_API_KEY"] = parent_key
     return env
 
 
@@ -704,9 +858,27 @@ def send_runtime_backup(handler):
 
 
 AUTH_TOKEN = configured_token()
+AUTH_TOKEN_EPHEMERAL = os.environ.get("LINUX_AGENT_WEB_TOKEN_EPHEMERAL", "0") == "1"
 if not AUTH_TOKEN:
-    AUTH_TOKEN = uuid.uuid4().hex
-    print("[警告] web.token 未配置，已生成本次运行临时 token。", file=sys.stderr, flush=True)
+    AUTH_TOKEN = secrets.token_hex(32)
+    AUTH_TOKEN_EPHEMERAL = True
+
+
+def persist_ephemeral_token():
+    """Write an auto-generated token to a 0600 file instead of echoing it.
+
+    The token only exists for this process run. Persisting it (rather than
+    printing it) keeps it out of terminal scrollback, logs, and process
+    listings while still letting the local operator read it over the same
+    trust boundary that can read config.json.
+    """
+    EPHEMERAL_TOKEN_FILE.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(str(EPHEMERAL_TOKEN_FILE), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        os.write(fd, (AUTH_TOKEN + "\n").encode("utf-8"))
+    finally:
+        os.close(fd)
+    os.chmod(EPHEMERAL_TOKEN_FILE, 0o600)
 
 
 def json_response(handler, status, payload):
@@ -723,6 +895,11 @@ def read_json_body(handler):
     length = int(handler.headers.get("Content-Length", "0") or "0")
     if length <= 0:
         return {}
+    if length > MAX_REQUEST_BODY_BYTES:
+        # Drain and reject oversized bodies before allocating/parsing them.
+        raise RequestBodyTooLarge(
+            f"request body {length} bytes exceeds limit {MAX_REQUEST_BODY_BYTES} bytes"
+        )
     raw = handler.rfile.read(length)
     try:
         return json.loads(raw.decode("utf-8"))
@@ -751,6 +928,40 @@ def read_job(job_id):
         return json.load(handle)
 
 
+def _job_record_lock(job_id):
+    with JOB_RECORD_LOCKS_GUARD:
+        lock = JOB_RECORD_LOCKS.get(job_id)
+        if lock is None:
+            lock = threading.Lock()
+            JOB_RECORD_LOCKS[job_id] = lock
+        return lock
+
+
+def update_job(job_id, mutator):
+    """Serialized read-modify-write of a job record.
+
+    All concurrent writers to one job (started/partial-output/final/cancel) go
+    through the job's lock and a monotonic ``version`` counter, so a slow partial
+    update can never clobber a terminal result and vice versa. ``mutator(job)``
+    edits the dict in place; returning ``False`` aborts the write (no-op).
+    """
+    with _job_record_lock(job_id):
+        job = read_job(job_id)
+        if job is None:
+            return None
+        if mutator(job) is False:
+            return job
+        job["version"] = int(job.get("version", 0)) + 1
+        job["updated_at"] = now_iso()
+        write_job(job_id, job)
+        return job
+
+
+def discard_job_record_lock(job_id):
+    with JOB_RECORD_LOCKS_GUARD:
+        JOB_RECORD_LOCKS.pop(job_id, None)
+
+
 def cleanup_jobs():
     JOBS_ROOT.mkdir(parents=True, exist_ok=True)
     cutoff = time.time() - (JOB_RETENTION_HOURS * 3600)
@@ -758,8 +969,32 @@ def cleanup_jobs():
         try:
             if path.stat().st_mtime < cutoff:
                 path.unlink()
+                discard_job_record_lock(path.stem)
         except OSError:
             continue
+
+
+def recover_interrupted_jobs():
+    """Finalize jobs left active by a previous Web process."""
+
+    for path in JOBS_ROOT.glob("*.json"):
+        job_id = path.stem
+
+        def mark_interrupted(job):
+            if not isinstance(job, dict) or job.get("status") not in ("queued", "running"):
+                return False
+            job["status"] = "failed"
+            job["finished_at"] = now_iso()
+            job["result"] = {
+                "ok": False,
+                "status": "server_restarted",
+                "error": "The Web server restarted before this job completed.",
+            }
+            job["result_ok"] = False
+            job["result_status"] = "server_restarted"
+            return None
+
+        update_job(job_id, mark_interrupted)
 
 
 def safe_policy_path(relative_path):
@@ -1528,23 +1763,50 @@ def agent_stderr_block(resource, stderr):
 def update_job_partial_output(job_id, resource, stderr):
     if not job_id or not stderr:
         return
-    job = read_job(job_id)
-    if not isinstance(job, dict) or job.get("status") != "running":
-        return
     block = agent_stderr_block(resource, stderr)
     if not block:
         return
-    job["result"] = {
-        "ok": False,
-        "status": "running",
-        "timeline": [],
-        "approval_card": None,
-        "output_blocks": [block],
-    }
-    job["result_ok"] = False
-    job["result_status"] = "running"
-    job["updated_at"] = now_iso()
-    write_job(job_id, job)
+
+    def apply_partial(job):
+        # Never overwrite a terminal state with a stale "running" snapshot.
+        if job.get("status") != "running":
+            return False
+        job["result"] = {
+            "ok": False,
+            "status": "running",
+            "timeline": [],
+            "approval_card": None,
+            "output_blocks": [block],
+        }
+        job["result_ok"] = False
+        job["result_status"] = "running"
+        return None
+
+    update_job(job_id, apply_partial)
+
+
+def terminate_job_process(process):
+    try:
+        os.killpg(process.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+    except OSError:
+        process.terminate()
+
+
+def register_job_process(job_id, process):
+    """Register a child only while its job is still running."""
+
+    try:
+        with JOB_PROCESSES_LOCK:
+            job = read_job(job_id)
+            if isinstance(job, dict) and job.get("status") == "running":
+                JOB_PROCESSES[job_id] = process
+                return True
+    except (OSError, json.JSONDecodeError):
+        pass
+    terminate_job_process(process)
+    return False
 
 
 def run_agent_api_job_process(command, env, resource, timeout, job_id):
@@ -1557,8 +1819,7 @@ def run_agent_api_job_process(command, env, resource, timeout, job_id):
         stderr=subprocess.PIPE,
         start_new_session=True,
     )
-    with JOB_PROCESSES_LOCK:
-        JOB_PROCESSES[job_id] = process
+    register_job_process(job_id, process)
 
     stdout_chunks = []
     stderr_chunks = []
@@ -1617,6 +1878,9 @@ def run_agent_api(resource, action="", payload=None, timeout=None, job_id=None):
     env["LINUX_AGENT_SESSION_ID"] = session_id
     env["LINUX_AGENT_AUDIT_LOG"] = audit_log
     env["LINUX_AGENT_CONVERSATION_HISTORY_FILE"] = history_file
+    env["LINUX_AGENT_REQUEST_ID"] = uuid.uuid4().hex
+    if job_id:
+        env["LINUX_AGENT_JOB_ID"] = job_id
     if job_id is None:
         process = subprocess.run(
             command,
@@ -1663,52 +1927,91 @@ def run_agent_api(resource, action="", payload=None, timeout=None, job_id=None):
 
 
 def run_job(job_id, job, resource, action, payload):
-    started_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-    job["status"] = "running"
-    job["started_at"] = started_at
-    job["updated_at"] = started_at
-    write_job(job_id, job)
+    def mark_running(record):
+        # A cancel that landed while we were queued wins.
+        if record.get("status") == "cancelled":
+            return False
+        record["status"] = "running"
+        record["started_at"] = now_iso()
+        return None
+
+    if update_job(job_id, mark_running) is None:
+        return
+    current = read_job(job_id)
+    if isinstance(current, dict) and current.get("status") == "cancelled":
+        return
     try:
         result = run_agent_api(resource, action, payload, timeout=None, job_id=job_id)
-        finished_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-        if result.get("status") == "cancelled":
-            job["status"] = "cancelled"
-        else:
-            job["status"] = "succeeded" if result.get("ok") or result.get("status") == "approval_required" else "failed"
-        job["result"] = result
-        job["result_ok"] = bool(result.get("ok"))
-        job["result_status"] = result.get("status", job["status"])
-        job["finished_at"] = finished_at
-        job["updated_at"] = finished_at
-        write_job(job_id, job)
+
+        def apply_result(record):
+            # If a cancel already finalized this job, do not resurrect it.
+            if record.get("status") == "cancelled":
+                return False
+            if result.get("status") == "cancelled":
+                record["status"] = "cancelled"
+            else:
+                record["status"] = "succeeded" if result.get("ok") or result.get("status") == "approval_required" else "failed"
+            record["result"] = result
+            record["result_ok"] = bool(result.get("ok"))
+            record["result_status"] = result.get("status", record["status"])
+            record["finished_at"] = now_iso()
+            return None
+
+        update_job(job_id, apply_result)
     except Exception as exc:  # noqa: BLE001 - surfaced as a job failure.
-        finished_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-        job["status"] = "failed"
-        job["result"] = {"ok": False, "status": "job_exception", "error": str(exc)}
-        job["result_ok"] = False
-        job["result_status"] = "job_exception"
-        job["finished_at"] = finished_at
-        job["updated_at"] = finished_at
-        write_job(job_id, job)
+        def apply_failure(record):
+            if record.get("status") == "cancelled":
+                return False
+            record["status"] = "failed"
+            record["result"] = {"ok": False, "status": "job_exception", "error": str(exc)}
+            record["result_ok"] = False
+            record["result_status"] = "job_exception"
+            record["finished_at"] = now_iso()
+            return None
+
+        update_job(job_id, apply_failure)
+
+
+def count_active_jobs():
+    JOBS_ROOT.mkdir(parents=True, exist_ok=True)
+    active = 0
+    for path in JOBS_ROOT.glob("*.json"):
+        try:
+            with path.open("r", encoding="utf-8") as handle:
+                job = json.load(handle)
+        except (OSError, json.JSONDecodeError):
+            continue
+        if isinstance(job, dict) and job.get("status") in ("queued", "running"):
+            active += 1
+    return active
 
 
 def start_job(resource, action, payload):
     cleanup_jobs()
-    job_id = uuid.uuid4().hex
     now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-    job = {
-        "ok": True,
-        "job_id": job_id,
-        "resource": resource,
-        "action": action,
-        "status": "queued",
-        "created_at": now,
-        "updated_at": now,
-        "result": None,
-        "result_ok": None,
-        "result_status": None,
-    }
-    write_job(job_id, job)
+    with JOB_ADMISSION_LOCK:
+        if count_active_jobs() >= MAX_ACTIVE_JOBS:
+            return {
+                "ok": False,
+                "status": "too_many_jobs",
+                "error": f"活动 Job 数已达上限 ({MAX_ACTIVE_JOBS})，请稍后重试。",
+                "active_limit": MAX_ACTIVE_JOBS,
+            }
+        job_id = uuid.uuid4().hex
+        job = {
+            "ok": True,
+            "job_id": job_id,
+            "resource": resource,
+            "action": action,
+            "status": "queued",
+            "version": 0,
+            "created_at": now,
+            "updated_at": now,
+            "result": None,
+            "result_ok": None,
+            "result_status": None,
+        }
+        write_job(job_id, job)
 
     threading.Thread(target=run_job, args=(job_id, job, resource, action, payload), daemon=True).start()
     return job
@@ -1722,23 +2025,29 @@ def cancel_job(job_id):
         return {"ok": False, "status": "not_running", "job": job}
     with JOB_PROCESSES_LOCK:
         process = JOB_PROCESSES.get(job_id)
-    if process is None:
-        return {"ok": False, "status": "process_not_found", "job": job}
-    try:
-        os.killpg(process.pid, signal.SIGTERM)
-    except ProcessLookupError:
-        pass
-    except OSError:
-        process.terminate()
-    now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-    job["status"] = "cancelled"
-    job["updated_at"] = now
-    job["finished_at"] = now
-    job["result"] = {"ok": False, "status": "cancelled", "error": "Job cancellation requested."}
-    job["result_ok"] = False
-    job["result_status"] = "cancelled"
-    write_job(job_id, job)
-    return {"ok": True, "status": "cancelled", "job": job}
+    if process is not None:
+        terminate_job_process(process)
+
+    def apply_cancel(record):
+        if record.get("status") not in ("queued", "running"):
+            return False
+        record["status"] = "cancelled"
+        record["finished_at"] = now_iso()
+        record["result"] = {"ok": False, "status": "cancelled", "error": "Job cancellation requested."}
+        record["result_ok"] = False
+        record["result_status"] = "cancelled"
+        return None
+
+    updated = update_job(job_id, apply_cancel)
+    if updated is None:
+        return {"ok": False, "status": "not_found"}
+    if updated.get("status") != "cancelled":
+        return {"ok": False, "status": "not_running", "job": updated}
+    with JOB_PROCESSES_LOCK:
+        process = JOB_PROCESSES.get(job_id)
+    if process is not None:
+        terminate_job_process(process)
+    return {"ok": True, "status": "cancelled", "job": updated}
 
 
 def compact_summary(value, limit=220):
@@ -2242,9 +2551,9 @@ class Handler(SimpleHTTPRequestHandler):
         token = ""
         if auth.startswith("Bearer "):
             token = auth[len("Bearer ") :].strip()
-        if not token:
-            token = self.headers.get("X-Agent-Token", "").strip()
-        return token == AUTH_TOKEN
+        if not token or not AUTH_TOKEN:
+            return False
+        return secrets.compare_digest(token, AUTH_TOKEN)
 
     def require_auth(self):
         if self.authenticated():
@@ -2270,6 +2579,9 @@ class Handler(SimpleHTTPRequestHandler):
             return
         try:
             body = read_json_body(self)
+        except RequestBodyTooLarge as exc:
+            json_response(self, HTTPStatus.REQUEST_ENTITY_TOO_LARGE, {"ok": False, "status": "request_too_large", "error": str(exc)})
+            return
         except ValueError as exc:
             json_response(self, HTTPStatus.BAD_REQUEST, {"ok": False, "status": "invalid_json", "error": str(exc)})
             return
@@ -2328,6 +2640,9 @@ class Handler(SimpleHTTPRequestHandler):
             return
         if path == "/api/config/providers":
             json_response(self, HTTPStatus.OK, providers_public_state())
+            return
+        if path == "/api/schema":
+            json_response(self, HTTPStatus.OK, {"ok": True, "status": "ok", "schema": DOMAIN_SCHEMA})
             return
         if path == "/api/observer/bootstrap":
             json_response(self, HTTPStatus.OK, observer_bootstrap_public_state(force_ok=True))
@@ -2479,6 +2794,9 @@ class Handler(SimpleHTTPRequestHandler):
                 json_response(self, HTTPStatus.BAD_REQUEST, {"ok": False, "status": "unsupported_job"})
                 return
             job = start_job(resource, action, payload)
+            if not job.get("ok") and job.get("status") == "too_many_jobs":
+                json_response(self, HTTPStatus.TOO_MANY_REQUESTS, job)
+                return
             json_response(self, HTTPStatus.ACCEPTED, job)
             return
         route = sync_routes.get(path)
@@ -2513,15 +2831,36 @@ def main():
             print("[提示] web.host 不是当前机器可用地址。默认建议使用 127.0.0.1。", file=sys.stderr, flush=True)
         raise SystemExit(1) from exc
 
+    recover_interrupted_jobs()
     initialize_web_agent_session()
-    print(f"[信息] Web 控制台: http://{HOST}:{PORT}/", file=sys.stderr, flush=True)
-    print(f"[信息] Authorization Bearer token: {AUTH_TOKEN}", file=sys.stderr, flush=True)
-    print(f"[info] serving {STATIC_ROOT} on http://{HOST}:{PORT}/", flush=True)
     try:
+        print(f"[信息] Web 控制台: http://{HOST}:{PORT}/", file=sys.stderr, flush=True)
+        if AUTH_TOKEN_EPHEMERAL:
+            persist_ephemeral_token()
+            print(
+                f"[信息] 本次运行临时 token 已写入 {EPHEMERAL_TOKEN_FILE}（权限 0600，不在终端回显）。",
+                file=sys.stderr,
+                flush=True,
+            )
+        else:
+            print("[信息] 使用 config/config.json 中配置的 web.token 认证。", file=sys.stderr, flush=True)
+        print(f"[info] serving {STATIC_ROOT} on http://{HOST}:{PORT}/", flush=True)
+
+        def handle_shutdown_signal(_signum, _frame):
+            terminate_running_jobs()
+            threading.Thread(target=shutdown_server_later, args=(server,), daemon=True).start()
+
+        signal.signal(signal.SIGTERM, handle_shutdown_signal)
+        signal.signal(signal.SIGHUP, handle_shutdown_signal)
         server.serve_forever()
     except KeyboardInterrupt:
         print("\n[信息] Web 控制台已停止。", file=sys.stderr, flush=True)
     finally:
+        if AUTH_TOKEN_EPHEMERAL:
+            try:
+                EPHEMERAL_TOKEN_FILE.unlink()
+            except OSError:
+                pass
         record_web_audit_event(
             "session_finished",
             {

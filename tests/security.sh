@@ -43,7 +43,9 @@ LINUX_AGENT_CONFIG_JSON="$(jq --arg api_url "${FAKE_AI_URL}" '
     | del(.api_key_file)
     | .model = "fake-chat-completions"
     | .request_timeout_sec = 10
+    | .providers_security.allowed_hosts = ["127.0.0.1"]
 ' <<<"${LINUX_AGENT_CONFIG_JSON}")"
+baseline_config_json="${LINUX_AGENT_CONFIG_JSON}"
 
 request_context="$(linux_agent_build_request_context "检查磁盘" '{"topic":"disk"}' "work")"
 grep -q '"current_request":"检查磁盘"' <<<"${request_context}"
@@ -53,6 +55,29 @@ payload_context="$(linux_agent_build_ai_payload_context "${request_context}" '{"
 grep -q '"environment_context":{"topic":"disk"}' <<<"${payload_context}"
 repair_response="$(linux_agent_call_ai_with_context "repair" "${request_context}" "repair" '{"topic":"disk"}')"
 jq -e '(.failure_context | fromjson).environment_context.topic == "disk"' <<<"${repair_response}" >/dev/null
+
+# Provider address pinning must not be bypassed by ambient proxy variables.
+proxy_direct_response="$(
+    HTTP_PROXY=http://127.0.0.1:1 \
+    HTTPS_PROXY=http://127.0.0.1:1 \
+    ALL_PROXY=http://127.0.0.1:1 \
+    http_proxy=http://127.0.0.1:1 \
+    https_proxy=http://127.0.0.1:1 \
+    all_proxy=http://127.0.0.1:1 \
+    NO_PROXY= \
+    no_proxy= \
+    linux_agent_call_ai_with_context "proxy bypass regression" "${request_context}" "repair" '{"topic":"disk"}'
+)"
+jq -e '(.failure_context | fromjson).environment_context.topic == "disk"' <<<"${proxy_direct_response}" >/dev/null
+
+blocked_provider_config="$(jq '
+    .api_url = "http://169.254.169.254/latest/meta-data/"
+    | .providers_security.require_https = false
+    | .providers_security.allowed_hosts = []
+' <<<"${baseline_config_json}")"
+blocked_provider_response="$(LINUX_AGENT_CONFIG_JSON="${blocked_provider_config}" linux_agent_call_ai_with_context "blocked provider" "${request_context}" "repair" '{"topic":"disk"}')"
+jq -e '.status == "blocked_internal_address" and .response_type == "error"' <<<"${blocked_provider_response}" >/dev/null
+LINUX_AGENT_CONFIG_JSON="${baseline_config_json}"
 
 config_key_state="$(linux_agent_api_key_state_json)"
 jq -e '.configured == true and .source == "config" and .config_configured == true and (.file_configured | not)' <<<"${config_key_state}" >/dev/null
@@ -235,9 +260,15 @@ linux_agent_prepare_execution_command "least" root_prepared bash -lc 'id -u'
 [[ "${root_prepared[1]}" == "-u" ]]
 [[ "${root_prepared[2]}" == "nobody" ]]
 [[ "${root_prepared[3]}" == "--" ]]
+# AI secrets are scrubbed from the step's child environment.
+[[ "${root_prepared[4]}" == "env" ]]
+printf '%s\n' "${root_prepared[@]}" | grep -qx 'LINUX_AGENT_API_KEY'
 current_prepared=()
 linux_agent_prepare_execution_command "current" current_prepared bash -lc 'id -u'
-[[ "${current_prepared[0]}" == "bash" ]]
+[[ "${current_prepared[0]}" == "env" ]]
+[[ "${current_prepared[1]}" == "-u" ]]
+[[ "${current_prepared[2]}" == "LINUX_AGENT_API_KEY" ]]
+printf '%s\n' "${current_prepared[@]}" | grep -qx 'bash'
 proxy_meta="$(linux_agent_execution_proxy_metadata "least" "true")"
 jq -e '.enabled == true and .requested_privilege == "least" and .execution_user == "root" and .target_user == "nobody" and .prepared_root == true' <<<"${proxy_meta}" >/dev/null
 PATH="${old_path}"
