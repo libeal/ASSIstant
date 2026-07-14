@@ -5,6 +5,9 @@
   "model": "gpt-4.1-mini",
   "request_timeout_sec": 90,
   "context_turns": 6,
+  "command_guard": {
+    "enabled": true
+  },
   "agent_loop": {
     "enabled_for_work": true,
     "observation_text_limit": 4000,

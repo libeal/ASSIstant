@@ -420,6 +420,10 @@ def list_provider_models(body):
 def config_public_state():
     config = read_config()
     agent_loop = config.get("agent_loop") if isinstance(config.get("agent_loop"), dict) else {}
+    command_guard = config.get("command_guard") if isinstance(config.get("command_guard"), dict) else {}
+    command_guard_enabled = command_guard.get("enabled", True)
+    if not isinstance(command_guard_enabled, bool):
+        command_guard_enabled = True
     approvals = config.get("approvals") if isinstance(config.get("approvals"), dict) else {}
     auto_approvals = approvals.get("auto") if isinstance(approvals.get("auto"), dict) else {}
     observer = config.get("observer") if isinstance(config.get("observer"), dict) else {}
@@ -441,6 +445,9 @@ def config_public_state():
             "model": config.get("model", ""),
             "request_timeout_sec": config.get("request_timeout_sec", 90),
             "context_turns": config.get("context_turns", 6),
+            "command_guard": {
+                "enabled": command_guard_enabled,
+            },
             "agent_loop": {
                 "enabled_for_work": bool(agent_loop.get("enabled_for_work", True)),
                 "observation_text_limit": int(agent_loop.get("observation_text_limit", 4000) or 4000),
@@ -827,6 +834,37 @@ def sudo_check(password):
         "status": "sudo_denied",
         "error": (process.stderr or "sudo validation failed").strip()[:400],
     }
+
+
+def update_command_guard(enabled, password):
+    if not isinstance(enabled, bool):
+        return {"ok": False, "status": "invalid_config_value", "error": "command_guard.enabled must be boolean."}
+
+    if os.geteuid() == 0:
+        method = "root"
+    else:
+        check = sudo_check(password)
+        if not check.get("ok"):
+            return check
+        method = str(check.get("method") or "sudo")
+
+    config = read_config()
+    command_guard = config.get("command_guard") if isinstance(config.get("command_guard"), dict) else {}
+    command_guard["enabled"] = enabled
+    config["command_guard"] = command_guard
+    try:
+        write_config(config)
+    except OSError as exc:
+        return {"ok": False, "status": "config_write_failed", "error": f"Could not save command guard setting: {exc}"}
+    result = config_public_state()
+    result["status"] = "updated"
+    result["method"] = method
+    result["command_guard"] = result["config"]["command_guard"]
+    record_web_audit_event(
+        "command_guard_updated",
+        {"enabled": enabled, "method": method},
+    )
+    return result
 
 
 def append_audit_event(log_path, session_id, stage, payload=None):
@@ -2343,6 +2381,10 @@ class Handler(SimpleHTTPRequestHandler):
             return
         if path == "/api/policies/sudo-check":
             result = sudo_check(str(body.get("password") or ""))
+            json_response(self, HTTPStatus.OK, result)
+            return
+        if path == "/api/policies/command-guard":
+            result = update_command_guard(body.get("enabled"), str(body.get("password") or ""))
             json_response(self, HTTPStatus.OK, result)
             return
         if path == "/api/policies/validate":

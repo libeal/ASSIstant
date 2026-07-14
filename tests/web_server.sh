@@ -188,6 +188,7 @@ config_state="$(curl --noproxy '*' -sS -H "Authorization: Bearer ${token}" "${ba
 jq -e '.ok == true and (.config.agent_loop.thinking_trace_enabled | type == "boolean") and .config.api_key_configured == true and .config.api_key_source == "config" and .config.api_key_configured_in_config == true and .config.web.token_configured == true and (.config | has("api_key") | not) and (.config | has("api_key_file") | not) and (.config | has("api_key_file_configured") | not) and (.config | has("api_key_migration_recommended") | not)
     and (.config.agent_loop | has("auto_execute_low_risk") | not)
     and (.config.agent_loop | has("auto_execute_shell_low_risk") | not)
+    and .config.command_guard.enabled == true
     and .config.observer.privilege == "sudo_interactive"
     and .config.approvals.auto.skill_readonly == true
     and .config.approvals.auto.shell_readonly == false
@@ -374,7 +375,17 @@ vault_policy_write="$(curl --noproxy '*' -sS \
 jq -e 'if .ok then .status == "saved" and (.method == "root" or .method == "sudo") else .status == "sudo_required" end' <<<"${vault_policy_write}" >/dev/null
 
 grep -q 'id="policyEditVaultBtn"' "${project}/web/static/index.html"
+grep -q 'id="policyInspectBtn"' "${project}/web/static/index.html"
+grep -q 'id="policyFileDialog"' "${project}/web/static/index.html"
+grep -q 'id="policyGuardToggleBtn"' "${project}/web/static/index.html"
 grep -q 'file-vault.json' "${project}/web/static/app.js"
+
+command_guard_state="$(curl --noproxy '*' -sS \
+    -H "Authorization: Bearer ${token}" \
+    -H 'Content-Type: application/json' \
+    -d '{"enabled":true,"password":""}' \
+    "${base_url}/api/policies/command-guard")"
+jq -e 'if .ok then .status == "updated" and .command_guard.enabled == true else (.status | IN("sudo_required","sudo_not_found","sudo_timeout","sudo_denied")) end' <<<"${command_guard_state}" >/dev/null
 
 policy_write_payload="$(jq -cn --rawfile content "${project}/policies/audit-boundaries.json" '{path:"audit-boundaries.json", content:$content, password:""}')"
 policy_validate="$(curl --noproxy '*' -sS \

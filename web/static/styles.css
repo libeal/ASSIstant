@@ -791,6 +791,23 @@ button.event { cursor: pointer; }
 .toggle-row:first-child { border-top: 0; padding-top: 0; }
 
 .locked-note { background: #242426; border: 1px solid var(--line-soft); border-radius: var(--radius-xl); padding: 12px; }
+.policy-file-picker { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.policy-file-picker .select { min-width: 0; flex: 1 1 auto; }
+.policy-file-picker .btn { flex: 0 0 auto; white-space: nowrap; }
+.policy-security-status {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  margin-bottom: 12px;
+  padding: 12px;
+  border: 1px solid var(--line-soft);
+  border-radius: var(--radius-lg);
+  background: var(--panel-3);
+}
+.policy-security-status strong { display: block; color: var(--text); font-size: 14px; }
+.policy-security-status .small { margin-top: 4px; }
+.policy-security-status .btn { flex: 0 0 auto; white-space: nowrap; }
 .policy-guard-grid {
   display: grid;
   grid-template-columns: repeat(3, minmax(0, 1fr));
@@ -848,6 +865,47 @@ button.event { cursor: pointer; }
   border-radius: 0;
   max-height: 300px;
 }
+.vault-summary-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 10px;
+}
+.vault-summary-head strong,
+.vault-summary-head > div span { display: block; }
+.vault-summary-head strong { color: var(--text); font-size: 14px; }
+.vault-summary-head > div span { margin-top: 3px; color: var(--text-4); font-size: 12px; }
+.vault-summary-head .pill { display: inline-flex; margin-top: 0; white-space: nowrap; }
+.vault-path-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
+.vault-path-card {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+  padding: 11px;
+  border: 1px solid rgba(255,214,10,0.24);
+  border-radius: var(--radius-lg);
+  background: linear-gradient(135deg, rgba(255,214,10,0.08), var(--panel-3));
+}
+.vault-path-icon {
+  display: grid;
+  place-items: center;
+  width: 30px;
+  height: 30px;
+  flex: 0 0 30px;
+  border-radius: 9px;
+  color: #ffd60a;
+  background: rgba(255,214,10,0.12);
+  font-size: 16px;
+}
+.vault-path-body { min-width: 0; flex: 1 1 auto; }
+.vault-path-body strong,
+.vault-path-body span { display: block; overflow-wrap: anywhere; }
+.vault-path-body strong { color: var(--text); font-size: 12px; }
+.vault-path-body span { margin-top: 4px; color: var(--text-4); font-size: 11px; }
+.vault-path-card .pill { flex: 0 0 auto; white-space: nowrap; }
+.vault-empty { padding: 12px; border: 1px dashed var(--line-soft); border-radius: var(--radius-lg); color: var(--text-3); font-size: 12px; }
 .policy-raw-editor { margin-top: 12px; }
 .policy-raw-editor .textarea {
   border: 0;
@@ -855,6 +913,34 @@ button.event { cursor: pointer; }
   border-radius: 0;
   min-height: 260px;
 }
+.policy-file-dialog {
+  width: min(860px, calc(100vw - 28px));
+  max-width: 860px;
+  border: 1px solid rgba(255,255,255,0.16);
+  border-radius: var(--radius-xl);
+  background: rgba(36,36,38,0.98);
+  color: var(--text-2);
+  padding: 0;
+  box-shadow: 0 24px 80px rgba(0,0,0,0.48);
+}
+.policy-file-dialog::backdrop { background: rgba(0,0,0,0.58); }
+.policy-file-dialog-card { padding: 16px; }
+.policy-file-dialog-card h2 { margin: 3px 0 0; color: var(--text); font-size: 19px; }
+.policy-file-dialog-card .panel-header { align-items: flex-start; }
+.policy-file-preview,
+.policy-file-editor {
+  width: 100%;
+  min-height: min(56vh, 520px);
+  max-height: 62vh;
+  margin-top: 12px;
+  border: 1px solid var(--line-soft);
+  border-radius: var(--radius-lg);
+  background: #151516;
+  box-sizing: border-box;
+}
+.policy-file-preview { white-space: pre-wrap; overflow: auto; }
+.policy-file-editor { resize: vertical; }
+.policy-file-dialog-actions { justify-content: flex-end; margin-top: 12px; }
 .config-section { display: grid; grid-template-columns: 180px minmax(0, 1fr); gap: 14px; padding: 14px 0; border-top: 1px solid var(--line-soft); }
 .config-section:first-of-type { border-top: 0; padding-top: 0; }
 .config-section h4 { margin: 0; color: var(--text); font-size: 14px; }
@@ -1040,6 +1126,10 @@ button.event { cursor: pointer; }
   .grid-2, .grid-3, .grid-4, .form-grid, .config-section, .config-field-list { grid-template-columns: 1fr; }
   .config-control-row { align-items: stretch; flex-direction: column; }
   .compact-btn { width: 100%; }
+  .policy-file-picker { align-items: stretch; flex-direction: column; }
+  .policy-security-status, .vault-summary-head { align-items: stretch; flex-direction: column; }
+  .policy-security-status .btn { width: 100%; }
+  .vault-path-grid { grid-template-columns: 1fr; }
   .policy-guard-grid { grid-template-columns: 1fr; }
   .event { grid-template-columns: 1fr; gap: 5px; }
   .kv { grid-template-columns: 1fr; gap: 2px; }

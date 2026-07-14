@@ -44,6 +44,12 @@ free_redirect_result="$(linux_agent_policy_review_text "shell" "printf bad > /tm
 grep -q '"approved": false' <<<"$(jq . <<<"${free_redirect_result}")"
 grep -q 'AST_FILE_MUTATION_REQUIRES_SKILL' <<<"${free_redirect_result}"
 
+guard_config_before="${LINUX_AGENT_CONFIG_JSON}"
+LINUX_AGENT_CONFIG_JSON="$(jq '.command_guard.enabled=false' <<<"${LINUX_AGENT_CONFIG_JSON}")"
+guard_disabled_result="$(linux_agent_policy_review_text "shell" "printf bad > /tmp/agent-guard-disabled-test")"
+jq -e '.approved == true and .approval_required == false and ([.findings[] | select(.code | startswith("AST_"))] | length) == 0' <<<"${guard_disabled_result}" >/dev/null
+LINUX_AGENT_CONFIG_JSON="${guard_config_before}"
+
 free_cp_result="$(linux_agent_policy_review_text "shell" "cp /tmp/source /tmp/dest")"
 grep -q '"approved": false' <<<"$(jq . <<<"${free_cp_result}")"
 grep -q 'AST_FILE_MUTATION_REQUIRES_SKILL' <<<"${free_cp_result}"

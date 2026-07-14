@@ -362,25 +362,32 @@
                   <div class="locked-note">
                     <strong class="white">编辑状态</strong>
                     <div class="kv"><div class="k">mode</div><div class="v" id="policyEditMode">read-only</div></div>
-                    <div class="kv"><div class="k">scope</div><div class="v">risk-rules.json、audit boundary、remote script policy</div></div>
-                    <div class="kv"><div class="k">file</div><div class="v"><select class="select" id="policyFileSelect"></select></div></div>
-                    <div class="toolbar"><button class="btn secondary" id="policyReloadBtn" type="button">刷新策略</button><button class="btn secondary" id="policyValidateBtn" type="button">校验当前文件</button><button class="btn secondary policy-edit" id="policySaveBtn" type="button" disabled>保存当前文件</button></div>
+                    <div class="kv"><div class="k">scope</div><div class="v">命令安全、正则规则、audit 边界和文件保险箱</div></div>
+                    <div class="kv"><div class="k">file</div><div class="v"><div class="policy-file-picker"><select class="select" id="policyFileSelect" aria-label="选择策略文件"></select><button class="btn secondary" id="policyInspectBtn" type="button">查阅文件</button></div></div></div>
+                    <div class="toolbar"><button class="btn secondary" id="policyReloadBtn" type="button">刷新策略</button><button class="btn secondary" id="policyValidateBtn" type="button">校验当前文件</button></div>
                   </div>
                 </div>
               </div>
 
               <div class="panel">
                 <div class="panel-header">
-                  <div><h3>命令守卫与 AST 安全审计</h3><p>策略执行前会先用结构化命令守卫审查 shell 形态，再叠加正则策略。</p></div>
-                  <span class="pill risk low">ast+rules</span>
+                  <div><h3>命令安全检查</h3><p>在命令真正执行前，系统会检查远程脚本、文件改动和隐藏命令等高风险操作。</p></div>
+                  <span class="pill risk low" id="policyGuardPill">已启用</span>
+                </div>
+                <div class="policy-security-status">
+                  <div>
+                    <strong id="policyGuardStatus">命令安全检查已启用</strong>
+                    <p class="small" id="policyGuardDescription">用于拦截高风险命令；关闭后仍保留正则规则和文件保险箱保护。</p>
+                  </div>
+                  <button class="btn secondary policy-edit" id="policyGuardToggleBtn" type="button" disabled>关闭检查</button>
                 </div>
                 <div class="policy-guard-grid" id="astGuardSummary">
-                  <article class="policy-card"><strong>远程脚本管道</strong><span>阻断 curl/wget 直接管道到 sh/bash，包括 env/sudo 包装。</span></article>
-                  <article class="policy-card"><strong>文件变更</strong><span>重定向、cp/mv/rm/tee/rsync/chmod/chown 等必须走受控 Skill。</span></article>
-                  <article class="policy-card"><strong>隐藏执行</strong><span>命令替换、进程替换、shell -c、xargs/timeout 等转发器需要审查。</span></article>
-                  <article class="policy-card"><strong>数据外传</strong><span>curl/wget 上传本地内容、file:// 读取等进入人工审批。</span></article>
-                  <article class="policy-card"><strong>混淆检测</strong><span>识别 ${IFS} 等分词混淆后再做远程管道和命令头审查。</span></article>
-                  <article class="policy-card"><strong>交互命令</strong><span>watch、less、vim、tail -f、未带批处理参数的 top 不适合 agent 执行。</span></article>
+                  <article class="policy-card"><strong>远程脚本</strong><span>拦截下载脚本后直接交给 shell 执行的命令。</span></article>
+                  <article class="policy-card"><strong>文件改动</strong><span>识别删除、覆盖、权限变更和批量写入操作。</span></article>
+                  <article class="policy-card"><strong>隐藏命令</strong><span>识别命令替换、转发器和嵌套 shell。</span></article>
+                  <article class="policy-card"><strong>数据外传</strong><span>识别上传本地文件和通过 file:// 读取内容。</span></article>
+                  <article class="policy-card"><strong>混淆命令</strong><span>识别变量分词等方式隐藏真实命令。</span></article>
+                  <article class="policy-card"><strong>交互操作</strong><span>提示不适合自动执行的 watch、编辑器和持续跟踪命令。</span></article>
                 </div>
               </div>
 
@@ -417,16 +424,6 @@
                     <div class="list" id="policyBoundaryOptionsList"></div>
                     <div class="divider"></div>
                   </div>
-                  <details class="detail-block policy-raw-editor">
-                    <summary>查看或编辑原始策略 JSON</summary>
-                    <textarea class="textarea policy-edit mono" id="policyEditor" disabled>{
-  "audit_boundary": {
-    "observer": "auto",
-    "session_log_dir": "logs/session",
-    "output_block_text_limit": 4096
-  }
-}</textarea>
-                  </details>
                   <pre class="code action-gap" id="policyOutput">policy editor: read-only</pre>
                 </div>
               </div>
@@ -523,6 +520,24 @@
         <div class="approval-actions">
           <button class="btn" id="observerAuditEnableBtn" type="button">启用审计</button>
           <button class="btn secondary" id="observerAuditSkipBtn" type="button">跳过并记录</button>
+        </div>
+      </section>
+    </dialog>
+    <dialog class="policy-file-dialog" id="policyFileDialog" aria-labelledby="policyFileDialogTitle">
+      <section class="policy-file-dialog-card">
+        <div class="panel-header">
+          <div>
+            <div class="small">策略文件</div>
+            <h2 id="policyFileDialogTitle">未选择文件</h2>
+            <p id="policyFileDialogMeta">选择文件后点击“查阅文件”。</p>
+          </div>
+          <button class="btn secondary" id="policyFileDialogClose" type="button">关闭</button>
+        </div>
+        <pre class="policy-file-preview" id="policyFilePreview">暂无文件内容。</pre>
+        <textarea class="textarea policy-file-editor policy-edit mono" id="policyEditor" disabled hidden aria-label="编辑策略文件"></textarea>
+        <div class="toolbar policy-file-dialog-actions">
+          <button class="btn secondary" id="policyDialogValidateBtn" type="button">校验当前文件</button>
+          <button class="btn policy-edit" id="policySaveBtn" type="button" disabled>保存当前文件</button>
         </div>
       </section>
     </dialog>

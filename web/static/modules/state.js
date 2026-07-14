@@ -41,6 +41,7 @@ export function createInitialState() {
     auditWebTimeline: null,
     currentAuditSession: "",
     configSnapshot: null,
+    commandGuardEnabled: true,
     configOriginal: {},
     configDraft: {},
     configProviders: [],

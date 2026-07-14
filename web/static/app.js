@@ -1716,6 +1716,7 @@ async function loadConfig() {
   }
   const data = await api("/api/config");
   state.configSnapshot = data.config || {};
+  state.commandGuardEnabled = state.configSnapshot?.command_guard?.enabled !== false;
   state.configOriginal = collectEditableConfigValues(state.configSnapshot);
   state.configDraft = { ...state.configOriginal };
   renderConfigCenter(state.configSnapshot);
@@ -3065,6 +3066,26 @@ function updatePolicyEditState() {
   if ($("policyBoundaryOptions")) $("policyBoundaryOptions").hidden = !unlocked;
   setStatus("policyLockPill", unlocked ? "可编辑" : "已锁定", unlocked ? "ok" : "medium");
   setText("policyEditMode", unlocked ? "本次会话可编辑" : "只读");
+  renderCommandGuardState();
+  renderPolicyFileDialog();
+}
+
+function renderCommandGuardState() {
+  const enabled = state.commandGuardEnabled !== false;
+  setStatus("policyGuardPill", enabled ? "已启用" : "已关闭", enabled ? "ok" : "medium");
+  setText("policyGuardStatus", enabled ? "命令安全检查已启用" : "命令安全检查已关闭");
+  setText(
+    "policyGuardDescription",
+    enabled
+      ? "用于拦截高风险命令；关闭后仍保留正则规则和文件保险箱保护。"
+      : "当前只保留正则规则和文件保险箱保护；重新启用需要 sudo 核对。",
+  );
+  const button = $("policyGuardToggleBtn");
+  if (button) {
+    button.disabled = !state.policySudoUnlocked;
+    button.textContent = enabled ? "关闭检查" : "启用检查";
+    button.title = state.policySudoUnlocked ? "需要 sudo 授权才能切换" : "请先核对服务器密码";
+  }
 }
 
 async function loadPolicies() {
@@ -3081,6 +3102,7 @@ async function loadPolicies() {
   updatePolicyEditState();
   if (!state.policyFiles.length) {
     $("policyEditor").value = "";
+    renderPolicyFileDialog();
     printOutput("policyOutput", { ok: true, status: "no_policy_files" });
     renderRiskRules(null);
     renderAuditBoundaries(null);
@@ -3125,15 +3147,17 @@ async function readPolicy(path) {
   const data = await api("/api/policies/read", { method: "POST", body: { path } });
   if (!data.ok) {
     printOutput("policyOutput", data);
-    return;
+    return data;
   }
   state.currentPolicyPath = data.path;
   $("policyEditor").value = data.content || "";
+  renderPolicyFileDialog();
   printOutput("policyOutput", { ok: true, status: "read", path: data.path });
   if (data.path === "risk-rules.json") renderRiskRules(data.json);
   if (data.path === "audit-boundaries.json") renderAuditBoundaries(data.json);
   if (data.path === "file-vault.json") renderFileVault(data.json);
   updatePolicyEditState();
+  return data;
 }
 
 async function unlockPolicy() {
@@ -3169,6 +3193,71 @@ async function validatePolicy({ silent = false } = {}) {
   }
   if (!silent) showToast("策略校验通过");
   return data;
+}
+
+function renderPolicyFileDialog() {
+  const path = state.currentPolicyPath || "未选择文件";
+  const editing = state.policySudoUnlocked;
+  const editor = $("policyEditor");
+  const preview = $("policyFilePreview");
+  const saveButton = $("policySaveBtn");
+  setText("policyFileDialogTitle", path);
+  setText(
+    "policyFileDialogMeta",
+    state.currentPolicyPath
+      ? (editing ? "编辑状态：修改内容后保存当前文件。" : "只读状态：查看当前策略文件的完整内容。")
+      : "选择文件后点击“查阅文件”。",
+  );
+  if (editor) {
+    editor.disabled = !editing;
+    editor.hidden = !editing;
+  }
+  if (preview) {
+    preview.textContent = editor?.value || "暂无文件内容。";
+    preview.hidden = editing;
+  }
+  if (saveButton) saveButton.disabled = !editing || !state.currentPolicyPath;
+}
+
+function openPolicyFileDialog() {
+  const dialog = $("policyFileDialog");
+  if (!dialog) return;
+  renderPolicyFileDialog();
+  if (typeof dialog.showModal === "function") {
+    if (!dialog.open) dialog.showModal();
+  } else {
+    dialog.setAttribute("open", "");
+  }
+  if (state.policySudoUnlocked) $("policyEditor")?.focus();
+}
+
+function closePolicyFileDialog() {
+  const dialog = $("policyFileDialog");
+  if (!dialog) return;
+  if (typeof dialog.close === "function" && dialog.open) dialog.close();
+  else dialog.removeAttribute("open");
+}
+
+async function toggleCommandGuard() {
+  if (!state.policySudoUnlocked) {
+    showToast("请先核对服务器密码");
+    return;
+  }
+  const enabled = state.commandGuardEnabled === false;
+  const data = await api("/api/policies/command-guard", {
+    method: "POST",
+    body: { enabled, password: state.policySudoPassword },
+  });
+  printOutput("policyOutput", data);
+  if (!data.ok) {
+    if (String(data.status || "").startsWith("sudo_")) lockPolicy();
+    showToast(data.error || data.status || "命令安全检查切换失败");
+    return;
+  }
+  state.commandGuardEnabled = data.command_guard?.enabled !== false;
+  state.configSnapshot = data.config || state.configSnapshot;
+  renderCommandGuardState();
+  showToast(state.commandGuardEnabled ? "命令安全检查已启用" : "命令安全检查已关闭");
 }
 
 function lockPolicy() {
@@ -3212,9 +3301,14 @@ function startNewSkill() {
 }
 
 async function openPolicyFile(path) {
+  if (!path) {
+    showToast("当前没有可查阅的策略文件");
+    return;
+  }
   if ($("policyFileSelect")) $("policyFileSelect").value = path;
-  await readPolicy(path);
-  $("policyEditor").focus();
+  const data = await readPolicy(path);
+  if (!data?.ok) return;
+  openPolicyFileDialog();
 }
 
 function appendRuleRow(container, level, pattern, action, reason) {
@@ -3299,15 +3393,18 @@ function renderFileVault(json) {
   if (!container) return;
   const paths = Array.isArray(json?.paths) ? json.paths : [];
   if (!json) {
-    container.innerHTML = '<div class="kv"><div class="k">file-vault.paths</div><div class="v">未加载 file-vault.json</div></div>';
+    container.innerHTML = '<div class="vault-empty">未加载文件保险箱策略。</div>';
     return;
   }
   container.innerHTML = `
-    <div class="policy-raw-head"><strong class="mono">file-vault.paths</strong><span>工作模式写入会阻断，读取与终端访问需要人工确认；末尾 <code>/*</code> 表示目录及其嵌套文件。</span></div>
-    <div class="list">${paths.length ? paths.map((path) => {
+    <div class="vault-summary-head">
+      <div><strong>文件保险箱</strong><span>工作模式写入会阻断，读取与终端访问需要人工确认。</span></div>
+      <span class="pill risk high">${paths.length} 条保护路径</span>
+    </div>
+    <div class="vault-path-grid">${paths.length ? paths.map((path) => {
       const wildcard = typeof path === "string" && path.endsWith("/*");
-      return `<article class="item"><div class="item-head"><h4 class="mono">${escapeHtml(path)}</h4><span class="pill risk high">${wildcard ? "folder wildcard" : "protected"}</span></div></article>`;
-    }).join("") : '<div class="small">当前没有加入保险箱的文件路径。</div>'}</div>
+      return `<article class="vault-path-card"><div class="vault-path-icon" aria-hidden="true">▣</div><div class="vault-path-body"><strong class="mono">${escapeHtml(path)}</strong><span>${wildcard ? "目录及嵌套文件" : "单个文件"}</span></div><span class="pill risk high">保护中</span></article>`;
+    }).join("") : '<div class="vault-empty">当前没有加入保险箱的保护路径。</div>'}</div>
   `;
 }
 
@@ -3454,6 +3551,14 @@ function bindActions() {
   on("policyReloadBtn", "click", () => safeAction(loadPolicies));
   on("policyValidateBtn", "click", () => safeAction(validatePolicy));
   on("policySaveBtn", "click", () => safeAction(savePolicy));
+  on("policyInspectBtn", "click", () => safeAction(() => openPolicyFile($("policyFileSelect")?.value || "")));
+  on("policyDialogValidateBtn", "click", () => safeAction(validatePolicy));
+  on("policyFileDialogClose", "click", closePolicyFileDialog);
+  on("policyFileDialog", "cancel", (event) => {
+    event.preventDefault();
+    closePolicyFileDialog();
+  });
+  on("policyGuardToggleBtn", "click", () => safeAction(toggleCommandGuard));
   on("policyFileSelect", "change", (event) => safeAction(() => readPolicy(event.target.value)));
   on("policyAddRuleBtn", "click", () => safeAction(() => openPolicyFile("risk-rules.json")));
   on("policyEditBoundaryBtn", "click", () => safeAction(() => openPolicyFile("audit-boundaries.json")));

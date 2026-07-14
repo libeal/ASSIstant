@@ -34,7 +34,7 @@ Web 视图包括：
 - Work 工作台：自然语言任务、terminal 命令、执行时间线、审批抽屉、环境主题刷新。
 - Skill 库：script 运行、script 审查、edit 生成、edit 审查、保存、skill 树、Markdown 预览、`skills validate`。
 - MCP：读取 `mcp/<id>/mcp.json` 外部 MCP server manifest，校验 stdio、legacy SSE 和 Streamable HTTP 三种传输配置，并在 work/edit 上下文暴露可用 tools。
-- Policy：查看、校验和编辑 `policies/` 下的 JSON 策略文件（含风险规则、审计边界和文件保险箱），保存前会先运行策略校验，写入前需要 sudo 校验。
+- Policy：以运维视角查看命令安全检查、校验和编辑 `policies/` 下的 JSON 策略文件（含风险规则、审计边界和文件保险箱）；策略文件通过“查阅文件”弹窗查看，解锁后可编辑保存；命令安全检查默认开启，只有 sudo 核对后才能从 Web 切换。
 - Audit：查看 JSONL 审计 session、事件筛选、指标统计、报告导出，并可把审计事件恢复为 Web 工作台时间线。
 - Config：读取和保存白名单配置项，运行 Doctor，展示运行时配置快照。
 

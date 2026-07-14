@@ -84,6 +84,15 @@ linux_agent_policy_ast_findings() {
     local mode="${2:-local}"
     local guard="${LINUX_AGENT_ROOT}/lib/command_guard.py"
     local review_text
+    local guard_enabled="true"
+
+    if [[ -n "${LINUX_AGENT_CONFIG_JSON:-}" ]]; then
+        guard_enabled="$(jq -r 'if ((.command_guard? | type) == "object" and .command_guard.enabled == false) then "false" else "true" end' <<<"${LINUX_AGENT_CONFIG_JSON}" 2>/dev/null || printf 'true')"
+    fi
+    if [[ "${guard_enabled}" != "true" ]]; then
+        printf '[]\n'
+        return 0
+    fi
 
     if [[ "${text}" == skill_script=* || "${text}" == mcp_tool=* ]]; then
         printf '[]\n'
