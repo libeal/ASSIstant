@@ -6,6 +6,22 @@ linux_agent_risk_rules_path() {
     printf '%s/policies/risk-rules.json\n' "${LINUX_AGENT_ROOT}"
 }
 
+linux_agent_file_vault_policy_path() {
+    printf '%s\n' "${LINUX_AGENT_FILE_VAULT_POLICY_PATH:-${LINUX_AGENT_ROOT}/policies/file-vault.json}"
+}
+
+linux_agent_file_vault_guard_path() {
+    local guard="${LINUX_AGENT_ROOT}/lib/file_vault.py"
+    if [[ ! -f "${guard}" ]]; then
+        local policy_dir
+        policy_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+        if [[ -f "${policy_dir}/file_vault.py" ]]; then
+            guard="${policy_dir}/file_vault.py"
+        fi
+    fi
+    printf '%s\n' "${guard}"
+}
+
 linux_agent_policy_add_finding() {
     local findings="$1"
     local severity="$2"
@@ -107,11 +123,101 @@ linux_agent_policy_merge_findings() {
     '
 }
 
+linux_agent_policy_file_vault_match() {
+    local text="$1"
+    local policy_path guard result
+    policy_path="$(linux_agent_file_vault_policy_path)"
+    guard="$(linux_agent_file_vault_guard_path)"
+
+    if [[ ! -f "${policy_path}" ]] || [[ ! -f "${guard}" ]] || ! command -v python3 >/dev/null 2>&1; then
+        jq -cn '{ok:false, error:"file-vault guard or policy is unavailable"}'
+        return 0
+    fi
+    result="$(printf '%s' "${text}" | python3 "${guard}" --policy "${policy_path}" --mode work 2>/dev/null)" || {
+        jq -cn '{ok:false, error:"file-vault guard failed"}'
+        return 0
+    }
+    if ! jq -e 'type == "object" and (.ok // false) == true' <<<"${result}" >/dev/null 2>&1; then
+        jq -cn --arg error "$(jq -r '.error // "file-vault guard returned invalid output"' <<<"${result}" 2>/dev/null || printf 'file-vault guard returned invalid output')" '{ok:false, error:$error}'
+        return 0
+    fi
+    printf '%s\n' "${result}"
+}
+
+linux_agent_policy_file_vault_add_finding() {
+    local findings="$1"
+    local severity="$2"
+    local code="$3"
+    local action="$4"
+    local paths="$5"
+    local message="$6"
+    local review_action="approve"
+    [[ "${severity}" == "critical" ]] && review_action="block"
+
+    jq -cn \
+        --argjson prior "${findings}" \
+        --arg severity "${severity}" \
+        --arg code "${code}" \
+        --arg action "${action}" \
+        --arg review_action "${review_action}" \
+        --argjson paths "${paths}" \
+        --arg message "${message}" \
+        '$prior + [{severity:$severity, code:$code, action:$review_action, vault_action:$action, paths:$paths, message:$message, source:"file_vault", category:"file_vault"}]'
+}
+
+linux_agent_policy_file_vault_findings() {
+    local match_json="$1"
+    local execution_mode="${2:-work}"
+    local findings='[]'
+    local action paths severity code message
+
+    if [[ "$(jq -r '.ok // false' <<<"${match_json}")" != "true" ]]; then
+        linux_agent_policy_file_vault_add_finding \
+            "${findings}" "critical" "FILE_VAULT_GUARD_FAILED" "block" '[]' \
+            "文件保险箱守卫不可用，拒绝继续执行。"
+        return 0
+    fi
+    if [[ "$(jq -r '.matched // false' <<<"${match_json}")" != "true" ]]; then
+        printf '%s\n' "${findings}"
+        return 0
+    fi
+
+    action="$(jq -r '.action // "unknown"' <<<"${match_json}")"
+    paths="$(jq -c '.matched_paths // []' <<<"${match_json}")"
+    case "${action}" in
+        modify)
+            if [[ "${execution_mode}" == "terminal" ]]; then
+                severity="high"
+                code="FILE_VAULT_MODIFICATION_REQUIRES_APPROVAL"
+                message="终端命令将修改文件保险箱中的文件，必须确认后执行。"
+            else
+                severity="critical"
+                code="FILE_VAULT_MODIFICATION_BLOCKED"
+                message="工作模式禁止修改文件保险箱中的文件。"
+            fi
+            ;;
+        read)
+            severity="high"
+            code="FILE_VAULT_READ_REQUIRES_APPROVAL"
+            message="访问文件保险箱中的文件，必须经过人工审批。"
+            ;;
+        *)
+            severity="high"
+            code="FILE_VAULT_ACCESS_REQUIRES_APPROVAL"
+            message="无法静态判断文件保险箱访问动作，必须经过人工审批。"
+            ;;
+    esac
+    findings="$(linux_agent_policy_file_vault_add_finding \
+        "${findings}" "${severity}" "${code}" "${action}" "${paths}" "${message}")"
+    printf '%s\n' "${findings}"
+}
+
 linux_agent_policy_review_text() {
     local subject="$1"
     local text="$2"
     local mode="${3:-local}"
-    local ast blocked warn remote protected_paths protected_services findings
+    local execution_mode="${4:-work}"
+    local ast blocked warn remote protected_paths protected_services vault_match vault_findings findings
 
     ast="$(linux_agent_policy_ast_findings "${text}" "${mode}")"
     case "${subject}" in
@@ -128,6 +234,56 @@ linux_agent_policy_review_text() {
     else
         remote='[]'
     fi
+    vault_match="$(linux_agent_policy_file_vault_match "${text}")"
+    if [[ "${execution_mode}" == "terminal" ]] \
+        && [[ "$(jq -r '.matched // false' <<<"${vault_match}")" == "true" ]] \
+        && [[ "$(jq -r '.action // "unknown"' <<<"${vault_match}")" == "modify" ]]; then
+        local vault_paths
+        vault_paths="$(jq -c '.matched_paths // []' <<<"${vault_match}")"
+        ast="$(jq -c --argjson paths "${vault_paths}" '
+            map(
+                . as $finding
+                | if ($finding.severity == "critical")
+                    and ($finding.code | IN(
+                        "AST_FILE_MUTATION_REQUIRES_SKILL",
+                        "AST_PROTECTED_WRITE",
+                        "AST_PROTECTED_REDIRECT",
+                        "AST_IN_PLACE_EDIT",
+                        "AST_RECURSIVE_PERMISSION_CHANGE",
+                        "AST_DESTRUCTIVE_COMMAND"
+                    ))
+                    and any($paths[]; . as $path | (($finding.text // "") | contains($path)))
+                  then $finding + {
+                      severity:"high",
+                      action:"approve",
+                      message:"终端模式的文件保险箱修改需要人工确认。"
+                  }
+                  else $finding
+                  end
+            )
+        ' <<<"${ast}")"
+        blocked="$(jq -c '
+            map(
+                if (.severity == "critical" and .code == "REGEX_BLOCKED"
+                    and ((.pattern // "") | test("sed|perl|python|python2|python3|ruby|node|nodejs|lua|php|chmod|chown|chgrp|setfacl|setcap|dd|ln|mv|rm|truncate|tee|install")))
+                then . + {severity:"high", action:"approve", message:"终端模式的文件保险箱修改需要人工确认。"}
+                else .
+                end
+            )
+        ' <<<"${blocked}")"
+        protected_paths="$(jq -c 'map(if .severity == "critical" then . + {severity:"high", action:"approve", message:"终端模式的文件保险箱修改需要人工确认。"} else . end)' <<<"${protected_paths}")"
+    fi
+    vault_findings="$(linux_agent_policy_file_vault_findings "${vault_match}" "${execution_mode}")"
+    if [[ "$(jq -r '.matched // false' <<<"${vault_match}")" == "true" ]] \
+        && declare -F linux_agent_log_event >/dev/null 2>&1 \
+        && [[ -n "${LINUX_AGENT_AUDIT_LOG:-}" ]]; then
+        linux_agent_log_event "file_vault_detected" "$(jq -cn \
+            --arg subject "${subject}" \
+            --arg mode "${execution_mode}" \
+            --argjson match "${vault_match}" \
+            --argjson findings "${vault_findings}" \
+            '{subject:$subject, mode:$mode, action:($match.action // "unknown"), matched_paths:($match.matched_paths // []), findings:$findings}')"
+    fi
 
     findings="$(linux_agent_policy_merge_findings \
         --argjson ast "${ast}" \
@@ -135,14 +291,19 @@ linux_agent_policy_review_text() {
         --argjson warn "${warn}" \
         --argjson remote "${remote}" \
         --argjson protected_paths "${protected_paths}" \
-        --argjson protected_services "${protected_services}")"
+        --argjson protected_services "${protected_services}" \
+        --argjson vault "${vault_findings}")"
 
     jq -cn \
         --arg subject "${subject}" \
+        --arg execution_mode "${execution_mode}" \
+        --argjson file_vault "${vault_match}" \
         --argjson findings "${findings}" \
         '{
             subject:$subject,
+            execution_mode:$execution_mode,
             engine:"ast+rules",
+            file_vault:$file_vault,
             approved:((($findings | map(.severity == "critical") | any) | not)),
             approval_required:(($findings | length) > 0),
             risk_level:(
@@ -164,7 +325,7 @@ linux_agent_policy_review_step() {
     subject="$(jq -r '.id // .title // "step"' <<<"${step_json}")"
     step_risk="$(jq -r '.risk_level // "low"' <<<"${step_json}")"
     executor_type="$(jq -r '.executor_type // empty' <<<"${step_json}")"
-    review="$(linux_agent_policy_review_text "${subject}" "${text}" "${mode}")"
+    review="$(linux_agent_policy_review_text "${subject}" "${text}" "${mode}" "work")"
     review="$(jq -c --arg step_risk "${step_risk}" --arg mode "${mode}" '
         .approval_required = (.approval_required or ($step_risk == "medium") or ($step_risk == "high") or ($step_risk == "critical"))
         | .risk_level = (
@@ -410,6 +571,48 @@ linux_agent_policy_validate_audit_boundaries() {
     printf '%s\n' "${findings}"
 }
 
+linux_agent_policy_validate_file_vault() {
+    local path="$1"
+    local json="$2"
+    local findings='[]'
+    local pointer vault_path duplicate
+
+    if ! jq -e '.paths | type == "array"' <<<"${json}" >/dev/null 2>&1; then
+        findings="$(linux_agent_policy_add_validation_finding \
+            "${findings}" "critical" "POLICY_REQUIRED_ARRAY_MISSING" "${path}" \
+            "paths 必须是绝对文件路径数组。" "paths")"
+        printf '%s\n' "${findings}"
+        return 0
+    fi
+
+    while IFS= read -r pointer; do
+        [[ -n "${pointer}" ]] || continue
+        vault_path="$(jq -r "${pointer}" <<<"${json}")"
+        if [[ "${vault_path}" != /* ]] \
+            || [[ "${vault_path}" == "/" ]] \
+            || [[ "${vault_path}" == */ ]] \
+            || [[ "${vault_path}" == *$'\n'* || "${vault_path}" == *$'\r'* ]] \
+            || [[ "${vault_path}" == *"//"* ]] \
+            || [[ "/${vault_path}/" == *"/./"* || "/${vault_path}/" == *"/../"* ]] \
+            || [[ "${vault_path}" =~ [\?\[\]] ]] \
+            || ([[ "${vault_path}" == *"*"* ]] \
+                && { [[ "${vault_path}" != */\* ]] || [[ "${vault_path%/*}" == *"*"* ]]; }); then
+            findings="$(linux_agent_policy_add_validation_finding \
+                "${findings}" "critical" "POLICY_VAULT_PATH_INVALID" "${path}" \
+                "文件保险箱路径必须是规范的绝对路径；通配符仅允许作为末尾 /*，表示目录下文件。" "${pointer}")"
+        fi
+    done < <(jq -r '.paths | if type == "array" then to_entries[] | ".paths[\(.key)]" else empty end' <<<"${json}" 2>/dev/null || true)
+
+    while IFS= read -r duplicate; do
+        [[ -n "${duplicate}" ]] || continue
+        findings="$(linux_agent_policy_add_validation_finding \
+            "${findings}" "critical" "POLICY_VAULT_PATH_DUPLICATE" "${path}" \
+            "文件保险箱路径不能重复。" "paths")"
+    done < <(jq -r '.paths[]' <<<"${json}" | sort | uniq -d)
+
+    printf '%s\n' "${findings}"
+}
+
 linux_agent_validate_policy_content() {
     local path="$1"
     local content="$2"
@@ -437,6 +640,9 @@ linux_agent_validate_policy_content() {
             ;;
         audit-boundaries.json)
             findings="$(linux_agent_policy_validate_audit_boundaries "${path}" "${json}")"
+            ;;
+        file-vault.json)
+            findings="$(linux_agent_policy_validate_file_vault "${path}" "${json}")"
             ;;
         *)
             if ! jq -e 'type == "object"' <<<"${json}" >/dev/null 2>&1; then

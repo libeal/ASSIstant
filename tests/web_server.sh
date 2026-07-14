@@ -336,7 +336,9 @@ sense_resource="$(curl --noproxy '*' -sS \
 jq -e '.ok == true and .topic == "resource" and .sense.topic == "resource"' <<<"${sense_resource}" >/dev/null
 
 policies="$(curl --noproxy '*' -sS -H "Authorization: Bearer ${token}" "${base_url}/api/policies")"
-jq -e '.ok == true and .requires_sudo_to_edit == true and any(.files[]?.path; . == "audit-boundaries.json")' <<<"${policies}" >/dev/null
+jq -e '.ok == true and .requires_sudo_to_edit == true
+    and any(.files[]?.path; . == "audit-boundaries.json")
+    and any(.files[]?.path; . == "file-vault.json")' <<<"${policies}" >/dev/null
 
 boundary_payload="$(jq -cn '{path:"audit-boundaries.json"}')"
 boundary="$(curl --noproxy '*' -sS \
@@ -345,6 +347,34 @@ boundary="$(curl --noproxy '*' -sS \
     -d "${boundary_payload}" \
     "${base_url}/api/policies/read")"
 jq -e '.ok == true and .json.observing.audit_payload_mode == "safe_summary" and (.json.allowed_to_observe.observer_syscalls | index("openat"))' <<<"${boundary}" >/dev/null
+
+vault_policy_payload="$(jq -cn '{path:"file-vault.json"}')"
+vault_policy_read="$(curl --noproxy '*' -sS \
+    -H "Authorization: Bearer ${token}" \
+    -H "Content-Type: application/json" \
+    -d "${vault_policy_payload}" \
+    "${base_url}/api/policies/read")"
+jq -e '.ok == true and .json.paths == []' <<<"${vault_policy_read}" >/dev/null
+
+vault_policy_content='{"paths":["/tmp/web-file-vault-test"]}'
+vault_policy_validate_payload="$(jq -cn --arg content "${vault_policy_content}" '{path:"file-vault.json",content:$content}')"
+vault_policy_validate="$(curl --noproxy '*' -sS \
+    -H "Authorization: Bearer ${token}" \
+    -H "Content-Type: application/json" \
+    -d "${vault_policy_validate_payload}" \
+    "${base_url}/api/policies/validate")"
+jq -e '.ok == true and .status == "valid" and .validation.ok == true' <<<"${vault_policy_validate}" >/dev/null
+
+vault_policy_write_payload="$(jq -cn --arg content "${vault_policy_content}" '{path:"file-vault.json",content:$content,password:""}')"
+vault_policy_write="$(curl --noproxy '*' -sS \
+    -H "Authorization: Bearer ${token}" \
+    -H "Content-Type: application/json" \
+    -d "${vault_policy_write_payload}" \
+    "${base_url}/api/policies/write")"
+jq -e 'if .ok then .status == "saved" and (.method == "root" or .method == "sudo") else .status == "sudo_required" end' <<<"${vault_policy_write}" >/dev/null
+
+grep -q 'id="policyEditVaultBtn"' "${project}/web/static/index.html"
+grep -q 'file-vault.json' "${project}/web/static/app.js"
 
 policy_write_payload="$(jq -cn --rawfile content "${project}/policies/audit-boundaries.json" '{path:"audit-boundaries.json", content:$content, password:""}')"
 policy_validate="$(curl --noproxy '*' -sS \

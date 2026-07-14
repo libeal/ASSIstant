@@ -403,9 +403,13 @@
                 </div>
 
                 <div class="panel">
-                  <div class="panel-header"><div><h3>audit 边界策略</h3><p>直接核对 audit-boundaries.json 的生效字段；短注释只标明字段用途。</p></div><button class="btn secondary policy-edit" id="policyEditBoundaryBtn" type="button" disabled>编辑边界</button></div>
+                  <div class="panel-header"><div><h3>audit 边界策略</h3><p>直接核对 audit-boundaries.json 的生效字段；短注释只标明字段用途。</p></div><div class="toolbar"><button class="btn secondary policy-edit" id="policyEditBoundaryBtn" type="button" disabled>编辑边界</button><button class="btn secondary policy-edit" id="policyEditVaultBtn" type="button" disabled>编辑文件保险箱</button></div></div>
                   <div id="policyBoundaryList">
                     <div class="kv"><div class="k">observing</div><div class="v">等待加载当前生效字段。</div></div>
+                  </div>
+                  <div class="divider"></div>
+                  <div id="policyVaultSummary">
+                    <div class="kv"><div class="k">file-vault.paths</div><div class="v">等待加载文件保险箱策略。</div></div>
                   </div>
                   <div class="divider"></div>
                   <div id="policyBoundaryOptions" hidden>

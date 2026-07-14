@@ -324,6 +324,7 @@ linux_agent_observer_parse_ausearch() {
             comm:(field("comm") // null),
             exe:(field("exe") // null),
             syscall:(field("syscall") // null),
+            flags:(field("a2") // null),
             success:(field("success") // null),
             name:(field("name") // null),
             key:(field("key") // $audit_key)
@@ -340,12 +341,90 @@ linux_agent_observer_parse_ausearch() {
                 | map(select(.pid != null) | {pid:(.pid|tonumber?), ppid:(.ppid|tonumber?), comm, exe})
                 | unique_by(.pid, .comm, .exe)
                 | .[0:$max_events]) else [] end),
-            file_events:(if $include_file_events then ($events
-                | map(select(.name != null) | {name, syscall, success})
-                | unique_by(.name, .syscall, .success)
+        file_events:(if $include_file_events then ($events
+                | map(select(.name != null) as $file
+                    | {
+                        name:$file.name,
+                        syscall:(($events | map(select(.record_id != null and .record_id == $file.record_id and .syscall != null)) | .[0].syscall) // $file.syscall),
+                        flags:(($events | map(select(.record_id != null and .record_id == $file.record_id and .flags != null)) | .[0].flags) // $file.flags),
+                        success:(($events | map(select(.record_id != null and .record_id == $file.record_id and .success != null)) | .[0].success) // $file.success)
+                    })
+                | unique_by(.name, .syscall, .flags, .success)
                 | .[0:$max_events]) else [] end)
         }
     ' <<<"${raw}"
+}
+
+linux_agent_observer_log_file_vault_observations() {
+    local parsed="$1"
+    local scope="${2:-session}"
+    local policy_path="${LINUX_AGENT_FILE_VAULT_POLICY_PATH:-${LINUX_AGENT_ROOT}/policies/file-vault.json}"
+    local paths observed
+
+    [[ -f "${policy_path}" ]] || return 0
+    paths="$(jq -c '.paths // []' "${policy_path}" 2>/dev/null || printf '[]')"
+    observed="$(jq -c --argjson paths "${paths}" '
+        def path_matches($policy):
+            if ($policy | type) != "string" then false
+            elif ($policy | endswith("/*")) then
+                (($policy | .[0:-2]) as $base
+                 | . == $base or startswith($base + "/"))
+            else . == $policy
+            end;
+        [(.file_events // [])[] as $event
+         | select(($event.name // "") != "")
+         | select(($event.success // "yes") | tostring | IN("yes", "1", "true"))
+         | select(any($paths[]; . as $policy | ($event.name | path_matches($policy))))
+         | $event]
+        | unique_by(.name, .syscall, .flags, .success)
+    ' <<<"${parsed}" 2>/dev/null || printf '[]')"
+    [[ "${observed}" != "[]" ]] || return 0
+
+    linux_agent_observer_log_event "file_vault_observed" "$(jq -cn \
+        --arg scope "${scope}" \
+        --argjson events "${observed}" \
+        '
+        def is_open_syscall:
+            (.syscall // "") | tostring | IN("2", "257", "437", "open", "openat", "openat2");
+        def hex_digit:
+            if . >= 48 and . <= 57 then . - 48
+            elif . >= 65 and . <= 70 then . - 55
+            elif . >= 97 and . <= 102 then . - 87
+            else 0
+            end;
+        def numeric_flags:
+            if test("^0[xX][0-9a-fA-F]+$") then
+                .[2:] | explode | reduce .[] as $digit (0; . * 16 + ($digit | hex_digit))
+            elif test("^[0-9]+$") then tonumber
+            else null
+            end;
+        def open_flags_modify:
+            ((.flags // "") | tostring) as $flags
+            | if ($flags | test("O_WRONLY|O_RDWR|O_CREAT|O_TRUNC|O_APPEND|O_TMPFILE")) then true
+              elif ($flags | test("^(0[xX][0-9a-fA-F]+|[0-9]+)$")) then
+                  (($flags | numeric_flags) as $value
+                   | (($value % 4) != 0
+                      or ((($value / 64) | floor) % 2) == 1
+                      or ((($value / 512) | floor) % 2) == 1
+                      or ((($value / 1024) | floor) % 2) == 1
+                      or ((($value / 4194304) | floor) % 2) == 1))
+              else false
+              end;
+        def event_is_modify:
+            if is_open_syscall then open_flags_modify
+            else (.syscall // "") | tostring | IN(
+                "85", "76", "77", "82", "264", "316", "87", "263", "90", "91", "268", "92", "93", "260", "83", "258", "84", "88", "266", "86", "265",
+                "creat", "truncate", "ftruncate", "rename", "renameat", "renameat2", "unlink", "unlinkat", "chmod", "fchmod", "fchmodat", "chown", "fchown", "fchownat", "mkdir", "mkdirat", "rmdir", "symlink", "symlinkat", "link", "linkat"
+            )
+            end;
+        {
+            scope:$scope,
+            mode:(if $scope == "terminal" then "terminal" elif $scope == "session" then "unknown" else "work" end),
+            observed_paths:($events | map(.name) | unique),
+            event_count:($events | length),
+            action:(if any($events[]; event_is_modify) then "modify" else "access" end),
+            warning:"auditd 观察到文件保险箱路径发生文件事件。"
+        }')"
 }
 
 linux_agent_observer_session_finish() {
@@ -397,6 +476,7 @@ linux_agent_observer_session_finish() {
     fi
 
     parsed="$(linux_agent_observer_parse_ausearch "${raw}" "${audit_key}")"
+    linux_agent_observer_log_file_vault_observations "${parsed}" "$(jq -r '.scope // "session"' <<<"${context_json}")"
     notes="$(jq -cn --argjson prior "$(jq -c '.notes // []' <<<"${context_json}")" --argjson cleanup "${cleanup_notes}" '$prior + $cleanup')"
     parsed="$(jq -c \
         --arg start_time "$(jq -r '.start_time' <<<"${context_json}")" \

@@ -3084,6 +3084,7 @@ async function loadPolicies() {
     printOutput("policyOutput", { ok: true, status: "no_policy_files" });
     renderRiskRules(null);
     renderAuditBoundaries(null);
+    renderFileVault(null);
     return;
   }
   const paths = state.policyFiles.map((file) => file.path);
@@ -3104,6 +3105,10 @@ async function loadPolicySummaries(currentPath) {
   if (currentPath !== "audit-boundaries.json" && paths.includes("audit-boundaries.json")) {
     const data = await readPolicyJson("audit-boundaries.json");
     if (data?.ok) renderAuditBoundaries(data.json);
+  }
+  if (currentPath !== "file-vault.json" && paths.includes("file-vault.json")) {
+    const data = await readPolicyJson("file-vault.json");
+    if (data?.ok) renderFileVault(data.json);
   }
 }
 
@@ -3127,6 +3132,7 @@ async function readPolicy(path) {
   printOutput("policyOutput", { ok: true, status: "read", path: data.path });
   if (data.path === "risk-rules.json") renderRiskRules(data.json);
   if (data.path === "audit-boundaries.json") renderAuditBoundaries(data.json);
+  if (data.path === "file-vault.json") renderFileVault(data.json);
   updatePolicyEditState();
 }
 
@@ -3288,6 +3294,23 @@ function renderAuditBoundaries(json) {
   }
 }
 
+function renderFileVault(json) {
+  const container = $("policyVaultSummary");
+  if (!container) return;
+  const paths = Array.isArray(json?.paths) ? json.paths : [];
+  if (!json) {
+    container.innerHTML = '<div class="kv"><div class="k">file-vault.paths</div><div class="v">未加载 file-vault.json</div></div>';
+    return;
+  }
+  container.innerHTML = `
+    <div class="policy-raw-head"><strong class="mono">file-vault.paths</strong><span>工作模式写入会阻断，读取与终端访问需要人工确认；末尾 <code>/*</code> 表示目录及其嵌套文件。</span></div>
+    <div class="list">${paths.length ? paths.map((path) => {
+      const wildcard = typeof path === "string" && path.endsWith("/*");
+      return `<article class="item"><div class="item-head"><h4 class="mono">${escapeHtml(path)}</h4><span class="pill risk high">${wildcard ? "folder wildcard" : "protected"}</span></div></article>`;
+    }).join("") : '<div class="small">当前没有加入保险箱的文件路径。</div>'}</div>
+  `;
+}
+
 function renderBoundaryRawSection(title, value, note) {
   return `
     <section class="policy-raw-section">
@@ -3434,6 +3457,7 @@ function bindActions() {
   on("policyFileSelect", "change", (event) => safeAction(() => readPolicy(event.target.value)));
   on("policyAddRuleBtn", "click", () => safeAction(() => openPolicyFile("risk-rules.json")));
   on("policyEditBoundaryBtn", "click", () => safeAction(() => openPolicyFile("audit-boundaries.json")));
+  on("policyEditVaultBtn", "click", () => safeAction(() => openPolicyFile("file-vault.json")));
   on("thinkingTraceSwitch", "click", () => safeAction(toggleThinkingTraceFromWorkbench));
   on("auditExportBtn", "click", exportAuditReport);
   on("runtimeBackupBtn", "click", () => safeAction(downloadRuntimeBackup));

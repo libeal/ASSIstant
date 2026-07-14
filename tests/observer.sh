@@ -16,6 +16,19 @@ source "${ROOT_DIR}/lib/observer.sh"
 linux_agent_init_env "${ROOT_DIR}"
 linux_agent_load_config
 
+vault_policy="$(mktemp)"
+vault_log="$(mktemp)"
+printf '{"paths":["/tmp/linux-agent-observer-vault/*"]}\n' > "${vault_policy}"
+export LINUX_AGENT_FILE_VAULT_POLICY_PATH="${vault_policy}"
+LINUX_AGENT_AUDIT_LOG="${vault_log}"
+LINUX_AGENT_SESSION_ID="session-vault-observer-test"
+linux_agent_observer_log_file_vault_observations \
+    '{"file_events":[{"name":"/tmp/linux-agent-observer-vault/nested/secret","syscall":"openat","flags":"0x241","success":"yes"},{"name":"/tmp/linux-agent-observer-vault/nested/other","syscall":"openat","flags":"577","success":"yes"}]}' \
+    "session"
+jq -e 'select(.stage == "file_vault_observed") | .payload.action == "modify" and .payload.observed_path_count == 2' "${vault_log}" >/dev/null
+rm -f "${vault_policy}" "${vault_log}"
+unset LINUX_AGENT_FILE_VAULT_POLICY_PATH LINUX_AGENT_AUDIT_LOG LINUX_AGENT_SESSION_ID
+
 tmp_root="$(mktemp -d)"
 cleanup() {
     rm -rf "${tmp_root}"

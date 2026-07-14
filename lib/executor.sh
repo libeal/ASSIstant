@@ -582,7 +582,7 @@ linux_agent_terminal_review() {
     local command_text="$1"
     local review
 
-    review="$(linux_agent_policy_review_text "terminal" "${command_text}")"
+    review="$(linux_agent_policy_review_text "terminal" "${command_text}" "local" "terminal")"
     if [[ "$(jq -r '(.approved // false) == true and (.approval_required // false) == false and (.risk_level // "unknown") == "low"' <<<"${review}")" == "true" ]] \
         && [[ "$(linux_agent_auto_approval_enabled shell_readonly)" != "true" ]]; then
         jq -c '

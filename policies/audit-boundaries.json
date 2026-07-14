@@ -35,7 +35,8 @@
       "ai_files_manifest",
       "execution_started",
       "execution_finished",
-      "observer_*"
+      "observer_*",
+      "file_vault_*"
     ],
     "observer_syscalls": [
       "execve",
@@ -106,7 +107,8 @@
       "ai_files_manifest",
       "execution_started",
       "execution_finished",
-      "observer_*"
+      "observer_*",
+      "file_vault_*"
     ],
     "observer_syscalls": [
       "execve",

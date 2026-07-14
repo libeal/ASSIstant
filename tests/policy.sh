@@ -8,6 +8,8 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 source "${ROOT_DIR}/lib/common.sh"
 # shellcheck source=../lib/config.sh
 source "${ROOT_DIR}/lib/config.sh"
+# shellcheck source=../lib/audit.sh
+source "${ROOT_DIR}/lib/audit.sh"
 # shellcheck source=../lib/policy.sh
 source "${ROOT_DIR}/lib/policy.sh"
 
@@ -199,8 +201,103 @@ for readonly_wrapper_danger_command in \
     jq -e '.approved == false and ([.findings[] | select(.code == "AST_FILE_MUTATION_REQUIRES_SKILL")] | length) == 1' <<<"${readonly_wrapper_danger_result}" >/dev/null
 done
 
+vault_policy="$(mktemp)"
+vault_log="$(mktemp)"
+cat > "${vault_policy}" <<'JSON'
+{
+  "paths": [
+    "/tmp/linux-agent-vault-secret",
+    "/tmp/linux-agent-vault-dir/*"
+  ]
+}
+JSON
+export LINUX_AGENT_FILE_VAULT_POLICY_PATH="${vault_policy}"
+LINUX_AGENT_AUDIT_LOG="${vault_log}"
+LINUX_AGENT_SESSION_ID="session-vault-policy-test"
+
+vault_work_modify="$(linux_agent_policy_review_text "step-vault-write" "printf secret > /tmp/linux-agent-vault-secret" "local" "work")"
+jq -e '.approved == false and .approval_required == true and .risk_level == "critical"
+    and ([.findings[] | select(.code == "FILE_VAULT_MODIFICATION_BLOCKED" and .severity == "critical")] | length) == 1' <<<"${vault_work_modify}" >/dev/null
+
+vault_work_read="$(linux_agent_policy_review_text "step-vault-read" "cat /tmp/linux-agent-vault-secret" "local" "work")"
+jq -e '.approved == true and .approval_required == true and .risk_level == "high"
+    and ([.findings[] | select(.code == "FILE_VAULT_READ_REQUIRES_APPROVAL" and .severity == "high")] | length) == 1' <<<"${vault_work_read}" >/dev/null
+
+vault_alias_read="$(linux_agent_policy_review_text "step-vault-alias-read" "cat /tmp/./linux-agent-vault-secret" "local" "work")"
+jq -e '.approved == true and .approval_required == true and .risk_level == "high"
+    and ([.findings[] | select(.code == "FILE_VAULT_READ_REQUIRES_APPROVAL" and .severity == "high")] | length) == 1' <<<"${vault_alias_read}" >/dev/null
+
+vault_glob_read="$(linux_agent_policy_review_text "step-vault-glob-read" "cat /tmp/linux-agent-vault-dir/nested/secret" "local" "work")"
+jq -e '.approved == true and .approval_required == true and .risk_level == "high"
+    and ([.findings[] | select(.code == "FILE_VAULT_READ_REQUIRES_APPROVAL" and .severity == "high")] | length) == 1' <<<"${vault_glob_read}" >/dev/null
+
+vault_glob_modify="$(linux_agent_policy_review_text "step-vault-glob-write" "printf secret > /tmp/linux-agent-vault-dir/nested/secret" "local" "work")"
+jq -e '.approved == false and .approval_required == true and .risk_level == "critical"
+    and ([.findings[] | select(.code == "FILE_VAULT_MODIFICATION_BLOCKED" and .severity == "critical")] | length) == 1' <<<"${vault_glob_modify}" >/dev/null
+
+vault_sibling_read="$(linux_agent_policy_review_text "step-vault-sibling-read" "cat /tmp/linux-agent-vault-dir-sibling/secret" "local" "work")"
+jq -e '.approved == true and .approval_required == false and .risk_level == "low" and (.findings | length) == 0' <<<"${vault_sibling_read}" >/dev/null
+
+vault_dynamic_read="$(linux_agent_policy_review_text "step-vault-dynamic-read" 'cat "$LINUX_AGENT_VAULT_PATH"' "local" "work")"
+jq -e '.approved == true and .approval_required == true and .risk_level == "high"
+    and ([.findings[] | select(.code == "FILE_VAULT_ACCESS_REQUIRES_APPROVAL" and .severity == "high")] | length) == 1' <<<"${vault_dynamic_read}" >/dev/null
+
+vault_non_path_variable="$(linux_agent_policy_review_text "step-vault-non-path-variable" 'printf "%s" "$HOME"' "local" "work")"
+jq -e '.approved == true and .approval_required == false and .risk_level == "low" and (.findings | length) == 0' <<<"${vault_non_path_variable}" >/dev/null
+
+for vault_write_command in \
+    "cp --target-directory /tmp/linux-agent-vault-dir source" \
+    "unzip -d/tmp/linux-agent-vault-dir archive.zip" \
+    "curl -o/tmp/linux-agent-vault-dir https://example.test/file"; do
+    vault_write_action="$(printf '%s' "${vault_write_command}" | python3 "${ROOT_DIR}/lib/file_vault.py" --policy "${vault_policy}")"
+    jq -e '.action == "modify"' <<<"${vault_write_action}" >/dev/null
+done
+
+vault_terminal_modify="$(linux_agent_policy_review_text "terminal" "printf secret > /tmp/linux-agent-vault-secret" "local" "terminal")"
+jq -e '.approved == true and .approval_required == true and .risk_level == "high"
+    and ([.findings[] | select(.code == "FILE_VAULT_MODIFICATION_REQUIRES_APPROVAL" and .severity == "high")] | length) == 1' <<<"${vault_terminal_modify}" >/dev/null
+
+vault_terminal_sed="$(linux_agent_policy_review_text "terminal" "sed -i s/secret/updated/ /tmp/linux-agent-vault-secret" "local" "terminal")"
+jq -e '.approved == true and .approval_required == true and .risk_level == "high"
+    and ([.findings[] | select(.code == "REGEX_BLOCKED" and .severity == "high")] | length) == 1' <<<"${vault_terminal_sed}" >/dev/null
+
+vault_plain_command="$(linux_agent_policy_review_text "step-plain" "printf ok" "local" "work")"
+jq -e '.approved == true and .approval_required == false and .risk_level == "low" and (.findings | length) == 0' <<<"${vault_plain_command}" >/dev/null
+
+grep -q '"stage":"file_vault_detected"' "${vault_log}"
+rm -f "${vault_policy}" "${vault_log}"
+unset LINUX_AGENT_FILE_VAULT_POLICY_PATH LINUX_AGENT_AUDIT_LOG LINUX_AGENT_SESSION_ID
+
+# An empty vault protects nothing and must stay inert: even dynamic / non-statically
+# resolvable file paths keep their pre-vault classification (no spurious approval gate).
+empty_vault_policy="$(mktemp)"
+printf '{"paths":[]}\n' > "${empty_vault_policy}"
+export LINUX_AGENT_FILE_VAULT_POLICY_PATH="${empty_vault_policy}"
+for empty_vault_command in \
+    'cat "$SOME_VAR"' \
+    'grep needle "$LOGFILE"' \
+    'printf secret > "$OUT"' \
+    'cat /etc/hostname'; do
+    empty_vault_match="$(printf '%s' "${empty_vault_command}" | python3 "${ROOT_DIR}/lib/file_vault.py" --policy "${empty_vault_policy}")"
+    jq -e '.ok == true and .matched == false and .unresolved == false and (.matched_paths | length) == 0' <<<"${empty_vault_match}" >/dev/null
+done
+empty_vault_dynamic_review="$(linux_agent_policy_review_text "step-empty-vault-dynamic" 'cat "$SOME_VAR"' "local" "work")"
+jq -e '.approved == true and .approval_required == false and .risk_level == "low" and (.findings | length) == 0' <<<"${empty_vault_dynamic_review}" >/dev/null
+rm -f "${empty_vault_policy}"
+unset LINUX_AGENT_FILE_VAULT_POLICY_PATH
+
+audit_summary_dir="$(mktemp -d)"
+old_audit_log_dir="${LINUX_AGENT_LOG_DIR}"
+LINUX_AGENT_LOG_DIR="${audit_summary_dir}"
+audit_summary_session="file-vault-audit-summary-test"
+printf '%s\n' '{"timestamp":"2026-07-14T00:00:00Z","session_id":"file-vault-audit-summary-test","stage":"file_vault_observed","payload":{"mode":"work","action":"modify","matched_path_count":0,"observed_path_count":1}}' > "${audit_summary_dir}/${audit_summary_session}.jsonl"
+audit_summary_report="$(linux_agent_show_audit "${audit_summary_session}")"
+grep -q '匹配文件数=1' <<<"${audit_summary_report}"
+LINUX_AGENT_LOG_DIR="${old_audit_log_dir}"
+rm -rf "${audit_summary_dir}"
+
 policy_validation="$(linux_agent_validate_policy_file "")"
-jq -e '.ok == true and .status == "valid" and (.files | length) >= 3' <<<"${policy_validation}" >/dev/null
+jq -e '.ok == true and .status == "valid" and (.files | length) >= 4' <<<"${policy_validation}" >/dev/null
 
 policy_cli_validation="$(bash "${ROOT_DIR}/bin/agent" policy validate risk-rules.json)"
 jq -e '.ok == true and .status == "valid" and .path == "risk-rules.json"' <<<"${policy_cli_validation}" >/dev/null
@@ -213,6 +310,17 @@ jq -e '.ok == false and ([.findings[]?.code] | index("POLICY_REGEX_INVALID"))' <
 
 zero_width_redaction="$(linux_agent_validate_policy_content "redaction-rules.json" '{"rules":[{"id":"bad","pattern":".*","replacement":"x"}],"sensitive_key_pattern":"(?i)token"}')"
 jq -e '.ok == false and ([.findings[]?.code] | index("POLICY_REGEX_ZERO_WIDTH"))' <<<"${zero_width_redaction}" >/dev/null
+
+invalid_vault_validation="$(linux_agent_validate_policy_content "file-vault.json" '{"paths":["relative/path","/tmp/ok","/tmp/ok"]}')"
+jq -e '.ok == false
+    and ([.findings[]?.code] | index("POLICY_VAULT_PATH_INVALID"))
+    and ([.findings[]?.code] | index("POLICY_VAULT_PATH_DUPLICATE"))' <<<"${invalid_vault_validation}" >/dev/null
+
+valid_vault_glob_validation="$(linux_agent_validate_policy_content "file-vault.json" '{"paths":["/tmp/vault/*","/tmp/exact"]}')"
+jq -e '.ok == true and .status == "valid"' <<<"${valid_vault_glob_validation}" >/dev/null
+
+invalid_vault_glob_validation="$(linux_agent_validate_policy_content "file-vault.json" '{"paths":["/tmp/vault/*/nested","/tmp/vault*","/tmp/vault*/nested/*"]}')"
+jq -e '.ok == false and ([.findings[]?.code] | index("POLICY_VAULT_PATH_INVALID"))' <<<"${invalid_vault_glob_validation}" >/dev/null
 
 invalid_audit_selection="$(linux_agent_validate_policy_content "audit-boundaries.json" '{
   "observing": {

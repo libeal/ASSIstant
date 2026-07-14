@@ -51,7 +51,8 @@ linux_agent_audit_boundary_default_config() {
       "ai_files_manifest",
       "execution_started",
       "execution_finished",
-      "observer_*"
+      "observer_*",
+      "file_vault_*"
     ],
     "observer_syscalls": [
       "execve",
@@ -122,7 +123,8 @@ linux_agent_audit_boundary_default_config() {
       "ai_files_manifest",
       "execution_started",
       "execution_finished",
-      "observer_*"
+      "observer_*",
+      "file_vault_*"
     ],
     "observer_syscalls": [
       "execve",
@@ -575,6 +577,16 @@ linux_agent_audit_safe_summary() {
                 diagnostic:(.diagnostic // null),
                 notes:(.notes // [])
             }
+        elif ($stage | startswith("file_vault_")) then
+            {
+                subject:(.subject // null),
+                scope:(.scope // null),
+                mode:(.mode // null),
+                action:(.action // null),
+                matched_path_count:(if (.matched_paths? | type) == "array" then (.matched_paths | length) else 0 end),
+                observed_path_count:(if (.observed_paths? | type) == "array" then (.observed_paths | length) else 0 end),
+                warning:(.warning // null)
+            }
         elif ($stage == "executed" or $stage == "script_executed" or $stage == "terminal_executed" or $stage == "edit_applied") then
             result_summary(.)
             + {
@@ -810,6 +822,7 @@ linux_agent_show_audit() {
             elif $s == "script_executed" then "Skill 执行结果"
             elif $s == "finished" then "业务状态完成"
             elif ($s | startswith("observer_")) then "Observer 事件"
+            elif ($s | startswith("file_vault_")) then "文件保险箱事件"
             elif ($s | startswith("agent_")) then "Agent 循环"
             else $s end;
         def step_name($p):
@@ -855,6 +868,8 @@ linux_agent_show_audit() {
                 result_text($p)
               elif ($s | startswith("observer_")) then
                 "状态=" + (($p.status // "unknown") | tostring) + "；后端=" + (($p.backend // "auditd") | tostring) + "；exec=" + (($p.exec_count // 0) | tostring) + "；file=" + (($p.file_event_count // 0) | tostring)
+              elif ($s | startswith("file_vault_")) then
+                "模式=" + (($p.mode // "unknown") | tostring) + "；动作=" + (($p.action // "unknown") | tostring) + "；匹配文件数=" + ((if $s == "file_vault_observed" then ($p.observed_path_count // 0) else ($p.matched_path_count // 0) end) | tostring)
               else
                 ($p.message // $p.status // $p.event // ($p | tostring))
               end;

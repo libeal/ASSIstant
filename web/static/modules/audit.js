@@ -57,6 +57,8 @@ export function auditStageLabel(stage) {
   if (stage === "step_skipped_unexecuted") return "后续未执行";
   if (stage === "terminal_executed") return "终端执行";
   if (stage === "script_executed") return "Skill 执行";
+  if (stage === "file_vault_detected") return "文件保险箱检测";
+  if (stage === "file_vault_observed") return "文件保险箱实际事件";
   if (stage === "executed") return "工作流结果";
   if (stage === "finished") return "业务完成";
   if (stage === "agent_loop_started") return "Agent 循环开始";
@@ -128,6 +130,12 @@ export function auditEventDisplay(event, pretty = (value) => JSON.stringify(valu
     if (payload.output_preview) details.push(`输出：${payload.output_preview}`);
     if (payload.stderr_preview) details.push(`错误：${payload.stderr_preview}`);
     if (Array.isArray(payload.results)) details.push(`步骤结果：${payload.results.length} 个`);
+  } else if (String(stage).startsWith("file_vault_")) {
+    summary = `动作：${payload.action || "unknown"}`;
+    if (payload.mode) badges.push(payload.mode);
+    if (payload.matched_path_count != null) details.push(`匹配文件：${payload.matched_path_count}`);
+    if (payload.observed_path_count != null) details.push(`实际事件文件：${payload.observed_path_count}`);
+    if (payload.warning) details.push(payload.warning);
   } else if (String(stage).startsWith("observer_")) {
     status = payload.status || payload.lifecycle || status;
     summary = `状态：${payload.status || "unknown"}，后端：${payload.backend || "auditd"}`;

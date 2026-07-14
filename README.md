@@ -34,7 +34,7 @@ Web 视图包括：
 - Work 工作台：自然语言任务、terminal 命令、执行时间线、审批抽屉、环境主题刷新。
 - Skill 库：script 运行、script 审查、edit 生成、edit 审查、保存、skill 树、Markdown 预览、`skills validate`。
 - MCP：读取 `mcp/<id>/mcp.json` 外部 MCP server manifest，校验 stdio、legacy SSE 和 Streamable HTTP 三种传输配置，并在 work/edit 上下文暴露可用 tools。
-- Policy：查看、校验和编辑 `policies/` 下的 JSON 策略文件，保存前会先运行策略校验，写入前需要 sudo 校验。
+- Policy：查看、校验和编辑 `policies/` 下的 JSON 策略文件（含风险规则、审计边界和文件保险箱），保存前会先运行策略校验，写入前需要 sudo 校验。
 - Audit：查看 JSONL 审计 session、事件筛选、指标统计、报告导出，并可把审计事件恢复为 Web 工作台时间线。
 - Config：读取和保存白名单配置项，运行 Doctor，展示运行时配置快照。
 
@@ -83,6 +83,14 @@ export LINUX_AGENT_API_KEY="你的密钥"
 ```
 
 `config/config.json` 中仍需配置 `api_url` 和 `model`。如果不想使用环境变量，也可以在 `config.json` 中设置 `api_key` 作为兜底。
+
+如需启用文件保险箱，在 `policies/file-vault.json` 的 `paths` 中登记规范绝对路径；默认空数组表示不启用。建议先校验，再通过 Web Policy 页面或受保护的策略写入流程保存：
+
+```bash
+bash bin/agent policy validate file-vault.json
+```
+
+工作模式修改保险箱文件会被直接阻断，读取需要审批；终端模式访问或修改需要人工确认。末尾 `/*` 仅表示目录及其嵌套文件，不支持中间通配符。
 
 启动 Web：
 
@@ -150,7 +158,8 @@ Linux 运维 Agent
 │  │  ├─ doctor.sh           本地健康检查
 │  │  ├─ skills.sh           skill 解析、登记和校验
 │  │  ├─ mcp.sh              MCP manifest 发现、脱敏和校验
-│  │  └─ policy.sh           风险规则审查
+│  │  ├─ policy.sh           风险规则审查
+│  │  └─ file_vault.py       文件保险箱静态访问分类器（读取/修改/未知）
 │  ├─ AI 与编排
 │  │  ├─ ai.sh               模型请求、响应规范化和 schema 校验
 │  │  ├─ orchestrator.sh     work/edit/script/terminal 高层编排和反思循环
@@ -174,7 +183,8 @@ Linux 运维 Agent
 │  └─ policies/
 │     ├─ risk-rules.json     阻断、警告、保护路径和保护服务规则
 │     ├─ redaction-rules.json 脱敏规则集中配置
-│     └─ audit-boundaries.json audit/observer 允许观察边界
+│     ├─ audit-boundaries.json audit/observer 允许观察边界
+│     └─ file-vault.json     用户自定义的敏感文件保险箱路径，默认为空
 ├─ Skill 能力层 skills/
 │  ├─ INDEX.md               可执行 skill 白名单
 │  ├─ ops-basic/             基础巡检、日志、备份和安全清理 skill
@@ -263,6 +273,7 @@ Web MCP 页和 `agent api mcp list|validate|tools` 会隐藏 Authorization、tok
    - 对 shell、skill、remote script 做策略审查。
    - 低风险且策略干净的步骤按 `approvals.auto.*` 能力开关决定是否自动执行。
    - 自由 shell 文件写入、重定向写入、`sed -i`、`cp`、`mv`、`rm`、`curl -o` 和 `wget -O` 会被阻断，应改用 `controlled-tools`。
+   - 命中文件保险箱（`policies/file-vault.json`）中的路径时：工作模式修改一律阻断（critical），读取或调用一律需要人工审批（high）；保险箱为空则完全不生效。
    - 默认 shell、remote script、文件补丁、文件下载、medium/high/critical 或命中策略告警的步骤需要人工确认。
 6. 每步通过 observer 封装执行，结果写入审计。
 7. 失败时生成修复建议，但不会自动执行修复计划。
@@ -374,7 +385,7 @@ Web 版 edit 使用浏览器内联编辑器，但保存前仍调用同一套 `ed
 | `LINUX_AGENT_API_KEY` | 推荐的模型 API 密钥来源，优先级高于 `config.api_key`。 |
 | `LINUX_AGENT_OUTPUT_JSON=1` | 将 CLI 业务输出切换为机器可读 JSON。 |
 
-内部变量如 `LINUX_AGENT_TMP_DIR`、`LINUX_AGENT_SESSION_ID`、`LINUX_AGENT_AUDIT_LOG` 由程序设置，不建议外部手工使用。
+内部变量如 `LINUX_AGENT_TMP_DIR`、`LINUX_AGENT_SESSION_ID`、`LINUX_AGENT_AUDIT_LOG`、`LINUX_AGENT_FILE_VAULT_POLICY_PATH` 由程序设置，不建议外部手工使用。
 
 ## 安全边界
 
@@ -384,6 +395,7 @@ Web 版 edit 使用浏览器内联编辑器，但保存前仍调用同一套 `ed
 - Terminal 也会执行策略审查，高风险命令需要确认。
 - 保护路径覆盖 `/`、`/etc`、`/boot`、`/usr`、`/var/lib`、`/root` 和用户 `.ssh`。
 - 自由 shell 文件修改默认阻断；文件匹配、补丁、下载和本地文本分析应通过 `controlled-tools` 登记脚本执行。
+- 文件保险箱：`policies/file-vault.json` 列出用户指定的敏感文件绝对路径（默认为空、不生效；支持末尾 `/*` 目录通配）。命中后工作模式修改被阻断（critical），读取及终端访问需要人工审批（high），命令实际运行后 auditd observer 还会记录保险箱路径的真实文件事件。
 - `network-ops-tools` 中的扫描、SNMP、WOL、hosts/firewall 等工具即使由 work 模式调用，也按 `SKILL.md` 声明提升为 `medium` 或 `high` 风险，不能作为 low 风险自动执行。
 - Remote script 只能 HTTPS 下载后审查，不允许流式管道执行。
 - Web `/api/` 全部需要 Bearer token。
@@ -486,6 +498,7 @@ done
 | `lib/ai.sh` | 构造系统提示，记录 AI 输入文件清单，按 provider 适配鉴权和请求格式，规范化和校验模型响应。 |
 | `lib/command_guard.py` | 标准库命令守卫，识别 pipeline、redirect、wrapper、substitution、remote pipe、保护路径写入和交互命令等风险形态。 |
 | `lib/policy.sh` | 聚合 AST 守卫和项目风险规则，对命令、脚本、参数、远程脚本、保护路径和保护服务做审查。 |
+| `lib/file_vault.py` | 文件保险箱静态访问分类器，把命令文本按保险箱路径判定为读取、修改或未知（保险箱为空时保持惰性），供 `policy.sh` 决定阻断或审批。 |
 | `lib/protocol.sh` | 为 API/CLI 构造 `timeline`、`approval_card`、`output_blocks` 工作台协议。 |
 | `lib/observer.sh` | auditd observer 预检、规则安装和清理、`ausearch` 解析、执行过程 marker 和降级记录。 |
 | `lib/executor.sh` | Work 计划执行状态机，包含 API 审批输入队列、自动审批、人工审批、跳过/修改/终止、远程脚本下载审查、步骤执行、失败修复建议和输出渲染。 |
@@ -518,6 +531,7 @@ done
 | `policies/risk-rules.json` | 风险规则文件，包含阻断模式、警告模式、远程脚本阻断模式、保护路径和保护服务。 |
 | `policies/redaction-rules.json` | 脱敏规则文件，集中覆盖 Bearer、sk、AKIA、JWT、长 hex、私钥、敏感 key/value 和内网 IP。 |
 | `policies/audit-boundaries.json` | audit 和 observer 边界文件，定义审计事件范围、payload 模式、文本限制、observer syscall、observer 字段和事件上限。 |
+| `policies/file-vault.json` | 文件保险箱策略，列出用户自定义的敏感文件绝对路径（支持末尾 `/*` 目录通配），默认路径列表为空表示不启用。 |
 
 ### `skills/`
 
@@ -586,7 +600,7 @@ done
 | `tests/smoke.sh` | 覆盖主要 CLI 入口、fake AI 工作流、JSON 输出、AI 文件清单、checkpoint 和 thinking trace。 |
 | `tests/security.sh` | 覆盖脱敏、审计摘要、上下文边界、远程脚本审查和临时目录清理。 |
 | `tests/workflow.sh` | 覆盖失败中断、自动低风险执行、反思续写、拒绝、跳过、修改需求、终止和输出渲染。 |
-| `tests/policy.sh` | 覆盖风险规则、保护路径、远程脚本阻断和风险合并。 |
+| `tests/policy.sh` | 覆盖风险规则、保护路径、远程脚本阻断、文件保险箱访问判定和风险合并。 |
 | `tests/tools.sh` | 覆盖本地工具、skill 登记、日志清理边界和 doctor。 |
 | `tests/observer.sh` | 覆盖 observer 禁用、mock auditd、事件汇总和失败降级。 |
 | `tests/interactive.sh` | 覆盖 REPL 菜单、模式切换、terminal 模式和 edit 模式。 |
