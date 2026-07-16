@@ -1,0 +1,158 @@
+#!/usr/bin/env python3
+
+import json
+import sys
+import unittest
+from pathlib import Path
+
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "web"))
+
+from domain import DomainContract, DomainValidationError  # noqa: E402
+from timeline import TimelineDataError, timeline_from_turns  # noqa: E402
+
+
+class DomainContractTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        with (ROOT / "schema" / "domain.json").open(encoding="utf-8") as handle:
+            cls.contract = DomainContract(json.load(handle))
+
+    def result(self, **overrides):
+        result = {
+            "ok": True,
+            "status": "executed",
+            "timeline": [
+                {
+                    "id": "execution-one",
+                    "step_id": "one",
+                    "kind": "execution",
+                    "status": "succeeded",
+                }
+            ],
+            "approval_card": None,
+            "output_blocks": [],
+        }
+        result.update(overrides)
+        return self.contract.enrich_execution_result(result)
+
+    def test_execution_result_is_versioned_and_validated(self):
+        result = self.result()
+        self.assertEqual(self.contract.schema_version, result["schema_version"])
+        self.assertEqual(self.contract.protocol_version, result["protocol_version"])
+        self.assertEqual("step_projection", result["timeline_semantics"])
+
+    def test_duplicate_projection_and_unknown_status_are_rejected(self):
+        duplicate = self.result()["timeline"] * 2
+        with self.assertRaises(DomainValidationError):
+            self.result(timeline=duplicate)
+        with self.assertRaises(DomainValidationError):
+            self.result(status="invented")
+
+    def test_execution_status_does_not_accept_error_codes_as_lifecycle_states(self):
+        self.assertIn("observer_required_unavailable", self.contract.error_codes)
+        self.assertNotIn(
+            "observer_required_unavailable", self.contract.result_statuses
+        )
+        with self.assertRaisesRegex(
+            DomainValidationError, "unsupported execution_result status"
+        ):
+            self.result(status="observer_required_unavailable")
+
+    def test_error_contract_keeps_compatibility_aliases(self):
+        error = self.contract.normalize_error(
+            {"ok": False, "status": "too_many_jobs", "error": "busy"},
+            "request-one",
+        )
+        self.assertEqual("too_many_jobs", error["code"])
+        self.assertEqual("busy", error["message"])
+        self.assertEqual("busy", error["error"])
+        self.assertTrue(error["retryable"])
+        self.assertEqual("request-one", error["request_id"])
+        self.assertEqual({}, error["details"])
+
+    def test_known_business_and_service_errors_keep_their_status(self):
+        for status in (
+            "blocked",
+            "validated",
+            "unsupported_provider",
+            "model_list_unavailable",
+            "api_key_missing",
+        ):
+            with self.subTest(status=status):
+                error = self.contract.normalize_error(
+                    {"ok": False, "status": status, "error": status},
+                    "request-known",
+                )
+                self.assertEqual(status, error["code"])
+                self.assertEqual(status, error["status"])
+                self.assertNotIn("original_code", error["details"])
+
+    def test_unknown_error_code_is_normalized_to_schema_defined_internal_error(self):
+        error = self.contract.normalize_error(
+            {"ok": False, "status": "invented_error", "error": "broken"},
+            "request-two",
+        )
+        self.assertEqual("internal_error", error["code"])
+        self.assertEqual("internal_error", error["status"])
+        self.assertEqual("invented_error", error["details"]["original_code"])
+        self.assertTrue(error["retryable"])
+
+    def test_timeline_accepts_valid_turn_and_rejects_invalid_turn(self):
+        turn = {
+            "id": "turn-one",
+            "number": 1,
+            "mode": "work",
+            "input": "inspect",
+            "status": "executed",
+            "context_eligible": True,
+            "result": self.result(),
+        }
+        timeline = timeline_from_turns("session-one", [turn], self.contract)
+        self.assertEqual("session-one", timeline["session_id"])
+        self.assertEqual(self.contract.protocol_version, timeline["protocol_version"])
+        broken = dict(turn)
+        broken["result"] = {"ok": True, "status": "executed"}
+        with self.assertRaises(TimelineDataError):
+            timeline_from_turns("session-one", [broken], self.contract)
+
+    def test_persisted_turn_validates_outer_contract_and_result_consistency(self):
+        valid = {
+            "id": "turn-one",
+            "number": 1,
+            "status": "executed",
+            "context_eligible": False,
+            "result": self.result(),
+        }
+        self.assertIs(valid, self.contract.validate_turn(valid))
+
+        invalid_values = (
+            ("id", ""),
+            ("number", 0),
+            ("number", True),
+            ("status", "invented"),
+            ("context_eligible", "false"),
+        )
+        for field, value in invalid_values:
+            with self.subTest(field=field, value=value):
+                broken = dict(valid)
+                broken[field] = value
+                with self.assertRaises(DomainValidationError):
+                    self.contract.validate_turn(broken)
+
+        mismatched = dict(valid)
+        mismatched["status"] = "failed"
+        with self.assertRaisesRegex(DomainValidationError, "must match"):
+            self.contract.validate_turn(mismatched)
+
+        for missing in ("id", "number", "status", "context_eligible"):
+            with self.subTest(missing=missing):
+                broken = dict(valid)
+                del broken[missing]
+                with self.assertRaisesRegex(DomainValidationError, "missing required"):
+                    self.contract.validate_turn(broken)
+
+
+if __name__ == "__main__":
+    unittest.main()

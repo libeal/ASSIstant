@@ -209,7 +209,7 @@ done
 
 vault_policy="$(mktemp)"
 vault_log="$(mktemp)"
-cat > "${vault_policy}" <<'JSON'
+cat >"${vault_policy}" <<'JSON'
 {
   "paths": [
     "/tmp/linux-agent-vault-secret",
@@ -218,7 +218,10 @@ cat > "${vault_policy}" <<'JSON'
 }
 JSON
 export LINUX_AGENT_FILE_VAULT_POLICY_PATH="${vault_policy}"
+# Consumed by the sourced audit and policy modules.
+# shellcheck disable=SC2034
 LINUX_AGENT_AUDIT_LOG="${vault_log}"
+# shellcheck disable=SC2034
 LINUX_AGENT_SESSION_ID="session-vault-policy-test"
 
 vault_work_modify="$(linux_agent_policy_review_text "step-vault-write" "printf secret > /tmp/linux-agent-vault-secret" "local" "work")"
@@ -277,7 +280,7 @@ unset LINUX_AGENT_FILE_VAULT_POLICY_PATH LINUX_AGENT_AUDIT_LOG LINUX_AGENT_SESSI
 # An empty vault protects nothing and must stay inert: even dynamic / non-statically
 # resolvable file paths keep their pre-vault classification (no spurious approval gate).
 empty_vault_policy="$(mktemp)"
-printf '{"paths":[]}\n' > "${empty_vault_policy}"
+printf '{"paths":[]}\n' >"${empty_vault_policy}"
 export LINUX_AGENT_FILE_VAULT_POLICY_PATH="${empty_vault_policy}"
 for empty_vault_command in \
     'cat "$SOME_VAR"' \
@@ -296,7 +299,7 @@ audit_summary_dir="$(mktemp -d)"
 old_audit_log_dir="${LINUX_AGENT_LOG_DIR}"
 LINUX_AGENT_LOG_DIR="${audit_summary_dir}"
 audit_summary_session="file-vault-audit-summary-test"
-printf '%s\n' '{"timestamp":"2026-07-14T00:00:00Z","session_id":"file-vault-audit-summary-test","stage":"file_vault_observed","payload":{"mode":"work","action":"modify","matched_path_count":0,"observed_path_count":1}}' > "${audit_summary_dir}/${audit_summary_session}.jsonl"
+printf '%s\n' '{"timestamp":"2026-07-14T00:00:00Z","session_id":"file-vault-audit-summary-test","stage":"file_vault_observed","payload":{"mode":"work","action":"modify","matched_path_count":0,"observed_path_count":1}}' >"${audit_summary_dir}/${audit_summary_session}.jsonl"
 audit_summary_report="$(linux_agent_show_audit "${audit_summary_session}")"
 grep -q '匹配文件数=1' <<<"${audit_summary_report}"
 LINUX_AGENT_LOG_DIR="${old_audit_log_dir}"

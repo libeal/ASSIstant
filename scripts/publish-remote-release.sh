@@ -61,14 +61,14 @@ if [[ "${release_exists}" == "1" ]]; then
             --json isDraft,isPrerelease \
             --jq '[.isDraft, .isPrerelease] | @tsv'
     )
-    [[ "${is_prerelease}" == "false" ]] || \
+    [[ "${is_prerelease}" == "false" ]] ||
         fail "release ${RELEASE_TAG} is marked as a prerelease"
 
     declare -A published_assets=()
     while IFS= read -r asset_name; do
         [[ -n "${asset_name}" ]] || continue
         published_assets["${asset_name}"]=1
-        [[ -n "${expected_paths[${asset_name}]+present}" ]] || \
+        [[ -n "${expected_paths[${asset_name}]+present}" ]] ||
             fail "release ${RELEASE_TAG} contains unexpected asset: ${asset_name}"
     done < <(
         gh release view "${RELEASE_TAG}" --json assets --jq '.assets[].name' | sort
@@ -94,7 +94,7 @@ for asset_path in "${asset_paths[@]}"; do
         --pattern "${asset_name}" \
         --dir "${verify_dir}" \
         --clobber >/dev/null
-    [[ -f "${verify_dir}/${asset_name}" ]] || \
+    [[ -f "${verify_dir}/${asset_name}" ]] ||
         fail "release asset download produced no file: ${asset_name}"
     if ! cmp -s -- "${asset_path}" "${verify_dir}/${asset_name}"; then
         expected_sha="$(sha256sum "${asset_path}" | awk '{print $1}')"

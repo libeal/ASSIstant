@@ -112,8 +112,7 @@ linux_agent_mcp_validate_manifest_path() {
 
     transport="$(jq -r 'if (.transport | type) == "string" then .transport else "" end' <<<"${payload}")"
     case "${transport}" in
-        stdio|sse|streamable_http)
-            ;;
+        stdio | sse | streamable_http) ;;
         *)
             findings="$(linux_agent_mcp_append_finding "${findings}" "critical" "MCP_TRANSPORT_INVALID" "${rel}" "transport 必须是字符串 stdio、sse 或 streamable_http。" "${server_id}")"
             ;;
@@ -226,7 +225,7 @@ linux_agent_mcp_server_summary() {
 }
 
 linux_agent_validate_mcp() {
-    local paths path findings validation ok mcp_dir
+    local path findings validation ok mcp_dir
     mcp_dir="$(linux_agent_mcp_dir)"
     mkdir -p "${mcp_dir}"
     findings='[]'
@@ -479,7 +478,7 @@ linux_agent_mcp_call_tool() {
     mkdir -p "${tmp_dir}"
     args_file="$(mktemp "${tmp_dir}/mcp.args.XXXXXX")"
     chmod 600 "${args_file}" 2>/dev/null || true
-    printf '%s\n' "${args}" > "${args_file}"
+    printf '%s\n' "${args}" >"${args_file}"
     status=0
     output="$(python3 "${client}" call-tool "${path}" "${tool_name}" "${args_file}" 2>&1)" || status=$?
     rm -f "${args_file}"
@@ -515,8 +514,7 @@ linux_agent_mcp_context_json() {
     local catalog
 
     case "${mode}" in
-        work|work_revision|work_reflect|edit|edit_revision)
-            ;;
+        work | work_revision | work_reflect | edit | edit_revision) ;;
         *)
             jq -cn '{enabled:false, reason:"mcp is exposed only in work/edit modes", tools:[], findings:[]}'
             return 0

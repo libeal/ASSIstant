@@ -20,7 +20,7 @@ log_search_reject="$(bash "${SCRIPT_DIR}/log-search.sh" "{\"path\":\"${ROOT_DIR}
 log_search_no_journal="$(bash "${SCRIPT_DIR}/log-search.sh" '{"path":"/var/log","keyword":"__unlikely_linux_agent_test_keyword__","lines":1,"include_journal":false}')"
 
 controlled_file="$(mktemp /tmp/linux-agent-controlled-file.XXXXXX)"
-printf 'alpha\nneedle\nomega\n' > "${controlled_file}"
+printf 'alpha\nneedle\nomega\n' >"${controlled_file}"
 controlled_link="${controlled_file}.link"
 ln -s "${controlled_file}" "${controlled_link}"
 match_result="$(bash "${CONTROLLED_SCRIPT_DIR}/file-match.sh" "$(jq -cn --arg path "${controlled_file}" '{path:$path, find:"needle", context_lines:1}')")"
@@ -122,24 +122,24 @@ assert_network_field public-ip '{"method":"stun","dry_run":true}' '.status == "p
 assert_network_field service-discovery '{"protocol":"mdns","dry_run":true}' '.status == "planned"'
 # hosts-file-editor: merge/dedupe on a temporary file (plan only, no apply)
 hosts_tmp="$(mktemp /tmp/linux-agent-hosts.XXXXXX)"
-printf '127.0.0.1\tlocalhost\n10.0.0.5\tapp\n' > "${hosts_tmp}"
+printf '127.0.0.1\tlocalhost\n10.0.0.5\tapp\n' >"${hosts_tmp}"
 assert_network_field hosts-file-editor "$(jq -cn --arg p "${hosts_tmp}" '{path:$p, allow_custom_path:true, action:"plan-add", ip:"10.0.0.5", hostnames:["web"], merge:true}')" '.note == "merged into existing entry" and (.line | test("app web"))'
 rm -f "${hosts_tmp}"
 
 cleanup_file="$(mktemp /tmp/linux-agent-tools-cleanup.XXXXXX)"
-printf '0123456789' > "${cleanup_file}"
+printf '0123456789' >"${cleanup_file}"
 cleanup_false_result="$(bash "${SCRIPT_DIR}/safe-log-cleanup.sh" "$(jq -cn --arg path "${cleanup_file}" '{path:$path, max_size_mb:0, dry_run:false}')")"
 cleanup_false_size="$(stat -c '%s' "${cleanup_file}")"
 rm -f "${cleanup_file}"
 
 cleanup_bad_number_file="$(mktemp /tmp/linux-agent-tools-bad-number.XXXXXX)"
-printf 'data' > "${cleanup_bad_number_file}"
+printf 'data' >"${cleanup_bad_number_file}"
 cleanup_bad_number_result="$(bash "${SCRIPT_DIR}/safe-log-cleanup.sh" "$(jq -cn --arg path "${cleanup_bad_number_file}" '{path:$path, max_size_mb:"abc"}')")"
 rm -f "${cleanup_bad_number_file}"
 
 cleanup_target="$(mktemp /tmp/linux-agent-tools-target.XXXXXX)"
 cleanup_link="$(mktemp -u /tmp/linux-agent-tools-link.XXXXXX)"
-printf 'keep-me' > "${cleanup_target}"
+printf 'keep-me' >"${cleanup_target}"
 ln -s "${cleanup_target}" "${cleanup_link}"
 cleanup_symlink_result="$(bash "${SCRIPT_DIR}/safe-log-cleanup.sh" "$(jq -cn --arg path "${cleanup_link}" '{path:$path, max_size_mb:0, dry_run:false}')")"
 cleanup_target_size="$(stat -c '%s' "${cleanup_target}")"
@@ -217,9 +217,9 @@ grep -q '"tool":"controlled.file.match"' <<<"${controlled_skill_result}"
 
 broken_skills_root="$(mktemp -d)"
 cp -a "${ROOT_DIR}/skills" "${broken_skills_root}/skills"
-printf '\n- `ops-basic/ghost-script`: bogus\n' >> "${broken_skills_root}/skills/INDEX.md"
-printf '\n- `scripts/ghost-script.sh`: bogus\n' >> "${broken_skills_root}/skills/ops-basic/SKILL.md"
-awk '!/^## .*传参/ && !/^## 参数契约/' "${broken_skills_root}/skills/ops-basic/SKILL.md" > "${broken_skills_root}/skills/ops-basic/SKILL.md.tmp"
+printf '\n- `ops-basic/ghost-script`: bogus\n' >>"${broken_skills_root}/skills/INDEX.md"
+printf '\n- `scripts/ghost-script.sh`: bogus\n' >>"${broken_skills_root}/skills/ops-basic/SKILL.md"
+awk '!/^## .*传参/ && !/^## 参数契约/' "${broken_skills_root}/skills/ops-basic/SKILL.md" >"${broken_skills_root}/skills/ops-basic/SKILL.md.tmp"
 mv "${broken_skills_root}/skills/ops-basic/SKILL.md.tmp" "${broken_skills_root}/skills/ops-basic/SKILL.md"
 original_config_json="${LINUX_AGENT_CONFIG_JSON}"
 LINUX_AGENT_CONFIG_JSON="$(jq --arg skills_dir "${broken_skills_root}/skills" '.skills_dir=$skills_dir' <<<"${LINUX_AGENT_CONFIG_JSON}")"
@@ -235,7 +235,7 @@ mcp_root="$(mktemp -d)"
 original_mcp_dir="${LINUX_AGENT_MCP_DIR}"
 LINUX_AGENT_MCP_DIR="${mcp_root}"
 mkdir -p "${mcp_root}/stdio-sample" "${mcp_root}/streamable-sample" "${mcp_root}/sse-sample" "${mcp_root}/broken-sample" "${mcp_root}/array-sample" "${mcp_root}/stdio-tools"
-cat > "${mcp_root}/stdio-sample/mcp.json" <<'JSON'
+cat >"${mcp_root}/stdio-sample/mcp.json" <<'JSON'
 {
   "id": "stdio-sample",
   "name": "Stdio sample",
@@ -247,7 +247,7 @@ cat > "${mcp_root}/stdio-sample/mcp.json" <<'JSON'
   "env": {"API_TOKEN": "should-not-leak"}
 }
 JSON
-cat > "${mcp_root}/streamable-sample/mcp.json" <<'JSON'
+cat >"${mcp_root}/streamable-sample/mcp.json" <<'JSON'
 {
   "id": "streamable-sample",
   "name": "Streamable HTTP sample",
@@ -256,7 +256,7 @@ cat > "${mcp_root}/streamable-sample/mcp.json" <<'JSON'
   "headers": {"Authorization": "Bearer should-not-leak"}
 }
 JSON
-cat > "${mcp_root}/sse-sample/mcp.json" <<'JSON'
+cat >"${mcp_root}/sse-sample/mcp.json" <<'JSON'
 {
   "id": "sse-sample",
   "name": "Legacy SSE sample",
@@ -265,19 +265,19 @@ cat > "${mcp_root}/sse-sample/mcp.json" <<'JSON'
   "message_url": "http://127.0.0.1:9124/messages"
 }
 JSON
-cat > "${mcp_root}/broken-sample/mcp.json" <<'JSON'
+cat >"${mcp_root}/broken-sample/mcp.json" <<'JSON'
 {
   "id": "broken-sample",
   "transport": "stdio",
   "args": ["missing-command"]
 }
 JSON
-cat > "${mcp_root}/array-sample/mcp.json" <<'JSON'
+cat >"${mcp_root}/array-sample/mcp.json" <<'JSON'
 [
   {"id": "array-sample", "transport": "stdio", "command": "node"}
 ]
 JSON
-cat > "${mcp_root}/stdio-tools/mcp.json" <<JSON
+cat >"${mcp_root}/stdio-tools/mcp.json" <<JSON
 {
   "id": "stdio-tools",
   "name": "Fake stdio tools",

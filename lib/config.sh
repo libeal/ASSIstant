@@ -4,8 +4,11 @@ set -euo pipefail
 
 LINUX_AGENT_CONFIG_JSON=""
 LINUX_AGENT_API_KEY_SOURCE=""
+LINUX_AGENT_JSON_SAFE_INTEGER_MAX=9007199254740991
 
 linux_agent_load_config() {
+    local config_json
+
     linux_agent_require_command jq
 
     if [[ ! -f "${LINUX_AGENT_CONFIG_FILE}" ]]; then
@@ -17,7 +20,93 @@ linux_agent_load_config() {
         return 1
     fi
 
-    LINUX_AGENT_CONFIG_JSON="$(cat "${LINUX_AGENT_CONFIG_FILE}")"
+    config_json="$(cat "${LINUX_AGENT_CONFIG_FILE}")"
+    if ! jq -e 'type == "object"' >/dev/null 2>&1 <<<"${config_json}"; then
+        linux_agent_print_error "config/config.json 必须是合法的 JSON 对象。"
+        return 1
+    fi
+    if ! linux_agent_config_validate_observer_require "${config_json}"; then
+        linux_agent_print_error "observer.require 必须是 JSON boolean（true 或 false）。"
+        return 1
+    fi
+    if ! linux_agent_config_validate_audit "${config_json}"; then
+        linux_agent_print_error "audit 配置非法：fsync 必须是 boolean，max_bytes/min_free_bytes 必须是 0-${LINUX_AGENT_JSON_SAFE_INTEGER_MAX} 的整数，on_full 仅支持 degrade 或 block。"
+        return 1
+    fi
+    if linux_agent_config_has_removed_integrity_chain "${config_json}"; then
+        linux_agent_print_error "audit.integrity_chain 已移除；审计 hash chain 现在是强制不变量。"
+        return 1
+    fi
+
+    LINUX_AGENT_CONFIG_JSON="${config_json}"
+}
+
+linux_agent_config_has_removed_integrity_chain() {
+    local config_json="${1:-${LINUX_AGENT_CONFIG_JSON:-}}"
+
+    jq -e '
+        (.audit? | type) == "object"
+        and (.audit | has("integrity_chain"))
+    ' >/dev/null 2>&1 <<<"${config_json}"
+}
+
+# observer.require is a compliance boundary, so unlike permissive feature flags
+# it must never accept strings/numbers or silently coerce an invalid value.
+# Missing observer/require remains valid and preserves the default false mode.
+linux_agent_config_validate_observer_require() {
+    local config_json="${1:-${LINUX_AGENT_CONFIG_JSON:-}}"
+
+    jq -e '
+        type == "object"
+        and (
+            if (.observer? == null) then true
+            elif (.observer | type) != "object" then false
+            elif (.observer | has("require") | not) then true
+            else (.observer.require | type) == "boolean"
+            end
+        )
+    ' >/dev/null 2>&1 <<<"${config_json}"
+}
+
+# Audit durability settings are a compliance boundary.  Explicit values must
+# retain the same type and value in Bash and Python; strings, fractional
+# numbers, negative numbers, and integers outside JSON's interoperable exact
+# range are rejected instead of being coerced or silently defaulted.
+linux_agent_config_validate_audit() {
+    local config_json="${1:-${LINUX_AGENT_CONFIG_JSON:-}}"
+
+    jq -e --argjson max "${LINUX_AGENT_JSON_SAFE_INTEGER_MAX}" '
+        type == "object"
+        and (
+            if has("audit") | not then true
+            elif (.audit | type) != "object" then false
+            else
+                ((.audit | has("fsync") | not) or ((.audit.fsync | type) == "boolean"))
+                and (
+                    (.audit | has("max_bytes") | not)
+                    or (
+                        (.audit.max_bytes | type) == "number"
+                        and .audit.max_bytes == (.audit.max_bytes | floor)
+                        and .audit.max_bytes >= 0
+                        and .audit.max_bytes <= $max
+                    )
+                )
+                and (
+                    (.audit | has("min_free_bytes") | not)
+                    or (
+                        (.audit.min_free_bytes | type) == "number"
+                        and .audit.min_free_bytes == (.audit.min_free_bytes | floor)
+                        and .audit.min_free_bytes >= 0
+                        and .audit.min_free_bytes <= $max
+                    )
+                )
+                and (
+                    (.audit | has("on_full") | not)
+                    or (.audit.on_full == "degrade" or .audit.on_full == "block")
+                )
+            end
+        )
+    ' >/dev/null 2>&1 <<<"${config_json}"
 }
 
 linux_agent_config_get() {
@@ -38,13 +127,31 @@ linux_agent_config_bool_default() {
 
     value="$(linux_agent_config_get_default "${key}" "${default_value}")"
     case "${value,,}" in
-        true|1|yes|on)
+        true | 1 | yes | on)
             printf 'true\n'
             ;;
         *)
             printf 'false\n'
             ;;
     esac
+}
+
+# False-safe boolean read. jq's `//` treats an explicit `false` like a missing
+# value (`false // "true"` yields "true"), so bind the value and test it
+# directly for booleans whose default is true (for example audit.fsync).
+linux_agent_config_bool_strict() {
+    local key="$1"
+    local default_value="${2:-false}"
+    local value
+
+    value="$(jq -er --argjson d "${default_value}" "
+        (${key}) as \$v
+        | if \$v == null then \$d
+          elif (\$v | type) == \"boolean\" then \$v
+          else error(\"configuration value must be a boolean\")
+          end
+    " <<<"${LINUX_AGENT_CONFIG_JSON}")" || return 1
+    printf '%s\n' "${value}"
 }
 
 linux_agent_config_positive_int_default() {
@@ -59,6 +166,26 @@ linux_agent_config_positive_int_default() {
     if [[ ! "${value}" =~ ^[0-9]+$ || "${value}" -le 0 ]]; then
         value=1
     fi
+    printf '%s\n' "${value}"
+}
+
+# Like positive_int_default but permits 0 (e.g. audit.max_bytes / audit.min_free_bytes
+# use 0 to disable rotation / disk-space protection). Non-integers fall back to the default.
+linux_agent_config_nonneg_int_default() {
+    local key="$1"
+    local default_value="$2"
+    local value
+
+    value="$(jq -er --argjson d "${default_value}" --argjson max "${LINUX_AGENT_JSON_SAFE_INTEGER_MAX}" "
+        (${key}) as \$v
+        | if \$v == null then \$d
+          elif (\$v | type) == \"number\"
+               and \$v == (\$v | floor)
+               and \$v >= 0
+               and \$v <= \$max then \$v
+          else error(\"configuration value must be a non-negative interoperable JSON integer\")
+          end
+    " <<<"${LINUX_AGENT_CONFIG_JSON}")" || return 1
     printf '%s\n' "${value}"
 }
 
@@ -103,6 +230,9 @@ linux_agent_config_api_key_placeholder() {
     [[ -z "${value}" || "${value}" == "please-set-your-api-key" ]]
 }
 
+# The source marker is part of the shared sourced-module environment and is
+# explicitly scrubbed before launching child processes.
+# shellcheck disable=SC2034
 linux_agent_config_api_key() {
     local env_value config_value
 

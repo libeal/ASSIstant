@@ -214,27 +214,9 @@ function configInputId(key) {
 }
 
 function normalizeProviderId(value) {
-  const normalized = String(value || "")
-    .trim()
-    .toLowerCase()
-    .replace(/[-\s/]+/g, "_");
-  const rules = state.domainSchema?.provider_normalization;
-  if (rules) {
-    for (const rule of rules.prefix_rules || []) {
-      if (rule.prefix && normalized.startsWith(rule.prefix)) return rule.canonical || rule.prefix;
-    }
-    const aliases = rules.aliases || {};
-    if (normalized in aliases) return aliases[normalized];
-    if (!normalized) return aliases[""] || "openai_compatible";
-    return normalized;
-  }
-  // schema not loaded yet — inline fallback (mirrors schema/domain.json)
-  if (!normalized || normalized.startsWith("openai_compatible")) return "openai_compatible";
-  if (["zhipu", "zhipuai"].includes(normalized)) return "zhipu_ai";
-  if (normalized === "sarvam") return "sarvam_ai";
-  if (normalized === "moonshot") return "moonshot_ai";
-  if (normalized === "xai") return "x_ai";
-  return normalized;
+  // Provider IDs returned by /api/config and /api/config/providers are already
+  // canonical.  The browser deliberately does not duplicate backend aliases.
+  return String(value || "").trim();
 }
 
 function findConfigProvider(providerId) {
@@ -253,9 +235,10 @@ function providerLabel(providerId) {
 
 function statusKind(value) {
   const text = String(value || "").toLowerCase();
-  if (["ok", "executed", "succeeded", "success", "approved", "auto_approved"].includes(text)) return "low";
-  if (["running", "queued", "approval_required", "pending", "skipped", "review"].includes(text)) return "medium";
-  if (["failed", "blocked", "rejected", "terminated", "critical", "high"].includes(text)) return "high";
+  const presentation = state.domainSchema?.status_presentation || {};
+  for (const kind of ["low", "medium", "high"]) {
+    if (Array.isArray(presentation[kind]) && presentation[kind].includes(text)) return kind;
+  }
   return pillKind(text);
 }
 
@@ -935,7 +918,6 @@ function openApprovalDrawer(result, input) {
     input,
     response,
     context: result.context || state.workContext || {},
-    turnId: state.activeWorkTurnId || "",
     card,
     step,
     index: Math.max(0, steps.indexOf(step)),
@@ -1035,7 +1017,6 @@ async function submitApprovalDecision(decision) {
   }
 
   const pendingApproval = state.pendingApproval;
-  const turnId = pendingApproval.turnId || state.activeWorkTurnId || "";
   const payload = {
     input: pendingApproval.input,
     response: pendingApproval.response,
@@ -1045,7 +1026,6 @@ async function submitApprovalDecision(decision) {
   };
   if (decision === "s") payload.decisions.push($("approvalRevision")?.value || "");
   closeApprovalDrawer();
-  state.activeWorkTurnId = turnId;
   if (state.activeWorkJobId || state.workSubmitting) return showToast("Work job is already running.");
   state.workSubmitting = true;
   state.workApprovalSubmitting = true;
@@ -1059,7 +1039,7 @@ async function submitApprovalDecision(decision) {
     state.workSuspended = false;
     updateWorkActionLabel();
     const completed = await pollJob(job.job_id, "workJobStatus", null, { suspendFlag: "workSuspended", onProgress: renderWorkJobProgress });
-    handleCompletedWork(completed, payload.input);
+    await handleCompletedWork(completed, payload.input);
   } finally {
     state.workSubmitting = false;
     state.workApprovalSubmitting = false;
@@ -1076,7 +1056,6 @@ function renderWorkPlan(response, input = "", context = null, awaitingApproval =
 }
 
 function prepareNewWorkRun(input) {
-  state.activeWorkTurnId = "";
   state.selectedTurnId = "";
   state.selectedStepKey = "";
   state.selectedStepIndex = -1;
@@ -1086,15 +1065,6 @@ function prepareNewWorkRun(input) {
   printOutput("terminalOutput", { status: "running", message: "本轮执行中，等待返回新的共享执行输出。" });
   renderSessionTimeline();
   renderStepDetail(null);
-}
-
-function renderTimelineReturns(title, result) {
-  const turnSpecs = workResultTurnSpecs(title, result, result?.input || state.workPlanInput || "");
-  let lastTurn = null;
-  for (const spec of turnSpecs) {
-    lastTurn = upsertSessionTurn(spec.title, spec.result, spec.input, spec.options);
-  }
-  return lastTurn;
 }
 
 function renderSharedProtocolExecution(title, result, outputId = "terminalOutput") {
@@ -1116,163 +1086,14 @@ function renderWorkJobProgress(job) {
   printOutput("terminalOutput", text);
 }
 
-function executionItems(result) {
-  return (Array.isArray(result?.timeline) ? result.timeline : []).filter((item) => ["execution", "failure", "observer", "audit"].includes(item.kind));
-}
-
-function executionIteration(item) {
-  const value = Number(item?.iteration);
-  if (!Number.isFinite(value) || value <= 0) return null;
-  return Math.floor(value);
-}
-
-function executionIterations(result) {
-  const seen = new Set();
-  const iterations = [];
-  for (const item of executionItems(result)) {
-    const iteration = executionIteration(item);
-    if (iteration === null || seen.has(iteration)) continue;
-    seen.add(iteration);
-    iterations.push(iteration);
-  }
-  return iterations;
-}
-
-function fallbackStepFromExecution(item, index) {
-  if (isPlainObject(item?.step) && Object.keys(item.step).length) return item.step;
-  return {
-    id: item?.step_id || `step-${index + 1}`,
-    title: item?.title || item?.step_id || `step-${index + 1}`,
-    executor_type: item?.step?.executor_type || "skill_script",
-    risk_level: item?.risk_level || "low",
-  };
-}
-
-function workResultTurnSpecs(title, result, input = "") {
-  const iterations = executionIterations(result);
-  if (iterations.length <= 1) {
-    return [{
-      title,
-      result,
-      input,
-      options: {
-        turnId: state.activeWorkTurnId || "",
-        mode: "work",
-      },
-    }];
-  }
-  const response = isPlainObject(result?.response) ? result.response : {};
-  const rootTimeline = Array.isArray(result?.timeline) ? result.timeline : [];
-  const lastIteration = iterations[iterations.length - 1];
-  return iterations.map((iteration, index) => {
-    const isFirst = index === 0;
-    const isLast = iteration === lastIteration;
-    const iterExecutions = executionItems(result).filter((item) => executionIteration(item) === iteration);
-    const iterTimeline = rootTimeline.filter((item) => {
-      if (["execution", "failure", "observer", "audit"].includes(item?.kind)) return executionIteration(item) === iteration;
-      return isFirst && item?.kind === "plan_step";
-    });
-    const steps = isFirst && Array.isArray(response.steps) && response.steps.length
-      ? response.steps
-      : iterExecutions.map(fallbackStepFromExecution);
-    const iterResult = {
-      ...result,
-      status: isLast ? result?.status : "executed",
-      response: {
-        ...response,
-        response_type: response.response_type || "work_plan",
-        summary: isFirst ? (response.summary || response.summary_preview || "") : `Agent loop 第 ${iteration} 轮`,
-        steps,
-      },
-      timeline: iterTimeline,
-      output_blocks: isLast ? (result?.output_blocks || []) : [{
-        kind: "meta",
-        title: "工作流摘要",
-        json: { status: "executed", iteration, source: "loop_iteration" },
-      }],
-      iteration,
-      loop_iteration: iteration,
-      input: result?.input || input,
-    };
-    return {
-      title: `${title || "work_return"} · 第 ${iteration} 轮`,
-      result: iterResult,
-      input: result?.input || input,
-      options: {
-        turnId: isFirst ? (state.activeWorkTurnId || "") : "",
-        mode: "work",
-      },
-    };
-  });
-}
-
 function entryStepKey(entry) {
   return String(entry?.output?.id || entry?.step?.id || entry?.output?.step_id || entry?.index || "0");
 }
 
-function entryMatchStepKey(entry) {
-  return String(entry?.step?.id || entry?.output?.step_id || entry?.index || "0");
-}
-
 function normalizedTurnEntries(title, result) {
-  const response = result?.response || {};
-  const steps = Array.isArray(response.steps) ? response.steps : [];
-  const protocolEntries = executionItems(result).length ? normalizeExecutionEntries(title, result) : [];
-  if (steps.length) {
-    const byStepId = new Map();
-    for (const entry of protocolEntries) {
-      const key = entryMatchStepKey(entry);
-      if (!byStepId.has(key)) byStepId.set(key, entry);
-    }
-    const pendingIndex = result?.status === "approval_required" ? completedExecutionCount(result) : -1;
-    const usedEntries = new Set();
-    const plannedEntries = steps.map((step, index) => {
-      const key = String(step.id || index);
-      const matched = byStepId.get(key) || protocolEntries.find((entry) => entry.index === index);
-      if (matched) {
-        usedEntries.add(matched);
-        return {
-          ...matched,
-          index,
-          number: index + 1,
-          title: matched.title || step.title || step.id || `step-${index + 1}`,
-          step: { ...step, ...(matched.step || {}) },
-        };
-      }
-      const status = index === pendingIndex ? "approval_required" : "planned";
-      return {
-        index,
-        number: index + 1,
-        title: step.title || step.id || `step-${index + 1}`,
-        status,
-        step,
-        output: {
-          status,
-          summary: step.expected_effect || step.reason || (status === "approval_required" ? "等待审批后执行。" : "尚未执行。"),
-        },
-      };
-    });
-    const extraEntries = protocolEntries
-      .filter((entry) => !usedEntries.has(entry))
-      .map((entry, extraIndex) => ({
-        ...entry,
-        index: steps.length + extraIndex,
-        number: steps.length + extraIndex + 1,
-      }));
-    return [...plannedEntries, ...extraEntries];
-  }
-  if (response.response_type === "answer") {
-    return [{
-      index: 0,
-      number: "A",
-      title: "answer_received",
-      status: result?.status || "answered",
-      step: {},
-      output: { status: result?.status || "answered", summary: response.answer || "" },
-    }];
-  }
   return normalizeExecutionEntries(title, result);
 }
+
 
 function contextTurnCapacity() {
   const raw = Number(state.sessionInfo?.context_turns ?? state.configSnapshot?.context_turns ?? 6);
@@ -1282,8 +1103,7 @@ function contextTurnCapacity() {
 
 function turnCanEnterContext(turn) {
   const mode = String(turn?.mode || "work");
-  const status = String(turn?.status || "");
-  return turn?.contextEligible !== false && mode === "work" && status !== "approval_required";
+  return mode === "work" && turn?.contextEligible === true;
 }
 
 function contextMetaByTurn() {
@@ -1325,6 +1145,7 @@ function createSessionTurn(title, result, input = "", options = {}) {
     created_at: options.created_at || now,
     updated_at: options.updated_at || now,
     source: options.source || result?.source || "live",
+    jobId: options.jobId || result?.job_id || "",
     result: result || {},
     entries: normalizedTurnEntries(title, result || {}),
     contextEligible: options.contextEligible ?? (mode === "work" && status !== "approval_required"),
@@ -1335,16 +1156,17 @@ function normalizeRestoredTurn(turn, index) {
   const result = turn?.result || turn || {};
   const order = index + 1;
   sessionTurnCounter = Math.max(sessionTurnCounter, order);
-  return createSessionTurn(`审计恢复 ${turn?.number || order}`, result, turn?.input || result.input || "", {
+  return createSessionTurn(`持久化轮次 ${turn?.number || order}`, result, turn?.input || result.input || "", {
     id: turn?.id || `restored-${order}`,
     number: turn?.number || order,
     order,
     mode: turn?.mode || "work",
     status: turn?.status || result.status || "restored",
-    source: "audit",
+    source: turn?.source || "persisted",
     created_at: turn?.created_at || "",
     updated_at: turn?.updated_at || "",
-    contextEligible: (turn?.mode || "work") === "work" && (turn?.status || result.status) !== "approval_required",
+    jobId: turn?.job_id || "",
+    contextEligible: typeof turn?.context_eligible === "boolean" ? turn.context_eligible : false,
   });
 }
 
@@ -1727,7 +1549,7 @@ async function loadDomainSchema() {
     const data = await api("/api/schema");
     if (data?.ok && data.schema) state.domainSchema = data.schema;
   } catch (err) {
-    // Non-fatal: normalizeProviderId falls back to its inline rules.
+    // Non-fatal for basic rendering; protocol validation remains unavailable.
   }
 }
 
@@ -1762,8 +1584,9 @@ async function loadSessionState() {
   const data = await api("/api/session/state");
   state.sessionInfo = data;
   state.restoredAuditSessionId = data.restored_from || "";
+  const persistedTurns = data.web_timeline?.turns || data.turns || [];
+  replaceSessionTurns(persistedTurns);
   updateSessionLeaveState();
-  renderSessionTimeline();
   return data;
 }
 
@@ -1792,7 +1615,6 @@ async function leaveWorkbenchSession() {
   state.sessionTurns = [];
   state.selectedTurnId = "";
   state.selectedStepKey = "";
-  state.activeWorkTurnId = "";
   state.workPlan = null;
   state.workContext = null;
   state.workPlanInput = "";
@@ -2477,7 +2299,7 @@ async function runWork() {
     state.workSuspended = false;
     updateWorkActionLabel();
     const completed = await pollJob(state.activeWorkJobId, "workJobStatus", null, { suspendFlag: "workSuspended", onProgress: renderWorkJobProgress });
-    handleCompletedWork(completed, state.workPlanInput);
+    await handleCompletedWork(completed, state.workPlanInput);
     return;
   }
   const input = $("workInput").value.trim();
@@ -2494,14 +2316,14 @@ async function runWork() {
     state.workSuspended = false;
     updateWorkActionLabel();
     const completed = await pollJob(job.job_id, "workJobStatus", null, { suspendFlag: "workSuspended", onProgress: renderWorkJobProgress });
-    handleCompletedWork(completed, input);
+    await handleCompletedWork(completed, input);
   } finally {
     state.workSubmitting = false;
     updateWorkActionLabel();
   }
 }
 
-function handleCompletedWork(completed, input) {
+async function handleCompletedWork(completed, input) {
   if (completed.status === "suspended") return;
   state.activeWorkJobId = "";
   state.workApprovalSubmitting = false;
@@ -2523,18 +2345,18 @@ function handleCompletedWork(completed, input) {
       Array.isArray(result.output_blocks) ||
       ["approval_required", "executed", "answered", "failed", "cancelled"].includes(result.status)
   );
-  let turn = null;
   if (hasWorkbenchResult) {
-    turn = renderTimelineReturns(result.status || "work_return", result);
     const sharedText = renderSharedExecutionOutput(result.status || "work_return", result);
     if (sharedText.trim()) printOutput("terminalOutput", sharedText);
   }
+  // SessionStore commits the immutable turn before publishing the terminal
+  // Job record.  Reload it instead of assigning browser-local IDs/timestamps
+  // or merging approval continuations differently from the backend.
+  await loadSessionState();
   if (result.status === "approval_required") {
-    state.activeWorkTurnId = turn?.id || state.activeWorkTurnId || "";
     openApprovalDrawer(result, input);
     showToast("需要审批后继续");
   } else {
-    state.activeWorkTurnId = "";
     closeApprovalDrawer();
   }
 }
@@ -2549,7 +2371,10 @@ async function cancelWork() {
   closeApprovalDrawer();
   updateWorkActionLabel();
   setStatus("workJobStatus", data.status, data.ok ? "high" : "medium");
-  renderTimelineReturns("cancelled", data.job || data);
+  const result = data.job?.result || data;
+  const sharedText = renderSharedExecutionOutput(result.status || "cancelled", result);
+  if (sharedText.trim()) printOutput("terminalOutput", sharedText);
+  await loadSessionState();
 }
 
 function suspendWork() {
@@ -2726,6 +2551,7 @@ async function loadAuditList() {
   state.auditSessions = data.sessions || [];
   state.auditEvents = [];
   state.auditWebTimeline = null;
+  state.auditTimelineUnavailableReason = "";
   state.currentAuditSession = "";
   renderAuditSessionList();
   resetAuditSummary();
@@ -2812,6 +2638,7 @@ async function readAudit(sessionId) {
   state.currentAuditSession = sessionId;
   state.auditEvents = Array.isArray(data.events) ? data.events : [];
   state.auditWebTimeline = data.web_timeline || null;
+  state.auditTimelineUnavailableReason = data.timeline_unavailable_reason || "";
   renderAuditEventTimeline();
   renderAuditObserverSummary();
   updateAuditMetrics();
@@ -2878,6 +2705,9 @@ function renderAuditReadableReport(data) {
     `事件数: ${events.length}`,
     `可回放轮次: ${Array.isArray(restored.turns) ? restored.turns.length : 0}`,
     `可回放步骤: ${Array.isArray(restored.timeline) ? restored.timeline.length : 0}`,
+    ...(data.timeline_unavailable_reason
+      ? [`Timeline: 不可用（${data.timeline_unavailable_reason}）；该会话仅显示只读审计事件。`]
+      : []),
     "",
     "事件时间线:",
   ];
@@ -3018,16 +2848,17 @@ function findAuditFailure() {
 }
 
 async function restoreAuditTimelineToWorkbench() {
-  const restored = state.auditWebTimeline;
-  if (!restored?.timeline?.length && !restored?.turns?.length) {
+  const preview = state.auditWebTimeline;
+  if (!preview?.timeline?.length && !preview?.turns?.length) {
     return showToast("当前审计 session 没有可恢复的工作时间线");
   }
-  const sessionId = state.currentAuditSession || restored.session_id || "";
+  const sessionId = state.currentAuditSession || preview.session_id || "";
   const backend = await api("/api/session/restore", { method: "POST", body: { session_id: sessionId } });
   if (!backend.ok) {
     showToast(backend.error || backend.status || "恢复会话失败");
     return;
   }
+  const restored = backend.web_timeline || preview;
   state.sessionInfo = backend.session || state.sessionInfo;
   state.restoredAuditSessionId = sessionId;
   state.lastProtocolResult = restored;
@@ -3035,7 +2866,6 @@ async function restoreAuditTimelineToWorkbench() {
   state.workContext = { restored_from_audit: sessionId };
   state.workPlanInput = restored.input || "";
   state.awaitingWorkApproval = false;
-  state.activeWorkTurnId = "";
   closeApprovalDrawer();
   if ($("workInput") && restored.input) $("workInput").value = restored.input;
   updateSessionLeaveState();

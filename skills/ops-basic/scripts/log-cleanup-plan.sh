@@ -37,8 +37,7 @@ if ! resolved_root="$(realpath -e "${root_path}" 2>/dev/null)"; then
 fi
 
 case "${resolved_root}" in
-    /var/log|/var/log/*|/tmp|/tmp/*)
-        ;;
+    /var/log | /var/log/* | /tmp | /tmp/*) ;;
     *)
         jq -cn \
             --arg root_path "${root_path}" \
@@ -56,7 +55,6 @@ if [[ ! -d "${resolved_root}" ]]; then
     exit 0
 fi
 
-threshold_bytes=$((min_size_mb * 1024 * 1024))
 candidate_file="$(mktemp)"
 rejected_file="$(mktemp)"
 trap 'rm -f "${candidate_file}" "${rejected_file}"' EXIT
@@ -73,7 +71,7 @@ while IFS= read -r file_path; do
             --arg path "${file_path}" \
             --arg reason "疑似关键日志或数据库日志" \
             --argjson size_bytes "${size_bytes}" \
-            '{path:$path, size_bytes:$size_bytes, reason:$reason}' >> "${rejected_file}"
+            '{path:$path, size_bytes:$size_bytes, reason:$reason}' >>"${rejected_file}"
         continue
     fi
 
@@ -107,10 +105,10 @@ while IFS= read -r file_path; do
                     risk_level:"high"
                 }
             ]
-        }' >> "${candidate_file}"
+        }' >>"${candidate_file}"
 
     count=$((count + 1))
-    if (( count >= limit )); then
+    if ((count >= limit)); then
         break
     fi
 done < <(find "${resolved_root}" -maxdepth "${max_depth}" -type f -size +"${min_size_mb}"M 2>/dev/null | sort)

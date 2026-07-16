@@ -10,7 +10,7 @@ linux_agent_observer_config_enabled() {
         enabled="$(linux_agent_config_get_default '.observer.enabled' 'auto')"
     fi
     case "${enabled}" in
-        auto|auditd|disabled) printf '%s\n' "${enabled}" ;;
+        auto | auditd | disabled) printf '%s\n' "${enabled}" ;;
         *) printf 'auto\n' ;;
     esac
 }
@@ -21,7 +21,7 @@ linux_agent_observer_privilege_mode() {
         mode="$(linux_agent_config_get_default '.observer.privilege' 'sudo_interactive')"
     fi
     case "${mode}" in
-        sudo_interactive|passwordless|none) printf '%s\n' "${mode}" ;;
+        sudo_interactive | passwordless | none) printf '%s\n' "${mode}" ;;
         *) printf 'sudo_interactive\n' ;;
     esac
 }
@@ -38,6 +38,156 @@ linux_agent_observer_max_events() {
         max_events="$(linux_agent_audit_boundary_observer_max_events "${max_events}")"
     fi
     printf '%s\n' "${max_events}"
+}
+
+# Strict-compliance switch: when true, execution is refused if the auditd
+# observer is not actively observing this session. Default false (degrade).
+linux_agent_observer_require_enabled() {
+    [[ -n "${LINUX_AGENT_CONFIG_JSON:-}" ]] || return 1
+
+    # Normal startup rejects this in linux_agent_load_config. Treat an invalid
+    # in-memory override as required as a defense-in-depth fail-closed posture.
+    if declare -F linux_agent_config_validate_observer_require >/dev/null 2>&1 &&
+        ! linux_agent_config_validate_observer_require "${LINUX_AGENT_CONFIG_JSON}"; then
+        return 0
+    fi
+    jq -e '.observer.require == true' >/dev/null 2>&1 <<<"${LINUX_AGENT_CONFIG_JSON}"
+}
+
+# Execution gates are normally invoked inside command substitution, so a
+# failed-context assignment in the gate's subshell cannot update its parent.
+# Persist only the fail-closed transition in the session temp directory and
+# treat it as an authoritative overlay for subsequent gates and cleanup.
+linux_agent_observer_failed_context_path() {
+    local tmp_dir="${LINUX_AGENT_TMP_DIR:-}"
+    local session_id="${LINUX_AGENT_SESSION_ID:-}"
+    local safe_session
+    [[ -n "${tmp_dir}" && -n "${session_id}" ]] || return 1
+    safe_session="$(printf '%s' "${session_id}" | tr -c 'A-Za-z0-9_.-' '_' | cut -c 1-96)"
+    [[ -n "${safe_session}" ]] || return 1
+    printf '%s/observer-%s.failed.json\n' "${tmp_dir}" "${safe_session}"
+}
+
+linux_agent_observer_current_context() {
+    local context_json="${LINUX_AGENT_OBSERVER_SESSION_CONTEXT:-}"
+    local failed_path
+    if failed_path="$(linux_agent_observer_failed_context_path)" && [[ -e "${failed_path}" || -L "${failed_path}" ]]; then
+        if [[ -f "${failed_path}" && ! -L "${failed_path}" ]] &&
+            jq -e 'type == "object" and .status == "failed"' "${failed_path}" >/dev/null 2>&1; then
+            cat "${failed_path}"
+            return 0
+        fi
+        jq -cn '{status:"failed", available:false, reason_code:"observer_runtime_context_invalid", reason:"persisted observer failure context is invalid"}'
+        return 0
+    fi
+    printf '%s\n' "${context_json}"
+}
+
+linux_agent_observer_persist_failed_context() {
+    local context_json="$1"
+    local failed_path temp_path previous_umask
+    jq -e 'type == "object" and .status == "failed"' >/dev/null 2>&1 <<<"${context_json}" || return 1
+    failed_path="$(linux_agent_observer_failed_context_path)" || return 1
+    mkdir -p "$(dirname "${failed_path}")"
+    previous_umask="$(umask)"
+    umask 077
+    if ! temp_path="$(mktemp "${failed_path}.tmp.XXXXXX")"; then
+        umask "${previous_umask}"
+        return 1
+    fi
+    if ! printf '%s\n' "${context_json}" >"${temp_path}" ||
+        ! chmod 600 "${temp_path}" ||
+        ! mv -f "${temp_path}" "${failed_path}"; then
+        rm -f "${temp_path}"
+        umask "${previous_umask}"
+        return 1
+    fi
+    umask "${previous_umask}"
+}
+
+linux_agent_observer_clear_failed_context() {
+    local failed_path
+    failed_path="$(linux_agent_observer_failed_context_path)" || return 0
+    if [[ -e "${failed_path}" || -L "${failed_path}" ]]; then
+        rm -f "${failed_path}"
+    fi
+}
+
+# True only when the current session's observer actually installed auditd rules
+# (session context status == "running"). Any other status (unavailable /
+# disabled / failed / unset) means execution is not being observed.
+linux_agent_observer_is_observing() {
+    local ctx
+    ctx="$(linux_agent_observer_current_context)"
+    [[ -n "${ctx}" ]] || return 1
+    [[ "$(jq -r '.status // ""' <<<"${ctx}" 2>/dev/null)" == "running" ]]
+}
+
+# Print a structured block result and return non-zero when strict compliance is
+# enabled but this session is not fully observed. Callers use the return status
+# before starting any real process; the command wrapper also calls this as a
+# defense-in-depth guard for direct execution paths.
+linux_agent_observer_execution_gate() {
+    local scope="${1:-execution}"
+    local subject_json="${2:-}"
+    local observer_ctx observer_status payload runtime_verification audit_rc
+
+    if ! linux_agent_observer_require_enabled; then
+        return 0
+    fi
+
+    [[ -n "${subject_json}" ]] || subject_json='{}'
+    if ! jq -e . >/dev/null 2>&1 <<<"${subject_json}"; then
+        subject_json='{}'
+    fi
+    observer_ctx="$(linux_agent_observer_current_context)"
+    if [[ -z "${observer_ctx}" ]] || ! jq -e . >/dev/null 2>&1 <<<"${observer_ctx}"; then
+        observer_ctx='{}'
+    fi
+
+    observer_status="$(jq -r '.status // ""' <<<"${observer_ctx}")"
+    if [[ "${observer_status}" == "running" ]]; then
+        runtime_verification="$(linux_agent_observer_runtime_verify "${observer_ctx}")"
+        if [[ "$(jq -r '.ok // false' <<<"${runtime_verification}")" == "true" ]]; then
+            return 0
+        fi
+        observer_ctx="$(jq -c \
+            --argjson verification "${runtime_verification}" \
+            '. + {
+                status:"failed",
+                available:false,
+                reason_code:($verification.reason_code // "observer_runtime_verification_failed"),
+                reason:($verification.reason // "strict observer runtime verification failed"),
+                runtime_verification:$verification
+            }' <<<"${observer_ctx}")"
+        LINUX_AGENT_OBSERVER_SESSION_CONTEXT="${observer_ctx}"
+        linux_agent_observer_persist_failed_context "${observer_ctx}" || true
+    fi
+
+    payload="$(jq -cn \
+        --arg scope "${scope}" \
+        --argjson subject "${subject_json}" \
+        --argjson observer "${observer_ctx}" \
+        '{scope:$scope, subject:$subject, error_code:"observer_required_unavailable", status:($observer.status // null), observer_status:($observer.status // null), reason_code:($observer.reason_code // null)}')"
+    audit_rc=0
+    if declare -F linux_agent_audit_require_event >/dev/null 2>&1; then
+        linux_agent_audit_require_event "observer_required_unavailable" "${payload}" || audit_rc=$?
+    else
+        linux_agent_observer_log_event "observer_required_unavailable" "${payload}" || audit_rc=$?
+    fi
+    if ((audit_rc != 0)); then
+        if declare -F linux_agent_audit_failure_result >/dev/null 2>&1; then
+            linux_agent_audit_failure_result "${audit_rc}" "observer_required_unavailable"
+        else
+            jq -cn --argjson exit_code "${audit_rc}" '
+                {ok:false, status:"blocked", code:"audit_integrity_broken", error_code:"audit_integrity_broken", exit_code:$exit_code, output:{raw:"审计事件无法持久写入，操作未执行。"}}'
+        fi
+        return 1
+    fi
+    jq -cn \
+        --argjson observer "${observer_ctx}" \
+        '{ok:false, status:"blocked", error_code:"observer_required_unavailable", exit_code:126, output:{raw:"observer.require 已启用，但 auditd observer 未在观察本次执行，已拒绝执行该步骤。"}, observer:$observer}'
+    return 1
 }
 
 linux_agent_observer_log_event() {
@@ -156,6 +306,171 @@ linux_agent_observer_preflight() {
     fi
 }
 
+# Match one complete rule emitted by `auditctl -l`. Observer installs one b64
+# always/exit rule per syscall, filtered by login uid and the session key. The
+# listing may render the key as either `-F key=...` or `-k ...`, and may combine
+# several syscall names after one `-S` token.
+linux_agent_observer_rule_is_listed() {
+    local listing="$1"
+    local audit_key="$2"
+    local audit_uid="$3"
+    local syscall="$4"
+
+    awk \
+        -v expected_key="${audit_key}" \
+        -v expected_uid="${audit_uid}" \
+        -v expected_syscall="${syscall}" '
+        function contains_syscall(value, expected, count, names, i) {
+            count = split(value, names, ",")
+            for (i = 1; i <= count; i += 1) {
+                if (names[i] == expected) {
+                    return 1
+                }
+            }
+            return 0
+        }
+        {
+            action = 0
+            arch = 0
+            uid = 0
+            key = 0
+            syscall = 0
+            for (i = 1; i <= NF; i += 1) {
+                if ($i == "-a" && $(i + 1) == "always,exit") {
+                    action = 1
+                } else if ($i == "-F" && $(i + 1) == "arch=b64") {
+                    arch = 1
+                } else if ($i == "-F" && $(i + 1) == "auid=" expected_uid) {
+                    uid = 1
+                } else if ($i == "-F" && $(i + 1) == "key=" expected_key) {
+                    key = 1
+                } else if ($i == "-k" && $(i + 1) == expected_key) {
+                    key = 1
+                } else if ($i == "-S" && contains_syscall($(i + 1), expected_syscall)) {
+                    syscall = 1
+                }
+            }
+            if (action && arch && uid && key && syscall) {
+                found = 1
+            }
+        }
+        END { exit(found ? 0 : 1) }
+    ' <<<"${listing}"
+}
+
+# Revalidate a cached running context immediately before every strict-mode
+# execution. This intentionally never repairs or reinstalls rules: a daemon or
+# rule failure is a compliance boundary and must fail closed for the caller.
+linux_agent_observer_runtime_verify() {
+    local context_json="$1"
+    local preflight audit_key audit_uid installed_syscalls listing diagnostic syscall
+    local auditctl_exit_code missing_syscalls='[]'
+
+    if ! jq -e '
+        type == "object"
+        and .status == "running"
+        and (.audit_key | type == "string" and test("^[A-Za-z0-9_.-]+$"))
+        and ((.audit_uid // .uid) | type == "number")
+        and (.installed_syscalls | type == "array" and length > 0)
+        and all(.installed_syscalls[]; type == "string" and test("^[A-Za-z0-9_]+$"))
+    ' >/dev/null 2>&1 <<<"${context_json}"; then
+        jq -cn '{ok:false, status:"failed", phase:"context", reason_code:"observer_runtime_context_invalid", reason:"cached observer context is incomplete or invalid"}'
+        return 0
+    fi
+
+    preflight="$(linux_agent_observer_preflight)"
+    if [[ "$(jq -r '.status // ""' <<<"${preflight}")" != "available" ]]; then
+        jq -cn \
+            --argjson preflight "${preflight}" \
+            '{
+                ok:false,
+                status:"failed",
+                phase:"preflight",
+                reason_code:($preflight.reason_code // "observer_runtime_preflight_failed"),
+                reason:($preflight.reason // "observer runtime preflight failed"),
+                preflight:$preflight
+            }'
+        return 0
+    fi
+
+    audit_key="$(jq -r '.audit_key' <<<"${context_json}")"
+    audit_uid="$(jq -r '(.audit_uid // .uid) | tostring' <<<"${context_json}")"
+    installed_syscalls="$(jq -c '.installed_syscalls' <<<"${context_json}")"
+
+    set +e
+    listing="$(linux_agent_observer_auditctl -l 2>&1)"
+    auditctl_exit_code=$?
+    set -e
+    if [[ "${auditctl_exit_code}" -ne 0 ]]; then
+        diagnostic="${listing}"
+        if declare -F linux_agent_sanitize_text >/dev/null 2>&1; then
+            diagnostic="$(linux_agent_sanitize_text "${listing}" 500)"
+        fi
+        jq -cn \
+            --arg diagnostic "${diagnostic}" \
+            --argjson auditctl_exit_code "${auditctl_exit_code}" \
+            --argjson preflight "${preflight}" \
+            '{
+                ok:false,
+                status:"failed",
+                phase:"rule_listing",
+                reason_code:"observer_rule_list_failed",
+                reason:"auditctl -l failed during strict observer runtime verification",
+                diagnostic:$diagnostic,
+                auditctl_exit_code:$auditctl_exit_code,
+                preflight:$preflight
+            }'
+        return 0
+    fi
+
+    while IFS= read -r syscall; do
+        [[ -z "${syscall}" ]] && continue
+        if ! linux_agent_observer_rule_is_listed "${listing}" "${audit_key}" "${audit_uid}" "${syscall}"; then
+            missing_syscalls="$(jq -cn \
+                --argjson prior "${missing_syscalls}" \
+                --arg syscall "${syscall}" \
+                '$prior + [$syscall]')"
+        fi
+    done < <(jq -r '.[]' <<<"${installed_syscalls}")
+
+    if [[ "$(jq 'length' <<<"${missing_syscalls}")" -gt 0 ]]; then
+        jq -cn \
+            --arg audit_key "${audit_key}" \
+            --arg audit_uid "${audit_uid}" \
+            --argjson checked_syscalls "${installed_syscalls}" \
+            --argjson missing_syscalls "${missing_syscalls}" \
+            --argjson preflight "${preflight}" \
+            '{
+                ok:false,
+                status:"failed",
+                phase:"rule_verification",
+                reason_code:"observer_rule_missing",
+                reason:"one or more strict observer auditd rules are no longer installed",
+                audit_key:$audit_key,
+                audit_uid:($audit_uid | tonumber),
+                checked_syscalls:$checked_syscalls,
+                missing_syscalls:$missing_syscalls,
+                preflight:$preflight
+            }'
+        return 0
+    fi
+
+    jq -cn \
+        --arg audit_key "${audit_key}" \
+        --arg audit_uid "${audit_uid}" \
+        --argjson checked_syscalls "${installed_syscalls}" \
+        --argjson preflight "${preflight}" \
+        '{
+            ok:true,
+            status:"verified",
+            phase:"rule_verification",
+            audit_key:$audit_key,
+            audit_uid:($audit_uid | tonumber),
+            checked_syscalls:$checked_syscalls,
+            preflight:$preflight
+        }'
+}
+
 linux_agent_observer_key() {
     local scope="$1"
     local session="${LINUX_AGENT_SESSION_ID:-session}"
@@ -170,7 +485,7 @@ linux_agent_observer_key() {
 linux_agent_observer_audit_uid() {
     local uid login_uid
     uid="$(id -u)"
-    if [[ -r /proc/self/loginuid ]] && read -r login_uid < /proc/self/loginuid; then
+    if [[ -r /proc/self/loginuid ]] && read -r login_uid </proc/self/loginuid; then
         if [[ "${login_uid}" =~ ^[0-9]+$ && "${login_uid}" != "4294967295" ]]; then
             printf '%s\n' "${login_uid}"
             return 0
@@ -197,7 +512,9 @@ linux_agent_observer_session_start() {
     local scope="${1:-session}"
     local subject_json="${2:-}"
     local preflight key uid audit_uid start_time installed='[]' notes='[]' selected_syscalls boundary_summary
+    local require_all=false selected_count installed_count rolled_back='[]' rollback_failed='[]'
     [[ -n "${subject_json}" ]] || subject_json='{}'
+    linux_agent_observer_clear_failed_context
 
     boundary_summary="$(linux_agent_audit_boundary_runtime_summary)"
     preflight="$(linux_agent_observer_preflight)"
@@ -225,6 +542,10 @@ linux_agent_observer_session_start() {
         return 0
     fi
 
+    if linux_agent_observer_require_enabled; then
+        require_all=true
+    fi
+
     uid="$(id -u)"
     audit_uid="$(linux_agent_observer_audit_uid)"
     key="$(linux_agent_observer_key "${scope}")"
@@ -240,6 +561,38 @@ linux_agent_observer_session_start() {
             notes="$(jq -cn --argjson prior "${notes}" --arg syscall "${syscall}" '$prior + ["failed to install syscall rule: " + $syscall]')"
         fi
     done < <(jq -r '.[]' <<<"${selected_syscalls}")
+
+    selected_count="$(jq 'length' <<<"${selected_syscalls}")"
+    installed_count="$(jq 'length' <<<"${installed}")"
+    if [[ "${require_all}" == "true" && "${installed_count}" -ne "${selected_count}" ]]; then
+        while IFS= read -r syscall; do
+            [[ -z "${syscall}" ]] && continue
+            if linux_agent_observer_remove_syscall_rule "${audit_uid}" "${key}" "${syscall}"; then
+                rolled_back="$(jq -cn --argjson prior "${rolled_back}" --arg syscall "${syscall}" '$prior + [$syscall]')"
+            else
+                rollback_failed="$(jq -cn --argjson prior "${rollback_failed}" --arg syscall "${syscall}" '$prior + [$syscall]')"
+                notes="$(jq -cn --argjson prior "${notes}" --arg syscall "${syscall}" '$prior + ["failed to roll back syscall rule: " + $syscall]')"
+            fi
+        done < <(jq -r '.[]' <<<"${installed}")
+
+        LINUX_AGENT_OBSERVER_SESSION_CONTEXT="$(jq -cn \
+            --arg scope "${scope}" \
+            --argjson subject "${subject_json}" \
+            --arg audit_key "${key}" \
+            --arg uid "${uid}" \
+            --arg audit_uid "${audit_uid}" \
+            --arg start_time "${start_time}" \
+            --argjson selected_syscalls "${selected_syscalls}" \
+            --argjson attempted_installed_syscalls "${installed}" \
+            --argjson installed_syscalls "${rollback_failed}" \
+            --argjson rolled_back_syscalls "${rolled_back}" \
+            --argjson rollback_failed_syscalls "${rollback_failed}" \
+            --argjson notes "${notes}" \
+            --argjson audit_boundary "${boundary_summary}" \
+            '{status:"failed", available:false, backend:"auditd", lifecycle:"session", scope:$scope, subject:$subject, audit_key:$audit_key, uid:($uid|tonumber), audit_uid:($audit_uid|tonumber), start_time:$start_time, audit_boundary:$audit_boundary, reason_code:"observer_rule_install_incomplete", reason:"strict observer requires every selected auditd rule to be installed", selected_syscalls:$selected_syscalls, attempted_installed_syscalls:$attempted_installed_syscalls, installed_syscalls:$installed_syscalls, rolled_back_syscalls:$rolled_back_syscalls, rollback_failed_syscalls:$rollback_failed_syscalls, notes:$notes}')"
+        linux_agent_observer_log_event "observer_failed" "${LINUX_AGENT_OBSERVER_SESSION_CONTEXT}"
+        return 0
+    fi
 
     if [[ "$(jq 'length' <<<"${installed}")" -eq 0 ]]; then
         LINUX_AGENT_OBSERVER_SESSION_CONTEXT="$(jq -cn \
@@ -429,17 +782,40 @@ linux_agent_observer_log_file_vault_observations() {
 
 linux_agent_observer_session_finish() {
     local final_status="${1:-unknown}"
-    local context_json="${LINUX_AGENT_OBSERVER_SESSION_CONTEXT:-}"
-    local status end_time audit_key audit_uid installed cleanup_notes notes raw parsed query_status
-    [[ -n "${context_json}" ]] || return 0
+    local context_json
+    local status end_time audit_key audit_uid installed cleanup_notes cleanup_remaining notes raw parsed query_status syscall
+    context_json="$(linux_agent_observer_current_context)"
+    if [[ -z "${context_json}" ]]; then
+        linux_agent_observer_clear_failed_context
+        return 0
+    fi
 
     status="$(jq -r '.status // "unknown"' <<<"${context_json}")"
     end_time="$(linux_agent_now_iso)"
     if [[ "${status}" != "running" ]]; then
         local done_context
-        done_context="$(jq -c --arg end_time "${end_time}" --arg final_status "${final_status}" \
-            '. + {end_time:$end_time, final_status:$final_status}' <<<"${context_json}")"
+        audit_key="$(jq -r '.audit_key // empty' <<<"${context_json}")"
+        audit_uid="$(jq -r '.audit_uid // .uid // empty' <<<"${context_json}")"
+        installed="$(jq -c '.installed_syscalls // []' <<<"${context_json}")"
+        cleanup_notes='[]'
+        cleanup_remaining='[]'
+        if [[ -n "${audit_key}" && -n "${audit_uid}" ]]; then
+            while IFS= read -r syscall; do
+                [[ -z "${syscall}" ]] && continue
+                if ! linux_agent_observer_remove_syscall_rule "${audit_uid}" "${audit_key}" "${syscall}"; then
+                    cleanup_notes="$(jq -cn --argjson prior "${cleanup_notes}" --arg syscall "${syscall}" '$prior + ["failed to remove syscall rule: " + $syscall]')"
+                    cleanup_remaining="$(jq -cn --argjson prior "${cleanup_remaining}" --arg syscall "${syscall}" '$prior + [$syscall]')"
+                fi
+            done < <(jq -r '.[]' <<<"${installed}")
+        fi
+        done_context="$(jq -c \
+            --arg end_time "${end_time}" \
+            --arg final_status "${final_status}" \
+            --argjson cleanup_notes "${cleanup_notes}" \
+            --argjson cleanup_remaining "${cleanup_remaining}" \
+            '. + {end_time:$end_time, final_status:$final_status, cleanup_notes:$cleanup_notes, installed_syscalls:$cleanup_remaining}' <<<"${context_json}")"
         linux_agent_observer_log_event "observer_session_finished" "${done_context}"
+        linux_agent_observer_clear_failed_context
         LINUX_AGENT_OBSERVER_SESSION_CONTEXT=""
         return 0
     fi
@@ -471,6 +847,7 @@ linux_agent_observer_session_finish() {
             '{status:"failed", backend:"auditd", lifecycle:"session", audit_key:$audit_key, start_time:$start_time, end_time:$end_time, final_status:$final_status, exec_count:0, file_event_count:0, processes:[], file_events:[], notes:$notes}')"
         linux_agent_observer_log_event "observer_failed" "${failed}"
         linux_agent_observer_log_event "observer_session_finished" "${failed}"
+        linux_agent_observer_clear_failed_context
         LINUX_AGENT_OBSERVER_SESSION_CONTEXT=""
         return 0
     fi
@@ -485,6 +862,7 @@ linux_agent_observer_session_finish() {
         --argjson notes "${notes}" \
         '. + {lifecycle:"session", start_time:$start_time, end_time:$end_time, final_status:$final_status, notes:$notes}' <<<"${parsed}")"
     linux_agent_observer_log_event "observer_session_finished" "${parsed}"
+    linux_agent_observer_clear_failed_context
     LINUX_AGENT_OBSERVER_SESSION_CONTEXT=""
 }
 
@@ -497,6 +875,7 @@ linux_agent_run_observed_process() {
     [[ "${1:-}" == "--" ]] && shift
 
     local pid exit_code start_time end_time observer_marker timeout_sec timed_out observer_status
+    local audit_payload audit_rc audit_block
     local -a execution_command
     start_time="$(linux_agent_now_iso)"
     timeout_sec="$(linux_agent_execution_timeout_sec)"
@@ -517,15 +896,32 @@ linux_agent_run_observed_process() {
         return 0
     fi
     execution_command=(timeout -s TERM -k 5s "${timeout_sec}s" "$@")
-    set +e
-    "${execution_command[@]}" >"${stdout_file}" 2>"${stderr_file}" &
-    pid=$!
-    linux_agent_observer_log_event "execution_started" "$(jq -cn \
+    audit_payload="$(jq -cn \
         --arg scope "${scope}" \
         --argjson subject "${subject_json}" \
         --arg start_time "${start_time}" \
-        --argjson root_pid "${pid}" \
-        '{scope:$scope, subject:$subject, start_time:$start_time, root_pid:$root_pid}')"
+        '{scope:$scope, subject:$subject, start_time:$start_time, root_pid:null}')"
+    audit_rc=0
+    if declare -F linux_agent_audit_require_event >/dev/null 2>&1; then
+        linux_agent_audit_require_event "execution_started" "${audit_payload}" || audit_rc=$?
+    else
+        linux_agent_observer_log_event "execution_started" "${audit_payload}" || audit_rc=$?
+    fi
+    if ((audit_rc != 0)); then
+        if declare -F linux_agent_audit_failure_result >/dev/null 2>&1; then
+            audit_block="$(linux_agent_audit_failure_result "${audit_rc}" "execution_started")"
+        else
+            audit_block="$(jq -cn --argjson exit_code "${audit_rc}" \
+                '{ok:false, status:"blocked", code:"audit_integrity_broken", error_code:"audit_integrity_broken", exit_code:$exit_code, output:{raw:"审计事件无法持久写入，操作未执行。"}}')"
+        fi
+        jq -cn \
+            --argjson blocked_result "${audit_block}" \
+            '{exit_code:($blocked_result.exit_code // 125), root_pid:null, timed_out:false, observer:{status:"audit_blocked", backend:"auditd", lifecycle:"execution"}, blocked_result:$blocked_result}'
+        return 0
+    fi
+    set +e
+    "${execution_command[@]}" >"${stdout_file}" 2>"${stderr_file}" &
+    pid=$!
     wait "${pid}"
     exit_code=$?
     set -e

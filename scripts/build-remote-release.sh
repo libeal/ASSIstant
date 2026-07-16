@@ -25,14 +25,14 @@ cleanup() {
 }
 trap cleanup EXIT
 
-if [[ -L "${OUTPUT_DIR}" || ( -e "${OUTPUT_DIR}" && ( ! -d "${OUTPUT_DIR}" || -n "$(find "${OUTPUT_DIR}" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null)" ) ) ]]; then
+if [[ -L "${OUTPUT_DIR}" || (-e "${OUTPUT_DIR}" && (! -d "${OUTPUT_DIR}" || -n "$(find "${OUTPUT_DIR}" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null)")) ]]; then
     printf 'output directory must not exist or must be empty: %s\n' "${OUTPUT_DIR}" >&2
     exit 1
 fi
 mkdir -p "${OUTPUT_DIR}"
 resolved_output="$(readlink -f "${OUTPUT_DIR}")"
 resolved_root="$(readlink -f "${ROOT_DIR}")"
-if [[ "${resolved_output}" == "${resolved_root}" || ( "${resolved_output}" == "${resolved_root}/"* && "${resolved_output}" != "${resolved_root}/dist" && "${resolved_output}" != "${resolved_root}/dist/"* ) ]]; then
+if [[ "${resolved_output}" == "${resolved_root}" || ("${resolved_output}" == "${resolved_root}/"* && "${resolved_output}" != "${resolved_root}/dist" && "${resolved_output}" != "${resolved_root}/dist/"*) ]]; then
     printf 'output inside the source tree is only allowed under dist/: %s\n' "${OUTPUT_DIR}" >&2
     exit 1
 fi
@@ -70,8 +70,8 @@ create_archive() {
         --mtime="@${SOURCE_EPOCH}" \
         --owner=0 --group=0 --numeric-owner \
         --format=gnu \
-        -C "${stage_root}" -cf - "${entries[@]}" \
-        | gzip -n > "${output_path}"
+        -C "${stage_root}" -cf - "${entries[@]}" |
+        gzip -n >"${output_path}"
 }
 
 asset_json() {
@@ -130,9 +130,9 @@ while IFS= read -r skill_dir; do
         script_name="${ref#*/}.sh"
         manifest_line="$(grep -E "scripts/${script_name}(\`|[[:space:]):,-])" "${skill_dir}/SKILL.md" 2>/dev/null | head -n 1 || true)"
         risk="$(sed -nE 's/.*risk:[[:space:]]*`?(low|medium|high|critical)`?.*/\1/p' <<<"${manifest_line}" | head -n 1)"
-        case "${risk}" in low|medium|high|critical) ;; *) risk=low ;; esac
+        case "${risk}" in low | medium | high | critical) ;; *) risk=low ;; esac
         refs="$(jq -cn --argjson prior "${refs}" --arg ref "${ref}" --arg description "${description}" --arg risk "${risk}" '$prior + [{ref:$ref, description:$description, risk:$risk}]')"
-    done < "${ROOT_DIR}/skills/INDEX.md"
+    done <"${ROOT_DIR}/skills/INDEX.md"
     [[ "$(jq 'length' <<<"${refs}")" -gt 0 ]] || {
         printf 'skill has no INDEX.md references: %s\n' "${skill_name}" >&2
         exit 1
@@ -164,11 +164,11 @@ done < <(find "${ROOT_DIR}/skills" -mindepth 1 -maxdepth 1 -type d | sort)
 {
     printf '#!/usr/bin/env bash\nexport LINUX_AGENT_REMOTE_ENTRYPOINT=cli\n'
     sed '1d' "${ROOT_DIR}/remote/bootstrap.sh"
-} > "${OUTPUT_DIR}/linux-agent-cli.sh"
+} >"${OUTPUT_DIR}/linux-agent-cli.sh"
 {
     printf '#!/usr/bin/env bash\nexport LINUX_AGENT_REMOTE_ENTRYPOINT=web\n'
     sed '1d' "${ROOT_DIR}/remote/bootstrap.sh"
-} > "${OUTPUT_DIR}/linux-agent-web.sh"
+} >"${OUTPUT_DIR}/linux-agent-web.sh"
 chmod 0755 "${OUTPUT_DIR}/linux-agent-cli.sh" "${OUTPUT_DIR}/linux-agent-web.sh"
 
 jq -S -n \
@@ -184,14 +184,14 @@ jq -S -n \
         repository:"libeal/ASSIstant",
         assets:{bootstrap_cli:$bootstrap_cli, bootstrap_web:$bootstrap_web, core:$core, web:$web},
         skills:$skills
-    }' > "${OUTPUT_DIR}/release-manifest.json"
+    }' >"${OUTPUT_DIR}/release-manifest.json"
 
 (
     cd "${OUTPUT_DIR}"
-    find . -maxdepth 1 -type f ! -name SHA256SUMS -printf '%f\n' \
-        | sort \
-        | while IFS= read -r name; do sha256sum "${name}"; done \
-        > SHA256SUMS
+    find . -maxdepth 1 -type f ! -name SHA256SUMS -printf '%f\n' |
+        sort |
+        while IFS= read -r name; do sha256sum "${name}"; done \
+            >SHA256SUMS
 )
 
 printf 'remote release built: %s\n' "${OUTPUT_DIR}"

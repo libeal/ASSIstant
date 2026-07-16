@@ -12,6 +12,203 @@ linux_agent_audit_boundaries_path() {
     printf '%s/policies/audit-boundaries.json\n' "${LINUX_AGENT_ROOT}"
 }
 
+linux_agent_audit_chain_writer() {
+    local candidate="${LINUX_AGENT_ROOT}/lib/audit_chain.py"
+    if [[ -f "${candidate}" ]]; then
+        printf '%s\n' "${candidate}"
+        return 0
+    fi
+    # Fall back to the directory this script was sourced from (mirrors the
+    # lib/mcp.sh + lib/policy.sh resolution), so callers that point
+    # LINUX_AGENT_ROOT at a project dir without a bundled lib/ still find it.
+    printf '%s\n' "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/audit_chain.py"
+}
+
+# Cached CLI options for lib/audit_chain.py, derived from config .audit.*.
+# Changing .audit.* at runtime requires clearing LINUX_AGENT_AUDIT_CHAIN_ARGS.
+linux_agent_audit_chain_args() {
+    if [[ -z "${LINUX_AGENT_AUDIT_CHAIN_ARGS:-}" ]]; then
+        # The hash chain (seq/prev_hash/hash) is a mandatory integrity invariant,
+        # not a toggle: verify rejects unchained events as tampered, so writing
+        # them would be self-contradictory. Only fsync and disk policy are tunable.
+        local fsync="true" max_bytes="52428800" min_free="10485760" on_full="degrade"
+        if [[ -n "${LINUX_AGENT_CONFIG_JSON:-}" ]] && declare -F linux_agent_config_bool_strict >/dev/null 2>&1; then
+            fsync="$(linux_agent_config_bool_strict '.audit.fsync' 'true')"
+            max_bytes="$(linux_agent_config_nonneg_int_default '.audit.max_bytes' '52428800')"
+            min_free="$(linux_agent_config_nonneg_int_default '.audit.min_free_bytes' '10485760')"
+            on_full="$(linux_agent_config_get_default '.audit.on_full' 'degrade')"
+        fi
+        [[ "${on_full}" == "block" || "${on_full}" == "degrade" ]] || on_full="degrade"
+        local args=""
+        [[ "${fsync}" == "true" ]] || args+=" --no-fsync"
+        args+=" --max-bytes ${max_bytes} --min-free-bytes ${min_free} --on-full ${on_full}"
+        LINUX_AGENT_AUDIT_CHAIN_ARGS="${args# }"
+    fi
+    printf '%s\n' "${LINUX_AGENT_AUDIT_CHAIN_ARGS}"
+}
+
+# Keep one Python chain writer per Bash process/session. The protocol is
+# synchronous: success is returned only after the event has been persisted.
+linux_agent_audit_writer_stop() {
+    local input_fd="${LINUX_AGENT_AUDIT_WRITER_INPUT_FD:-}"
+    local output_fd="${LINUX_AGENT_AUDIT_WRITER_OUTPUT_FD:-}"
+    local writer_pid="${LINUX_AGENT_AUDIT_WRITER_PID:-}"
+    if [[ -n "${LINUX_AGENT_AUDIT_WRITER_OWNER_PID:-}" &&
+        "${LINUX_AGENT_AUDIT_WRITER_OWNER_PID}" != "${BASHPID}" ]]; then
+        unset LINUX_AGENT_AUDIT_WRITER_INPUT_FD LINUX_AGENT_AUDIT_WRITER_OUTPUT_FD
+        unset LINUX_AGENT_AUDIT_WRITER_PID LINUX_AGENT_AUDIT_WRITER_KEY
+        unset LINUX_AGENT_AUDIT_WRITER_OWNER_PID
+        unset LINUX_AGENT_AUDIT_WRITER_PROCESS LINUX_AGENT_AUDIT_WRITER_PROCESS_PID
+        return 0
+    fi
+    if [[ -n "${input_fd}" ]]; then
+        exec {input_fd}>&- 2>/dev/null || true
+    fi
+    if [[ -n "${output_fd}" ]]; then
+        exec {output_fd}<&- 2>/dev/null || true
+    fi
+    if [[ -n "${writer_pid}" ]]; then
+        wait "${writer_pid}" 2>/dev/null || true
+    fi
+    unset LINUX_AGENT_AUDIT_WRITER_INPUT_FD LINUX_AGENT_AUDIT_WRITER_OUTPUT_FD
+    unset LINUX_AGENT_AUDIT_WRITER_PID LINUX_AGENT_AUDIT_WRITER_KEY
+    unset LINUX_AGENT_AUDIT_WRITER_OWNER_PID
+    unset LINUX_AGENT_AUDIT_WRITER_PROCESS LINUX_AGENT_AUDIT_WRITER_PROCESS_PID
+}
+
+linux_agent_audit_writer_start() {
+    local writer chain_args writer_key
+    writer="$(linux_agent_audit_chain_writer)"
+    linux_agent_audit_chain_args >/dev/null
+    chain_args="${LINUX_AGENT_AUDIT_CHAIN_ARGS}"
+    writer_key="${writer}|${LINUX_AGENT_AUDIT_LOG}|${chain_args}"
+    if [[ "${LINUX_AGENT_AUDIT_WRITER_KEY:-}" == "${writer_key}" &&
+        "${LINUX_AGENT_AUDIT_WRITER_OWNER_PID:-}" == "${BASHPID}" &&
+        -n "${LINUX_AGENT_AUDIT_WRITER_PID:-}" ]] &&
+        kill -0 "${LINUX_AGENT_AUDIT_WRITER_PID}" 2>/dev/null; then
+        return 0
+    fi
+
+    linux_agent_audit_writer_stop
+    # chain_args is a controlled option string.
+    # shellcheck disable=SC2086
+    coproc LINUX_AGENT_AUDIT_WRITER_PROCESS {
+        python3 "${writer}" serve "${LINUX_AGENT_AUDIT_LOG}" ${chain_args}
+    }
+    LINUX_AGENT_AUDIT_WRITER_INPUT_FD="${LINUX_AGENT_AUDIT_WRITER_PROCESS[1]}"
+    LINUX_AGENT_AUDIT_WRITER_OUTPUT_FD="${LINUX_AGENT_AUDIT_WRITER_PROCESS[0]}"
+    LINUX_AGENT_AUDIT_WRITER_PID="${LINUX_AGENT_AUDIT_WRITER_PROCESS_PID}"
+    LINUX_AGENT_AUDIT_WRITER_KEY="${writer_key}"
+    LINUX_AGENT_AUDIT_WRITER_OWNER_PID="${BASHPID}"
+}
+
+# One-shot append via a throwaway python3 process. Used from subshells that
+# inherited a parent coproc they do not own: bash allows only one coproc per
+# shell and cannot spawn a second without warning, and the inherited writer's
+# fds belong to the parent. `serve` takes a fresh flock per line, so a one-shot
+# `append` interleaves safely with the owner's persistent writer.
+linux_agent_audit_append_oneshot() {
+    local event="$1"
+    local writer chain_args
+    writer="$(linux_agent_audit_chain_writer)"
+    linux_agent_audit_chain_args >/dev/null
+    chain_args="${LINUX_AGENT_AUDIT_CHAIN_ARGS}"
+    # chain_args is a controlled option string.
+    # shellcheck disable=SC2086
+    printf '%s\n' "${event}" | python3 "${writer}" append "${LINUX_AGENT_AUDIT_LOG}" ${chain_args}
+}
+
+linux_agent_audit_write_event() {
+    local event="$1"
+    local input_fd output_fd response_code response_error
+    # A subshell (command substitution) inherits the coproc fds and tracking
+    # variables but has a different BASHPID. Rebuilding a coproc here would make
+    # bash warn "coproc ... still exists" and orphan the inherited writer, so
+    # non-owner contexts take the one-shot append path instead.
+    if [[ -n "${LINUX_AGENT_AUDIT_WRITER_OWNER_PID:-}" &&
+        "${LINUX_AGENT_AUDIT_WRITER_OWNER_PID}" != "${BASHPID}" ]]; then
+        linux_agent_audit_append_oneshot "${event}"
+        return $?
+    fi
+    linux_agent_audit_writer_start || return 4
+    input_fd="${LINUX_AGENT_AUDIT_WRITER_INPUT_FD}"
+    output_fd="${LINUX_AGENT_AUDIT_WRITER_OUTPUT_FD}"
+    if ! printf '%s\n' "${event}" >&"${input_fd}"; then
+        linux_agent_audit_writer_stop
+        return 4
+    fi
+    if ! IFS=$'\t' read -r response_code response_error <&"${output_fd}"; then
+        linux_agent_audit_writer_stop
+        return 4
+    fi
+    if [[ ! "${response_code}" =~ ^[0-9]+$ ]]; then
+        linux_agent_audit_writer_stop
+        return 4
+    fi
+    if ((response_code != 0)) && [[ -n "${response_error}" ]]; then
+        printf '%s\n' "${response_error}" >&2
+    fi
+    return "${response_code}"
+}
+
+linux_agent_audit_segment_paths() {
+    local live_file="$1"
+    if [[ -z "${live_file}" ]]; then
+        return 1
+    fi
+    [[ -f "${live_file}" && ! -L "${live_file}" ]] || return 1
+
+    local candidate suffix
+    local -a indexes=() sorted_indexes=()
+    for candidate in "${live_file}".*; do
+        [[ -f "${candidate}" && ! -L "${candidate}" ]] || continue
+        suffix="${candidate#"${live_file}".}"
+        [[ "${suffix}" =~ ^[1-9][0-9]*$ ]] || continue
+        indexes+=("${suffix}")
+    done
+    if ((${#indexes[@]} > 0)); then
+        mapfile -t sorted_indexes < <(printf '%s\n' "${indexes[@]}" | LC_ALL=C sort -n)
+        for suffix in "${sorted_indexes[@]}"; do
+            printf '%s\n' "${live_file}.${suffix}"
+        done
+    fi
+    printf '%s\n' "${live_file}"
+}
+
+linux_agent_audit_segment_files() {
+    local session_id="$1"
+    if [[ -z "${session_id}" || ! "${session_id}" =~ ^[A-Za-z0-9._-]+$ ]]; then
+        return 1
+    fi
+    linux_agent_audit_segment_paths "${LINUX_AGENT_LOG_DIR}/${session_id}.jsonl"
+}
+
+linux_agent_audit_snapshot() {
+    local session_id="$1"
+    local destination_directory="$2"
+    if [[ -z "${session_id}" || ! "${session_id}" =~ ^[A-Za-z0-9._-]+$ ]]; then
+        return 1
+    fi
+    python3 "$(linux_agent_audit_chain_writer)" snapshot \
+        "${LINUX_AGENT_LOG_DIR}/${session_id}.jsonl" \
+        "${destination_directory}"
+}
+
+linux_agent_audit_verify_chain() {
+    local session_id="$1"
+    local log_file="${2:-}"
+    if [[ -z "${session_id}" || ! "${session_id}" =~ ^[A-Za-z0-9._-]+$ ]]; then
+        jq -cn '{ok:false, status:"invalid_session_id", error:"session_id 非法。"}'
+        return 1
+    fi
+    [[ -n "${log_file}" ]] || log_file="${LINUX_AGENT_LOG_DIR}/${session_id}.jsonl"
+    if [[ ! -f "${log_file}" ]]; then
+        jq -cn '{ok:false, status:"not_found", error:"审计 session 不存在。"}'
+        return 1
+    fi
+    python3 "$(linux_agent_audit_chain_writer)" verify "${log_file}"
+}
+
 linux_agent_audit_boundary_default_config() {
     cat <<'JSON'
 {
@@ -630,13 +827,14 @@ linux_agent_start_session() {
         LINUX_AGENT_AUDIT_LOG="${LINUX_AGENT_AUDIT_LOG:-${LINUX_AGENT_LOG_DIR}/${LINUX_AGENT_SESSION_ID}.jsonl}"
         mkdir -p "$(dirname "${LINUX_AGENT_AUDIT_LOG}")"
         touch "${LINUX_AGENT_AUDIT_LOG}"
+        chmod 600 "${LINUX_AGENT_AUDIT_LOG}" 2>/dev/null || true
         if declare -F linux_agent_use_session_tmp_dir >/dev/null 2>&1; then
             linux_agent_use_session_tmp_dir "${LINUX_AGENT_SESSION_ID}"
         fi
         LINUX_AGENT_SESSION_ACTIVE=1
         LINUX_AGENT_SESSION_FINISHED=0
         if [[ -n "${LINUX_AGENT_REMOTE_PREFLIGHT:-}" ]] && jq -e 'type == "object"' <<<"${LINUX_AGENT_REMOTE_PREFLIGHT}" >/dev/null 2>&1; then
-            linux_agent_log_event "remote_bootstrap_verified" "${LINUX_AGENT_REMOTE_PREFLIGHT}"
+            linux_agent_audit_require_event "remote_bootstrap_verified" "${LINUX_AGENT_REMOTE_PREFLIGHT}" || return $?
         fi
         if declare -F linux_agent_observer_session_start >/dev/null 2>&1; then
             linux_agent_observer_session_start "session" "$(jq -cn --arg request "${user_input}" '{request:$request}')"
@@ -656,54 +854,132 @@ linux_agent_start_session() {
     LINUX_AGENT_SESSION_ACTIVE=1
     LINUX_AGENT_SESSION_FINISHED=0
 
-    : > "${LINUX_AGENT_AUDIT_LOG}"
+    : >"${LINUX_AGENT_AUDIT_LOG}"
+    chmod 600 "${LINUX_AGENT_AUDIT_LOG}" 2>/dev/null || true
     boundary_summary="$(linux_agent_audit_boundary_runtime_summary)"
     if [[ "${LINUX_AGENT_WEB:-0}" == "1" ]]; then
         entrypoint="web"
     else
         entrypoint="cli"
     fi
-    linux_agent_log_event "session_started" "$(jq -cn \
+    linux_agent_audit_require_event "session_started" "$(jq -cn \
         --arg request "${user_input}" \
         --arg entrypoint "${entrypoint}" \
         --arg audit_mode "$(linux_agent_audit_mode)" \
         --argjson audit_boundary "${boundary_summary}" \
-        '{request:$request, entrypoint:$entrypoint, audit_mode:$audit_mode, audit_boundary:$audit_boundary}')"
+        '{request:$request, entrypoint:$entrypoint, audit_mode:$audit_mode, audit_boundary:$audit_boundary}')" || return $?
     if [[ -n "${LINUX_AGENT_REMOTE_PREFLIGHT:-}" ]] && jq -e 'type == "object"' <<<"${LINUX_AGENT_REMOTE_PREFLIGHT}" >/dev/null 2>&1; then
-        linux_agent_log_event "remote_bootstrap_verified" "${LINUX_AGENT_REMOTE_PREFLIGHT}"
+        linux_agent_audit_require_event "remote_bootstrap_verified" "${LINUX_AGENT_REMOTE_PREFLIGHT}" || return $?
     fi
     if declare -F linux_agent_observer_session_start >/dev/null 2>&1; then
         linux_agent_observer_session_start "session" "$(jq -cn --arg request "${user_input}" '{request:$request}')"
     fi
 }
 
+# bin/agent reads LINUX_AGENT_LAST_BUSINESS_STATUS after this sourced function
+# records the terminal business event.
+# shellcheck disable=SC2034
 linux_agent_log_event() {
     local stage="$1"
     local payload="${2:-}"
-    local safe_payload
+    local required="${3:-false}"
+    local safe_payload event_execution_user
     [[ -n "${LINUX_AGENT_AUDIT_LOG:-}" ]] || return 0
     [[ -z "${payload}" ]] && payload='{}'
     if [[ "${stage}" == "finished" ]] && printf '%s' "${payload}" | jq -e . >/dev/null 2>&1; then
         LINUX_AGENT_LAST_BUSINESS_STATUS="$(jq -r '.status // empty' <<<"${payload}")"
     fi
-    if ! linux_agent_audit_boundary_should_log_stage "${stage}"; then
+    if [[ "${required}" != "true" ]] && ! linux_agent_audit_boundary_should_log_stage "${stage}"; then
         return 0
     fi
     if [[ -z "${LINUX_AGENT_SYSTEM_USER:-}" ]]; then
         LINUX_AGENT_SYSTEM_USER="$(id -un 2>/dev/null || printf 'unknown')"
     fi
     safe_payload="$(linux_agent_audit_payload "${stage}" "${payload}")"
-    jq -cn \
+    event_execution_user="$(jq -r '
+        [.. | objects | .execution_proxy? // empty
+         | .target_user // .execution_user // empty]
+        | first // empty
+    ' <<<"${safe_payload}" 2>/dev/null || true)"
+    if [[ -z "${event_execution_user}" ]]; then
+        event_execution_user="${LINUX_AGENT_EXECUTION_USER:-${LINUX_AGENT_SYSTEM_USER:-unknown}}"
+    fi
+    local event chain_rc=0
+    event="$(jq -cn \
         --arg ts "$(linux_agent_now_iso)" \
         --arg session_id "${LINUX_AGENT_SESSION_ID}" \
         --arg stage "${stage}" \
         --arg request_id "${LINUX_AGENT_REQUEST_ID:-}" \
         --arg job_id "${LINUX_AGENT_JOB_ID:-}" \
         --arg system_user "${LINUX_AGENT_SYSTEM_USER:-unknown}" \
+        --arg execution_user "${event_execution_user}" \
         --argjson payload "${safe_payload}" \
-        '{timestamp:$ts, session_id:$session_id, stage:$stage, system_user:$system_user, payload:$payload}
-         + (if $request_id != "" then {request_id:$request_id} else {} end)
-         + (if $job_id != "" then {job_id:$job_id} else {} end)' >> "${LINUX_AGENT_AUDIT_LOG}"
+        '{
+            schema_version:1,
+            timestamp:$ts,
+            session_id:$session_id,
+            stage:$stage,
+            request_id:$request_id,
+            job_id:$job_id,
+            system_user:$system_user,
+            execution_user:$execution_user,
+            payload:$payload
+        }')"
+    linux_agent_audit_write_event "${event}" || chain_rc=$?
+    if ((chain_rc != 0)); then
+        if ((chain_rc == 3)); then
+            printf '[错误] 磁盘空间不足或无法确认可用空间，审计事件已被策略拒绝。\n' >&2
+        else
+            printf '[错误] 审计事件写入失败 (stage=%s, exit=%s)，已停止当前操作。\n' "${stage}" "${chain_rc}" >&2
+        fi
+        return "${chain_rc}"
+    fi
+    return 0
+}
+
+# Compliance-sensitive callers use this before executing a command or
+# committing a durable mutation.  Unlike ordinary observational events, a
+# required event cannot be disabled by the application-event display filter.
+# Return codes intentionally preserve the writer contract:
+#   3: audit.on_full=block refused the write
+#   4: the existing chain is untrusted or the audit write failed
+linux_agent_audit_require_event() {
+    local stage="$1"
+    local payload="${2:-}"
+    [[ -n "${payload}" ]] || payload='{}'
+    linux_agent_log_event "${stage}" "${payload}" true
+}
+
+linux_agent_audit_failure_result() {
+    local audit_rc="${1:-4}"
+    local stage="${2:-audit}"
+    local code message retryable
+    if [[ "${audit_rc}" -eq 3 ]]; then
+        code="audit_write_blocked"
+        message="审计空间策略拒绝写入，操作未执行。"
+        retryable=true
+    else
+        code="audit_integrity_broken"
+        message="审计链不可信或无法持久写入，操作未执行。"
+        retryable=false
+    fi
+    jq -cn \
+        --arg code "${code}" \
+        --arg message "${message}" \
+        --arg stage "${stage}" \
+        --argjson exit_code "${audit_rc}" \
+        --argjson retryable "${retryable}" '
+        {
+            ok:false,
+            status:"blocked",
+            code:$code,
+            error_code:$code,
+            error:$message,
+            message:$message,
+            retryable:$retryable,
+            exit_code:$exit_code,
+            details:{audit_stage:$stage}
+        }'
 }
 
 linux_agent_log_step_status() {
@@ -744,7 +1020,7 @@ linux_agent_finish_session() {
 linux_agent_log_command_started() {
     local command="$1"
     local args="${2:-}"
-    linux_agent_log_event "command_started" "$(jq -cn --arg command "${command}" --arg args "${args}" '{command:$command, args:$args}')"
+    linux_agent_audit_require_event "command_started" "$(jq -cn --arg command "${command}" --arg args "${args}" '{command:$command, args:$args}')"
 }
 
 linux_agent_log_command_finished() {
@@ -757,7 +1033,7 @@ linux_agent_log_command_finished() {
 linux_agent_log_turn_started() {
     local mode="$1"
     local input="$2"
-    linux_agent_log_event "turn_started" "$(jq -cn --arg mode "${mode}" --arg input "${input}" '{mode:$mode, input:$input}')"
+    linux_agent_audit_require_event "turn_started" "$(jq -cn --arg mode "${mode}" --arg input "${input}" '{mode:$mode, input:$input}')"
 }
 
 linux_agent_log_turn_finished() {
@@ -776,10 +1052,16 @@ linux_agent_log_control_event() {
 
 linux_agent_show_audit() {
     local session_id="$1"
-    local log_file="${LINUX_AGENT_LOG_DIR}/${session_id}.jsonl"
+    local log_file="${2:-${LINUX_AGENT_LOG_DIR}/${session_id}.jsonl}"
     local report
+    local -a log_segments=()
 
-    if [[ ! -f "${log_file}" ]]; then
+    if [[ -z "${session_id}" || ! "${session_id}" =~ ^[A-Za-z0-9._-]+$ ]]; then
+        linux_agent_print_error "审计 session-id 非法。"
+        return 1
+    fi
+    mapfile -t log_segments < <(linux_agent_audit_segment_paths "${log_file}" || true)
+    if ((${#log_segments[@]} == 0)); then
         linux_agent_print_error "未找到审计日志: ${session_id}"
         return 1
     fi
@@ -803,7 +1085,7 @@ linux_agent_show_audit() {
           "- execution_finished: " + (($events | count_stage("execution_finished")) | tostring),
           "- observer_unavailable: " + (($events | count_stage("observer_unavailable")) | tostring),
           "- observer_failed: " + (($events | count_stage("observer_failed")) | tostring)
-    ' "${log_file}")"
+    ' "${log_segments[@]}")"
     printf '# 审计报告\n\n'
     linux_agent_sanitize_text "${report}"
 
@@ -886,12 +1168,14 @@ linux_agent_show_audit() {
                 ($p.message // $p.status // $p.event // ($p | tostring))
               end;
         .[] | "- " + ((.timestamp // "--") | tostring) + " · " + stage_label(.stage // "event") + "： " + describe
-    ' "${log_file}" | while IFS= read -r line; do
+    ' "${log_segments[@]}" | while IFS= read -r line; do
         linux_agent_sanitize_text "${line}"
     done
 
     printf '\n# JSONL 审计流\n\n'
-    while IFS= read -r line; do
-        linux_agent_sanitize_text "${line}"
-    done < "${log_file}"
+    for log_file in "${log_segments[@]}"; do
+        while IFS= read -r line; do
+            linux_agent_sanitize_text "${line}"
+        done <"${log_file}"
+    done
 }

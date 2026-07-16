@@ -70,7 +70,7 @@ assert_thinking_trace() {
     (
         cd "${project}"
         tmp_config="$(mktemp)"
-        jq '.agent_loop.thinking_trace_enabled=true' config/config.json > "${tmp_config}"
+        jq '.agent_loop.thinking_trace_enabled=true' config/config.json >"${tmp_config}"
         mv "${tmp_config}" config/config.json
         LINUX_AGENT_THINKING_TRACE_DIR="${thinking_root}" \
             bash bin/agent work "查看cpu继续深入" >/dev/null 2>&1
@@ -99,7 +99,7 @@ assert_no_default_thinking_trace() {
     local log_file session_id thinking_root
     thinking_root="${tmp_root}/thinking-traces"
     copy_project "${project}"
-    (cd "${project}" && \
+    (cd "${project}" &&
         LINUX_AGENT_THINKING_TRACE_DIR="${thinking_root}" \
             bash bin/agent work "查看cpu占用,内存环境" >/dev/null 2>&1)
     log_file="$(find "${project}/logs" -name '*.jsonl' -print -quit)"
@@ -114,9 +114,9 @@ assert_checkpoint_stop() {
     output="$(
         cd "${project}"
         tmp_config="$(mktemp)"
-        jq '.agent_loop.checkpoint_turns=1' config/config.json > "${tmp_config}"
+        jq '.agent_loop.checkpoint_turns=1' config/config.json >"${tmp_config}"
         mv "${tmp_config}" config/config.json
-        bash bin/agent work "查看cpu继续深入" <<< $'n\n' 2>&1
+        bash bin/agent work "查看cpu继续深入" <<<$'n\n' 2>&1
     )"
     grep -q '允许继续深入' <<<"${output}"
     grep -q '工作流执行完成: status=checkpoint_stopped' <<<"${output}"
@@ -129,7 +129,7 @@ assert_iteration_limit_stop() {
     output="$(
         cd "${project}"
         tmp_config="$(mktemp)"
-        jq '.agent_loop.max_iterations=1 | .agent_loop.checkpoint_turns=10' config/config.json > "${tmp_config}"
+        jq '.agent_loop.max_iterations=1 | .agent_loop.checkpoint_turns=10' config/config.json >"${tmp_config}"
         mv "${tmp_config}" config/config.json
         bash bin/agent work "查看cpu继续深入" 2>&1
     )"
@@ -140,13 +140,13 @@ assert_iteration_limit_stop() {
 
 project_main="${tmp_root}/main-work"
 copy_project "${project_main}"
-output="$(cd "${project_main}" && bash bin/agent work "帮我检查磁盘空间是否异常" <<< $'y\ny\n' 2>&1)"
+output="$(cd "${project_main}" && bash bin/agent work "帮我检查磁盘空间是否异常" <<<$'y\ny\n' 2>&1)"
 plan_removed_output="$(bash "${ROOT_DIR}/bin/agent" plan "帮我检查磁盘空间是否异常" 2>&1 || true)"
-script_output="$(bash "${ROOT_DIR}/bin/agent" script ops-basic/resource-inspect '{"top_n":1}' <<< $'y\n' 2>&1)"
+script_output="$(bash "${ROOT_DIR}/bin/agent" script ops-basic/resource-inspect '{"top_n":1}' <<<$'y\n' 2>&1)"
 project_json="${tmp_root}/json-work"
 copy_project "${project_json}"
 json_output="$(cd "${project_json}" && LINUX_AGENT_OUTPUT_JSON=1 bash bin/agent work "查看cpu占用,内存环境" 2>/dev/null)"
-script_json_output="$(LINUX_AGENT_OUTPUT_JSON=1 bash "${ROOT_DIR}/bin/agent" script ops-basic/resource-inspect '{"top_n":1}' <<< $'y\n' 2>/dev/null)"
+script_json_output="$(LINUX_AGENT_OUTPUT_JSON=1 bash "${ROOT_DIR}/bin/agent" script ops-basic/resource-inspect '{"top_n":1}' <<<$'y\n' 2>/dev/null)"
 tools_output="$(bash "${ROOT_DIR}/bin/agent" tools list)"
 
 grep -q '工作流执行完成: status=executed' <<<"${output}"
@@ -157,7 +157,8 @@ grep -q '脚本执行结果: 成功' <<<"${script_output}"
 grep -q '系统负载' <<<"${script_output}"
 grep -q '"status": "executed"' <<<"${json_output}"
 grep -q '"auto_executed_count": 1' <<<"${json_output}"
-grep -q '"tool": "system.resource.inspect"' <<<"${script_json_output}"
+jq -e 'any(.output_blocks[]?; .kind == "json" and .json.tool == "system.resource.inspect")' \
+    <<<"${script_json_output}" >/dev/null
 grep -q 'ops-basic/process-inspect' <<<"${tools_output}"
 grep -q 'ops-basic/resource-inspect' <<<"${tools_output}"
 

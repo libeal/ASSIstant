@@ -55,7 +55,7 @@ context_history_file="${context_project}/tmp/conversation-history.json"
     linux_agent_record_conversation_turn "work" "第二轮请求" "第二轮完成" "executed" "request"
     linux_agent_record_conversation_turn "work" "第三轮请求" "第三轮完成" "executed" "request"
     linux_agent_history_window
-) > "${tmp_root}/context-window.json"
+) >"${tmp_root}/context-window.json"
 jq -e 'length == 2
     and .[0].request.content == "第二轮请求"
     and .[1].request.content == "第三轮请求"
@@ -66,7 +66,7 @@ legacy_history_file="${tmp_root}/legacy-history.json"
 jq -cn '[
     {role:"user", content:"旧用户请求", status:"work", timestamp:"t1"},
     {role:"assistant", content:"旧助手响应", status:"executed", timestamp:"t2"}
-]' > "${legacy_history_file}"
+]' >"${legacy_history_file}"
 legacy_window="$(
     cd "${context_project}"
     # shellcheck source=/dev/null
@@ -77,6 +77,8 @@ legacy_window="$(
     source lib/context.sh
     linux_agent_init_env "${context_project}"
     linux_agent_load_config
+    # Consumed by linux_agent_history_window from the sourced context module.
+    # shellcheck disable=SC2034
     LINUX_AGENT_CONVERSATION_HISTORY_FILE="${legacy_history_file}"
     LINUX_AGENT_CONFIG_JSON="$(jq '.context_turns=1' <<<"${LINUX_AGENT_CONFIG_JSON}")"
     linux_agent_history_window
@@ -87,36 +89,36 @@ jq -e 'length == 1
     and .[0].response.content == "旧助手响应"
     and .[0].status == "executed"' <<<"${legacy_window}" >/dev/null
 
-failure_output="$(run_agent_cmd failure bash bin/agent work "请演示失败中断" <<< $'y\n' 2>&1)"
+failure_output="$(run_agent_cmd failure bash bin/agent work "请演示失败中断" <<<$'y\n' 2>&1)"
 grep -q '工作流执行完成: status=failed' <<<"${failure_output}"
 grep -q '步骤执行结果: 失败' <<<"${failure_output}"
 grep -q '回滚或修复建议' <<<"${failure_output}"
 
-blocked_output="$(run_agent_cmd blocked bash bin/agent work "帮我检查磁盘空间是否异常" <<< $'n\n' 2>&1)"
+blocked_output="$(run_agent_cmd blocked bash bin/agent work "帮我检查磁盘空间是否异常" <<<$'n\n' 2>&1)"
 grep -q '工作流执行完成: status=rejected' <<<"${blocked_output}"
 
-skip_empty_output="$(run_agent_cmd skip-empty bash bin/agent work "帮我检查磁盘空间是否异常" <<< $'s\n\ny\n' 2>&1)"
+skip_empty_output="$(run_agent_cmd skip-empty bash bin/agent work "帮我检查磁盘空间是否异常" <<<$'s\n\ny\n' 2>&1)"
 grep -q '已跳过当前步骤' <<<"${skip_empty_output}"
 grep -q '工作流执行完成: status=executed' <<<"${skip_empty_output}"
 
-skip_json_output="$(run_agent_cmd skip-json env LINUX_AGENT_OUTPUT_JSON=1 bash bin/agent work "帮我检查磁盘空间是否异常" <<< $'s\n\ny\n' 2>/dev/null)"
+skip_json_output="$(run_agent_cmd skip-json env LINUX_AGENT_OUTPUT_JSON=1 bash bin/agent work "帮我检查磁盘空间是否异常" <<<$'s\n\ny\n' 2>/dev/null)"
 grep -q '"status": "executed"' <<<"${skip_json_output}"
 grep -q '"status": "skipped"' <<<"${skip_json_output}"
 grep -q '"action": "skipped_by_user"' <<<"${skip_json_output}"
 
-revision_output="$(run_agent_cmd revision bash bin/agent work "帮我检查磁盘空间是否异常" <<< $'s\n查看cpu占用\ny\n' 2>&1)"
+revision_output="$(run_agent_cmd revision bash bin/agent work "帮我检查磁盘空间是否异常" <<<$'s\n查看cpu占用\ny\n' 2>&1)"
 grep -q '根据修改需求生成续写计划' <<<"${revision_output}"
 grep -q '系统负载' <<<"${revision_output}"
 grep -q '工作流执行完成: status=executed' <<<"${revision_output}"
 
-terminated_output="$(run_agent_cmd terminated bash bin/agent work "请演示失败中断" <<< $'t\n' 2>&1)"
+terminated_output="$(run_agent_cmd terminated bash bin/agent work "请演示失败中断" <<<$'t\n' 2>&1)"
 grep -q '工作流执行完成: status=terminated' <<<"${terminated_output}"
 ! grep -q '步骤输出' <<<"${terminated_output}"
 
 invalid_script="$(bash "${ROOT_DIR}/bin/agent" script /tmp/not-allowed.sh '{}' 2>&1 || true)"
 grep -q '脚本状态: blocked' <<<"${invalid_script}"
 
-quiet_output="$(run_agent_cmd quiet bash bin/agent work "帮我检查磁盘空间是否异常" <<< $'y\ny\n' 2>&1)"
+quiet_output="$(run_agent_cmd quiet bash bin/agent work "帮我检查磁盘空间是否异常" <<<$'y\ny\n' 2>&1)"
 grep -q '工作流执行完成: status=executed' <<<"${quiet_output}"
 grep -q '步骤输出' <<<"${quiet_output}"
 ! grep -q '输出摘要（已脱敏' <<<"${quiet_output}"
@@ -161,10 +163,10 @@ grep -q '工作流执行完成: status=executed' <<<"${invalid_reflect_output}"
 
 render_input="$(jq -cn --arg table $'COL1\tCOL2\nA\tB' '{ok:true, exit_code:0, output:{ok:true, tool:"demo.render", table:$table, empty:"", count:2}}')"
 render_output="$(
-  {
-    source "${ROOT_DIR}/lib/executor.sh"
-    linux_agent_print_user_output "${render_input}" "步骤输出"
-  } 2>&1
+    {
+        source "${ROOT_DIR}/lib/executor.sh"
+        linux_agent_print_user_output "${render_input}" "步骤输出"
+    } 2>&1
 )"
 grep -q '步骤输出' <<<"${render_output}"
 grep -q $'COL1\tCOL2' <<<"${render_output}"

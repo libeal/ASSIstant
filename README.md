@@ -20,14 +20,14 @@ Linux 运维 Agent 是一个以 Bash CLI 为核心的本机运维助手。它把
 | Skills | `bash bin/agent skills validate` | 校验 skill 目录、`SKILL.md`、脚本和索引登记一致性。 |
 | MCP | `bash bin/agent mcp list` / `bash bin/agent mcp validate` / `bash bin/agent mcp tools` | 列出、校验并发现 `mcp/` 下安装的外部 MCP server tools。 |
 | Policy | `bash bin/agent policy validate [file]` | 校验 `policies/` 下策略 JSON、正则和审计边界。 |
-| Audit | `bash bin/agent audit <session-id>` | 读取历史 JSONL 审计会话并生成摘要报告。 |
+| Audit | `bash bin/agent audit <session-id>` / `bash bin/agent audit verify <session-id>` | 读取历史 JSONL 审计会话，或校验跨轮转文件的 SHA-256 hash chain。 |
 | API | `bash bin/agent api <resource> <action> [json]` | 给 Web 后端调用的机器可读 JSON 接口。 |
 
 交互式 REPL 支持 `/work`、`/edit`、`/script`、`/terminal`、`/mode`、`/help`、`/exit`。输入 `/` 或 `/前缀` 后回车会打开命令菜单。
 
 ### Web 控制台
 
-Web 控制台通过 `bash bin/agent-web` 启动，后端只使用 Python 标准库，不依赖 npm、pip 或数据库。它通过 `bash bin/agent api ...` 调用 CLI 核心能力。
+Web 控制台通过 `bash bin/agent-web` 启动，后端只使用 Python 标准库，不依赖 npm、pip 或外部数据库；Job 状态使用标准库 `sqlite3` 的本机 SQLite WAL。它通过 `bash bin/agent api ...` 调用 CLI 核心能力。
 
 Web 视图包括：
 
@@ -35,7 +35,7 @@ Web 视图包括：
 - Skill 库：script 运行、script 审查、edit 生成、edit 审查、保存、skill 树、Markdown 预览、`skills validate`。
 - MCP：读取 `mcp/<id>/mcp.json` 外部 MCP server manifest，校验 stdio、legacy SSE 和 Streamable HTTP 三种传输配置，并在 work/edit 上下文暴露可用 tools。
 - Policy：以运维视角查看命令安全检查、校验和编辑 `policies/` 下的 JSON 策略文件（含风险规则、审计边界和文件保险箱）；策略文件通过“查阅文件”弹窗查看，解锁后可编辑保存；命令安全检查默认开启，只有 sudo 核对后才能从 Web 切换。
-- Audit：查看 JSONL 审计 session、事件筛选、指标统计、报告导出，并可把审计事件恢复为 Web 工作台时间线。
+- Audit：查看 JSONL 审计 session、完整性结果、事件筛选、指标统计和报告导出。新会话可从持久化的权威 protocol turns 恢复工作台；没有 turns 的旧会话只显示只读事件，不再从审计事件推导业务状态。
 - Config：读取和保存白名单配置项，运行 Doctor，展示运行时配置快照。
 
 ### 内置 Skill
@@ -114,7 +114,7 @@ bash bin/agent-web
 ```
 
 默认访问 `http://127.0.0.1:8765/`。静态页面不需要认证，所有 `/api/` 请求都需要 `Authorization: Bearer <token>`（认证使用常量时间比较，不再支持 `X-Agent-Token` 备用头）。如果 `web.token` 留空，启动时会用系统 CSPRNG 生成本次运行的临时 token，并写入权限 `0600` 的 `tmp/web/auth-token` 文件（不在终端回显），退出时清理；配置文件 `config/config.json` 写入时也会强制 `0600`。
-连接后 Web 会申请一次服务器权限以启用 auditd observer；用户跳过或启用失败都会写入 Web 审计日志，后续任务仍可继续运行并按 observer 降级事件记录。
+连接后 Web 会申请一次服务器权限以启用 auditd observer；用户跳过或启用失败都会写入 Web 审计日志。默认 `observer.require=false` 时按降级模式继续；强合规环境设置为 `true` 后，observer 不可用或规则失效会拒绝真实执行。
 
 常用命令：
 
@@ -130,7 +130,10 @@ bash bin/agent mcp validate
 bash bin/agent mcp tools
 bash bin/agent policy validate
 bash bin/agent audit <session-id>
+bash bin/agent audit verify <session-id>
 ```
+
+审计 hash chain 是强制不变量，不能通过配置或 CLI 关闭；每个事件始终包含 `seq`、`prev_hash` 和 `hash`。升级配置如果仍含旧的 `audit.integrity_chain` 字段，CLI/Web 会要求删除该字段后再启动。追加只校验最后一个非空事件及其自身 hash，写入成本不随历史事件数增长。跨分段全链检查是显式职责：取证、导出或合规检查前运行 `audit verify`；中间事件或旧归档损坏会由该命令报告，但不会阻止后续追加。
 
 机器可读 API 示例：
 
@@ -167,6 +170,7 @@ Linux 运维 Agent
 │  │  ├─ common.sh           根目录、临时目录、脱敏、JSON 参数规范化
 │  │  ├─ config.sh           配置读取和默认值
 │  │  ├─ audit.sh            JSONL 审计和审计报告
+│  │  ├─ audit_chain.py      hash chain、fsync、轮转、磁盘策略与校验器
 │  │  └─ context.sh          会话历史和模型上下文
 │  ├─ 感知与校验
 │  │  ├─ sense.sh            环境采集
@@ -184,9 +188,19 @@ Linux 运维 Agent
 │  │  ├─ editor.sh           skill edit/staging/提交
 │  │  ├─ observer.sh         auditd observer 和降级记录
 │  │  ├─ api.sh              机器可读 API
+│  │  ├─ workflow.sh         CLI/API 共用的 Work 准备与执行选择
 │  │  └─ interactive.sh      REPL 菜单和模式选择
 ├─ Web 外壳层 web/
-│  ├─ server.py              标准库 HTTP 后端，认证、静态文件、job、策略/配置/skill API
+│  ├─ server.py              标准库 HTTP 路由、认证与服务编排
+│  ├─ jobs.py                SQLite WAL JobStore、幂等、版本和恢复
+│  ├─ sessions.py            工作台/Job 私有上下文、合并事务和持久化 turns
+│  ├─ execution.py           子进程、超时、取消、输出与环境隔离
+│  ├─ audit.py               Web 审计适配器（复用 audit_chain）
+│  ├─ domain.py              schema/domain.json 运行时契约校验
+│  ├─ timeline.py            只消费持久化 protocol turns 的时间线视图
+│  ├─ provider.py            Provider 配置与模型服务
+│  ├─ policy.py              Policy 文件与 sudo 写入服务
+│  ├─ skills.py              Skill 文件树服务
 │  └─ static/
 │     ├─ index.html          Web 页面结构
 │     ├─ app.js              前端工作台入口
@@ -263,16 +277,16 @@ Web MCP 页和 `agent api mcp list|validate|tools` 会隐藏 Authorization、tok
 6. `lib/orchestrator.sh` 根据模式调度 work、edit、script、terminal。
 7. `lib/policy.sh` 用 `policies/risk-rules.json` 做阻断、警告、保护路径和保护服务审查。
 8. `lib/executor.sh` 执行计划步骤，处理自动批准、人工审批、跳过、修改、终止、远程脚本下载审查和失败修复建议。
-9. `lib/observer.sh` 在可用时安装 auditd syscall 观察规则，执行结束后汇总 `ausearch` 事件；不可用时只记录降级事件。
-10. `lib/audit.sh` 负责审计 JSONL 写入、脱敏摘要、session 收尾和 `agent audit` 报告。
+9. `lib/observer.sh` 在可用时安装 auditd syscall 观察规则，执行结束后汇总 `ausearch` 事件；`observer.require=true` 时每次真实执行前复核规则并 fail closed。
+10. `lib/audit.sh` 与 `lib/audit_chain.py` 负责审计脱敏、0600 写入、hash chain、fsync、轮转、磁盘策略、session 收尾和校验/报告。
 
 ### Web 调用关系
 
 1. `bin/agent-web` 读取 `config/config.json` 的 `web` 段，导出环境变量并启动 `web/server.py`。
-2. `web/server.py` 提供静态文件、token 校验、策略/配置/skill 文件 API、异步 job API。
+2. `web/server.py` 提供静态文件、token 校验、策略/配置/skill 文件 API、异步 Job API，并把状态服务委托给平级模块。
 3. 对 CLI 核心能力，Web 后端调用 `bash bin/agent api ...`，不复制业务逻辑。
-4. 长任务通过 `/api/jobs` 启动，状态写入 `tmp/web/jobs/`，前端轮询 `/api/jobs/<job-id>`。
-5. 前端 `web/static/app.js` 负责页面状态、审批抽屉、轮询、中止、配置编辑、策略编辑、审计筛选和输出渲染。
+4. 长任务通过 `/api/jobs` 启动，状态事务化写入 `tmp/web/jobs.db`；每个 Job 使用独立 session、history、audit 和临时目录，完成后串行合并工作台历史/turn。
+5. 前端轮询 `/api/jobs/<job-id>`，终态后重新读取服务端持久化 turns；审计证据不参与业务状态重建。
 
 ## 运行逻辑
 
@@ -385,9 +399,14 @@ GitHub Actions 会构建、发布并实际执行 CLI/Web bootstrap smoke test。
 | `approvals.auto.remote_script` | 是否自动执行远程脚本，默认关闭。 |
 | `audit_mode` | 审计写入模式。 |
 | `audit_text_limit` | 审计和输出预览文本截断长度。 |
+| `audit.fsync` | 是否在审计追加/轮转后执行 fsync。 |
+| `audit.max_bytes` | 单个审计分段的轮转阈值；`0` 禁用轮转。 |
+| `audit.min_free_bytes` | 审计目录最小可用空间阈值；`0` 禁用检查。 |
+| `audit.on_full` | 空间不足时 `degrade`（写最小事件）或 `block`（拒绝操作）。 |
 | `observer.enabled` | observer 开关，默认 `auto`。 |
 | `observer.privilege` | auditd observer 的 sudo 策略。 |
 | `observer.max_events` | observer 汇总事件上限。 |
+| `observer.require` | 强合规开关；为 `true` 时 observer 未完整生效即拒绝真实执行。 |
 | `execution.min_privilege_proxy` | root 运行时是否尽量降权执行普通命令。 |
 | `execution.least_privilege_user` | 降权执行使用的目标用户。 |
 | `execution.timeout_sec` | 单个执行步骤的硬超时，范围 1–3600 秒，默认 300 秒；超时会记录 `timed_out`。 |
@@ -398,7 +417,11 @@ GitHub Actions 会构建、发布并实际执行 CLI/Web bootstrap smoke test。
 | `web.host` | Web 监听地址。 |
 | `web.port` | Web 监听端口。 |
 | `web.token` | Web Bearer token，空值则启动时生成临时 token。 |
-| `web.job_retention_hours` | Web job 状态文件保留小时数。 |
+| `web.job_retention_hours` | SQLite Job 历史保留小时数。 |
+| `web.max_active_jobs` | 同时处于 queued/running 的 Job 上限。 |
+| `web.job_timeout_sec` | 后台 Job 硬超时。 |
+| `web.max_job_attempts` | Job 重试次数上限。 |
+| `web.cancel_grace_sec` | 取消时从 SIGTERM 升级到 SIGKILL 的等待秒数。 |
 
 环境变量：
 
@@ -422,7 +445,7 @@ GitHub Actions 会构建、发布并实际执行 CLI/Web bootstrap smoke test。
 - `network-ops-tools` 中的扫描、SNMP、WOL、hosts/firewall 等工具即使由 work 模式调用，也按 `SKILL.md` 声明提升为 `medium` 或 `high` 风险，不能作为 low 风险自动执行。
 - Remote script 只能 HTTPS 下载后审查，不允许流式管道执行。
 - Web `/api/` 全部需要 Bearer token。
-- Web 启动后会在浏览器中申请一次服务器权限以启用 auditd observer；未启用会记录审计日志。
+- Web 启动后会在浏览器中申请一次服务器权限以启用 auditd observer；未启用会记录审计日志，`observer.require=true` 时同时阻断真实执行。
 - Web 策略编辑只允许 `policies/` 下 JSON 文件，保存前做策略校验，写入前做 sudo 校验。
 - 审计文本和上下文会脱敏并截断。
 - 当前 session 的临时目录只在当前进程结束时清理。
@@ -513,7 +536,8 @@ done
 | --- | --- |
 | `lib/common.sh` | 根目录、日志目录、临时目录初始化，通用输出函数，临时目录清理，文本和 JSON 脱敏，JSON 参数规范化。 |
 | `lib/config.sh` | 加载 `config/config.json`，提供配置读取、默认值读取、布尔和正整数读取。 |
-| `lib/audit.sh` | 审计边界读取、审计 payload 脱敏摘要、JSONL session 创建和写入、命令/turn/步骤状态记录、审计报告渲染。 |
+| `lib/audit.sh` | 审计边界读取、payload 脱敏摘要、JSONL session、命令/turn/步骤事件和报告渲染。 |
+| `lib/audit_chain.py` | 审计文件 0600、跨进程锁、SHA-256 链、fsync、轮转、磁盘策略和完整性校验。 |
 | `lib/context.sh` | 维护会话历史窗口，构造动态请求上下文，合并最终 AI payload 上下文。 |
 | `lib/sense.sh` | 采集磁盘、资源、进程、网络、日志、服务、权限等环境信息。 |
 | `lib/skills.sh` | 解析 skill 引用、定位脚本、读取索引、校验登记状态、执行 skill 脚本、校验 skill 目录。 |
@@ -527,6 +551,7 @@ done
 | `lib/executor.sh` | Work 计划执行状态机，包含 API 审批输入队列、自动审批、人工审批、跳过/修改/终止、远程脚本下载审查、步骤执行、失败修复建议和输出渲染。 |
 | `lib/editor.sh` | Edit 模式实现，生成 `SKILL.md`，打开编辑器，记录人工修改 diff，staging 校验并提交 skill。 |
 | `lib/api.sh` | 机器可读 JSON API，给 Web 提供 health、config、doctor、sense、tools、skills、audit、work、script、terminal、edit 等入口。 |
+| `lib/workflow.sh` | Work 请求准备和执行引擎选择的 CLI/API 共享边界。 |
 | `lib/interactive.sh` | REPL 输入、斜杠菜单、命令补全菜单和模式选择菜单。 |
 | `lib/orchestrator.sh` | 高层业务编排，负责 work/edit/script/terminal 分发、work 反思循环、checkpoint 和 thinking summary。 |
 
@@ -534,7 +559,12 @@ done
 
 | 文件 | 功能 |
 | --- | --- |
-| `web/server.py` | Python 标准库 Web 后端，提供静态文件、认证、配置 API、策略 API、skill 文件 API、job API，并转发 CLI API。 |
+| `web/server.py` | Python 标准库 Web 路由、认证、错误映射和服务编排，并转发 CLI API。 |
+| `web/jobs.py` | SQLite WAL JobStore，负责幂等 admission、版本、查询、清理和重启恢复。 |
+| `web/sessions.py` | 工作台 session、Job 快照/串行合并事务和不可变 protocol turns。 |
+| `web/execution.py` | Agent 子进程环境隔离、并发管道读取、超时、取消和进程组回收。 |
+| `web/audit.py` / `web/domain.py` / `web/timeline.py` | Web 审计适配、领域契约校验和持久化时间线读取。 |
+| `web/provider.py` / `web/policy.py` / `web/skills.py` | Provider、Policy 和 Skill 文件服务。 |
 | `web/static/index.html` | Web 控制台 HTML 页面，包含 Work、Skill、Policy、Audit、Config 五个主视图。 |
 | `web/static/app.js` | Web 前端入口，组合无构建 ES modules 并驱动工作台交互。 |
 | `web/static/modules/` | 前端 API、state、timeline、approval、output-blocks、audit、policy/config 模块。 |
@@ -626,6 +656,9 @@ done
 | `tests/policy.sh` | 覆盖风险规则、保护路径、远程脚本阻断、文件保险箱访问判定和风险合并。 |
 | `tests/tools.sh` | 覆盖本地工具、skill 登记、日志清理边界和 doctor。 |
 | `tests/observer.sh` | 覆盖 observer 禁用、mock auditd、事件汇总和失败降级。 |
+| `tests/audit_integrity.sh` | 覆盖审计链、篡改、权限、轮转、磁盘策略和并发写入。 |
+| `tests/workflow_unit.sh` | 覆盖 CLI/API 共享 Work 工作流边界。 |
+| `tests/test_web_*.py` | 覆盖 JobStore、Session 事务、Execution、Domain 与拆分后的 Web 服务。 |
 | `tests/interactive.sh` | 覆盖 REPL 菜单、模式切换、terminal 模式和 edit 模式。 |
 | `tests/web_api.sh` | 覆盖机器可读 API 的 work、script、terminal、edit、audit 等路径。 |
 | `tests/web_server.sh` | 覆盖 Web token 拦截、health、静态页面、config、skill、policy、job、shutdown 和新增 Web 入口。 |
@@ -635,7 +668,7 @@ done
 | 路径 | 功能 |
 | --- | --- |
 | `logs/` | JSONL 审计日志目录，被 `.gitignore` 忽略。 |
-| `tmp/` | 项目内临时目录，被 `.gitignore` 忽略；Web job 状态位于 `tmp/web/jobs/`。 |
+| `tmp/` | 项目内临时目录，被 `.gitignore` 忽略；Job 数据库为 `tmp/web/jobs.db`，私有 history/completion 位于 `tmp/web/jobs/`。 |
 | `sessions/` | 预留的本地 session 产物目录，被 `.gitignore` 忽略。 |
 | `/tmp/<session-id>/thinking/` | 开启 thinking trace 后保存简短思考摘要，不进入审计或上下文。 |
 | `__pycache__/`、`*.pyc` | Python 运行生成的字节码缓存，被 `.gitignore` 忽略。 |
@@ -647,4 +680,4 @@ done
 - Web 端口被占用：停止旧进程或修改 `web.port`。
 - Web 认证失败：确认页面右上角 token 与 `agent-web` 启动日志一致。
 - `skills validate` 失败：检查 `skills/INDEX.md`、对应 `SKILL.md` 和 `scripts/*.sh` 是否一致。
-- observer 不可用：通常是系统没有 auditd、缺少 sudo 权限或策略禁用了 syscall 观察；业务命令仍可继续执行，只会记录降级事件。
+- observer 不可用：通常是系统没有 auditd、缺少 sudo 权限或规则失效；`observer.require=false` 时记录降级事件并继续，`true` 时修复 observer 后才能执行。

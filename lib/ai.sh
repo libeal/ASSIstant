@@ -88,7 +88,7 @@ linux_agent_build_system_prompt() {
 
     jq -Rs --arg skill_index "${skill_index}" '
         . + "\n\n当前 skill 索引：\n" + $skill_index
-    ' < "${prompt_file}"
+    ' <"${prompt_file}"
 }
 
 linux_agent_record_ai_request_files() {
@@ -182,6 +182,7 @@ linux_agent_validate_work_response() {
             (.steps | type == "array") and
             (.steps | length > 0) and
             all(.steps[]?; valid_step) and
+            (([.steps[].id] | length) == ([.steps[].id] | unique | length)) and
             valid_continue and
             valid_thinking
           )
@@ -251,19 +252,19 @@ linux_agent_ai_provider_id() {
 
     # Fallback (schema unavailable): inline equivalent of schema/domain.json.
     case "${normalized}" in
-        ""|openai_compatible*)
+        "" | openai_compatible*)
             printf 'openai_compatible\n'
             ;;
-        zhipu|zhipuai|zhipu_ai)
+        zhipu | zhipuai | zhipu_ai)
             printf 'zhipu_ai\n'
             ;;
-        sarvam|sarvam_ai)
+        sarvam | sarvam_ai)
             printf 'sarvam_ai\n'
             ;;
-        moonshot|moonshot_ai)
+        moonshot | moonshot_ai)
             printf 'moonshot_ai\n'
             ;;
-        xai|x_ai)
+        xai | x_ai)
             printf 'x_ai\n'
             ;;
         *)
@@ -406,6 +407,7 @@ linux_agent_call_ai_with_context() {
     safe_current_request="$(linux_agent_sanitize_text "${current_request}")"
     safe_request_context="$(linux_agent_sanitize_json "${request_context}")"
     payload_context="$(linux_agent_build_ai_payload_context "${safe_request_context}" "${runtime_context}")"
+    payload_context="$(jq -c --arg current_request "${safe_current_request}" '.current_request = $current_request' <<<"${payload_context}")"
 
     local provider_id provider_json request_format auth_type
     provider_id="$(linux_agent_ai_provider_id)"
@@ -446,6 +448,9 @@ linux_agent_call_ai_with_context() {
     fi
 
     payload="$(linux_agent_ai_build_payload "${request_format}" "${model}" "${system_prompt}" "${purpose}" "${payload_context}")"
+    # Callers that source this module may inspect the last payload for security
+    # assertions; it is also explicitly removed from child process environments.
+    # shellcheck disable=SC2034
     LINUX_AGENT_LAST_AI_PAYLOAD="${payload}"
 
     local -a curl_headers

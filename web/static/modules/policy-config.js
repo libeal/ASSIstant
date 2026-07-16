@@ -98,6 +98,7 @@ export const CONFIG_GROUPS = [
       { key: "observer.enabled", label: "observer_backend", type: "select", options: ["auto", "auditd", "disabled"], comment: "auto 会优先尝试 auditd，失败时降级记录诊断。" },
       { key: "observer.privilege", label: "observer_privilege", type: "select", options: ["sudo_interactive", "passwordless", "none"], comment: "Web 端启用 auditd observer 时使用的提权策略。" },
       { key: "observer.max_events", label: "observer_max_events", type: "number", min: 1, comment: "单会话 observer 事件上限，避免报告过大。" },
+      { key: "observer.require", label: "observer_required", type: "boolean", comment: "开启后，auditd observer 未完整生效时拒绝所有真实执行。" },
     ],
   },
   {

@@ -32,8 +32,7 @@ if ! resolved_path="$(realpath -e "${path}" 2>/dev/null)"; then
 fi
 
 case "${resolved_path}" in
-    /var/log|/var/log/*)
-        ;;
+    /var/log | /var/log/*) ;;
     *)
         jq -cn \
             --arg tool "system.logs.search" \

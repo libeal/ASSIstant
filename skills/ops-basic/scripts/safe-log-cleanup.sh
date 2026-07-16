@@ -43,8 +43,7 @@ if ! resolved_path="$(realpath -e "${path}" 2>/dev/null)"; then
 fi
 
 case "${resolved_path}" in
-    /var/log|/var/log/*|/tmp|/tmp/*)
-        ;;
+    /var/log | /var/log/* | /tmp | /tmp/*) ;;
     *)
         jq -cn \
             --arg path "${path}" \
@@ -73,7 +72,7 @@ fi
 size_bytes="$(stat -c '%s' "${resolved_path}" 2>/dev/null || printf '0')"
 threshold_bytes=$((max_size_mb * 1024 * 1024))
 
-if (( size_bytes < threshold_bytes )); then
+if ((size_bytes < threshold_bytes)); then
     jq -cn \
         --arg path "${resolved_path}" \
         --argjson size_bytes "${size_bytes}" \
@@ -90,7 +89,7 @@ if [[ "${dry_run}" == "true" ]]; then
     exit 0
 fi
 
-: > "${resolved_path}"
+: >"${resolved_path}"
 
 jq -cn \
     --arg path "${resolved_path}" \

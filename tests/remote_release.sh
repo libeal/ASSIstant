@@ -69,8 +69,8 @@ while IFS= read -r skill_name; do
     mkdir -p "${skill_extract}"
     tar -xzf "${first}/${asset}" -C "${skill_extract}"
     manifest_refs="$(jq -r --arg skill "${skill_name}" '.skills[$skill].refs[].ref' "${first}/release-manifest.json" | sort)"
-    package_refs="$(find "${skill_extract}/skills/${skill_name}/scripts" -maxdepth 1 -type f -name '*.sh' -printf '%f\n' \
-        | sed 's/\.sh$//' | awk -v prefix="${skill_name}/" '{print prefix $0}' | sort)"
+    package_refs="$(find "${skill_extract}/skills/${skill_name}/scripts" -maxdepth 1 -type f -name '*.sh' -printf '%f\n' |
+        sed 's/\.sh$//' | awk -v prefix="${skill_name}/" '{print prefix $0}' | sort)"
     [[ "${manifest_refs}" == "${package_refs}" ]]
 done < <(jq -r '.skills | keys[]' "${first}/release-manifest.json")
 

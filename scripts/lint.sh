@@ -2,20 +2,41 @@
 #
 # 统一静态检查基线：本地与 CI 共用。
 # 必备检查（缺依赖即失败）：bash -n、python3 -m py_compile、node --check。
-# 可选检查（未安装则跳过并提示）：shellcheck、shfmt、pyflakes/ruff、eslint。
+# 可选检查（未安装则跳过并提示）：shellcheck、shfmt、pyflakes/ruff。
 
 set -uo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-cd "${ROOT_DIR}"
+cd "${ROOT_DIR}" || exit 1
 
 status=0
 note() { printf '[lint] %s\n' "$*"; }
 warn() { printf '[lint][skip] %s\n' "$*" >&2; }
-fail() { printf '[lint][fail] %s\n' "$*" >&2; status=1; }
+fail() {
+    printf '[lint][fail] %s\n' "$*" >&2
+    status=1
+}
 
-BASH_FILES=(bin/agent bin/agent-web test_config.sh lib/*.sh remote/*.sh scripts/*.sh tests/*.sh skills/*/scripts/*.sh)
-PY_FILES=(lib/command_guard.py lib/mcp_client.py lib/file_vault.py lib/provider_security.py web/server.py tests/fake_ai_server.py tests/fake_mcp_server.py)
+BASH_FILES=(bin/agent bin/agent-web test_config.sh)
+mapfile -d '' -t DISCOVERED_BASH_FILES < <(
+    find lib remote scripts tests skills -type f -name '*.sh' -print0 | sort -z
+)
+BASH_FILES+=("${DISCOVERED_BASH_FILES[@]}")
+
+mapfile -d '' -t PY_FILES < <(
+    find lib web tests skills -type f -name '*.py' -print0 | sort -z
+)
+
+mapfile -d '' -t JS_FILES < <(
+    find web/static tests -type f \( -name '*.js' -o -name '*.mjs' \) -print0 | sort -z
+)
+
+if [[ "${#PY_FILES[@]}" -eq 0 ]]; then
+    fail "未发现 Python 检查目标"
+fi
+if [[ "${#JS_FILES[@]}" -eq 0 ]]; then
+    fail "未发现 JavaScript 检查目标"
+fi
 
 note "bash -n"
 # shellcheck disable=SC2086
@@ -24,14 +45,13 @@ bash -n "${BASH_FILES[@]}" || fail "bash -n reported syntax errors"
 note "python3 -m py_compile"
 python3 -m py_compile "${PY_FILES[@]}" || fail "py_compile reported syntax errors"
 
-note "node --check web/static/app.js"
+note "node --check"
 if command -v node >/dev/null 2>&1; then
-    node --check web/static/app.js || fail "node --check reported syntax errors"
-    for module in web/static/modules/*.js; do
-        node --check "${module}" || fail "node --check failed for ${module}"
+    for js_file in "${JS_FILES[@]}"; do
+        node --check "${js_file}" || fail "node --check failed for ${js_file}"
     done
 else
-    warn "node 未安装，跳过前端语法检查"
+    fail "node 未安装，无法执行必备的前端语法检查"
 fi
 
 # JSON policy/config/schema files must parse.

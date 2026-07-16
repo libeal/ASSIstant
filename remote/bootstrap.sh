@@ -16,7 +16,7 @@ for command_name in bash curl python3 jq tar sha256sum stat mktemp; do
     command -v "${command_name}" >/dev/null 2>&1 || fail "缺少依赖命令: ${command_name}"
 done
 
-case "${ENTRYPOINT}" in cli|web) ;; *) fail 'remote entrypoint must be cli or web' ;; esac
+case "${ENTRYPOINT}" in cli | web) ;; *) fail 'remote entrypoint must be cli or web' ;; esac
 if [[ "${VERSION}" != "latest" && ! "${VERSION}" =~ ^v[0-9A-Za-z][0-9A-Za-z._-]*$ ]]; then
     fail 'LINUX_AGENT_VERSION 格式非法'
 fi
@@ -57,9 +57,9 @@ choose_runtime_root() {
         fi
         RUNTIME_ROOT="$(mktemp -d "${candidate%/}/linux-agent-remote.XXXXXX")"
         chmod 0700 "${RUNTIME_ROOT}"
-        [[ ! -L "${RUNTIME_ROOT}" \
-            && "$(stat -c '%u' "${RUNTIME_ROOT}")" == "$(id -u)" \
-            && "$(stat -c '%a' "${RUNTIME_ROOT}")" == "700" ]] || {
+        [[ ! -L "${RUNTIME_ROOT}" &&
+            "$(stat -c '%u' "${RUNTIME_ROOT}")" == "$(id -u)" &&
+            "$(stat -c '%a' "${RUNTIME_ROOT}")" == "700" ]] || {
             rm -rf -- "${RUNTIME_ROOT}"
             RUNTIME_ROOT=""
             continue
@@ -206,7 +206,7 @@ jq --arg version "${RELEASE_VERSION}" --arg storage "${STORAGE_BACKEND}" --arg a
         allow_api_key_transmission:($allow | ascii_downcase | IN("true", "1", "yes", "on"))
     })
     | .providers_security = ((.providers_security // {}) + {require_https:true})
-' "${agent_root}/config/config.json" > "${config_tmp}"
+' "${agent_root}/config/config.json" >"${config_tmp}"
 mv "${config_tmp}" "${agent_root}/config/config.json"
 
 export LINUX_AGENT_REMOTE_MODE=1
@@ -214,16 +214,17 @@ export LINUX_AGENT_REMOTE_RELEASE_BASE="${RELEASE_BASE}"
 export LINUX_AGENT_REMOTE_MANIFEST="${agent_root}/remote/release-manifest.json"
 export LINUX_AGENT_REMOTE_RELEASE_VERSION="${RELEASE_VERSION}"
 export LINUX_AGENT_REMOTE_STORAGE_BACKEND="${STORAGE_BACKEND}"
-export LINUX_AGENT_REMOTE_PREFLIGHT="$(jq -cn \
+LINUX_AGENT_REMOTE_PREFLIGHT="$(jq -cn \
     --arg release_version "${RELEASE_VERSION}" \
     --arg entrypoint "${ENTRYPOINT}" \
     --arg storage_backend "${STORAGE_BACKEND}" \
     --argjson assets "${validated_assets}" \
     '{status:"verified", release_version:$release_version, entrypoint:$entrypoint, storage_backend:$storage_backend, assets:$assets}')"
+export LINUX_AGENT_REMOTE_PREFLIGHT
 
 if [[ "${ENTRYPOINT}" == "cli" ]]; then
     HAS_TTY=0
-    if [[ -e /dev/tty ]] && (: < /dev/tty) 2>/dev/null; then
+    if [[ -e /dev/tty ]] && (: </dev/tty) 2>/dev/null; then
         HAS_TTY=1
     fi
     if [[ $# -eq 0 && "${HAS_TTY}" == "1" ]]; then
@@ -239,22 +240,22 @@ if [[ "${ENTRYPOINT}" == "cli" ]]; then
         NEEDS_AI=1
     fi
     if [[ "${HAS_TTY}" == "1" && "${NEEDS_AI}" == "1" && "$(jq -r '.remote.allow_api_key_transmission // false' "${agent_root}/config/config.json")" != "true" ]]; then
-        printf '是否允许当前 remote runtime 向已配置的 AI Provider 传输 API Key？[y/N] ' > /dev/tty
-        IFS= read -r allow_answer < /dev/tty || allow_answer=""
+        printf '是否允许当前 remote runtime 向已配置的 AI Provider 传输 API Key？[y/N] ' >/dev/tty
+        IFS= read -r allow_answer </dev/tty || allow_answer=""
         if [[ "${allow_answer,,}" == "y" || "${allow_answer,,}" == "yes" ]]; then
             allow_tmp="${agent_root}/config/config.json.allow.tmp"
-            jq '.remote.allow_api_key_transmission = true' "${agent_root}/config/config.json" > "${allow_tmp}"
+            jq '.remote.allow_api_key_transmission = true' "${agent_root}/config/config.json" >"${allow_tmp}"
             mv "${allow_tmp}" "${agent_root}/config/config.json"
             if [[ -z "${LINUX_AGENT_API_KEY:-}" ]]; then
-                printf 'API Key（仅保存在当前进程内存）: ' > /dev/tty
-                IFS= read -r -s LINUX_AGENT_API_KEY < /dev/tty || LINUX_AGENT_API_KEY=""
-                printf '\n' > /dev/tty
+                printf 'API Key（仅保存在当前进程内存）: ' >/dev/tty
+                IFS= read -r -s LINUX_AGENT_API_KEY </dev/tty || LINUX_AGENT_API_KEY=""
+                printf '\n' >/dev/tty
                 export LINUX_AGENT_API_KEY
             fi
         fi
     fi
     if [[ "${HAS_TTY}" == "1" ]]; then
-        bash "${agent_root}/bin/agent" "${exec_args[@]}" < /dev/tty
+        bash "${agent_root}/bin/agent" "${exec_args[@]}" </dev/tty
     else
         bash "${agent_root}/bin/agent" "${exec_args[@]}"
     fi

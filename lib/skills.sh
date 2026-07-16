@@ -36,7 +36,7 @@ linux_agent_skill_disclosure_candidates() {
     lowered="${request,,}"
 
     case "${mode}" in
-        work|work_revision|work_reflect|edit|edit_revision) ;;
+        work | work_revision | work_reflect | edit | edit_revision) ;;
         *) return 0 ;;
     esac
 
@@ -70,7 +70,7 @@ linux_agent_skill_context_json() {
     local disclosed='[]' unavailable='[]' candidates skill_name skill_md instructions relative_path total_count
 
     case "${mode}" in
-        work|work_revision|work_reflect|edit|edit_revision) ;;
+        work | work_revision | work_reflect | edit | edit_revision) ;;
         *)
             jq -cn '{enabled:false, disclosure:"not_available_in_mode", disclosed:[], unavailable:[]}'
             return 0
@@ -122,9 +122,9 @@ linux_agent_add_skill_context() {
 }
 
 linux_agent_remote_mode_enabled() {
-    [[ "${LINUX_AGENT_REMOTE_MODE:-0}" == "1" \
-        && -n "${LINUX_AGENT_REMOTE_MANIFEST:-}" \
-        && -f "${LINUX_AGENT_REMOTE_MANIFEST}" ]]
+    [[ "${LINUX_AGENT_REMOTE_MODE:-0}" == "1" &&
+        -n "${LINUX_AGENT_REMOTE_MANIFEST:-}" &&
+        -f "${LINUX_AGENT_REMOTE_MANIFEST}" ]]
 }
 
 linux_agent_remote_release_base() {
@@ -145,7 +145,8 @@ linux_agent_remote_ref_is_registered() {
 
 linux_agent_remote_skill_ready() {
     local skill_name="$1"
-    local marker="$(linux_agent_skills_dir)/${skill_name}/.remote-verified.json"
+    local marker
+    marker="$(linux_agent_skills_dir)/${skill_name}/.remote-verified.json"
     [[ -f "${marker}" ]] || return 1
     local expected_sha expected_version
     expected_sha="$(jq -r --arg skill "${skill_name}" '.skills[$skill].asset.sha256 // empty' "${LINUX_AGENT_REMOTE_MANIFEST}")"
@@ -205,9 +206,9 @@ PY
 
 linux_agent_materialize_skill() {
     local skill_name="$1"
-    local skills_dir lock_root lock_dir attempt lock_acquired asset_name expected_sha expected_size max_size
+    local skills_dir lock_root lock_dir lock_acquired asset_name expected_sha expected_size max_size
     local release_base archive_path download_ok actual_size actual_sha stage_root staged_skill validation files marker_tmp
-    local manifest_refs index_refs actual_refs
+    local manifest_refs index_refs actual_refs observer_gate observer_subject audit_rc audit_payload
 
     if ! linux_agent_remote_mode_enabled; then
         linux_agent_remote_skill_result false skill_package_invalid "${skill_name}" "当前不是 remote runtime。"
@@ -223,6 +224,25 @@ linux_agent_materialize_skill() {
         return 0
     fi
 
+    # Materialization downloads and installs code.  In strict-compliance mode
+    # it must be gated before even creating locks, archives, or staging files;
+    # callers may reach this function while merely resolving a remote Skill.
+    observer_subject="$(jq -cn --arg skill "${skill_name}" '{kind:"skill_materialize", skill:$skill}')"
+    if declare -F linux_agent_observer_execution_gate >/dev/null 2>&1 &&
+        ! observer_gate="$(linux_agent_observer_execution_gate "skill_materialize" "${observer_subject}")"; then
+        printf '%s\n' "${observer_gate}"
+        return 0
+    fi
+    if declare -F linux_agent_audit_require_event >/dev/null 2>&1 &&
+        [[ -n "${LINUX_AGENT_AUDIT_LOG:-}" ]]; then
+        audit_rc=0
+        linux_agent_audit_require_event "skill_materialize_started" "${observer_subject}" || audit_rc=$?
+        if ((audit_rc != 0)); then
+            linux_agent_audit_failure_result "${audit_rc}" "skill_materialize_started"
+            return 0
+        fi
+    fi
+
     skills_dir="$(linux_agent_skills_dir)"
     if [[ -e "${skills_dir}/${skill_name}" || -L "${skills_dir}/${skill_name}" ]]; then
         linux_agent_remote_skill_result false skill_package_invalid "${skill_name}" "目标 Skill 目录已存在但没有有效的远程校验标记。"
@@ -232,7 +252,7 @@ linux_agent_materialize_skill() {
     lock_dir="${lock_root}/${skill_name}.lock"
     mkdir -p "${lock_root}"
     lock_acquired=false
-    for attempt in $(seq 1 200); do
+    for _ in $(seq 1 200); do
         if mkdir "${lock_dir}" 2>/dev/null; then
             lock_acquired=true
             break
@@ -256,13 +276,13 @@ linux_agent_materialize_skill() {
     archive_path="${LINUX_AGENT_TMP_ROOT:-${LINUX_AGENT_ROOT}/tmp}/${asset_name}.$$"
     stage_root="${LINUX_AGENT_TMP_ROOT:-${LINUX_AGENT_ROOT}/tmp}/skill-stage.${skill_name}.$$"
 
-    if [[ ! "${asset_name}" =~ ^linux-agent-skill-[a-z0-9-]+\.tar\.gz$ \
-        || ! "${expected_sha}" =~ ^[0-9a-f]{64}$ \
-        || ! "${expected_size}" =~ ^[0-9]+$ \
-        || ! "${max_size}" =~ ^[0-9]+$ \
-        || "${expected_size}" -le 0 \
-        || "${expected_size}" -gt "${max_size}" \
-        || -z "${release_base}" ]]; then
+    if [[ ! "${asset_name}" =~ ^linux-agent-skill-[a-z0-9-]+\.tar\.gz$ ||
+        ! "${expected_sha}" =~ ^[0-9a-f]{64}$ ||
+        ! "${expected_size}" =~ ^[0-9]+$ ||
+        ! "${max_size}" =~ ^[0-9]+$ ||
+        "${expected_size}" -le 0 ||
+        "${expected_size}" -gt "${max_size}" ||
+        -z "${release_base}" ]]; then
         rmdir "${lock_dir}" 2>/dev/null || true
         linux_agent_remote_skill_result false skill_package_invalid "${skill_name}" "远程 Skill manifest 字段非法。"
         return 0
@@ -301,15 +321,15 @@ linux_agent_materialize_skill() {
     tar --no-same-owner --no-same-permissions -xzf "${archive_path}" -C "${stage_root}"
     staged_skill="${stage_root}/skills/${skill_name}"
     manifest_refs="$(jq -c --arg skill "${skill_name}" '[.skills[$skill].refs[].ref] | sort | unique' "${LINUX_AGENT_REMOTE_MANIFEST}")"
-    index_refs="$(linux_agent_index_declared_refs_at "$(linux_agent_skill_index_path)" \
-        | sed 's/\.sh$//' \
-        | awk -v prefix="${skill_name}/" 'index($0, prefix) == 1' \
-        | jq -R -s -c 'split("\n") | map(select(length > 0)) | sort | unique')"
-    actual_refs="$(find "${staged_skill}/scripts" -maxdepth 1 -type f -name '*.sh' -printf '%f\n' 2>/dev/null \
-        | sed 's/\.sh$//' \
-        | awk -v prefix="${skill_name}/" '{print prefix $0}' \
-        | jq -R -s -c 'split("\n") | map(select(length > 0)) | sort | unique')"
-    if [[ "${manifest_refs}" != "${index_refs}" || "${manifest_refs}" != "${actual_refs}" ]]; then
+    index_refs="$(linux_agent_index_declared_refs_at "$(linux_agent_skill_index_path)" |
+        sed 's/\.sh$//' |
+        awk -v prefix="${skill_name}/" 'index($0, prefix) == 1' |
+        jq -R -s -c 'split("\n") | map(select(length > 0)) | sort | unique')"
+    actual_refs="$(find "${staged_skill}/scripts" -maxdepth 1 -type f -name '*.sh' -printf '%f\n' 2>/dev/null |
+        sed 's/\.sh$//' |
+        awk -v prefix="${skill_name}/" '{print prefix $0}' |
+        jq -R -s -c 'split("\n") | map(select(length > 0)) | sort | unique')"
+    if [[ "${manifest_refs}" != "${index_refs}" ]] || [[ "${manifest_refs}" != "${actual_refs}" ]]; then
         rm -rf "${stage_root}" "${archive_path}"
         rmdir "${lock_dir}" 2>/dev/null || true
         linux_agent_remote_skill_result false skill_package_invalid "${skill_name}" "Skill 包、INDEX 与远程登记引用不一致。"
@@ -323,18 +343,40 @@ linux_agent_materialize_skill() {
         return 0
     fi
 
+    audit_payload="$(jq -cn --arg skill "${skill_name}" --arg sha256 "${actual_sha}" '{skill:$skill, sha256:$sha256}')"
+    if declare -F linux_agent_audit_require_event >/dev/null 2>&1 &&
+        [[ -n "${LINUX_AGENT_AUDIT_LOG:-}" ]]; then
+        audit_rc=0
+        linux_agent_audit_require_event "skill_materialize_commit" "${audit_payload}" || audit_rc=$?
+        if ((audit_rc != 0)); then
+            rm -rf "${stage_root}" "${archive_path}"
+            rmdir "${lock_dir}" 2>/dev/null || true
+            linux_agent_audit_failure_result "${audit_rc}" "skill_materialize_commit"
+            return 0
+        fi
+    fi
+
     mkdir -p "${skills_dir}"
     marker_tmp="${staged_skill}/.remote-verified.json.tmp"
     jq -cn --arg skill "${skill_name}" --arg sha256 "${actual_sha}" --arg version "$(jq -r '.version' "${LINUX_AGENT_REMOTE_MANIFEST}")" \
-        '{skill:$skill, sha256:$sha256, release_version:$version}' > "${marker_tmp}"
+        '{skill:$skill, sha256:$sha256, release_version:$version}' >"${marker_tmp}"
     mv "${marker_tmp}" "${staged_skill}/.remote-verified.json"
     mv "${staged_skill}" "${skills_dir}/${skill_name}"
     files="$(find "${skills_dir}/${skill_name}" -type f ! -name .remote-verified.json -printf '%P\n' | sort | jq -R -s --arg skill "${skill_name}" 'split("\n") | map(select(length > 0) | "skills/" + $skill + "/" + .)')"
+    if declare -F linux_agent_audit_require_event >/dev/null 2>&1 &&
+        [[ -n "${LINUX_AGENT_AUDIT_LOG:-}" ]]; then
+        audit_rc=0
+        linux_agent_audit_require_event "skill_materialized" "$(jq -c '. + {status:"skill_materialized"}' <<<"${audit_payload}")" || audit_rc=$?
+        if ((audit_rc != 0)); then
+            mv "${skills_dir}/${skill_name}" "${staged_skill}" 2>/dev/null || true
+            rm -rf "${stage_root}" "${archive_path}"
+            rmdir "${lock_dir}" 2>/dev/null || true
+            linux_agent_audit_failure_result "${audit_rc}" "skill_materialized"
+            return 0
+        fi
+    fi
     rm -rf "${stage_root}" "${archive_path}"
     rmdir "${lock_dir}" 2>/dev/null || true
-    if declare -F linux_agent_log_event >/dev/null 2>&1; then
-        linux_agent_log_event "skill_materialized" "$(jq -cn --arg skill "${skill_name}" --arg sha256 "${actual_sha}" '{skill:$skill, sha256:$sha256, status:"skill_materialized"}')"
-    fi
     linux_agent_remote_skill_result true skill_materialized "${skill_name}" "" "${files}"
 }
 
@@ -417,15 +459,15 @@ linux_agent_skill_manifest_declared_script_names_at() {
     local skill_md="$1"
     [[ -f "${skill_md}" ]] || return 0
 
-    grep -oE '`scripts/[a-z0-9][a-z0-9-]*\.sh`' "${skill_md}" 2>/dev/null \
-        | tr -d '`' \
-        | sed 's#^scripts/##' \
-        | sort -u
+    grep -oE '`scripts/[a-z0-9][a-z0-9-]*\.sh`' "${skill_md}" 2>/dev/null |
+        tr -d '`' |
+        sed 's#^scripts/##' |
+        sort -u
 }
 
 linux_agent_risk_is_valid() {
     case "${1:-}" in
-        low|medium|high|critical) return 0 ;;
+        low | medium | high | critical) return 0 ;;
         *) return 1 ;;
     esac
 }
@@ -514,9 +556,9 @@ linux_agent_index_declared_refs_at() {
     local index_path="$1"
     [[ -f "${index_path}" ]] || return 0
 
-    grep -oE '`[a-z0-9][a-z0-9-]*/[a-z0-9][a-z0-9-]*(\.sh)?`' "${index_path}" 2>/dev/null \
-        | tr -d '`' \
-        | sort -u
+    grep -oE '`[a-z0-9][a-z0-9-]*/[a-z0-9][a-z0-9-]*(\.sh)?`' "${index_path}" 2>/dev/null |
+        tr -d '`' |
+        sort -u
 }
 
 linux_agent_skill_script_content() {

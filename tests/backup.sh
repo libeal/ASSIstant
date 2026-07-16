@@ -27,15 +27,15 @@ jq '
     | .web.token = "backup-secret-web-token"
     | .remote.enabled = true
     | .remote.release_version = "v0.0.0-test"
-' "${project}/config/config.json" > "${config_tmp}"
+' "${project}/config/config.json" >"${config_tmp}"
 mv "${config_tmp}" "${project}/config/config.json"
 
 mkdir -p "${project}/logs" "${project}/tmp/web/jobs" "${project}/skills/custom-backup/scripts"
-printf '%s\n' '{"timestamp":"2026-01-01T00:00:00Z","stage":"finished","payload":{"status":"executed","api_key":"audit-secret-should-redact"}}' > "${project}/logs/session_backup.jsonl"
-printf '%s\n' '{"raw":"job-secret-should-not-export"}' > "${project}/tmp/web/jobs/job.json"
-printf '%s\n' '---' 'name: custom-backup' 'description: backup fixture' '---' > "${project}/skills/custom-backup/SKILL.md"
-printf '%s\n' '#!/usr/bin/env bash' 'printf custom-backup' > "${project}/skills/custom-backup/scripts/custom.sh"
-printf '%s\n' '{"skill":"ops-basic","sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}' > "${project}/skills/ops-basic/.remote-verified.json"
+printf '%s\n' '{"timestamp":"2026-01-01T00:00:00Z","stage":"finished","payload":{"status":"executed","api_key":"audit-secret-should-redact"}}' >"${project}/logs/session_backup.jsonl"
+printf '%s\n' '{"raw":"job-secret-should-not-export"}' >"${project}/tmp/web/jobs/job.json"
+printf '%s\n' '---' 'name: custom-backup' 'description: backup fixture' '---' >"${project}/skills/custom-backup/SKILL.md"
+printf '%s\n' '#!/usr/bin/env bash' 'printf custom-backup' >"${project}/skills/custom-backup/scripts/custom.sh"
+printf '%s\n' '{"skill":"ops-basic","sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}' >"${project}/skills/ops-basic/.remote-verified.json"
 
 backup_path="${tmp_root}/runtime-backup.tar.gz"
 backup_result="$(cd "${project}" && LINUX_AGENT_REMOTE_MODE=1 bash bin/agent backup "${backup_path}")"

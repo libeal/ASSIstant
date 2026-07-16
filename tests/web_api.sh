@@ -30,7 +30,7 @@ copy_project() {
         "${target}/"
     if [[ -f "${target}/mcp/context7/mcp.json" ]]; then
         tmp_manifest="$(mktemp)"
-        jq '.enabled = false' "${target}/mcp/context7/mcp.json" > "${tmp_manifest}"
+        jq '.enabled = false' "${target}/mcp/context7/mcp.json" >"${tmp_manifest}"
         mv "${tmp_manifest}" "${target}/mcp/context7/mcp.json"
     fi
     configure_fake_ai "${target}"
@@ -51,7 +51,7 @@ jq -e '([.scripts[] | select(.skill == "network-ops-tools")] | length) == 25
 mcp_project="${tmp_root}/project-mcp-api"
 copy_project "${mcp_project}"
 mkdir -p "${mcp_project}/mcp/stdio-api" "${mcp_project}/mcp/http-api" "${mcp_project}/mcp/sse-api"
-cat > "${mcp_project}/mcp/stdio-api/mcp.json" <<JSON
+cat >"${mcp_project}/mcp/stdio-api/mcp.json" <<JSON
 {
   "id": "stdio-api",
   "name": "API stdio server",
@@ -61,7 +61,7 @@ cat > "${mcp_project}/mcp/stdio-api/mcp.json" <<JSON
   "env": {"SECRET_TOKEN": "api-secret-value"}
 }
 JSON
-cat > "${mcp_project}/mcp/http-api/mcp.json" <<'JSON'
+cat >"${mcp_project}/mcp/http-api/mcp.json" <<'JSON'
 {
   "id": "http-api",
   "name": "API streamable HTTP server",
@@ -71,7 +71,7 @@ cat > "${mcp_project}/mcp/http-api/mcp.json" <<'JSON'
   "headers": {"Authorization": "Bearer api-secret-value"}
 }
 JSON
-cat > "${mcp_project}/mcp/sse-api/mcp.json" <<'JSON'
+cat >"${mcp_project}/mcp/sse-api/mcp.json" <<'JSON'
 {
   "id": "sse-api",
   "name": "API SSE server",
@@ -184,7 +184,7 @@ jq -e '.ok == true and .status == "executed"
 project_missing="${tmp_root}/project-missing-ai"
 copy_project "${project_missing}"
 tmp_config="$(mktemp)"
-jq 'del(.api_key) | del(.api_key_file)' "${project_missing}/config/config.json" > "${tmp_config}"
+jq 'del(.api_key) | del(.api_key_file)' "${project_missing}/config/config.json" >"${tmp_config}"
 mv "${tmp_config}" "${project_missing}/config/config.json"
 missing_ai="$(cd "${project_missing}" && bash bin/agent api work run '{"input":"查看cpu占用"}' 2>/dev/null)"
 jq -e '.ok == false and .status == "ai_config_missing"' <<<"${missing_ai}" >/dev/null
@@ -249,18 +249,18 @@ large_audit_project="${tmp_root}/project-large-audit"
 copy_project "${large_audit_project}"
 mkdir -p "${large_audit_project}/logs"
 large_log="${large_audit_project}/logs/session_large_api_read.jsonl"
-printf '{"timestamp":"2026-07-05T00:00:00Z","session_id":"session_large_api_read","stage":"session_started","payload":{"request":"large","entrypoint":"web"}}\n' > "${large_log}"
+printf '{"timestamp":"2026-07-05T00:00:00Z","session_id":"session_large_api_read","stage":"session_started","payload":{"request":"large","entrypoint":"web"}}\n' >"${large_log}"
 for index in $(seq 1 420); do
-    printf '{"timestamp":"2026-07-05T00:00:01Z","session_id":"session_large_api_read","stage":"step_succeeded","payload":{"status":"succeeded","step":{"id":"step-%s","title":"Large output step %s","executor_type":"shell","command_preview":"printf line-%s"},"detail":{"ok":true,"exit_code":0,"output_preview":"line-%s repeated payload for audit read regression"}}}\n' "${index}" "${index}" "${index}" "${index}" >> "${large_log}"
+    printf '{"timestamp":"2026-07-05T00:00:01Z","session_id":"session_large_api_read","stage":"step_succeeded","payload":{"status":"succeeded","step":{"id":"step-%s","title":"Large output step %s","executor_type":"shell","command_preview":"printf line-%s"},"detail":{"ok":true,"exit_code":0,"output_preview":"line-%s repeated payload for audit read regression"}}}\n' "${index}" "${index}" "${index}" "${index}" >>"${large_log}"
 done
-printf '{"timestamp":"2026-07-05T00:00:02Z","session_id":"session_large_api_read","stage":"session_finished","payload":{"status":"executed"}}\n' >> "${large_log}"
+printf '{"timestamp":"2026-07-05T00:00:02Z","session_id":"session_large_api_read","stage":"session_finished","payload":{"status":"executed"}}\n' >>"${large_log}"
 large_audit_read="$(cd "${large_audit_project}" && bash bin/agent api audit read '{"session_id":"session_large_api_read"}')"
 jq -e '.ok == true and .status == "read" and (.events | length) == 422 and (.report | contains("session_large_api_read"))' <<<"${large_audit_read}" >/dev/null
 
 history_project="${tmp_root}/project-history-skill"
 copy_project "${history_project}"
 mkdir -p "${history_project}/logs"
-cat > "${history_project}/logs/session_history_fixture.jsonl" <<'JSONL'
+cat >"${history_project}/logs/session_history_fixture.jsonl" <<'JSONL'
 {"timestamp":"2026-07-05T00:00:00Z","session_id":"session_history_fixture","stage":"session_started","payload":{"request":"fixture","entrypoint":"web"}}
 {"timestamp":"2026-07-05T00:00:01Z","session_id":"session_history_fixture","stage":"received","payload":{"mode":"terminal","command":"printf previous-output"}}
 {"timestamp":"2026-07-05T00:00:02Z","session_id":"session_history_fixture","stage":"terminal_executed","payload":{"status":"executed","exit_code":0,"output_preview":"previous-output","stderr_preview":""}}

@@ -1,5 +1,6 @@
 {
   "schema_version": 1,
+  "protocol_version": "1.0.0",
   "description": "Cross-language domain contract (single source of truth). Bash reads it via jq, Python via json, the web front-end via GET /api/schema. Keep provider normalization, status enums, and error codes here — do not fork per language.",
   "provider_normalization": {
     "note": "Normalize input: lowercase, then collapse runs of '-', whitespace, or '/' into a single '_'. Then apply prefix_rules (startswith) first, then exact aliases, then identity.",
@@ -33,9 +34,112 @@
     "failed",
     "skipped_user",
     "skipped_unexecuted",
-    "terminated"
+    "terminated",
+    "revision_requested"
   ],
+  "work_status": [
+    "answered",
+    "executed",
+    "approval_required",
+    "blocked",
+    "rejected",
+    "terminated",
+    "revision_requested",
+    "revision_failed",
+    "checkpoint_stopped",
+    "iteration_limit_stopped",
+    "ai_failed",
+    "ai_invalid_response",
+    "cancelled",
+    "timed_out",
+    "failed"
+  ],
+  "result_status": [
+    "answered", "executed", "approval_required", "blocked", "rejected",
+    "terminated", "revision_requested", "revision_failed", "checkpoint_stopped",
+    "iteration_limit_stopped", "ai_failed", "ai_invalid_response", "cancelled",
+    "timed_out", "failed", "planned", "edited", "validated", "listed",
+    "read", "updated", "saved", "ok", "completed", "succeeded", "running", "checked",
+    "sensed", "verified", "integrity_broken", "invalid",
+    "server_restarted", "session_persistence_failed", "job_exception",
+    "invalid_output", "invalid_agent_output"
+  ],
+  "status_presentation": {
+    "low": ["ok", "executed", "succeeded", "success", "approved", "auto_approved", "answered"],
+    "medium": ["running", "queued", "approval_required", "pending", "policy_checked", "skipped_user", "skipped_unexecuted", "revision_requested", "review"],
+    "high": ["failed", "blocked", "rejected", "terminated", "timed_out", "cancelled", "revision_failed", "critical", "high"]
+  },
+  "contracts": {
+    "error": {
+      "required": ["ok", "code", "message", "retryable", "request_id", "details"],
+      "compatibility_aliases": {"status": "code", "error": "message"}
+    },
+    "job": {
+      "required": [
+        "schema_version", "job_id", "request_id", "session_id", "resource",
+        "action", "status", "version", "attempt", "max_attempts",
+        "created_at", "updated_at", "payload"
+      ],
+      "status_enum": "job_status"
+    },
+    "plan": {
+      "required": ["response_type", "summary", "steps"],
+      "response_type": "work_plan"
+    },
+    "approval": {
+      "required": ["id", "type", "subject", "risk_level", "actions"]
+    },
+    "execution_result": {
+      "required": ["ok", "status", "timeline", "approval_card", "output_blocks"],
+      "status_enum": "result_status",
+      "timeline_semantics": "step_projection"
+    },
+    "persisted_turn": {
+      "required": [
+        "id",
+        "number",
+        "status",
+        "context_eligible",
+        "result"
+      ],
+      "status_enum": "result_status"
+    },
+    "audit_event": {
+      "required": [
+        "schema_version", "timestamp", "session_id", "stage", "payload",
+        "seq", "prev_hash", "hash", "request_id", "job_id",
+        "system_user", "execution_user"
+      ]
+    },
+    "skill_manifest": {
+      "required": ["name", "description", "scripts"]
+    }
+  },
   "error_codes": {
+    "internal_error": { "retryable": true, "http": 500 },
+    "not_found": { "retryable": false, "http": 404 },
+    "forbidden": { "retryable": false, "http": 403 },
+    "invalid_path": { "retryable": false, "http": 400 },
+    "invalid_action": { "retryable": false, "http": 400 },
+    "invalid_config_value": { "retryable": false, "http": 400 },
+    "invalid_session_id": { "retryable": false, "http": 400 },
+    "missing_input": { "retryable": false, "http": 400 },
+    "missing_command": { "retryable": false, "http": 400 },
+    "unknown_api_route": { "retryable": false, "http": 404 },
+    "read_failed": { "retryable": true, "http": 500 },
+    "not_running": { "retryable": false, "http": 409 },
+    "validation_failed": { "retryable": false, "http": 422 },
+    "commit_failed": { "retryable": true, "http": 500 },
+    "editor_failed": { "retryable": true, "http": 500 },
+    "editor_cancelled": { "retryable": false, "http": 409 },
+    "edit_revision_failed": { "retryable": true, "http": 502 },
+    "invalid_edit_package": { "retryable": false, "http": 400 },
+    "invalid_job_id": { "retryable": false, "http": 400 },
+    "unsupported_job": { "retryable": false, "http": 400 },
+    "job_start_failed": { "retryable": true, "http": 500 },
+    "job_exception": { "retryable": true, "http": 500 },
+    "invalid_agent_output": { "retryable": true, "http": 502 },
+    "timed_out": { "retryable": true, "http": 504 },
     "unauthorized": { "retryable": false, "http": 401 },
     "invalid_json": { "retryable": false, "http": 400 },
     "request_too_large": { "retryable": false, "http": 413 },
@@ -45,6 +149,66 @@
     "url_too_long": { "retryable": false, "http": 200 },
     "invalid_url": { "retryable": false, "http": 200 },
     "secret_transmission_disabled": { "retryable": false, "http": 200 },
-    "provider_security_unavailable": { "retryable": false, "http": 200 }
+    "provider_security_unavailable": { "retryable": false, "http": 200 },
+    "provider_request_failed": { "retryable": true, "http": 502 },
+    "provider_request_timeout": { "retryable": true, "http": 504 },
+    "provider_response_too_large": { "retryable": false, "http": 413 },
+    "provider_invalid_response": { "retryable": true, "http": 502 },
+    "unsupported_provider": { "retryable": false, "http": 200 },
+    "model_list_unavailable": { "retryable": false, "http": 200 },
+    "api_key_missing": { "retryable": false, "http": 200 },
+    "invalid_manifest": { "retryable": false, "http": 422 },
+    "mcp_client_unavailable": { "retryable": false, "http": 503 },
+    "server_not_found": { "retryable": false, "http": 404 },
+    "tool_not_found": { "retryable": false, "http": 404 },
+    "invalid_arguments": { "retryable": false, "http": 400 },
+    "invalid_output": { "retryable": true, "http": 502 },
+    "observer_required_unavailable": { "retryable": false, "http": 200 },
+    "observer_disabled": { "retryable": false, "http": 409 },
+    "auditctl_not_found": { "retryable": false, "http": 503 },
+    "ausearch_not_found": { "retryable": false, "http": 503 },
+    "auditctl_failed": { "retryable": true, "http": 503 },
+    "auditctl_permission_denied": { "retryable": false, "http": 403 },
+    "auditctl_timeout": { "retryable": true, "http": 504 },
+    "sudo_required": { "retryable": false, "http": 409 },
+    "sudo_not_found": { "retryable": false, "http": 503 },
+    "sudo_timeout": { "retryable": true, "http": 504 },
+    "sudo_denied": { "retryable": false, "http": 403 },
+    "sudo_write_failed": { "retryable": true, "http": 500 },
+    "ai_config_missing": { "retryable": false, "http": 503 },
+    "ai_request_failed": { "retryable": true, "http": 502 },
+    "ai_empty_response": { "retryable": true, "http": 502 },
+    "ai_invalid_json": { "retryable": true, "http": 502 },
+    "ai_invalid_response": { "retryable": true, "http": 200 },
+    "audit_degraded": { "retryable": true, "http": 200 },
+    "audit_write_blocked": { "retryable": true, "http": 507 },
+    "audit_integrity_broken": { "retryable": false, "http": 409 },
+    "invalid_idempotency_key": { "retryable": false, "http": 400 },
+    "idempotency_conflict": { "retryable": false, "http": 409 },
+    "job_not_retryable": { "retryable": false, "http": 409 },
+    "job_retry_limit_reached": { "retryable": false, "http": 409 },
+    "job_version_conflict": { "retryable": true, "http": 409 },
+    "invalid_job_version": { "retryable": false, "http": 400 },
+    "job_cancellation_failed": { "retryable": true, "http": 500 },
+    "job_persistence_failed": { "retryable": true, "http": 500 },
+    "session_persistence_failed": { "retryable": true, "http": 500 },
+    "session_busy": { "retryable": true, "http": 409 },
+    "persisted_session_invalid": { "retryable": false, "http": 500 },
+    "legacy_session_no_persisted_turns": { "retryable": false, "http": 200 },
+    "persisted_turns_invalid": { "retryable": false, "http": 500 },
+    "remote_config_read_only": { "retryable": false, "http": 403 },
+    "remote_security_policy_locked": { "retryable": false, "http": 403 },
+    "empty_content": { "retryable": false, "http": 400 },
+    "invalid_validation_response": { "retryable": true, "http": 502 },
+    "config_write_failed": { "retryable": true, "http": 500 },
+    "backup_unavailable": { "retryable": false, "http": 409 },
+    "backup_timeout": { "retryable": true, "http": 504 },
+    "backup_failed": { "retryable": true, "http": 500 },
+    "invalid_backup_path": { "retryable": false, "http": 400 },
+    "backup_exists": { "retryable": false, "http": 409 },
+    "backup_unsafe_skill": { "retryable": false, "http": 400 },
+    "server_restarted": { "retryable": true, "http": 503 },
+    "cancelled": { "retryable": false, "http": 200 },
+    "running": { "retryable": true, "http": 200 }
   }
 }

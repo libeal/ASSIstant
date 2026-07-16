@@ -59,14 +59,14 @@ jq -e '(.failure_context | fromjson).environment_context.topic == "disk"' <<<"${
 # Provider address pinning must not be bypassed by ambient proxy variables.
 proxy_direct_response="$(
     HTTP_PROXY=http://127.0.0.1:1 \
-    HTTPS_PROXY=http://127.0.0.1:1 \
-    ALL_PROXY=http://127.0.0.1:1 \
-    http_proxy=http://127.0.0.1:1 \
-    https_proxy=http://127.0.0.1:1 \
-    all_proxy=http://127.0.0.1:1 \
-    NO_PROXY= \
-    no_proxy= \
-    linux_agent_call_ai_with_context "proxy bypass regression" "${request_context}" "repair" '{"topic":"disk"}'
+        HTTPS_PROXY=http://127.0.0.1:1 \
+        ALL_PROXY=http://127.0.0.1:1 \
+        http_proxy=http://127.0.0.1:1 \
+        https_proxy=http://127.0.0.1:1 \
+        all_proxy=http://127.0.0.1:1 \
+        NO_PROXY='' \
+        no_proxy='' \
+        linux_agent_call_ai_with_context "proxy bypass regression" "${request_context}" "repair" '{"topic":"disk"}'
 )"
 jq -e '(.failure_context | fromjson).environment_context.topic == "disk"' <<<"${proxy_direct_response}" >/dev/null
 
@@ -103,6 +103,8 @@ config_only_state="$(linux_agent_api_key_state_json)"
 jq -e '.configured == true and .source == "config" and .config_configured == true and (.file_configured | not)' <<<"${config_only_state}" >/dev/null
 LINUX_AGENT_CONFIG_JSON="${saved_config_json}"
 
+# Consumed by linux_agent_config_api_key from the sourced config module.
+# shellcheck disable=SC2034
 LINUX_AGENT_API_KEY="TEST_ENV_API_KEY_123456"
 env_config_json="$(jq '.api_key = "TEST_CONFIG_KEY_MUST_NOT_WIN" | del(.api_key_file)' <<<"${LINUX_AGENT_CONFIG_JSON}")"
 LINUX_AGENT_CONFIG_JSON="${env_config_json}"
@@ -141,8 +143,8 @@ grep -q '"top_n":2' <<<"${encoded_step_args}"
 cleanup_root="$(mktemp -d)"
 linux_agent_init_env "${cleanup_root}"
 mkdir -p "${LINUX_AGENT_TMP_DIR}/nested"
-printf stale > "${LINUX_AGENT_TMP_DIR}/stale.tmp"
-printf stale > "${LINUX_AGENT_TMP_DIR}/nested/file.tmp"
+printf stale >"${LINUX_AGENT_TMP_DIR}/stale.tmp"
+printf stale >"${LINUX_AGENT_TMP_DIR}/nested/file.tmp"
 linux_agent_cleanup_tmp_dir
 [[ -d "${LINUX_AGENT_TMP_DIR}" ]]
 [[ -z "$(find "${LINUX_AGENT_TMP_DIR}" -mindepth 1 -print -quit)" ]]
@@ -195,7 +197,7 @@ linux_agent_load_config
 LINUX_AGENT_CONFIG_JSON="$(jq '.audit_mode="safe_summary" | .audit_text_limit=1000' <<<"${LINUX_AGENT_CONFIG_JSON}")"
 boundary_tmp="$(mktemp)"
 jq '.observing.audit_payload_mode="redacted_verbose" | .observing.audit_text_limit=20 | .observing.application_events=["session_started","received","session_finished"]' \
-    "${verbose_project}/policies/audit-boundaries.json" > "${boundary_tmp}"
+    "${verbose_project}/policies/audit-boundaries.json" >"${boundary_tmp}"
 mv "${boundary_tmp}" "${verbose_project}/policies/audit-boundaries.json"
 linux_agent_start_session '检查很长的文本'
 verbose_session_id="${LINUX_AGENT_SESSION_ID}"
@@ -216,7 +218,7 @@ grep -q '策略已禁用' <<<"${disabled_result}"
 LINUX_AGENT_CONFIG_JSON="$(jq '.remote_script_policy="download_review"' <<<"${LINUX_AGENT_CONFIG_JSON}")"
 
 linux_agent_download_remote_script() {
-    printf '#!/usr/bin/env bash\nprintf ok\n' > "$2"
+    printf '#!/usr/bin/env bash\nprintf ok\n' >"$2"
 }
 https_step='{"id":"remote-2","title":"remote","executor_type":"remote_script","url":"https://example.test/install.sh","arguments":{},"reason":"test","expected_effect":"test","risk_level":"low","rollback_hint":"none"}'
 prepared_step="$(linux_agent_prepare_remote_step "${https_step}")"
@@ -233,7 +235,7 @@ sudo_review="$(linux_agent_policy_review_text "terminal" "sudo systemctl restart
 
 fake_priv_bin="${tmp_root}/fake-root-bin"
 mkdir -p "${fake_priv_bin}"
-cat > "${fake_priv_bin}/id" <<'SH'
+cat >"${fake_priv_bin}/id" <<'SH'
 #!/usr/bin/env bash
 case "$*" in
     "-u") printf '0\n' ;;
@@ -246,7 +248,7 @@ case "$*" in
     *) /usr/bin/id "$@" ;;
 esac
 SH
-cat > "${fake_priv_bin}/runuser" <<'SH'
+cat >"${fake_priv_bin}/runuser" <<'SH'
 #!/usr/bin/env bash
 printf 'fake runuser should not execute in this test\n' >&2
 exit 127
@@ -310,7 +312,7 @@ mcp_exec_root="$(mktemp -d)"
 original_mcp_dir="${LINUX_AGENT_MCP_DIR}"
 LINUX_AGENT_MCP_DIR="${mcp_exec_root}"
 mkdir -p "${mcp_exec_root}/stdio-tools"
-cat > "${mcp_exec_root}/stdio-tools/mcp.json" <<JSON
+cat >"${mcp_exec_root}/stdio-tools/mcp.json" <<JSON
 {
   "id": "stdio-tools",
   "name": "Fake stdio tools",
@@ -346,19 +348,22 @@ jq -e '.status == "executed"
     and .results[0].result.ok == true
     and .results[0].result.output.tool == "mcp.stdio-tools.echo"
     and .results[0].result.output.structuredContent.echo == "hello"' <<<"${mcp_execution}" >/dev/null
+# Reset globals consumed by the sourced executor module.
+# shellcheck disable=SC2034
 LINUX_AGENT_API_MODE=0
+# shellcheck disable=SC2034
 LINUX_AGENT_API_INPUT_JSON='[]'
 LINUX_AGENT_MCP_DIR="${original_mcp_dir}"
 rm -rf "${mcp_exec_root}"
 
 linux_agent_download_remote_script() {
-    printf '\000\001' > "$2"
+    printf '\000\001' >"$2"
 }
 binary_result="$(linux_agent_prepare_remote_step "${https_step}" 2>&1 || true)"
 grep -q '不是文本内容' <<<"${binary_result}"
 
 linux_agent_download_remote_script() {
-    head -c 262145 /dev/zero > "$2"
+    head -c 262145 /dev/zero >"$2"
 }
 large_result="$(linux_agent_prepare_remote_step "${https_step}" 2>&1 || true)"
 grep -q '超过 256KB' <<<"${large_result}"

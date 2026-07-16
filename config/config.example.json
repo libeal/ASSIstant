@@ -28,10 +28,17 @@
   },
   "audit_mode": "safe_summary",
   "audit_text_limit": 1000,
+  "audit": {
+    "fsync": true,
+    "max_bytes": 52428800,
+    "min_free_bytes": 10485760,
+    "on_full": "degrade"
+  },
   "observer": {
     "enabled": "auto",
     "privilege": "sudo_interactive",
-    "max_events": 200
+    "max_events": 200,
+    "require": false
   },
   "execution": {
     "timeout_sec": 300,
@@ -56,6 +63,10 @@
     "host": "127.0.0.1",
     "port": 8765,
     "token": "",
-    "job_retention_hours": 24
+    "job_retention_hours": 24,
+    "max_active_jobs": 4,
+    "job_timeout_sec": 900,
+    "max_job_attempts": 3,
+    "cancel_grace_sec": 2
   }
 }

@@ -230,7 +230,7 @@ linux_agent_policy_review_text() {
 
     ast="$(linux_agent_policy_ast_findings "${text}" "${mode}")"
     case "${subject}" in
-        skill:*|script:*|edit:*)
+        skill:* | script:* | edit:*)
             ast="$(jq -c 'map(select(.code != "AST_FILE_MUTATION_REQUIRES_SKILL"))' <<<"${ast}")"
             ;;
     esac
@@ -244,9 +244,9 @@ linux_agent_policy_review_text() {
         remote='[]'
     fi
     vault_match="$(linux_agent_policy_file_vault_match "${text}")"
-    if [[ "${execution_mode}" == "terminal" ]] \
-        && [[ "$(jq -r '.matched // false' <<<"${vault_match}")" == "true" ]] \
-        && [[ "$(jq -r '.action // "unknown"' <<<"${vault_match}")" == "modify" ]]; then
+    if [[ "${execution_mode}" == "terminal" ]] &&
+        [[ "$(jq -r '.matched // false' <<<"${vault_match}")" == "true" ]] &&
+        [[ "$(jq -r '.action // "unknown"' <<<"${vault_match}")" == "modify" ]]; then
         local vault_paths
         vault_paths="$(jq -c '.matched_paths // []' <<<"${vault_match}")"
         ast="$(jq -c --argjson paths "${vault_paths}" '
@@ -283,9 +283,9 @@ linux_agent_policy_review_text() {
         protected_paths="$(jq -c 'map(if .severity == "critical" then . + {severity:"high", action:"approve", message:"终端模式的文件保险箱修改需要人工确认。"} else . end)' <<<"${protected_paths}")"
     fi
     vault_findings="$(linux_agent_policy_file_vault_findings "${vault_match}" "${execution_mode}")"
-    if [[ "$(jq -r '.matched // false' <<<"${vault_match}")" == "true" ]] \
-        && declare -F linux_agent_log_event >/dev/null 2>&1 \
-        && [[ -n "${LINUX_AGENT_AUDIT_LOG:-}" ]]; then
+    if [[ "$(jq -r '.matched // false' <<<"${vault_match}")" == "true" ]] &&
+        declare -F linux_agent_log_event >/dev/null 2>&1 &&
+        [[ -n "${LINUX_AGENT_AUDIT_LOG:-}" ]]; then
         linux_agent_log_event "file_vault_detected" "$(jq -cn \
             --arg subject "${subject}" \
             --arg mode "${execution_mode}" \
@@ -400,7 +400,7 @@ linux_agent_policy_validate_grep_regex() {
     local pattern="$1"
     printf '\n' | grep -Eq -- "${pattern}" >/dev/null 2>&1
     case "$?" in
-        0|1) return 0 ;;
+        0 | 1) return 0 ;;
         *) return 1 ;;
     esac
 }
@@ -597,15 +597,15 @@ linux_agent_policy_validate_file_vault() {
     while IFS= read -r pointer; do
         [[ -n "${pointer}" ]] || continue
         vault_path="$(jq -r "${pointer}" <<<"${json}")"
-        if [[ "${vault_path}" != /* ]] \
-            || [[ "${vault_path}" == "/" ]] \
-            || [[ "${vault_path}" == */ ]] \
-            || [[ "${vault_path}" == *$'\n'* || "${vault_path}" == *$'\r'* ]] \
-            || [[ "${vault_path}" == *"//"* ]] \
-            || [[ "/${vault_path}/" == *"/./"* || "/${vault_path}/" == *"/../"* ]] \
-            || [[ "${vault_path}" =~ [\?\[\]] ]] \
-            || ([[ "${vault_path}" == *"*"* ]] \
-                && { [[ "${vault_path}" != */\* ]] || [[ "${vault_path%/*}" == *"*"* ]]; }); then
+        if [[ "${vault_path}" != /* ]] ||
+            [[ "${vault_path}" == "/" ]] ||
+            [[ "${vault_path}" == */ ]] ||
+            [[ "${vault_path}" == *$'\n'* || "${vault_path}" == *$'\r'* ]] ||
+            [[ "${vault_path}" == *"//"* ]] ||
+            [[ "/${vault_path}/" == *"/./"* || "/${vault_path}/" == *"/../"* ]] ||
+            [[ "${vault_path}" =~ [\?\[\]] ]] ||
+            ([[ "${vault_path}" == *"*"* ]] &&
+                { [[ "${vault_path}" != */\* ]] || [[ "${vault_path%/*}" == *"*"* ]]; }); then
             findings="$(linux_agent_policy_add_validation_finding \
                 "${findings}" "critical" "POLICY_VAULT_PATH_INVALID" "${path}" \
                 "文件保险箱路径必须是规范的绝对路径；通配符仅允许作为末尾 /*，表示目录下文件。" "${pointer}")"

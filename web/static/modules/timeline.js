@@ -2,13 +2,12 @@ import { outputBlocksFrom, outputBlocksSummary } from "./output-blocks.js";
 
 export function normalizeProtocolExecutionEntries(title, result) {
   const timeline = Array.isArray(result?.timeline) ? result.timeline : [];
-  const executionItems = timeline.filter((item) => ["execution", "failure", "observer", "audit"].includes(item.kind));
-  if (!executionItems.length) return [];
-  return executionItems.map((item, index) => ({
+  if (!timeline.length) return [];
+  return timeline.filter((item) => item && typeof item === "object").map((item, index) => ({
     index,
     number: index + 1,
     title: item.title || item.step_id || title || "执行结果",
-    status: item.status || "completed",
+    status: item.status || "pending",
     step: item.step || {},
     output: {
       ...item,
@@ -19,18 +18,10 @@ export function normalizeProtocolExecutionEntries(title, result) {
 }
 
 export function normalizeExecutionEntries(title, result) {
-  const protocolEntries = normalizeProtocolExecutionEntries(title, result);
-  if (protocolEntries.length) return protocolEntries;
-
-  const root = result || {};
-  return [{
-    index: 0,
-    number: 1,
-    title,
-    status: root.status || (root.ok ? "executed" : "完成"),
-    step: {},
-    output: root,
-  }];
+  // An empty authoritative timeline means there are no protocol steps to
+  // render.  Root-level ok/status values describe the request envelope and
+  // must not be promoted into invented business-state steps in the browser.
+  return normalizeProtocolExecutionEntries(title, result);
 }
 
 export function completedExecutionCount(result) {

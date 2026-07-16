@@ -2,6 +2,11 @@
 
 set -euo pipefail
 
+if ! declare -F linux_agent_prepare_work_request >/dev/null 2>&1; then
+    # shellcheck source=workflow.sh
+    source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/workflow.sh"
+fi
+
 linux_agent_agent_loop_enabled() {
     linux_agent_config_bool_default '.agent_loop.enabled_for_work' 'true'
 }
@@ -89,7 +94,7 @@ linux_agent_store_thinking_summary() {
         printf 'timestamp=%s\n\n' "$(linux_agent_now_iso)"
         linux_agent_sanitize_text "${summary}" "${limit}"
         printf '\n'
-    } > "${path}"
+    } >"${path}"
 }
 
 linux_agent_build_agent_observation() {
@@ -101,14 +106,19 @@ linux_agent_build_agent_observation() {
     local limit observation
 
     limit="$(linux_agent_agent_observation_limit)"
-    observation="$(jq -cn \
-        --arg input "${user_input}" \
-        --argjson iteration "${iteration}" \
-        --argjson plan "${plan_json}" \
-        --argjson execution "${execution_json}" \
-        --argjson environment_context "${environment_context}" \
-        --argjson limit "${limit}" \
-        '
+    observation="$(printf '%s\n%s\n%s\n' \
+        "${plan_json}" \
+        "${execution_json}" \
+        "${environment_context}" |
+        jq -cs \
+            --arg input "${user_input}" \
+            --argjson iteration "${iteration}" \
+            --argjson limit "${limit}" \
+            '
+        .[0] as $plan
+        | .[1] as $execution
+        | .[2] as $environment_context
+        |
         def preview:
             tostring | if length > $limit then .[0:$limit] + "[TRUNCATED]" else . end;
         def step_summary($s): {
@@ -275,11 +285,20 @@ linux_agent_run_agent_loop() {
     local resume_state="${5:-}"
     local current_plan execution_json iteration_results all_results iteration status final_status final_answer stopped_reason
     local observation_json reflection_json checkpoint_turns max_iterations auto_executed_count checkpoint_required final_review final_approval_step
-    local execution_user sudo_probe
+    local execution_user sudo_probe all_step_states iteration_records pending_plan_resume
+    local iteration_prior_results iteration_prior_step_states iteration_prior_records iteration_step_states iteration_record
+    local resumable_plan loop_resume_state resume_iteration plan_resume_state
     [[ -n "${resume_state}" ]] || resume_state='{}'
+    if ! jq -e 'type == "object"' >/dev/null 2>&1 <<<"${resume_state}"; then
+        resume_state='{}'
+    fi
 
     current_plan="${initial_plan}"
     all_results='[]'
+    all_step_states='[]'
+    iteration_records='[]'
+    pending_plan_resume='{}'
+    loop_resume_state='{}'
     iteration=0
     final_status="executed"
     final_answer=""
@@ -290,6 +309,27 @@ linux_agent_run_agent_loop() {
     auto_executed_count=0
     execution_user=""
     sudo_probe=""
+    if jq -e '(.agent_loop // false) == true and (.current_plan | type == "object")' >/dev/null 2>&1 <<<"${resume_state}"; then
+        current_plan="$(jq -c '.current_plan' <<<"${resume_state}")"
+        resume_iteration="$(jq -r '.iteration // 1' <<<"${resume_state}")"
+        if [[ ! "${resume_iteration}" =~ ^[1-9][0-9]*$ ]]; then
+            resume_iteration=1
+        fi
+        iteration=$((resume_iteration - 1))
+        all_results="$(jq -c '.loop_prior_results // [] | if type == "array" then . else [] end' <<<"${resume_state}")"
+        all_step_states="$(jq -c '.loop_prior_step_states // [] | if type == "array" then . else [] end' <<<"${resume_state}")"
+        iteration_records="$(jq -c '.prior_iteration_records // [] | if type == "array" then . else [] end' <<<"${resume_state}")"
+        pending_plan_resume="$(jq -c '{
+            current_plan:(.current_plan // null),
+            iteration:(.iteration // 0),
+            step_scope:(.step_scope // ""),
+            next_step_index:(.next_step_index // 0),
+            results:(.results // []),
+            step_states:(.step_states // []),
+            prior_results:(.prior_results // []),
+            prior_step_states:(.prior_step_states // [])
+        }' <<<"${resume_state}")"
+    fi
     checkpoint_turns="$(linux_agent_agent_checkpoint_turns)"
     max_iterations="$(linux_agent_agent_max_iterations)"
 
@@ -303,21 +343,72 @@ linux_agent_run_agent_loop() {
     while true; do
         iteration=$((iteration + 1))
         reflection_json='null'
+        iteration_prior_results="${all_results}"
+        iteration_prior_step_states="${all_step_states}"
+        iteration_prior_records="${iteration_records}"
+        plan_resume_state="${pending_plan_resume}"
+        pending_plan_resume='{}'
         linux_agent_log_event "agent_loop_iteration_started" "$(jq -cn \
             --argjson iteration "${iteration}" \
             --argjson plan "$(linux_agent_response_without_thinking "${current_plan}")" \
             '{iteration:$iteration, plan:$plan}')"
 
-        execution_json="$(linux_agent_execute_work_plan "${current_plan}" "${user_input}" "${resume_state}")"
-        resume_state='{}'
+        execution_json="$(linux_agent_execute_work_plan \
+            "${current_plan}" \
+            "${user_input}" \
+            "${plan_resume_state}" \
+            "${iteration}" \
+            "iteration-${iteration}")"
         execution_user="$(jq -r '.execution_user // empty' <<<"${execution_json}" 2>/dev/null || true)"
         sudo_probe="$(jq -r '.sudo_probe // empty' <<<"${execution_json}" 2>/dev/null || true)"
         iteration_results="$(jq -c --argjson iteration "${iteration}" '(.results // []) | map(. + {iteration:$iteration})' <<<"${execution_json}")"
-        all_results="$(jq -cn --argjson prior "${all_results}" --argjson next "${iteration_results}" '$prior + $next')"
+        iteration_step_states="$(jq -c --argjson iteration "${iteration}" '(.step_states // []) | map(. + {iteration:$iteration})' <<<"${execution_json}")"
+        all_results="$(printf '%s\n%s\n' "${iteration_prior_results}" "${iteration_results}" | jq -cs '.[0] + .[1]')"
+        all_step_states="$(printf '%s\n%s\n' "${iteration_prior_step_states}" "${iteration_step_states}" | jq -cs '.[0] + .[1]')"
         status="$(jq -r '.status // "unknown"' <<<"${execution_json}")"
         final_status="${status}"
         final_review="$(jq -c '.review // null' <<<"${execution_json}")"
         final_approval_step="$(jq -c '.approval_step // null' <<<"${execution_json}")"
+        resumable_plan="$(jq -c --argjson fallback "${current_plan}" '.current_plan // $fallback' <<<"${execution_json}")"
+        iteration_record="$(jq -cn \
+            --argjson iteration "${iteration}" \
+            --arg status "${status}" \
+            --argjson plan "$(linux_agent_response_without_thinking "${current_plan}")" \
+            --argjson current_plan "$(linux_agent_response_without_thinking "${resumable_plan}")" \
+            --argjson result_count "$(jq 'length' <<<"${iteration_results}")" \
+            --argjson step_states "${iteration_step_states}" \
+            --argjson next_step_index "$(jq '.next_step_index // 0' <<<"${execution_json}")" \
+            --argjson approval_step "${final_approval_step}" \
+            --argjson review "${final_review}" '
+            {
+                iteration:$iteration,
+                status:$status,
+                plan:$plan,
+                current_plan:$current_plan,
+                next_step_index:$next_step_index,
+                approval_step:$approval_step,
+                review:$review,
+                result_count:$result_count,
+                step_states:$step_states
+            }
+        ')"
+        iteration_records="$(printf '%s\n%s\n' "${iteration_prior_records}" "${iteration_record}" | jq -cs '.[0] + [.[1]]')"
+        loop_resume_state="$(printf '%s\n%s\n%s\n%s\n%s\n' \
+            "$(jq -c '.resume_state // {}' <<<"${execution_json}")" \
+            "${resumable_plan}" \
+            "${iteration_prior_results}" \
+            "${iteration_prior_step_states}" \
+            "${iteration_prior_records}" |
+            jq -cs --argjson iteration "${iteration}" '
+            .[0] + {
+                agent_loop:true,
+                current_plan:.[1],
+                iteration:$iteration,
+                loop_prior_results:.[2],
+                loop_prior_step_states:.[3],
+                prior_iteration_records:.[4]
+            }
+        ')"
         auto_executed_count="$(jq '[.[] | select(.result.auto_approved == true)] | length' <<<"${all_results}")"
 
         if [[ "${status}" != "executed" && "${status}" != "failed" ]]; then
@@ -334,6 +425,7 @@ linux_agent_run_agent_loop() {
 
         observation_json="$(linux_agent_build_agent_observation "${user_input}" "${iteration}" "${current_plan}" "${execution_json}" "${environment_context}")"
         reflection_json="$(linux_agent_request_agent_reflection "${user_input}" "${iteration}" "${observation_json}")"
+        iteration_records="$(jq -c --argjson reflection "$(linux_agent_response_without_thinking "${reflection_json}")" '.[-1].reflection = $reflection' <<<"${iteration_records}")"
 
         if [[ "$(jq -r '.response_type' <<<"${reflection_json}")" == "answer" ]]; then
             final_answer="$(jq -r '.answer // empty' <<<"${reflection_json}")"
@@ -351,14 +443,14 @@ linux_agent_run_agent_loop() {
             break
         fi
 
-        if (( iteration >= max_iterations )); then
+        if ((iteration >= max_iterations)); then
             final_status="iteration_limit_stopped"
             stopped_reason="max_iterations_reached"
             linux_agent_record_agent_loop_iteration_turn "${user_input}" "${mode}" "${iteration}" "${current_plan}" "${execution_json}" "${reflection_json}" "${stopped_reason}" "${final_status}"
             break
         fi
 
-        if (( iteration % checkpoint_turns == 0 )); then
+        if ((iteration % checkpoint_turns == 0)); then
             checkpoint_required=true
             linux_agent_log_event "agent_checkpoint_requested" "$(jq -cn \
                 --argjson iteration "${iteration}" \
@@ -390,58 +482,73 @@ linux_agent_run_agent_loop() {
         --argjson auto_executed_count "${auto_executed_count}" \
         '{status:$status, stopped_reason:$stopped_reason, iterations:$iterations, auto_executed_count:$auto_executed_count}')"
 
-    jq -cn \
-        --arg status "${final_status}" \
-        --arg execution_user "${execution_user}" \
-        --arg sudo_probe "${sudo_probe}" \
-        --arg final_answer "${final_answer}" \
-        --arg stopped_reason "${stopped_reason}" \
-        --argjson iterations "${iteration}" \
-        --argjson auto_executed_count "${auto_executed_count}" \
-        --argjson checkpoint_required "${checkpoint_required}" \
-        --argjson review "${final_review}" \
-        --argjson approval_step "${final_approval_step}" \
-        --argjson results "${all_results}" \
-        '{status:$status, execution_user:$execution_user, sudo_probe:$sudo_probe, review:$review, approval_step:$approval_step, iterations:$iterations, auto_executed_count:$auto_executed_count, final_answer:$final_answer, checkpoint_required:$checkpoint_required, stopped_reason:$stopped_reason, results:$results}'
+    printf '%s\n%s\n%s\n%s\n%s\n%s\n%s\n' \
+        "${final_review}" \
+        "${final_approval_step}" \
+        "${all_results}" \
+        "${all_step_states}" \
+        "${iteration_records}" \
+        "${resumable_plan:-${current_plan}}" \
+        "${loop_resume_state}" |
+        jq -cs \
+            --arg status "${final_status}" \
+            --arg execution_user "${execution_user}" \
+            --arg sudo_probe "${sudo_probe}" \
+            --arg final_answer "${final_answer}" \
+            --arg stopped_reason "${stopped_reason}" \
+            --argjson iterations "${iteration}" \
+            --argjson auto_executed_count "${auto_executed_count}" \
+            --argjson checkpoint_required "${checkpoint_required}" \
+            --argjson next_step_index "$(jq '.next_step_index // 0' <<<"${execution_json}")" \
+            --arg approval_step_key "$(jq -r '.approval_step_key // empty' <<<"${execution_json}")" \
+            '
+        .[0] as $review
+        | .[1] as $approval_step
+        | .[2] as $results
+        | .[3] as $step_states
+        | .[4] as $iteration_records
+        | .[5] as $current_plan
+        | .[6] as $resume_state
+        |
+        {
+            status:$status,
+            execution_user:$execution_user,
+            sudo_probe:$sudo_probe,
+            review:$review,
+            approval_step:$approval_step,
+            approval_step_key:$approval_step_key,
+            iterations:$iterations,
+            iteration_records:$iteration_records,
+            current_plan:$current_plan,
+            next_step_index:$next_step_index,
+            auto_executed_count:$auto_executed_count,
+            final_answer:$final_answer,
+            checkpoint_required:$checkpoint_required,
+            stopped_reason:$stopped_reason,
+            results:$results,
+            step_states:$step_states,
+            resume_state:$resume_state
+        }'
 }
 
 linux_agent_process_work_request() {
     local user_input="$1"
     local mode="${2:-work}"
-    local topic context_json request_context response_json execution_json final_status response_type safe_response used_agent_loop
+    local prepared context_json response_json execution_json final_status response_type used_agent_loop execution_selection prepare_status
 
-    linux_agent_log_event "received" "$(jq -cn --arg input "${user_input}" --arg mode "${mode}" '{input:$input, mode:$mode}')"
-
-    topic="$(linux_agent_detect_topic "${user_input}")"
-    context_json="$(linux_agent_sense_topic "${topic}")"
-    context_json="$(linux_agent_redact_json "${context_json}")"
-    linux_agent_log_event "sensed" "${context_json}"
-
-    request_context="$(linux_agent_build_request_context "${user_input}" "${context_json}" "work")"
-    request_context="$(linux_agent_add_agent_loop_context "${request_context}")"
-    request_context="$(linux_agent_add_skill_context "${request_context}" "work")"
-    request_context="$(linux_agent_add_mcp_context "${request_context}" "work")"
-    linux_agent_log_event "request_context_built" "${request_context}"
-
-    linux_agent_record_ai_request_files "${request_context}"
-    response_json="$(linux_agent_call_ai_with_context "${user_input}" "${request_context}" "work_plan" "${context_json}")"
-    response_json="$(linux_agent_normalize_model_response "${response_json}")"
-    linux_agent_store_thinking_summary "${response_json}" "initial"
-    if linux_agent_ai_response_is_error "${response_json}"; then
-        linux_agent_log_event "ai_failed" "${response_json}"
-        linux_agent_print_error "$(linux_agent_ai_error_text "${response_json}")"
-        linux_agent_log_event "finished" "$(jq -cn '{status:"ai_failed"}')"
+    linux_agent_capture_prepared_work_request prepared "${user_input}" "${mode}"
+    if [[ "$(jq -r '.ok // false' <<<"${prepared}")" != "true" ]]; then
+        prepare_status="$(jq -r '.status // "ai_failed"' <<<"${prepared}")"
+        linux_agent_print_error "$(jq -r '.error // "AI request failed."' <<<"${prepared}")"
+        if [[ "${prepare_status}" == "ai_invalid_response" ]]; then
+            linux_agent_log_event "finished" "$(jq -cn '{status:"ai_invalid_response"}')"
+        else
+            linux_agent_log_event "finished" "$(jq -cn '{status:"ai_failed"}')"
+        fi
         return 1
     fi
-    if ! linux_agent_validate_work_response "${response_json}"; then
-        linux_agent_log_event "ai_invalid_response" "${response_json}"
-        linux_agent_print_error "模型响应不符合 work schema。"
-        linux_agent_log_event "finished" "$(jq -cn '{status:"ai_invalid_response"}')"
-        return 1
-    fi
-
-    safe_response="$(linux_agent_response_without_thinking "${response_json}")"
-    linux_agent_log_event "planned" "${safe_response}"
+    response_json="$(jq -c '.response' <<<"${prepared}")"
+    context_json="$(jq -c '.context' <<<"${prepared}")"
 
     response_type="$(jq -r '.response_type' <<<"${response_json}")"
     if [[ "${response_type}" == "answer" ]]; then
@@ -452,13 +559,14 @@ linux_agent_process_work_request() {
         return 0
     fi
 
-    if [[ "$(linux_agent_agent_loop_enabled)" == "true" ]]; then
-        used_agent_loop=true
-        execution_json="$(linux_agent_run_agent_loop "${user_input}" "${mode}" "${context_json}" "${response_json}")"
-    else
-        used_agent_loop=false
-        execution_json="$(linux_agent_execute_work_plan "${response_json}" "${user_input}")"
-    fi
+    execution_selection="$(linux_agent_execute_prepared_work \
+        "${user_input}" \
+        "${mode}" \
+        "${context_json}" \
+        "${response_json}" \
+        '{}')"
+    used_agent_loop="$(jq -r '.used_agent_loop' <<<"${execution_selection}")"
+    execution_json="$(jq -c '.execution' <<<"${execution_selection}")"
     linux_agent_log_event "executed" "${execution_json}"
     if linux_agent_output_json_enabled; then
         printf '%s\n' "$(linux_agent_compact_execution_result "${execution_json}" | jq .)"
@@ -477,23 +585,15 @@ linux_agent_print_execution_protocol_json() {
     local title="$1"
     local result_json="$2"
     local approval_card="${3:-null}"
-    local protocol
-
     if [[ "${LINUX_AGENT_API_MODE:-0}" == "1" ]]; then
         printf '%s\n' "$(jq . <<<"${result_json}")"
         return 0
     fi
 
-    protocol="$(linux_agent_protocol_for_single_execution "${title}" "${result_json}")"
-    jq --argjson protocol "${protocol}" --argjson approval_card "${approval_card}" '
-        {
-            ok:(.ok // false),
-            status:(.status // $protocol.timeline[0].status // (if (.ok // false) then "executed" else "failed" end)),
-            timeline:$protocol.timeline,
-            approval_card:$approval_card,
-            output_blocks:$protocol.output_blocks
-        }
-    ' <<<"${result_json}"
+    linux_agent_protocol_envelope_for_single_execution \
+        "${title}" \
+        "${result_json}" \
+        "${approval_card}"
 }
 
 linux_agent_process_script_request() {
@@ -584,7 +684,7 @@ linux_agent_process_terminal_request() {
     local command_text="$1"
     local approve="${2:-false}"
     local stdout_file stderr_file stdout_text stderr_text exit_code final_status result run_meta observer subject
-    local review proxy_meta proxy_error
+    local review proxy_meta proxy_error gate_result
     local -a command_args prepared_command
 
     linux_agent_log_event "received" "$(jq -cn --arg command "${command_text}" '{mode:"terminal", command:$command}')"
@@ -628,10 +728,26 @@ linux_agent_process_terminal_request() {
         fi
     fi
 
+    subject="$(jq -cn --arg command "${command_text}" '{kind:"terminal_command", command:$command}')"
+    if declare -F linux_agent_observer_execution_gate >/dev/null 2>&1 &&
+        ! gate_result="$(linux_agent_observer_execution_gate "terminal" "${subject}")"; then
+        result="$(jq -c \
+            --arg command "${command_text}" \
+            --argjson review "${review}" \
+            '. + {command:$command, timed_out:false, stdout:"", stderr:(.output.raw // "Observer 不可用，终端命令已被阻止。"), review:$review}' <<<"${gate_result}")"
+        linux_agent_log_event "terminal_blocked" "${result}"
+        if linux_agent_output_json_enabled; then
+            linux_agent_print_execution_protocol_json "终端输出" "${result}"
+        else
+            linux_agent_print_terminal_result "${result}"
+        fi
+        linux_agent_log_event "finished" "$(jq -cn '{status:"blocked"}')"
+        return 0
+    fi
+
     stdout_file="$(mktemp "${LINUX_AGENT_TMP_DIR}/terminal.stdout.XXXXXX")"
     stderr_file="$(mktemp "${LINUX_AGENT_TMP_DIR}/terminal.stderr.XXXXXX")"
 
-    subject="$(jq -cn --arg command "${command_text}" '{kind:"terminal_command", command:$command}')"
     command_args=(bash -lc "${command_text}")
     if ! linux_agent_prepare_execution_command "$(linux_agent_execution_privilege_from_review "${review}")" prepared_command "${command_args[@]}"; then
         proxy_error="least privilege proxy is unavailable; refusing to run as root without an explicit privileged path"
@@ -714,7 +830,7 @@ linux_agent_process_request() {
         terminal)
             linux_agent_process_terminal_request "${user_input}"
             ;;
-        work|interactive|oneshot|*)
+        work | interactive | oneshot | *)
             linux_agent_process_work_request "${user_input}" "${mode}"
             ;;
     esac

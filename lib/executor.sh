@@ -90,6 +90,8 @@ linux_agent_execution_privilege_from_review() {
     fi
 }
 
+# output_command_ref is a nameref used to populate the caller's command array.
+# shellcheck disable=SC2034
 linux_agent_prepare_execution_command() {
     local requested_privilege="$1"
     local output_var="$2"
@@ -311,19 +313,19 @@ linux_agent_prompt_step_decision() {
             IFS= read -r answer || true
         fi
         case "${answer,,}" in
-            y|yes)
+            y | yes)
                 printf -v "${result_var}" '%s' "approve"
                 return 0
                 ;;
-            n|no|"")
+            n | no | "")
                 printf -v "${result_var}" '%s' "reject"
                 return 0
                 ;;
-            s|skip)
+            s | skip)
                 printf -v "${result_var}" '%s' "skip"
                 return 0
                 ;;
-            t|terminate)
+            t | terminate)
                 printf -v "${result_var}" '%s' "terminate"
                 return 0
                 ;;
@@ -431,7 +433,7 @@ linux_agent_user_output_label() {
         processes) printf '进程列表' ;;
         zombies) printf '僵尸进程' ;;
         error) printf '错误' ;;
-        path|root_path|resolved_path) printf '路径' ;;
+        path | root_path | resolved_path) printf '路径' ;;
         service) printf '服务' ;;
         pattern) printf '匹配条件' ;;
         keyword) printf '关键字' ;;
@@ -589,8 +591,8 @@ linux_agent_terminal_review() {
     local review
 
     review="$(linux_agent_policy_review_text "terminal" "${command_text}" "local" "terminal")"
-    if [[ "$(jq -r '(.approved // false) == true and (.approval_required // false) == false and (.risk_level // "unknown") == "low"' <<<"${review}")" == "true" ]] \
-        && [[ "$(linux_agent_auto_approval_enabled shell_readonly)" != "true" ]]; then
+    if [[ "$(jq -r '(.approved // false) == true and (.approval_required // false) == false and (.risk_level // "unknown") == "low"' <<<"${review}")" == "true" ]] &&
+        [[ "$(linux_agent_auto_approval_enabled shell_readonly)" != "true" ]]; then
         jq -c '
             .approval_required = true
             | .findings = ((.findings // []) + [{
@@ -666,7 +668,7 @@ linux_agent_remote_script_policy() {
     local policy
     policy="$(linux_agent_config_get_default '.remote_script_policy' 'download_review')"
     case "${policy}" in
-        download_review|disabled)
+        download_review | disabled)
             printf '%s\n' "${policy}"
             ;;
         *)
@@ -728,7 +730,7 @@ linux_agent_prepare_remote_step() {
         return 1
     fi
     sha="$(sha256sum "${tmp_path}" | awk '{print $1}')"
-    size="$(wc -c < "${tmp_path}" | tr -d ' ')"
+    size="$(wc -c <"${tmp_path}" | tr -d ' ')"
     if [[ ! "${size}" =~ ^[0-9]+$ || "${size}" -eq 0 ]]; then
         jq -cn --arg error "远程脚本为空。" --arg url "${url}" --arg sha256 "${sha}" '{ok:false, error:$error, url:$url, sha256:$sha256}'
         return 1
@@ -766,8 +768,17 @@ linux_agent_prepare_remote_step() {
 linux_agent_execute_observed_command_output() {
     local scope="$1"
     local subject_json="$2"
+    local gate_result
     shift 2
     [[ "${1:-}" == "--" ]] && shift
+
+    # Defense-in-depth gate for direct script/MCP/step dispatch. Work-plan and
+    # terminal callers also check before publishing a running state.
+    if declare -F linux_agent_observer_execution_gate >/dev/null 2>&1 &&
+        ! gate_result="$(linux_agent_observer_execution_gate "${scope}" "${subject_json}")"; then
+        printf '%s\n' "${gate_result}"
+        return 0
+    fi
 
     local stdout_file stderr_file run_meta exit_code observer stdout_text stderr_text combined timed_out
     local requested_privilege proxy_meta proxy_error
@@ -793,6 +804,11 @@ linux_agent_execute_observed_command_output() {
     stderr_file="$(mktemp "${LINUX_AGENT_TMP_DIR}/observer.stderr.XXXXXX")"
 
     run_meta="$(linux_agent_run_observed_process "${scope}" "${subject_json}" "${stdout_file}" "${stderr_file}" -- "${prepared_command[@]}")"
+    if jq -e '.blocked_result | type == "object"' >/dev/null 2>&1 <<<"${run_meta}"; then
+        rm -f "${stdout_file}" "${stderr_file}"
+        jq -c '.blocked_result' <<<"${run_meta}"
+        return 0
+    fi
     exit_code="$(jq -r '.exit_code' <<<"${run_meta}")"
     timed_out="$(jq -r '.timed_out // false' <<<"${run_meta}")"
     observer="$(jq -c '.observer' <<<"${run_meta}")"
@@ -874,7 +890,7 @@ linux_agent_prepare_mcp_arguments_file() {
 
     args_file="$(mktemp "${LINUX_AGENT_TMP_DIR}/mcp.args.XXXXXX")"
     chmod 600 "${args_file}" 2>/dev/null || true
-    printf '%s\n' "${args_json}" > "${args_file}"
+    printf '%s\n' "${args_json}" >"${args_file}"
     if [[ "$(id -u)" -eq 0 && "$(linux_agent_min_privilege_proxy_enabled)" == "true" ]]; then
         target_user="$(linux_agent_least_privilege_user 2>/dev/null || true)"
         if [[ -n "${target_user}" ]]; then
@@ -911,6 +927,14 @@ linux_agent_execute_mcp_tool_step() {
             linux_agent_execute_observed_command_output "step_mcp_tool" "${subject}" -- python3 "${client}" call-tool "${manifest_path}" "${tool_name}" "${args_file}"
     )"
     rm -f "${args_file}"
+
+    # The observer gate is an execution-layer result, not an MCP helper payload.
+    # Preserve its status/error code verbatim so the work-plan caller can mark
+    # the step blocked instead of treating it as a failed MCP invocation.
+    if [[ "$(jq -r '.status // ""' <<<"${observed}")" == "blocked" ]]; then
+        printf '%s\n' "${observed}"
+        return 0
+    fi
 
     jq -cn \
         --argjson observed "${observed}" \
@@ -1072,12 +1096,249 @@ linux_agent_request_revised_work_plan() {
     printf '%s\n' "${revised_plan}"
 }
 
+linux_agent_plan_step_states() {
+    local plan_json="$1"
+    local iteration="${2:-0}"
+    local scope="${3:-plan}"
+    jq -c \
+        --arg scope "${scope}" \
+        --argjson iteration "${iteration}" '
+        [(.steps // []) | to_entries[] | {
+            key:($scope + ":" + (.key | tostring) + ":" + (.value.id // ("step-" + (.key | tostring)))),
+            step_id:(.value.id // ("step-" + (.key | tostring))),
+            step_index:.key,
+            iteration:(if $iteration > 0 then $iteration else null end),
+            scope:$scope,
+            step:.value,
+            status:"pending",
+            result:null
+        }]
+    ' <<<"${plan_json}"
+}
+
+linux_agent_update_step_state() {
+    local states="$1"
+    local index="$2"
+    local status="$3"
+    local detail="${4:-null}"
+    printf '%s\n%s\n' "${states}" "${detail}" | jq -cs \
+        --argjson index "${index}" \
+        --arg status "${status}" '
+        def compact_detail:
+            if . == null or type != "object" then null
+            else {
+                ok:(.ok // null),
+                approved:(.approved // null),
+                status:(.status // null),
+                exit_code:(.exit_code // null),
+                auto_approved:(.auto_approved // null),
+                risk_level:(.risk_level // null),
+                findings:(.findings // null),
+                output:(
+                    if (.output | type) == "object" then {
+                        action:(.output.action // null),
+                        summary:(.output.summary // null),
+                        message:(.output.message // null),
+                        raw:(if (.output.raw | type) == "string" then .output.raw[0:2000] else null end)
+                    } | with_entries(select(.value != null))
+                    else null end
+                )
+            } | with_entries(select(.value != null))
+            end;
+        .[0] as $states
+        | .[1] as $detail
+        | $states
+        | map(
+            if .step_index == $index then
+                .status = $status
+                | .result = ($detail | compact_detail)
+            else . end
+        )
+    '
+}
+
+linux_agent_skip_remaining_step_states() {
+    local states="$1"
+    local index="$2"
+    jq -c --argjson index "${index}" '
+        map(
+            if .step_index > $index and .status == "pending" then
+                .status = "skipped_unexecuted"
+            else . end
+        )
+    ' <<<"${states}"
+}
+
+linux_agent_restore_step_states_from_results() {
+    local states="$1"
+    local results="$2"
+    printf '%s\n%s\n' "${states}" "${results}" | jq -cs '
+        def result_status($result):
+            if (($result.output.action // "") == "skipped_by_user") or (($result.status // "") == "skipped_user") then "skipped_user"
+            elif ($result.ok // false) then "succeeded"
+            elif (["blocked", "rejected", "terminated", "approval_required"] | index($result.status // "")) != null then $result.status
+            else "failed" end;
+        .[0] as $states
+        | .[1] as $results
+        | reduce ($results | to_entries[]) as $entry ($states;
+            if $entry.key < length then
+                .[$entry.key].status = result_status($entry.value.result // {})
+                | .[$entry.key].result = ($entry.value.result // null)
+            else . end
+        )
+    '
+}
+
+linux_agent_finalize_work_plan_execution() {
+    local execution_json="$1"
+    local plan_json="$2"
+    local step_states="$3"
+    local iteration="$4"
+    local scope="$5"
+    local next_step_index="$6"
+    local prior_results="${7:-[]}"
+    local prior_step_states="${8:-[]}"
+    printf '%s\n%s\n%s\n%s\n%s\n' \
+        "${execution_json}" \
+        "${plan_json}" \
+        "${step_states}" \
+        "${prior_results}" \
+        "${prior_step_states}" |
+        jq -cs \
+            --argjson iteration "${iteration}" \
+            --arg scope "${scope}" \
+            --argjson next_step_index "${next_step_index}" '
+        .[0] as $execution
+        | .[1] as $plan
+        | .[2] as $current_step_states
+        | .[3] as $prior_results
+        | .[4] as $prior_step_states
+        |
+        ($execution.results // []) as $current_results
+        | $execution + {
+            current_plan:$plan,
+            iteration:(if $iteration > 0 then $iteration else null end),
+            step_scope:$scope,
+            next_step_index:$next_step_index,
+            resume_results:$current_results,
+            current_step_states:$current_step_states,
+            results:($prior_results + $current_results),
+            step_states:($prior_step_states + $current_step_states),
+            resume_state:{
+                current_plan:$plan,
+                iteration:$iteration,
+                step_scope:$scope,
+                next_step_index:$next_step_index,
+                results:$current_results,
+                step_states:$current_step_states,
+                prior_results:$prior_results,
+                prior_step_states:$prior_step_states
+            }
+        }
+    '
+}
+
+linux_agent_finalize_work_precondition_block() {
+    local result_json="$1"
+    local step_json="$2"
+    local plan_json="$3"
+    local step_states="$4"
+    local step_index="$5"
+    local iteration="$6"
+    local step_scope="$7"
+    local results="$8"
+    local prior_results="$9"
+    local prior_step_states="${10}"
+    local execution_user="${11}"
+    local sudo_probe="${12}"
+    local blocked_states blocked_results execution_result
+
+    blocked_states="$(linux_agent_update_step_state "${step_states}" "${step_index}" "blocked" "${result_json}")"
+    blocked_states="$(linux_agent_skip_remaining_step_states "${blocked_states}" "${step_index}")"
+    blocked_results="$(jq -cn \
+        --argjson prior "${results}" \
+        --arg step_key "$(jq -r --argjson index "${step_index}" '.[$index].key' <<<"${blocked_states}")" \
+        --argjson step_index "${step_index}" \
+        --argjson iteration "${iteration}" \
+        --arg scope "${step_scope}" \
+        --argjson step "${step_json}" \
+        --argjson result "${result_json}" \
+        '$prior + [{step_key:$step_key, step_index:$step_index, iteration:$iteration, scope:$scope, step:$step, result:$result}]')"
+    execution_result="$(jq -cn \
+        --arg execution_user "${execution_user}" \
+        --arg sudo_probe "${sudo_probe}" \
+        --argjson results "${blocked_results}" \
+        '{status:"blocked", execution_user:$execution_user, sudo_probe:$sudo_probe, results:$results}')"
+    linux_agent_finalize_work_plan_execution \
+        "${execution_result}" \
+        "${plan_json}" \
+        "${blocked_states}" \
+        "${iteration}" \
+        "${step_scope}" \
+        "${step_index}" \
+        "${prior_results}" \
+        "${prior_step_states}"
+}
+
+linux_agent_require_audit_event_result() {
+    local stage="$1"
+    local payload="${2:-{}}"
+    local audit_rc=0
+
+    if ! declare -F linux_agent_audit_require_event >/dev/null 2>&1; then
+        return 0
+    fi
+    linux_agent_audit_require_event "${stage}" "${payload}" || audit_rc=$?
+    if ((audit_rc == 0)); then
+        return 0
+    fi
+    if declare -F linux_agent_audit_failure_result >/dev/null 2>&1; then
+        linux_agent_audit_failure_result "${audit_rc}" "${stage}"
+    else
+        jq -cn --arg stage "${stage}" --argjson exit_code "${audit_rc}" '
+            {
+                ok:false,
+                status:"blocked",
+                code:"audit_integrity_broken",
+                error_code:"audit_integrity_broken",
+                error:"审计事件无法持久写入，操作未执行。",
+                exit_code:$exit_code,
+                details:{audit_stage:$stage}
+            }'
+    fi
+    return 1
+}
+
+linux_agent_require_step_status_event() {
+    local step_json="$1"
+    local status="$2"
+    local detail="${3:-{}}"
+    local payload
+    payload="$(jq -cn \
+        --arg status "${status}" \
+        --argjson step "${step_json}" \
+        --argjson detail "${detail}" \
+        '{status:$status, step:$step, detail:$detail}')"
+    linux_agent_require_audit_event_result "step_${status}" "${payload}"
+}
+
 linux_agent_execute_work_plan() {
     local plan_json="$1"
     local user_input="$2"
     local resume_state="${3:-}"
-    local execution_user sudo_probe step_count results executed_steps status
+    local iteration="${4:-0}"
+    local step_scope="${5:-}"
+    local execution_user sudo_probe step_count results executed_steps status step_states
+    local prior_results prior_step_states resume_index restored_result_count execution_result
     [[ -n "${resume_state}" ]] || resume_state='{}'
+    [[ "${iteration}" =~ ^[0-9]+$ ]] || iteration=0
+    if [[ -z "${step_scope}" ]]; then
+        if ((iteration > 0)); then
+            step_scope="iteration-${iteration}"
+        else
+            step_scope="plan"
+        fi
+    fi
 
     execution_user="$(id -un 2>/dev/null || printf 'unknown')"
     sudo_probe="$(linux_agent_probe_sudo)"
@@ -1085,11 +1346,20 @@ linux_agent_execute_work_plan() {
     results='[]'
     executed_steps='[]'
     status="executed"
+    step_states="$(linux_agent_plan_step_states "${plan_json}" "${iteration}" "${step_scope}")"
 
     if ! jq -e 'type == "object"' <<<"${resume_state}" >/dev/null 2>&1; then
         resume_state='{}'
     fi
-    local resume_index
+    prior_results="$(jq -c '.prior_results // [] | if type == "array" then . else [] end' <<<"${resume_state}")"
+    prior_step_states="$(jq -c '.prior_step_states // [] | if type == "array" then . else [] end' <<<"${resume_state}")"
+    results="$(jq -c '.results // [] | if type == "array" then . else [] end' <<<"${resume_state}")"
+    if jq -e --argjson count "${step_count}" '.step_states | type == "array" and length == $count' <<<"${resume_state}" >/dev/null 2>&1; then
+        step_states="$(jq -c '.step_states' <<<"${resume_state}")"
+    elif [[ "$(jq 'length' <<<"${results}")" -gt 0 ]]; then
+        step_states="$(linux_agent_restore_step_states_from_results "${step_states}" "${results}")"
+    fi
+
     resume_index="$(jq -r '.next_step_index // .start_index // 0' <<<"${resume_state}")"
     if [[ ! "${resume_index}" =~ ^[0-9]+$ ]]; then
         resume_index=0
@@ -1097,18 +1367,17 @@ linux_agent_execute_work_plan() {
     if [[ "${resume_index}" -gt "${step_count}" ]]; then
         resume_index="${step_count}"
     fi
+    restored_result_count="$(jq 'length' <<<"${results}")"
+    if [[ "${restored_result_count}" -lt "${resume_index}" ]]; then
+        resume_index="${restored_result_count}"
+    fi
     if [[ "${resume_index}" -gt 0 ]]; then
-        results="$(jq -c '.results // [] | if type == "array" then . else [] end' <<<"${resume_state}")"
-        local restored_result_count
-        restored_result_count="$(jq 'length' <<<"${results}")"
-        if [[ "${restored_result_count}" -lt "${resume_index}" ]]; then
-            resume_index="${restored_result_count}"
-        fi
         executed_steps="$(jq -c '[.[] | select(.result.ok == true)]' <<<"${results}")"
         linux_agent_log_event "execution_resumed" "$(jq -cn \
             --argjson next_step_index "${resume_index}" \
             --argjson restored_result_count "${restored_result_count}" \
-            '{next_step_index:$next_step_index, restored_result_count:$restored_result_count}')"
+            --arg scope "${step_scope}" \
+            '{next_step_index:$next_step_index, restored_result_count:$restored_result_count, scope:$scope}')"
     fi
 
     linux_agent_print_work_plan "${plan_json}" >&2
@@ -1118,20 +1387,41 @@ linux_agent_execute_work_plan() {
         local step step_review_text review result skipped prepared step_decision revision_request auto_approved
         step="$(jq -c --argjson index "${i}" '.steps[$index]' <<<"${plan_json}")"
         auto_approved=0
-        linux_agent_log_step_status "${step}" "pending"
+        step_states="$(linux_agent_update_step_state "${step_states}" "${i}" "pending" 'null')"
+        if ! result="$(linux_agent_require_step_status_event "${step}" "pending")"; then
+            linux_agent_finalize_work_precondition_block \
+                "${result}" "${step}" "${plan_json}" "${step_states}" "${i}" \
+                "${iteration}" "${step_scope}" "${results}" "${prior_results}" \
+                "${prior_step_states}" "${execution_user}" "${sudo_probe}"
+            return 0
+        fi
 
         if [[ "$(jq -r '.executor_type' <<<"${step}")" == "remote_script" ]]; then
+            local prepare_observer_subject
+            prepare_observer_subject="$(jq -cn --argjson step "${step}" '{kind:"work_step_prepare", step:$step}')"
+            if declare -F linux_agent_observer_execution_gate >/dev/null 2>&1 &&
+                ! result="$(linux_agent_observer_execution_gate "step_remote_script_prepare" "${prepare_observer_subject}")"; then
+                linux_agent_log_step_status "${step}" "blocked" "${result}" || true
+                linux_agent_finalize_work_precondition_block \
+                    "${result}" "${step}" "${plan_json}" "${step_states}" "${i}" \
+                    "${iteration}" "${step_scope}" "${results}" "${prior_results}" \
+                    "${prior_step_states}" "${execution_user}" "${sudo_probe}"
+                return 0
+            fi
             prepared="$(linux_agent_prepare_remote_step "${step}" 2>&1)" || {
                 local failed_detail skipped_steps
-                failed_detail="$(jq -cn --arg raw "${prepared}" '{ok:false, output:{raw:$raw}}')"
+                failed_detail="$(jq -cn --arg raw "${prepared}" '{ok:false, status:"failed", output:{raw:$raw}}')"
+                step_states="$(linux_agent_update_step_state "${step_states}" "${i}" "failed" "${failed_detail}")"
+                step_states="$(linux_agent_skip_remaining_step_states "${step_states}" "${i}")"
                 linux_agent_log_step_status "${step}" "failed" "${failed_detail}"
                 skipped_steps="$(linux_agent_skipped_steps_after "${plan_json}" "${i}")"
                 while IFS= read -r skipped; do
                     [[ -n "${skipped}" ]] && linux_agent_log_step_status "${skipped}" "skipped_unexecuted"
                 done < <(jq -c '.[]' <<<"${skipped_steps}")
                 linux_agent_request_repair_plan "${user_input}" "${plan_json}" "${executed_steps}" "${step}" "${failed_detail}" "${skipped_steps}"
-                jq -cn --arg status "failed" --arg execution_user "${execution_user}" --arg sudo_probe "${sudo_probe}" --argjson results "${results}" \
-                    '{status:$status, execution_user:$execution_user, sudo_probe:$sudo_probe, results:$results}'
+                execution_result="$(jq -cn --arg execution_user "${execution_user}" --arg sudo_probe "${sudo_probe}" --argjson results "${results}" \
+                    '{status:"failed", execution_user:$execution_user, sudo_probe:$sudo_probe, results:$results}')"
+                linux_agent_finalize_work_plan_execution "${execution_result}" "${plan_json}" "${step_states}" "${iteration}" "${step_scope}" "${i}" "${prior_results}" "${prior_step_states}"
                 return 0
             }
             step="${prepared}"
@@ -1145,13 +1435,16 @@ linux_agent_execute_work_plan() {
         if [[ "$(jq -r '.executor_type' <<<"${step}")" == "skill_script" ]] && ! linux_agent_skill_is_registered "$(jq -r '.skill_script' <<<"${step}")"; then
             local blocked_detail skipped_steps
             blocked_detail="$(jq -cn --arg ref "$(jq -r '.skill_script' <<<"${step}")" '{approved:false, risk_level:"critical", findings:[{severity:"critical", code:"SKILL_SCRIPT_UNREGISTERED", ref:$ref, message:"AI 提出的 skill 脚本未登记。"}]}')"
+            step_states="$(linux_agent_update_step_state "${step_states}" "${i}" "blocked" "${blocked_detail}")"
+            step_states="$(linux_agent_skip_remaining_step_states "${step_states}" "${i}")"
             linux_agent_log_step_status "${step}" "blocked" "${blocked_detail}"
             skipped_steps="$(linux_agent_skipped_steps_after "${plan_json}" "${i}")"
             while IFS= read -r skipped_step; do
                 [[ -n "${skipped_step}" ]] && linux_agent_log_step_status "${skipped_step}" "skipped_unexecuted"
             done < <(jq -c '.[]' <<<"${skipped_steps}")
-            jq -cn --arg status "blocked" --arg execution_user "${execution_user}" --arg sudo_probe "${sudo_probe}" --argjson findings "$(jq '.findings' <<<"${blocked_detail}")" --argjson results "${results}" \
-                '{status:$status, execution_user:$execution_user, sudo_probe:$sudo_probe, findings:$findings, results:$results}'
+            execution_result="$(jq -cn --arg execution_user "${execution_user}" --arg sudo_probe "${sudo_probe}" --argjson findings "$(jq '.findings' <<<"${blocked_detail}")" --argjson results "${results}" \
+                '{status:"blocked", execution_user:$execution_user, sudo_probe:$sudo_probe, findings:$findings, results:$results}')"
+            linux_agent_finalize_work_plan_execution "${execution_result}" "${plan_json}" "${step_states}" "${iteration}" "${step_scope}" "${i}" "${prior_results}" "${prior_step_states}"
             return 0
         fi
         if [[ "$(jq -r '.executor_type' <<<"${step}")" == "mcp_tool" ]] && ! linux_agent_mcp_tool_is_available "$(jq -r '.mcp_server // empty' <<<"${step}")" "$(jq -r '.mcp_tool // empty' <<<"${step}")"; then
@@ -1160,27 +1453,39 @@ linux_agent_execute_work_plan() {
                 --arg server_id "$(jq -r '.mcp_server // empty' <<<"${step}")" \
                 --arg tool "$(jq -r '.mcp_tool // empty' <<<"${step}")" \
                 '{approved:false, risk_level:"critical", findings:[{severity:"critical", code:"MCP_TOOL_UNAVAILABLE", server_id:$server_id, tool:$tool, message:"AI 提出的 MCP tool 未安装、未启用或未在 tools/list 中声明。"}]}')"
+            step_states="$(linux_agent_update_step_state "${step_states}" "${i}" "blocked" "${blocked_detail}")"
+            step_states="$(linux_agent_skip_remaining_step_states "${step_states}" "${i}")"
             linux_agent_log_step_status "${step}" "blocked" "${blocked_detail}"
             skipped_steps="$(linux_agent_skipped_steps_after "${plan_json}" "${i}")"
             while IFS= read -r skipped_step; do
                 [[ -n "${skipped_step}" ]] && linux_agent_log_step_status "${skipped_step}" "skipped_unexecuted"
             done < <(jq -c '.[]' <<<"${skipped_steps}")
-            jq -cn --arg status "blocked" --arg execution_user "${execution_user}" --arg sudo_probe "${sudo_probe}" --argjson findings "$(jq '.findings' <<<"${blocked_detail}")" --argjson results "${results}" \
-                '{status:$status, execution_user:$execution_user, sudo_probe:$sudo_probe, findings:$findings, results:$results}'
+            execution_result="$(jq -cn --arg execution_user "${execution_user}" --arg sudo_probe "${sudo_probe}" --argjson findings "$(jq '.findings' <<<"${blocked_detail}")" --argjson results "${results}" \
+                '{status:"blocked", execution_user:$execution_user, sudo_probe:$sudo_probe, findings:$findings, results:$results}')"
+            linux_agent_finalize_work_plan_execution "${execution_result}" "${plan_json}" "${step_states}" "${iteration}" "${step_scope}" "${i}" "${prior_results}" "${prior_step_states}"
             return 0
         fi
         step_review_text="$(linux_agent_step_review_material "${step}")"
         review="$(linux_agent_policy_review_step "${step}" "${step_review_text}" "$(case "$(jq -r '.executor_type' <<<"${step}")" in remote_script) printf 'remote' ;; mcp_tool) printf 'mcp' ;; *) printf 'local' ;; esac)")"
-        linux_agent_log_event "step_policy_checked" "$(jq -cn --argjson step "${step}" --argjson review "${review}" '{step:$step, review:$review}')"
+        if ! result="$(linux_agent_require_step_status_event "${step}" "policy_checked" "${review}")"; then
+            linux_agent_finalize_work_precondition_block \
+                "${result}" "${step}" "${plan_json}" "${step_states}" "${i}" \
+                "${iteration}" "${step_scope}" "${results}" "${prior_results}" \
+                "${prior_step_states}" "${execution_user}" "${sudo_probe}"
+            return 0
+        fi
 
         if [[ "$(jq -r '.approved' <<<"${review}")" != "true" ]]; then
+            step_states="$(linux_agent_update_step_state "${step_states}" "${i}" "blocked" "${review}")"
+            step_states="$(linux_agent_skip_remaining_step_states "${step_states}" "${i}")"
             linux_agent_log_step_status "${step}" "blocked" "${review}"
             skipped="$(linux_agent_skipped_steps_after "${plan_json}" "${i}")"
             while IFS= read -r skipped_step; do
                 [[ -n "${skipped_step}" ]] && linux_agent_log_step_status "${skipped_step}" "skipped_unexecuted"
             done < <(jq -c '.[]' <<<"${skipped}")
-            jq -cn --arg status "blocked" --arg execution_user "${execution_user}" --arg sudo_probe "${sudo_probe}" --argjson findings "$(jq '.findings' <<<"${review}")" --argjson results "${results}" \
-                '{status:$status, execution_user:$execution_user, sudo_probe:$sudo_probe, findings:$findings, results:$results}'
+            execution_result="$(jq -cn --arg execution_user "${execution_user}" --arg sudo_probe "${sudo_probe}" --argjson findings "$(jq '.findings' <<<"${review}")" --argjson results "${results}" \
+                '{status:"blocked", execution_user:$execution_user, sudo_probe:$sudo_probe, findings:$findings, results:$results}')"
+            linux_agent_finalize_work_plan_execution "${execution_result}" "${plan_json}" "${step_states}" "${iteration}" "${step_scope}" "${i}" "${prior_results}" "${prior_step_states}"
             return 0
         fi
 
@@ -1197,35 +1502,43 @@ linux_agent_execute_work_plan() {
         fi
         case "${step_decision}" in
             approval_required)
+                step_states="$(linux_agent_update_step_state "${step_states}" "${i}" "approval_required" "${review}")"
                 linux_agent_log_step_status "${step}" "approval_required" "${review}"
-                jq -cn \
-                    --arg status "approval_required" \
+                execution_result="$(jq -cn \
                     --arg execution_user "${execution_user}" \
                     --arg sudo_probe "${sudo_probe}" \
+                    --arg approval_step_key "$(jq -r --argjson index "${i}" '.[$index].key' <<<"${step_states}")" \
                     --argjson approval_step "${step}" \
                     --argjson review "${review}" \
                     --argjson results "${results}" \
-                    '{status:$status, execution_user:$execution_user, sudo_probe:$sudo_probe, approval_step:$approval_step, review:$review, results:$results}'
+                    '{status:"approval_required", execution_user:$execution_user, sudo_probe:$sudo_probe, approval_step:$approval_step, approval_step_key:$approval_step_key, review:$review, results:$results}')"
+                linux_agent_finalize_work_plan_execution "${execution_result}" "${plan_json}" "${step_states}" "${iteration}" "${step_scope}" "${i}" "${prior_results}" "${prior_step_states}"
                 return 0
                 ;;
             reject)
+                step_states="$(linux_agent_update_step_state "${step_states}" "${i}" "rejected" 'null')"
+                step_states="$(linux_agent_skip_remaining_step_states "${step_states}" "${i}")"
                 linux_agent_log_step_status "${step}" "rejected"
                 skipped="$(linux_agent_skipped_steps_after "${plan_json}" "${i}")"
                 while IFS= read -r skipped_step; do
                     [[ -n "${skipped_step}" ]] && linux_agent_log_step_status "${skipped_step}" "skipped_unexecuted"
                 done < <(jq -c '.[]' <<<"${skipped}")
-                jq -cn --arg status "rejected" --arg execution_user "${execution_user}" --arg sudo_probe "${sudo_probe}" --argjson results "${results}" \
-                    '{status:$status, execution_user:$execution_user, sudo_probe:$sudo_probe, results:$results}'
+                execution_result="$(jq -cn --arg execution_user "${execution_user}" --arg sudo_probe "${sudo_probe}" --argjson results "${results}" \
+                    '{status:"rejected", execution_user:$execution_user, sudo_probe:$sudo_probe, results:$results}')"
+                linux_agent_finalize_work_plan_execution "${execution_result}" "${plan_json}" "${step_states}" "${iteration}" "${step_scope}" "${i}" "${prior_results}" "${prior_step_states}"
                 return 0
                 ;;
             terminate)
+                step_states="$(linux_agent_update_step_state "${step_states}" "${i}" "terminated" 'null')"
+                step_states="$(linux_agent_skip_remaining_step_states "${step_states}" "${i}")"
                 linux_agent_log_step_status "${step}" "terminated"
                 skipped="$(linux_agent_skipped_steps_after "${plan_json}" "${i}")"
                 while IFS= read -r skipped_step; do
                     [[ -n "${skipped_step}" ]] && linux_agent_log_step_status "${skipped_step}" "skipped_unexecuted"
                 done < <(jq -c '.[]' <<<"${skipped}")
-                jq -cn --arg status "terminated" --arg execution_user "${execution_user}" --arg sudo_probe "${sudo_probe}" --argjson results "${results}" \
-                    '{status:$status, execution_user:$execution_user, sudo_probe:$sudo_probe, results:$results}'
+                execution_result="$(jq -cn --arg execution_user "${execution_user}" --arg sudo_probe "${sudo_probe}" --argjson results "${results}" \
+                    '{status:"terminated", execution_user:$execution_user, sudo_probe:$sudo_probe, results:$results}')"
+                linux_agent_finalize_work_plan_execution "${execution_result}" "${plan_json}" "${step_states}" "${iteration}" "${step_scope}" "${i}" "${prior_results}" "${prior_step_states}"
                 return 0
                 ;;
             skip)
@@ -1233,18 +1546,29 @@ linux_agent_execute_work_plan() {
                 skipped="$(linux_agent_skipped_steps_after "${plan_json}" "${i}")"
                 if [[ -z "${revision_request}" ]]; then
                     result="$(jq -cn '{ok:true, status:"skipped", exit_code:null, output:{action:"skipped_by_user", message:"用户跳过当前步骤。"}}')"
+                    step_states="$(linux_agent_update_step_state "${step_states}" "${i}" "skipped_user" "${result}")"
                     linux_agent_log_step_status "${step}" "skipped_user" "${result}"
-                    results="$(jq -cn --argjson prior "${results}" --argjson step "${step}" --argjson result "${result}" '$prior + [{step:$step, result:$result}]')"
+                    results="$(jq -cn \
+                        --argjson prior "${results}" \
+                        --arg step_key "$(jq -r --argjson index "${i}" '.[$index].key' <<<"${step_states}")" \
+                        --argjson step_index "${i}" \
+                        --argjson iteration "${iteration}" \
+                        --arg scope "${step_scope}" \
+                        --argjson step "${step}" \
+                        --argjson result "${result}" \
+                        '$prior + [{step_key:$step_key, step_index:$step_index, iteration:$iteration, scope:$scope, step:$step, result:$result}]')"
                     printf '已跳过当前步骤，继续执行后续步骤。\n' >&2
                     i=$((i + 1))
                     continue
                 fi
 
-                local revision_detail revised_plan revised_execution combined_results
+                local revision_detail revised_plan revised_execution revision_resume_state
                 revision_detail="$(jq -cn \
                     --arg revision_request "${revision_request}" \
                     --argjson remaining_steps "${skipped}" \
                     '{ok:true, status:"revision_requested", revision_request:$revision_request, remaining_step_count:($remaining_steps | length)}')"
+                step_states="$(linux_agent_update_step_state "${step_states}" "${i}" "revision_requested" "${revision_detail}")"
+                step_states="$(linux_agent_skip_remaining_step_states "${step_states}" "${i}")"
                 linux_agent_log_step_status "${step}" "revision_requested" "${revision_detail}"
                 while IFS= read -r skipped_step; do
                     [[ -n "${skipped_step}" ]] && linux_agent_log_step_status "${skipped_step}" "skipped_unexecuted"
@@ -1252,33 +1576,96 @@ linux_agent_execute_work_plan() {
 
                 if ! revised_plan="$(linux_agent_request_revised_work_plan "${user_input}" "${plan_json}" "${executed_steps}" "${step}" "${revision_request}" "${skipped}")"; then
                     result="$(jq -cn --arg error "${revised_plan}" '{ok:false, status:"revision_failed", output:{raw:$error}}')"
+                    step_states="$(linux_agent_update_step_state "${step_states}" "${i}" "failed" "${result}")"
                     linux_agent_log_step_status "${step}" "failed" "${result}"
-                    jq -cn --arg status "revision_failed" --arg execution_user "${execution_user}" --arg sudo_probe "${sudo_probe}" --argjson results "${results}" \
-                        '{status:$status, execution_user:$execution_user, sudo_probe:$sudo_probe, results:$results}'
+                    execution_result="$(jq -cn --arg execution_user "${execution_user}" --arg sudo_probe "${sudo_probe}" --argjson results "${results}" \
+                        '{status:"revision_failed", execution_user:$execution_user, sudo_probe:$sudo_probe, results:$results}')"
+                    linux_agent_finalize_work_plan_execution "${execution_result}" "${plan_json}" "${step_states}" "${iteration}" "${step_scope}" "${i}" "${prior_results}" "${prior_step_states}"
                     return 0
                 fi
-                revised_execution="$(linux_agent_execute_work_plan "${revised_plan}" "${user_input}")"
-                combined_results="$(jq -cn --argjson prior "${results}" --argjson next "$(jq '.results // []' <<<"${revised_execution}")" '$prior + $next')"
-                jq -c --argjson results "${combined_results}" '.results = $results' <<<"${revised_execution}"
+                revision_resume_state="$(jq -cn \
+                    --argjson prior_results "${prior_results}" \
+                    --argjson results "${results}" \
+                    --argjson prior_step_states "${prior_step_states}" \
+                    --argjson step_states "${step_states}" '
+                    {
+                        prior_results:($prior_results + $results),
+                        prior_step_states:($prior_step_states + $step_states)
+                    }
+                ')"
+                revised_execution="$(linux_agent_execute_work_plan \
+                    "${revised_plan}" \
+                    "${user_input}" \
+                    "${revision_resume_state}" \
+                    "${iteration}" \
+                    "${step_scope}.revision-${i}")"
+                printf '%s\n' "${revised_execution}"
                 return 0
                 ;;
         esac
 
-        linux_agent_log_step_status "${step}" "approved"
-        linux_agent_log_step_status "${step}" "running"
-        result="$(linux_agent_execute_step_command "${step}" "${review}")"
+        if ! result="$(linux_agent_require_step_status_event "${step}" "approved" "${review}")"; then
+            linux_agent_finalize_work_precondition_block \
+                "${result}" "${step}" "${plan_json}" "${step_states}" "${i}" \
+                "${iteration}" "${step_scope}" "${results}" "${prior_results}" \
+                "${prior_step_states}" "${execution_user}" "${sudo_probe}"
+            return 0
+        fi
+        local observer_scope observer_subject
+        observer_scope="step_$(jq -r '.executor_type' <<<"${step}")"
+        observer_subject="$(jq -cn --argjson step "${step}" '{kind:"work_step", step:$step}')"
+        if declare -F linux_agent_observer_execution_gate >/dev/null 2>&1 &&
+            ! result="$(linux_agent_observer_execution_gate "${observer_scope}" "${observer_subject}")"; then
+            :
+        else
+            if ! result="$(linux_agent_require_step_status_event "${step}" "running" "${review}")"; then
+                linux_agent_finalize_work_precondition_block \
+                    "${result}" "${step}" "${plan_json}" "${step_states}" "${i}" \
+                    "${iteration}" "${step_scope}" "${results}" "${prior_results}" \
+                    "${prior_step_states}" "${execution_user}" "${sudo_probe}"
+                return 0
+            fi
+            result="$(linux_agent_execute_step_command "${step}" "${review}")"
+        fi
         if [[ "${auto_approved}" -eq 1 ]]; then
             result="$(jq -c '. + {auto_approved:true}' <<<"${result}")"
         fi
-        results="$(jq -cn --argjson prior "${results}" --argjson step "${step}" --argjson result "${result}" '$prior + [{step:$step, result:$result}]')"
+        results="$(jq -cn \
+            --argjson prior "${results}" \
+            --arg step_key "$(jq -r --argjson index "${i}" '.[$index].key' <<<"${step_states}")" \
+            --argjson step_index "${i}" \
+            --argjson iteration "${iteration}" \
+            --arg scope "${step_scope}" \
+            --argjson step "${step}" \
+            --argjson result "${result}" \
+            '$prior + [{step_key:$step_key, step_index:$step_index, iteration:$iteration, scope:$scope, step:$step, result:$result}]')"
 
         if [[ "$(jq -r '.ok' <<<"${result}")" == "true" ]]; then
+            step_states="$(linux_agent_update_step_state "${step_states}" "${i}" "succeeded" "${result}")"
             linux_agent_log_step_status "${step}" "succeeded" "${result}"
             executed_steps="$(jq -cn --argjson prior "${executed_steps}" --argjson step "${step}" --argjson result "${result}" '$prior + [{step:$step, result:$result}]')"
             linux_agent_print_step_result_summary "${result}"
             linux_agent_print_step_output_preview "${result}"
         else
+            if [[ "$(jq -r '.status // ""' <<<"${result}")" == "blocked" ]]; then
+                status="blocked"
+                step_states="$(linux_agent_update_step_state "${step_states}" "${i}" "blocked" "${result}")"
+                step_states="$(linux_agent_skip_remaining_step_states "${step_states}" "${i}")"
+                linux_agent_log_step_status "${step}" "blocked" "${result}"
+                linux_agent_print_step_result_summary "${result}"
+                linux_agent_print_step_output_preview "${result}"
+                skipped="$(linux_agent_skipped_steps_after "${plan_json}" "${i}")"
+                while IFS= read -r skipped_step; do
+                    [[ -n "${skipped_step}" ]] && linux_agent_log_step_status "${skipped_step}" "skipped_unexecuted"
+                done < <(jq -c '.[]' <<<"${skipped}")
+                execution_result="$(jq -cn --arg status "${status}" --arg execution_user "${execution_user}" --arg sudo_probe "${sudo_probe}" --argjson results "${results}" \
+                    '{status:$status, execution_user:$execution_user, sudo_probe:$sudo_probe, results:$results}')"
+                linux_agent_finalize_work_plan_execution "${execution_result}" "${plan_json}" "${step_states}" "${iteration}" "${step_scope}" "${i}" "${prior_results}" "${prior_step_states}"
+                return 0
+            fi
             status="failed"
+            step_states="$(linux_agent_update_step_state "${step_states}" "${i}" "failed" "${result}")"
+            step_states="$(linux_agent_skip_remaining_step_states "${step_states}" "${i}")"
             linux_agent_log_step_status "${step}" "failed" "${result}"
             linux_agent_print_step_result_summary "${result}"
             linux_agent_print_step_output_preview "${result}"
@@ -1287,14 +1674,16 @@ linux_agent_execute_work_plan() {
                 [[ -n "${skipped_step}" ]] && linux_agent_log_step_status "${skipped_step}" "skipped_unexecuted"
             done < <(jq -c '.[]' <<<"${skipped}")
             linux_agent_request_repair_plan "${user_input}" "${plan_json}" "${executed_steps}" "${step}" "${result}" "${skipped}"
-            jq -cn --arg status "${status}" --arg execution_user "${execution_user}" --arg sudo_probe "${sudo_probe}" --argjson results "${results}" \
-                '{status:$status, execution_user:$execution_user, sudo_probe:$sudo_probe, results:$results}'
+            execution_result="$(jq -cn --arg status "${status}" --arg execution_user "${execution_user}" --arg sudo_probe "${sudo_probe}" --argjson results "${results}" \
+                '{status:$status, execution_user:$execution_user, sudo_probe:$sudo_probe, results:$results}')"
+            linux_agent_finalize_work_plan_execution "${execution_result}" "${plan_json}" "${step_states}" "${iteration}" "${step_scope}" "${i}" "${prior_results}" "${prior_step_states}"
             return 0
         fi
 
         i=$((i + 1))
     done
 
-    jq -cn --arg status "${status}" --arg execution_user "${execution_user}" --arg sudo_probe "${sudo_probe}" --argjson results "${results}" \
-        '{status:$status, execution_user:$execution_user, sudo_probe:$sudo_probe, results:$results}'
+    execution_result="$(jq -cn --arg status "${status}" --arg execution_user "${execution_user}" --arg sudo_probe "${sudo_probe}" --argjson results "${results}" \
+        '{status:$status, execution_user:$execution_user, sudo_probe:$sudo_probe, results:$results}')"
+    linux_agent_finalize_work_plan_execution "${execution_result}" "${plan_json}" "${step_states}" "${iteration}" "${step_scope}" "${step_count}" "${prior_results}" "${prior_step_states}"
 }

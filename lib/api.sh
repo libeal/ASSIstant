@@ -2,6 +2,11 @@
 
 set -euo pipefail
 
+if ! declare -F linux_agent_prepare_work_request >/dev/null 2>&1; then
+    # shellcheck source=workflow.sh
+    source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/workflow.sh"
+fi
+
 linux_agent_api_payload() {
     local raw="${1:-}"
     if [[ -z "${raw}" && ! -t 0 ]]; then
@@ -9,7 +14,19 @@ linux_agent_api_payload() {
     fi
     [[ -n "${raw}" ]] || raw='{}'
     if ! jq -e . >/dev/null 2>&1 <<<"${raw}"; then
-        jq -cn --arg raw "${raw}" '{ok:false, status:"invalid_json", error:"API payload must be valid JSON.", raw_preview:($raw[0:200])}'
+        jq -cn \
+            --arg raw "${raw}" \
+            --arg request_id "${LINUX_AGENT_REQUEST_ID:-}" '
+            {
+                ok:false,
+                status:"invalid_json",
+                error:"API payload must be valid JSON.",
+                code:"invalid_json",
+                message:"API payload must be valid JSON.",
+                retryable:false,
+                request_id:$request_id,
+                details:{raw_preview:($raw[0:200])}
+            }'
         return 1
     fi
     jq -c . <<<"${raw}"
@@ -18,7 +35,25 @@ linux_agent_api_payload() {
 linux_agent_api_error() {
     local status="$1"
     local message="$2"
-    jq -cn --arg status "${status}" --arg error "${message}" '{ok:false, status:$status, error:$error}'
+    local retryable=false schema_file="${LINUX_AGENT_ROOT}/schema/domain.json"
+    if [[ -f "${schema_file}" ]]; then
+        retryable="$(jq -r --arg code "${status}" '.error_codes[$code].retryable // false' "${schema_file}" 2>/dev/null || printf 'false')"
+    fi
+    jq -cn \
+        --arg status "${status}" \
+        --arg message "${message}" \
+        --arg request_id "${LINUX_AGENT_REQUEST_ID:-}" \
+        --argjson retryable "${retryable}" '
+        {
+            ok:false,
+            status:$status,
+            error:$message,
+            code:$status,
+            message:$message,
+            retryable:$retryable,
+            request_id:$request_id,
+            details:{}
+        }'
 }
 
 linux_agent_api_web_config_json() {
@@ -27,12 +62,20 @@ linux_agent_api_web_config_json() {
         --arg host "$(linux_agent_config_get_default '.web.host' '127.0.0.1')" \
         --arg port "$(linux_agent_config_get_default '.web.port' '8765')" \
         --arg job_retention_hours "$(linux_agent_config_get_default '.web.job_retention_hours' '24')" \
+        --arg max_active_jobs "$(linux_agent_config_get_default '.web.max_active_jobs' '4')" \
+        --arg job_timeout_sec "$(linux_agent_config_get_default '.web.job_timeout_sec' '900')" \
+        --arg max_job_attempts "$(linux_agent_config_get_default '.web.max_job_attempts' '3')" \
+        --arg cancel_grace_sec "$(linux_agent_config_get_default '.web.cancel_grace_sec' '2')" \
         --arg token "$(linux_agent_config_get_default '.web.token' '')" \
         '{
             enabled:$enabled,
             host:(if $host == "" then "127.0.0.1" else $host end),
             port:($port | tonumber? // 8765),
             job_retention_hours:($job_retention_hours | tonumber? // 24),
+            max_active_jobs:($max_active_jobs | tonumber? // 4),
+            job_timeout_sec:($job_timeout_sec | tonumber? // 900),
+            max_job_attempts:($max_job_attempts | tonumber? // 3),
+            cancel_grace_sec:($cancel_grace_sec | tonumber? // 2),
             token_configured:($token != "")
         }'
 }
@@ -82,6 +125,8 @@ linux_agent_api_tools_list() {
 linux_agent_api_audit_list() {
     local payload="$1"
     local limit include_runtime query entries item path session_id size mtime count summary haystack
+    local segment_path segment_size segment_mtime
+    local -a segment_files=()
     limit="$(jq -r '.limit // 50' <<<"${payload}")"
     [[ "${limit}" =~ ^[0-9]+$ && "${limit}" -gt 0 ]] || limit=50
     include_runtime="$(jq -r '.include_runtime // false' <<<"${payload}")"
@@ -89,15 +134,26 @@ linux_agent_api_audit_list() {
     entries='[]'
     count=0
 
-    while IFS= read -r item; do
+    while IFS= read -r -d '' item; do
         [[ -n "${item}" ]] || continue
-        path="${item#* }"
+        path="${item#*$'\t'}"
         session_id="$(basename "${path}" .jsonl)"
+        [[ "${session_id}" =~ ^[A-Za-z0-9._-]+$ ]] || continue
         if [[ "${include_runtime}" != "true" && "${session_id}" == web_* ]]; then
             continue
         fi
-        size="$(stat -c '%s' "${path}" 2>/dev/null || printf '0')"
-        mtime="$(stat -c '%Y' "${path}" 2>/dev/null || printf '0')"
+        mapfile -t segment_files < <(linux_agent_audit_segment_files "${session_id}" || true)
+        ((${#segment_files[@]} > 0)) || continue
+        size=0
+        mtime=0
+        for segment_path in "${segment_files[@]}"; do
+            segment_size="$(stat -c '%s' "${segment_path}" 2>/dev/null || printf '0')"
+            segment_mtime="$(stat -c '%Y' "${segment_path}" 2>/dev/null || printf '0')"
+            size=$((size + segment_size))
+            if ((segment_mtime > mtime)); then
+                mtime="${segment_mtime}"
+            fi
+        done
         summary="$(jq -s -c \
             --arg session_id "${session_id}" \
             --arg path "${path}" \
@@ -173,7 +229,7 @@ linux_agent_api_audit_list() {
                 size_bytes:$size_bytes,
                 mtime:$mtime
               }
-        ' "${path}" 2>/dev/null || jq -cn \
+        ' "${segment_files[@]}" 2>/dev/null || jq -cn \
             --arg session_id "${session_id}" \
             --arg path "${path}" \
             --argjson size_bytes "${size}" \
@@ -193,14 +249,16 @@ linux_agent_api_audit_list() {
             --argjson prior "${entries}" \
             --argjson summary "${summary}" \
             '$prior + [$summary]')"
-    done < <(find "${LINUX_AGENT_LOG_DIR}" -maxdepth 1 -type f -name '*.jsonl' -printf '%T@ %p\n' 2>/dev/null | sort -rn)
+    done < <(find "${LINUX_AGENT_LOG_DIR}" -maxdepth 1 -type f -name '*.jsonl' -printf '%T@\t%p\0' 2>/dev/null | sort -z -nr)
 
     jq -cn --argjson entries "${entries}" '{ok:true, status:"listed", sessions:$entries}'
 }
 
 linux_agent_api_audit_read() {
     local payload="$1"
-    local session_id log_file report_file tmp_root
+    local session_id log_file report_file tmp_root integrity_report read_rc=0
+    local snapshot_dir="" snapshot_log=""
+    local -a log_segments=()
     session_id="$(jq -r '.session_id // empty' <<<"${payload}")"
     if [[ -z "${session_id}" || ! "${session_id}" =~ ^[A-Za-z0-9_.-]+$ ]]; then
         linux_agent_api_error "invalid_session_id" "session_id is required and must be a safe file name."
@@ -211,68 +269,63 @@ linux_agent_api_audit_read() {
         linux_agent_api_error "not_found" "Audit session not found."
         return 0
     fi
-
     tmp_root="${LINUX_AGENT_TMP_DIR:-/tmp}"
-    report_file="$(mktemp "${tmp_root%/}/audit-report.XXXXXX")"
-    if ! linux_agent_show_audit "${session_id}" > "${report_file}"; then
-        rm -f "${report_file}"
+    if ! snapshot_dir="$(mktemp -d "${tmp_root%/}/audit-read.XXXXXX")"; then
+        linux_agent_api_error "read_failed" "Audit snapshot directory could not be created."
+        return 0
+    fi
+    if ! snapshot_log="$(linux_agent_audit_snapshot "${session_id}" "${snapshot_dir}" 2>/dev/null)"; then
+        rmdir "${snapshot_dir}" 2>/dev/null || true
+        linux_agent_api_error "read_failed" "Audit session could not be snapshotted."
+        return 0
+    fi
+    mapfile -t log_segments < <(linux_agent_audit_segment_paths "${snapshot_log}" || true)
+    if ((${#log_segments[@]} == 0)); then
+        rm -f -- "${snapshot_log}"
+        rmdir "${snapshot_dir}" 2>/dev/null || true
+        linux_agent_api_error "read_failed" "Audit snapshot did not contain a live segment."
+        return 0
+    fi
+
+    report_file="${snapshot_dir}/report.txt"
+    if ! linux_agent_show_audit "${session_id}" "${snapshot_log}" >"${report_file}"; then
+        rm -f -- "${report_file}" "${snapshot_log}.lock" "${log_segments[@]}"
+        rmdir "${snapshot_dir}" 2>/dev/null || true
         linux_agent_api_error "read_failed" "Audit session could not be rendered."
         return 0
     fi
-    jq -n --arg session_id "${session_id}" --rawfile report "${report_file}" --slurpfile events "${log_file}" \
-        '{ok:true, status:"read", session_id:$session_id, report:$report, events:$events}'
-    rm -f "${report_file}"
+    integrity_report="$(linux_agent_audit_verify_chain "${session_id}" "${snapshot_log}" 2>/dev/null || true)"
+    if ! jq -e 'type == "object"' >/dev/null 2>&1 <<<"${integrity_report}"; then
+        integrity_report='{"ok":false,"status":"verify_failed","breaks":[]}'
+    fi
+    jq -s \
+        --arg session_id "${session_id}" \
+        --rawfile report "${report_file}" \
+        --argjson integrity "${integrity_report}" \
+        '{
+            ok:true,
+            status:"read",
+            session_id:$session_id,
+            report:$report,
+            integrity:$integrity,
+            integrity_ok:($integrity.ok // false),
+            events:.
+        }' \
+        "${log_segments[@]}" || read_rc=$?
+    rm -f -- "${report_file}" "${snapshot_log}.lock" "${log_segments[@]}"
+    rmdir "${snapshot_dir}" 2>/dev/null || true
+    if ((read_rc != 0)); then
+        linux_agent_api_error "read_failed" "Audit session events could not be parsed."
+    fi
 }
 
 linux_agent_api_work_prepare_response() {
-    local user_input="$1"
-    local mode="${2:-work}"
-    local topic context_json request_context response_json safe_response
-
-    linux_agent_log_event "received" "$(jq -cn --arg input "${user_input}" --arg mode "${mode}" '{input:$input, mode:$mode}')"
-    topic="$(linux_agent_detect_topic "${user_input}")"
-    context_json="$(linux_agent_sense_topic "${topic}")"
-    context_json="$(linux_agent_redact_json "${context_json}")"
-    linux_agent_log_event "sensed" "${context_json}"
-
-    request_context="$(linux_agent_build_request_context "${user_input}" "${context_json}" "work")"
-    request_context="$(linux_agent_add_agent_loop_context "${request_context}")"
-    request_context="$(linux_agent_add_skill_context "${request_context}" "work")"
-    request_context="$(linux_agent_add_mcp_context "${request_context}" "work")"
-    linux_agent_log_event "request_context_built" "${request_context}"
-
-    linux_agent_record_ai_request_files "${request_context}"
-    response_json="$(linux_agent_call_ai_with_context "${user_input}" "${request_context}" "work_plan" "${context_json}")"
-    response_json="$(linux_agent_normalize_model_response "${response_json}")"
-    linux_agent_store_thinking_summary "${response_json}" "initial"
-    if linux_agent_ai_response_is_error "${response_json}"; then
-        linux_agent_log_event "ai_failed" "${response_json}"
-        jq -cn \
-            --arg status "$(jq -r '.status' <<<"${response_json}")" \
-            --arg error "$(linux_agent_ai_error_text "${response_json}")" \
-            --argjson context "${context_json}" \
-            --argjson response "${response_json}" \
-            '{ok:false, status:$status, error:$error, context:$context, response:$response}'
-        return 0
-    fi
-    if ! linux_agent_validate_work_response "${response_json}"; then
-        linux_agent_log_event "ai_invalid_response" "${response_json}"
-        jq -cn \
-            --argjson context "${context_json}" \
-            --argjson response "${response_json}" \
-            '{ok:false, status:"ai_invalid_response", error:"模型响应不符合 work schema。", context:$context, response:$response}'
-        return 0
-    fi
-
-    safe_response="$(linux_agent_response_without_thinking "${response_json}")"
-    linux_agent_log_event "planned" "${safe_response}"
-    jq -cn --argjson context "${context_json}" --argjson response "${response_json}" \
-        '{ok:true, context:$context, response:$response}'
+    linux_agent_prepare_work_request "$@"
 }
 
 linux_agent_api_work_run() {
     local payload="$1"
-    local user_input prepared response_json context_json response_type execution_json final_status compact answer used_agent_loop execution_state_json
+    local user_input prepared response_json execution_plan_json context_json response_type execution_json final_status answer used_agent_loop execution_state_json execution_selection
     user_input="$(jq -r '.input // .request // empty' <<<"${payload}")"
     if [[ -z "${user_input}" ]]; then
         linux_agent_api_error "missing_input" "input is required."
@@ -309,7 +362,7 @@ linux_agent_api_work_run() {
         linux_agent_log_event "received" "$(jq -cn --arg input "${user_input}" '{input:$input, mode:"work"}')"
         linux_agent_log_event "planned" "$(linux_agent_response_without_thinking "${response_json}")"
     else
-        prepared="$(linux_agent_api_work_prepare_response "${user_input}" "work")"
+        linux_agent_capture_prepared_work_request prepared "${user_input}" "work"
         if [[ "$(jq -r '.ok // false' <<<"${prepared}")" != "true" ]]; then
             final_status="$(jq -r '.status // "ai_failed"' <<<"${prepared}")"
             linux_agent_log_event "finished" "$(jq -cn --arg status "${final_status}" '{status:$status}')"
@@ -338,37 +391,66 @@ linux_agent_api_work_run() {
         return 0
     fi
 
-    if [[ "$(linux_agent_agent_loop_enabled)" == "true" ]]; then
-        used_agent_loop=true
-        execution_json="$(linux_agent_run_agent_loop "${user_input}" "work" "${context_json}" "${response_json}" "${execution_state_json}")"
-    else
-        used_agent_loop=false
-        execution_json="$(linux_agent_execute_work_plan "${response_json}" "${user_input}" "${execution_state_json}")"
+    execution_plan_json="${response_json}"
+    if [[ "$(jq -r '.agent_loop // false' <<<"${execution_state_json}")" != "true" ]] &&
+        jq -e '.current_plan | type == "object"' >/dev/null 2>&1 <<<"${execution_state_json}"; then
+        execution_plan_json="$(jq -c '.current_plan' <<<"${execution_state_json}")"
     fi
+    execution_selection="$(linux_agent_execute_prepared_work \
+        "${user_input}" \
+        "work" \
+        "${context_json}" \
+        "${execution_plan_json}" \
+        "${execution_state_json}")"
+    used_agent_loop="$(jq -r '.used_agent_loop' <<<"${execution_selection}")"
+    execution_json="$(jq -c '.execution' <<<"${execution_selection}")"
     linux_agent_log_event "executed" "${execution_json}"
     final_status="$(jq -r '.status // "unknown"' <<<"${execution_json}")"
     linux_agent_log_event "finished" "$(jq -cn --arg status "${final_status}" '{status:$status}')"
     if [[ "${used_agent_loop}" != "true" ]]; then
         linux_agent_record_conversation_turn "work" "${user_input}" "$(jq -c '{status:.status, results:(.results | length)}' <<<"${execution_json}")" "${final_status}" "request"
     fi
-    execution_state_json="$(jq -c '
-        {
-            next_step_index:((.results // []) | length),
-            approval_step_id:(.approval_step.id // null),
-            status:(.status // null),
-            results:(.results // [])
-        }
+    execution_state_json="$(jq -c \
+        --argjson used_agent_loop "${used_agent_loop}" '
+        if (.resume_state | type) == "object" then
+            .resume_state + {
+                agent_loop:$used_agent_loop,
+                approval_step_id:(.approval_step.id // null),
+                status:(.status // null)
+            }
+        else
+            {
+                agent_loop:$used_agent_loop,
+                current_plan:(.current_plan // null),
+                next_step_index:(.next_step_index // ((.results // []) | length)),
+                approval_step_id:(.approval_step.id // null),
+                status:(.status // null),
+                results:(.resume_results // .results // []),
+                step_states:(.current_step_states // [])
+            }
+        end
     ' <<<"${execution_json}")"
-    jq -cn --arg status "${final_status}" --argjson context "${context_json}" --argjson response "${response_json}" --argjson protocol "$(linux_agent_protocol_for_work "${final_status}" "${response_json}" "${execution_json}")" --argjson execution_state "${execution_state_json}" \
-        '{
+    printf '%s\n%s\n%s\n%s\n' \
+        "${context_json}" \
+        "${response_json}" \
+        "$(linux_agent_protocol_for_work "${final_status}" "${response_json}" "${execution_json}")" \
+        "${execution_state_json}" |
+        jq -cs --arg status "${final_status}" \
+            '{
+            context:.[0],
+            response:.[1],
+            protocol:.[2],
+            execution_state:.[3]
+        } as $input
+        | {
             ok:($status == "executed" or $status == "answered"),
             status:$status,
-            context:$context,
-            response:$response,
-            timeline:$protocol.timeline,
-            approval_card:$protocol.approval_card,
-            output_blocks:$protocol.output_blocks,
-            execution_state:$execution_state
+            context:$input.context,
+            response:$input.response,
+            timeline:$input.protocol.timeline,
+            approval_card:$input.protocol.approval_card,
+            output_blocks:$input.protocol.output_blocks,
+            execution_state:$input.execution_state
         }'
 }
 
@@ -402,7 +484,7 @@ linux_agent_api_script_review() {
 
 linux_agent_api_script_run() {
     local payload="$1"
-    local review_json ref args result final_status script_path subject
+    local review_json ref args result final_status script_path subject envelope
     review_json="$(linux_agent_api_script_review "${payload}")"
     ref="$(jq -r '.ref // empty' <<<"${review_json}")"
     args="$(jq -c '.arguments // {}' <<<"${review_json}")"
@@ -443,14 +525,12 @@ linux_agent_api_script_run() {
         final_status="failed"
     fi
     linux_agent_log_event "finished" "$(jq -cn --arg status "${final_status}" '{status:$status}')"
-    jq -cn --arg status "${final_status}" --argjson review_response "${review_json}" --argjson protocol "$(linux_agent_protocol_for_single_execution "Skill 输出" "${result}")" \
-        '{
-            ok:($status == "executed"),
-            status:$status,
-            timeline:(($review_response.timeline // []) + $protocol.timeline),
-            approval_card:null,
-            output_blocks:$protocol.output_blocks
-        }'
+    envelope="$(linux_agent_protocol_envelope_for_single_execution "Skill 输出" "${result}")"
+    jq -cn --argjson envelope "${envelope}" --argjson review_response "${review_json}" '
+        $envelope + {
+            timeline:(($review_response.timeline // []) + $envelope.timeline)
+        }
+    '
 }
 
 linux_agent_api_terminal_review() {
@@ -474,9 +554,12 @@ linux_agent_api_terminal_review() {
         }'
 }
 
+# These mode flags are consumed by functions from executor.sh and
+# orchestrator.sh after the modules are sourced into the same shell.
+# shellcheck disable=SC2034
 linux_agent_api_terminal_run() {
     local payload="$1"
-    local command_text stdout
+    local command_text stdout approval_card
     command_text="$(jq -r '.command // empty' <<<"${payload}")"
     if [[ -z "${command_text}" ]]; then
         linux_agent_api_error "missing_command" "command is required."
@@ -486,13 +569,14 @@ linux_agent_api_terminal_run() {
     LINUX_AGENT_API_MODE=1
     stdout="$(linux_agent_process_terminal_request "${command_text}" "$(jq -r '.approve // false' <<<"${payload}")")"
     if jq -e . >/dev/null 2>&1 <<<"${stdout}"; then
-        jq -cn --argjson result "${stdout}" --argjson protocol "$(linux_agent_protocol_for_single_execution "终端输出" "${stdout}")" --argjson approval_card "$(linux_agent_approval_card_for_terminal "${command_text}" "$(jq -c '.review // {}' <<<"${stdout}")")" '{
-            ok:($result.ok // false),
-            status:($result.status // "unknown"),
-            timeline:$protocol.timeline,
-            approval_card:(if ($result.status // "") == "approval_required" then $approval_card else null end),
-            output_blocks:$protocol.output_blocks
-        }'
+        approval_card="$(linux_agent_approval_card_for_terminal "${command_text}" "$(jq -c '.review // {}' <<<"${stdout}")")"
+        if [[ "$(jq -r '.status // ""' <<<"${stdout}")" != "approval_required" ]]; then
+            approval_card='null'
+        fi
+        linux_agent_protocol_envelope_for_single_execution \
+            "终端输出" \
+            "${stdout}" \
+            "${approval_card}"
     else
         jq -cn --arg raw "${stdout}" '{ok:false, status:"invalid_output", timeline:[], approval_card:null, output_blocks:[{kind:"stdout", title:"原始输出", text:$raw, truncated_bytes:0}]}'
     fi
@@ -579,7 +663,7 @@ linux_agent_api_needs_session() {
     local resource="${1:-}"
     local action="${2:-}"
     case "${resource}:${action}" in
-        work:run|script:run|terminal:run|edit:plan|edit:apply|skills:materialize)
+        work:run | script:run | terminal:run | edit:plan | edit:apply | skills:materialize)
             printf 'true\n'
             ;;
         *)
@@ -588,7 +672,7 @@ linux_agent_api_needs_session() {
     esac
 }
 
-linux_agent_api_dispatch() {
+linux_agent_api_dispatch_raw() {
     local resource="${1:-health}"
     local action="${2:-}"
     local raw_payload="${3:-}"
@@ -600,16 +684,16 @@ linux_agent_api_dispatch() {
     }
 
     case "${resource}:${action}" in
-        health:|"health:get")
+        health: | "health:get")
             linux_agent_api_health
             ;;
         config:web)
             jq -cn --argjson web "$(linux_agent_api_web_config_json)" '{ok:true, status:"ok", web:$web}'
             ;;
-        doctor:|doctor:run)
+        doctor: | doctor:run)
             jq -cn --argjson doctor "$(linux_agent_doctor)" '{ok:($doctor.ok // false), status:"checked", doctor:$doctor}'
             ;;
-        sense:|sense:get)
+        sense: | sense:get)
             local topic sensed
             topic="$(jq -r '.topic // "all"' <<<"${payload}")"
             sensed="$(linux_agent_sense_topic "${topic}")"
@@ -626,7 +710,7 @@ linux_agent_api_dispatch() {
             skill_name="$(jq -r '.skill // empty' <<<"${payload}")"
             linux_agent_materialize_skill "${skill_name}"
             ;;
-        mcp:|mcp:list)
+        mcp: | mcp:list)
             linux_agent_mcp_list
             ;;
         mcp:validate)
@@ -643,6 +727,17 @@ linux_agent_api_dispatch() {
             ;;
         audit:read)
             linux_agent_api_audit_read "${payload}"
+            ;;
+        audit:verify)
+            local verify_session verify_report
+            verify_session="$(jq -r '.session_id // empty' <<<"${payload}")"
+            verify_report="$(linux_agent_audit_verify_chain "${verify_session}")" || true
+            jq -cn --argjson report "${verify_report}" '
+                {ok:($report.ok // false),
+                 status:(if ($report.status // "") != "" then $report.status
+                         elif ($report.ok // false) then "verified"
+                         else "integrity_broken" end),
+                 report:$report}'
             ;;
         work:run)
             if ! linux_agent_remote_api_key_transmission_allowed; then
@@ -680,4 +775,72 @@ linux_agent_api_dispatch() {
             linux_agent_api_error "unknown_api_route" "Unsupported API route."
             ;;
     esac
+}
+
+linux_agent_api_normalize_envelope() {
+    local schema_file="${LINUX_AGENT_ROOT}/schema/domain.json"
+    local schema='{"schema_version":1,"protocol_version":"1.0.0","error_codes":{}}'
+    if [[ -f "${schema_file}" ]] && jq -e 'type == "object"' "${schema_file}" >/dev/null 2>&1; then
+        schema="$(jq -c . "${schema_file}")"
+    fi
+    jq -c \
+        --argjson schema "${schema}" \
+        --arg request_id "${LINUX_AGENT_REQUEST_ID:-}" '
+        if type != "object" then .
+        else
+            . + {
+                schema_version:($schema.schema_version // 1),
+                protocol_version:($schema.protocol_version // "1.0.0")
+            }
+            | if has("timeline") then
+                . + {timeline_semantics:(.timeline_semantics // "step_projection")}
+              else . end
+            | if .ok == false then
+                (.code // .status // "internal_error") as $code
+                | (.message // .error // $code | tostring) as $message
+                | . + {
+                    status:$code,
+                    error:$message,
+                    code:$code,
+                    message:$message,
+                    retryable:(
+                        if has("retryable") and (.retryable | type) == "boolean" then
+                            .retryable
+                        else
+                            ($schema.error_codes[$code].retryable // false)
+                        end
+                    ),
+                    request_id:(.request_id // $request_id),
+                    details:(if (.details | type) == "object" then .details else {} end)
+                }
+              else . end
+        end
+    '
+}
+
+linux_agent_api_dispatch() {
+    local output_file dispatch_rc=0 render_rc=0
+    if ! output_file="$(mktemp "${LINUX_AGENT_TMP_DIR:-/tmp}/api-dispatch.XXXXXX")"; then
+        linux_agent_api_error "internal_error" "Could not allocate the API response buffer."
+        return 1
+    fi
+
+    # Run the adapter in the current shell so session-wide audit state (for
+    # example AI file manifests and the final business status) survives until
+    # linux_agent_finish_run performs session teardown.
+    linux_agent_api_dispatch_raw "$@" >"${output_file}" || dispatch_rc=$?
+    if jq -e 'type == "object"' "${output_file}" >/dev/null 2>&1; then
+        linux_agent_api_normalize_envelope <"${output_file}" || render_rc=$?
+    else
+        cat "${output_file}" || render_rc=$?
+    fi
+    rm -f "${output_file}"
+
+    if ((dispatch_rc != 0)); then
+        return "${dispatch_rc}"
+    fi
+    if ((render_rc != 0)); then
+        return "${render_rc}"
+    fi
+    return "${dispatch_rc}"
 }

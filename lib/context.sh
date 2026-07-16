@@ -34,16 +34,23 @@ linux_agent_persist_conversation_history() {
     dir="$(dirname "${history_file}")"
     mkdir -p "${dir}"
     tmp_file="${history_file}.$$.$RANDOM.tmp"
-    printf '%s\n' "${LINUX_AGENT_CONVERSATION_HISTORY}" > "${tmp_file}"
-    mv "${tmp_file}" "${history_file}"
+    if ! (umask 077 && printf '%s\n' "${LINUX_AGENT_CONVERSATION_HISTORY}" >"${tmp_file}"); then
+        rm -f "${tmp_file}"
+        return 1
+    fi
+    if ! chmod 600 "${tmp_file}" || ! mv "${tmp_file}" "${history_file}"; then
+        rm -f "${tmp_file}"
+        return 1
+    fi
+    chmod 600 "${history_file}"
 }
 
 linux_agent_history_lock_acquire() {
-    local history_file lock_dir attempt
+    local history_file lock_dir
     history_file="$(linux_agent_conversation_history_file 2>/dev/null || true)"
     [[ -n "${history_file}" ]] || return 1
     lock_dir="${history_file}.lock"
-    for attempt in $(seq 1 80); do
+    for _ in $(seq 1 80); do
         if mkdir "${lock_dir}" 2>/dev/null; then
             printf '%s\n' "${lock_dir}"
             return 0
@@ -125,13 +132,26 @@ linux_agent_record_conversation_turn() {
     local status="${4:-completed}"
     local turn_type="${5:-request}"
     local metadata="${6:-}"
-    local lock_dir normalized_history timestamp
+    local lock_dir normalized_history timestamp audit_payload
 
     if [[ -z "${metadata}" ]]; then
         metadata='{}'
     fi
     if ! jq -e 'type == "object"' <<<"${metadata}" >/dev/null 2>&1; then
         metadata='{}'
+    fi
+
+    # History is durable business state.  Record the intent before acquiring
+    # its lock or changing the file so a mandatory audit failure cannot be
+    # hidden by callers that only consume this function's side effect.
+    if declare -F linux_agent_audit_require_event >/dev/null 2>&1 &&
+        [[ -n "${LINUX_AGENT_AUDIT_LOG:-}" ]]; then
+        audit_payload="$(jq -cn \
+            --arg mode "${mode}" \
+            --arg status "${status}" \
+            --arg turn_type "${turn_type}" \
+            '{mode:$mode, status:$status, turn_type:$turn_type}')"
+        linux_agent_audit_require_event "history_write_started" "${audit_payload}" || return $?
     fi
 
     lock_dir="$(linux_agent_history_lock_acquire 2>/dev/null || true)"

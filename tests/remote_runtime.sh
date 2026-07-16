@@ -22,8 +22,8 @@ SOURCE_DATE_EPOCH=0 bash "${ROOT_DIR}/scripts/build-remote-release.sh" v0.0.0-te
 
 run_remote_cli() {
     XDG_RUNTIME_DIR="${runtime_base}" \
-    LINUX_AGENT_ALLOW_INSECURE_TEST_URL=1 \
-    LINUX_AGENT_RELEASE_BASE_URL="file://${release_dir}" \
+        LINUX_AGENT_ALLOW_INSECURE_TEST_URL=1 \
+        LINUX_AGENT_RELEASE_BASE_URL="file://${release_dir}" \
         bash "${release_dir}/linux-agent-cli.sh" "$@"
 }
 
@@ -36,21 +36,21 @@ jq -e '
 ' <<<"${doctor_json}" >/dev/null
 [[ -z "$(find "${runtime_base}" -mindepth 1 -maxdepth 1 -print -quit)" ]]
 
-piped_doctor_json="$(curl -fsSL "file://${release_dir}/linux-agent-cli.sh" \
-    | XDG_RUNTIME_DIR="${runtime_base}" \
-      LINUX_AGENT_ALLOW_INSECURE_TEST_URL=1 \
-      LINUX_AGENT_RELEASE_BASE_URL="file://${release_dir}" \
-      bash -s -- doctor)"
+piped_doctor_json="$(curl -fsSL "file://${release_dir}/linux-agent-cli.sh" |
+    XDG_RUNTIME_DIR="${runtime_base}" \
+        LINUX_AGENT_ALLOW_INSECURE_TEST_URL=1 \
+        LINUX_AGENT_RELEASE_BASE_URL="file://${release_dir}" \
+        bash -s -- doctor)"
 jq -e '.ok == true and .remote.enabled == true' <<<"${piped_doctor_json}" >/dev/null
 [[ -z "$(find "${runtime_base}" -mindepth 1 -maxdepth 1 -print -quit)" ]]
 
 web_stdout="${tmp_root}/remote-web.stdout"
 web_stderr="${tmp_root}/remote-web.stderr"
-curl -fsSL "file://${release_dir}/linux-agent-web.sh" \
-    | XDG_RUNTIME_DIR="${runtime_base}" \
-      LINUX_AGENT_ALLOW_INSECURE_TEST_URL=1 \
-      LINUX_AGENT_RELEASE_BASE_URL="file://${release_dir}" \
-      bash >"${web_stdout}" 2>"${web_stderr}" &
+curl -fsSL "file://${release_dir}/linux-agent-web.sh" |
+    XDG_RUNTIME_DIR="${runtime_base}" \
+        LINUX_AGENT_ALLOW_INSECURE_TEST_URL=1 \
+        LINUX_AGENT_RELEASE_BASE_URL="file://${release_dir}" \
+        bash >"${web_stdout}" 2>"${web_stderr}" &
 web_pid="$!"
 web_token=""
 for _ in $(seq 1 100); do
@@ -61,8 +61,8 @@ for _ in $(seq 1 100); do
         web_token="$(<"${token_file}")"
     fi
     if [[ -n "${web_token}" ]] && curl -fsS -H "Authorization: Bearer ${web_token}" \
-        http://127.0.0.1:8765/api/health \
-        | jq -e '.ok == true and .remote.enabled == true and .remote.release_version == "v0.0.0-test"' >/dev/null; then
+        http://127.0.0.1:8765/api/health |
+        jq -e '.ok == true and .remote.enabled == true and .remote.release_version == "v0.0.0-test"' >/dev/null; then
         break
     fi
     sleep 0.1
@@ -113,11 +113,11 @@ web_pid=""
 sleep 0.2
 signal_stdout="${tmp_root}/remote-web-signal.stdout"
 signal_stderr="${tmp_root}/remote-web-signal.stderr"
-curl -fsSL "file://${release_dir}/linux-agent-web.sh" \
-    | XDG_RUNTIME_DIR="${runtime_base}" \
-      LINUX_AGENT_ALLOW_INSECURE_TEST_URL=1 \
-      LINUX_AGENT_RELEASE_BASE_URL="file://${release_dir}" \
-      bash >"${signal_stdout}" 2>"${signal_stderr}" &
+curl -fsSL "file://${release_dir}/linux-agent-web.sh" |
+    XDG_RUNTIME_DIR="${runtime_base}" \
+        LINUX_AGENT_ALLOW_INSECURE_TEST_URL=1 \
+        LINUX_AGENT_RELEASE_BASE_URL="file://${release_dir}" \
+        bash >"${signal_stdout}" 2>"${signal_stderr}" &
 web_pid="$!"
 signal_token=""
 for _ in $(seq 1 100); do
@@ -159,7 +159,7 @@ jq -e '
 ' <<<"${materialized}" >/dev/null
 
 cp "${release_dir}/linux-agent-skill-os-deep-inspect.tar.gz" "${tmp_root}/valid-skill.tar.gz"
-printf 'corrupt' >> "${release_dir}/linux-agent-skill-os-deep-inspect.tar.gz"
+printf 'corrupt' >>"${release_dir}/linux-agent-skill-os-deep-inspect.tar.gz"
 digest_failure="$(run_remote_cli api skills materialize '{"skill":"os-deep-inspect"}')"
 jq -e '.ok == false and .status == "skill_digest_mismatch"' <<<"${digest_failure}" >/dev/null
 [[ -z "$(find "${runtime_base}" -mindepth 1 -maxdepth 1 -print -quit)" ]]
@@ -167,7 +167,7 @@ mv "${tmp_root}/valid-skill.tar.gz" "${release_dir}/linux-agent-skill-os-deep-in
 
 cp "${release_dir}/release-manifest.json" "${tmp_root}/valid-manifest.json"
 jq '.skills["os-deep-inspect"].refs[0].ref = "os-deep-inspect/not-registered"' \
-    "${release_dir}/release-manifest.json" > "${tmp_root}/mismatched-manifest.json"
+    "${release_dir}/release-manifest.json" >"${tmp_root}/mismatched-manifest.json"
 mv "${tmp_root}/mismatched-manifest.json" "${release_dir}/release-manifest.json"
 registry_failure="$(run_remote_cli api skills materialize '{"skill":"os-deep-inspect"}')"
 jq -e '.ok == false and .status == "skill_package_invalid"' <<<"${registry_failure}" >/dev/null
@@ -191,7 +191,7 @@ manifest_tmp="${tmp_root}/unsafe-manifest.json"
 jq --arg sha "${unsafe_sha}" --argjson size "${unsafe_size}" '
     .skills["os-deep-inspect"].asset.sha256 = $sha
     | .skills["os-deep-inspect"].asset.size_bytes = $size
-' "${release_dir}/release-manifest.json" > "${manifest_tmp}"
+' "${release_dir}/release-manifest.json" >"${manifest_tmp}"
 mv "${manifest_tmp}" "${release_dir}/release-manifest.json"
 unsafe_failure="$(run_remote_cli api skills materialize '{"skill":"os-deep-inspect"}')"
 jq -e '.ok == false and .status == "skill_package_invalid"' <<<"${unsafe_failure}" >/dev/null

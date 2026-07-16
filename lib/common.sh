@@ -10,6 +10,8 @@ LINUX_AGENT_MCP_DIR=""
 LINUX_AGENT_TMP_ROOT=""
 LINUX_AGENT_TMP_DIR=""
 
+# Other sourced modules consume the initialized path globals.
+# shellcheck disable=SC2034
 linux_agent_init_env() {
     local root_dir="$1"
     LINUX_AGENT_ROOT="${root_dir}"
@@ -50,7 +52,7 @@ linux_agent_cleanup_tmp_dir() {
     resolved_root="$(readlink -f "${tmp_root}" 2>/dev/null || true)"
     [[ -n "${resolved_tmp}" && -n "${resolved_root}" ]] || return 0
 
-    if [[ "${resolved_tmp}" == "/" || ( "${resolved_tmp}" != "${resolved_root}" && "${resolved_tmp}" != "${resolved_root}/"* ) ]]; then
+    if [[ "${resolved_tmp}" == "/" || ("${resolved_tmp}" != "${resolved_root}" && "${resolved_tmp}" != "${resolved_root}/"*) ]]; then
         linux_agent_print_warn "跳过临时目录清理，路径不在项目 tmp 内: ${tmp_dir}"
         return 0
     fi
@@ -98,7 +100,7 @@ linux_agent_audit_mode() {
     fi
 
     case "${mode}" in
-        safe_summary|redacted_verbose)
+        safe_summary | redacted_verbose)
             if declare -F linux_agent_audit_boundary_payload_mode >/dev/null 2>&1; then
                 mode="$(linux_agent_audit_boundary_payload_mode "${mode}")"
             fi

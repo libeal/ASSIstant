@@ -113,10 +113,59 @@ validate_config() {
     fi
     print_ok "config/config.json JSON 格式合法"
 
+    if jq -e --argjson max 9007199254740991 '
+        type == "object"
+        and (
+            if has("audit") | not then true
+            elif (.audit | type) != "object" then false
+            else
+                ((.audit | has("fsync") | not) or ((.audit.fsync | type) == "boolean"))
+                and (
+                    (.audit | has("max_bytes") | not)
+                    or (
+                        (.audit.max_bytes | type) == "number"
+                        and .audit.max_bytes == (.audit.max_bytes | floor)
+                        and .audit.max_bytes >= 0
+                        and .audit.max_bytes <= $max
+                    )
+                )
+                and (
+                    (.audit | has("min_free_bytes") | not)
+                    or (
+                        (.audit.min_free_bytes | type) == "number"
+                        and .audit.min_free_bytes == (.audit.min_free_bytes | floor)
+                        and .audit.min_free_bytes >= 0
+                        and .audit.min_free_bytes <= $max
+                    )
+                )
+                and (
+                    (.audit | has("on_full") | not)
+                    or (.audit.on_full == "degrade" or .audit.on_full == "block")
+                )
+            end
+        )
+    ' "${CONFIG_FILE}" >/dev/null 2>&1; then
+        print_ok "audit 持久化配置类型与范围合法"
+    else
+        print_error "audit 配置非法：fsync 必须是 boolean，max_bytes/min_free_bytes 必须是 0-9007199254740991 的整数，on_full 仅支持 degrade 或 block"
+        failures=$((failures + 1))
+    fi
+
+    if jq -e '
+        (.audit? | type) == "object"
+        and (.audit | has("integrity_chain"))
+    ' "${CONFIG_FILE}" >/dev/null 2>&1; then
+        print_error "audit.integrity_chain 已移除；hash chain 始终启用，请删除该配置项"
+        failures=$((failures + 1))
+    else
+        print_ok "审计 hash chain 使用强制不变量（无可关闭配置）"
+    fi
+
     local api_url api_key api_key_src model timeout context_turns audit_mode audit_text_limit remote_policy skills_dir
-    local web_enabled web_host web_port web_token web_retention remote_api_key_transmission
+    local web_enabled web_host web_port web_token web_retention web_max_active web_job_timeout web_max_attempts web_cancel_grace remote_api_key_transmission
     local loop_enabled observation_limit thinking_trace checkpoint_turns max_iterations execution_timeout
     local approval_skill approval_shell approval_file_match approval_file_patch approval_file_download approval_local_analyze approval_remote_script
+    local audit_fsync audit_max_bytes audit_min_free audit_on_full observer_require
     api_url="$(json_get '.api_url')"
     api_key="$(api_key_value)"
     api_key_src="$(api_key_source)"
@@ -132,6 +181,10 @@ validate_config() {
     web_port="$(json_get '.web.port')"
     web_token="$(json_get '.web.token')"
     web_retention="$(json_get '.web.job_retention_hours')"
+    web_max_active="$(json_get '.web.max_active_jobs')"
+    web_job_timeout="$(json_get '.web.job_timeout_sec')"
+    web_max_attempts="$(json_get '.web.max_job_attempts')"
+    web_cancel_grace="$(json_get '.web.cancel_grace_sec')"
     loop_enabled="$(json_get '.agent_loop.enabled_for_work')"
     observation_limit="$(json_get '.agent_loop.observation_text_limit')"
     thinking_trace="$(json_get '.agent_loop.thinking_trace_enabled')"
@@ -146,6 +199,11 @@ validate_config() {
     approval_local_analyze="$(json_get '.approvals.auto.local_analyze')"
     approval_remote_script="$(json_get '.approvals.auto.remote_script')"
     remote_api_key_transmission="$(json_get '.remote.allow_api_key_transmission')"
+    audit_fsync="$(json_get '.audit.fsync')"
+    audit_max_bytes="$(json_get '.audit.max_bytes')"
+    audit_min_free="$(json_get '.audit.min_free_bytes')"
+    audit_on_full="$(json_get '.audit.on_full')"
+    observer_require="$(json_get '.observer.require')"
 
     validate_non_empty "api_url" "${api_url}" || failures=$((failures + 1))
     validate_non_empty "api_key" "${api_key}" || failures=$((failures + 1))
@@ -213,6 +271,33 @@ validate_config() {
         print_warn "audit_text_limit 未配置，将默认使用 1000"
     fi
 
+    if [[ -n "${audit_on_full}" ]]; then
+        if [[ "${audit_on_full}" == "degrade" || "${audit_on_full}" == "block" ]]; then
+            print_ok "audit.on_full 合法: ${audit_on_full}"
+        else
+            print_error "audit.on_full 仅支持 degrade 或 block"
+            failures=$((failures + 1))
+        fi
+    else
+        print_warn "audit.on_full 未配置，将默认使用 degrade"
+    fi
+
+    for nonneg_field in \
+        "audit.max_bytes:${audit_max_bytes}" \
+        "audit.min_free_bytes:${audit_min_free}"; do
+        local nn_name nn_value
+        nn_name="${nonneg_field%%:*}"
+        nn_value="${nonneg_field#*:}"
+        if [[ -z "${nn_value}" ]]; then
+            print_warn "${nn_name} 未配置，将由程序默认值兜底"
+        elif [[ "${nn_value}" =~ ^[0-9]+$ ]]; then
+            print_ok "${nn_name} 合法: ${nn_value}"
+        else
+            print_error "${nn_name} 必须是非负整数（0 表示关闭）"
+            failures=$((failures + 1))
+        fi
+    done
+
     if [[ -n "${remote_policy}" && "${remote_policy}" != "download_review" && "${remote_policy}" != "disabled" ]]; then
         print_error "remote_script_policy 仅支持 download_review 或 disabled"
         failures=$((failures + 1))
@@ -232,6 +317,8 @@ validate_config() {
         "approvals.auto.file_download:${approval_file_download}" \
         "approvals.auto.local_analyze:${approval_local_analyze}" \
         "approvals.auto.remote_script:${approval_remote_script}" \
+        "audit.fsync:${audit_fsync}" \
+        "observer.require:${observer_require}" \
         "remote.allow_api_key_transmission:${remote_api_key_transmission}"; do
         local field_name field_value
         field_name="${bool_field%%:*}"
@@ -342,6 +429,29 @@ validate_config() {
             print_error "web.job_retention_hours 必须是正整数"
             failures=$((failures + 1))
         fi
+
+        local web_bound name value minimum maximum default_value numeric_value
+        for web_bound in \
+            "web.max_active_jobs:${web_max_active}:1:64:4" \
+            "web.job_timeout_sec:${web_job_timeout}:1:86400:900" \
+            "web.max_job_attempts:${web_max_attempts}:1:10:3" \
+            "web.cancel_grace_sec:${web_cancel_grace}:0:30:2"; do
+            IFS=: read -r name value minimum maximum default_value <<<"${web_bound}"
+            if [[ -z "${value}" ]]; then
+                print_warn "${name} 未配置，将默认使用 ${default_value}"
+            elif [[ "${value}" =~ ^[0-9]+$ ]]; then
+                numeric_value=$((10#${value}))
+                if ((numeric_value >= minimum && numeric_value <= maximum)); then
+                    print_ok "${name} 合法: ${value}"
+                else
+                    print_error "${name} 必须是 ${minimum}-${maximum} 的整数"
+                    failures=$((failures + 1))
+                fi
+            else
+                print_error "${name} 必须是 ${minimum}-${maximum} 的整数"
+                failures=$((failures + 1))
+            fi
+        done
     else
         print_warn "web 配置段未配置；CLI 不受影响，bin/agent-web 会使用本机默认值和临时 token"
     fi
@@ -404,7 +514,7 @@ for arg in "$@"; do
         --live)
             LIVE_CHECK="true"
             ;;
-        -h|--help)
+        -h | --help)
             usage
             exit 0
             ;;

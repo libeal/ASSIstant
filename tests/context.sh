@@ -26,6 +26,7 @@ LINUX_AGENT_CONVERSATION_HISTORY_FILE="${history_file}"
 linux_agent_record_conversation_turn "work" "第一轮请求" "第一轮完成" "executed" "request"
 linux_agent_record_conversation_turn "work" "第二轮请求" "第二轮完成" "executed" "request"
 linux_agent_record_conversation_turn "work" "第三轮请求" "第三轮完成" "executed" "request"
+[[ "$(stat -c '%a' "${history_file}")" == "600" ]]
 linux_agent_history_window | jq -e 'length == 2
     and .[0].request.content == "第二轮请求"
     and .[1].request.content == "第三轮请求"
@@ -35,7 +36,7 @@ legacy_history_file="${tmp_root}/legacy-history.json"
 jq -cn '[
     {role:"user", content:"旧用户请求", status:"work", timestamp:"t1"},
     {role:"assistant", content:"旧助手响应", status:"executed", timestamp:"t2"}
-]' > "${legacy_history_file}"
+]' >"${legacy_history_file}"
 LINUX_AGENT_CONVERSATION_HISTORY_FILE="${legacy_history_file}"
 LINUX_AGENT_CONFIG_JSON='{"context_turns":1,"agent_loop":{"checkpoint_turns":10,"thinking_trace_enabled":false,"observation_text_limit":1000}}'
 linux_agent_history_window | jq -e 'length == 1
@@ -45,7 +46,11 @@ linux_agent_history_window | jq -e 'length == 1
     and .[0].status == "executed"' >/dev/null
 
 loop_history_file="${tmp_root}/loop-history.json"
+# Consumed by functions sourced from lib/context.sh.
+# shellcheck disable=SC2034
 LINUX_AGENT_CONVERSATION_HISTORY_FILE="${loop_history_file}"
+# Consumed by functions sourced from lib/config.sh and lib/orchestrator.sh.
+# shellcheck disable=SC2034
 LINUX_AGENT_CONFIG_JSON='{"context_turns":6,"agent_loop":{"checkpoint_turns":10,"thinking_trace_enabled":false,"observation_text_limit":1000}}'
 
 linux_agent_auto_approval_config_json() {

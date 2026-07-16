@@ -4,8 +4,13 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
-CONFIG_FILE="${ROOT_DIR}/config/config.json"
-EXAMPLE_FILE="${ROOT_DIR}/config/config.example.json"
+
+# Keep startup validation identical to the CLI.  In particular, audit
+# durability settings must not be normalized differently by the Web adapter.
+# shellcheck source=../lib/common.sh
+source "${ROOT_DIR}/lib/common.sh"
+# shellcheck source=../lib/config.sh
+source "${ROOT_DIR}/lib/config.sh"
 
 require_command() {
     local name="$1"
@@ -18,7 +23,7 @@ require_command() {
 config_get() {
     local query="$1"
     local default_value="$2"
-    jq -r --arg default_value "${default_value}" "${query} // \$default_value" "${CONFIG_FILE}"
+    linux_agent_config_get_default "${query}" "${default_value}"
 }
 
 generate_token() {
@@ -27,27 +32,12 @@ generate_token() {
 
 require_command jq
 require_command python3
-
-if [[ ! -f "${CONFIG_FILE}" ]]; then
-    mkdir -p "$(dirname "${CONFIG_FILE}")"
-    cp "${EXAMPLE_FILE}" "${CONFIG_FILE}"
-    printf '[警告] 未找到 config/config.json，已根据示例生成；请补充真实 AI 配置。\n' >&2
-fi
-
-if ! chmod 600 "${CONFIG_FILE}" 2>/dev/null; then
-    printf '[错误] 无法将 config/config.json 权限收紧为 0600。\n' >&2
-    exit 1
-fi
-
-if ! jq -e . "${CONFIG_FILE}" >/dev/null 2>&1; then
-    printf '[错误] config/config.json 不是合法 JSON。\n' >&2
-    exit 1
-fi
+linux_agent_init_env "${ROOT_DIR}"
+linux_agent_load_config
 
 enabled="$(config_get '.web.enabled' 'true')"
 case "${enabled,,}" in
-    true|1|yes|on)
-        ;;
+    true | 1 | yes | on) ;;
     *)
         printf '[错误] config/config.json 中 web.enabled 已关闭。\n' >&2
         exit 1
@@ -58,6 +48,10 @@ host="$(config_get '.web.host' '127.0.0.1')"
 port="$(config_get '.web.port' '8765')"
 token="$(config_get '.web.token' '')"
 retention="$(config_get '.web.job_retention_hours' '24')"
+max_active_jobs="$(config_get '.web.max_active_jobs' '4')"
+job_timeout="$(config_get '.web.job_timeout_sec' '900')"
+max_job_attempts="$(config_get '.web.max_job_attempts' '3')"
+cancel_grace="$(config_get '.web.cancel_grace_sec' '2')"
 
 [[ -n "${host}" ]] || host="127.0.0.1"
 if [[ "${LINUX_AGENT_REMOTE_MODE:-0}" == "1" ]]; then
@@ -70,6 +64,22 @@ fi
 if [[ ! "${retention}" =~ ^[0-9]+$ || "${retention}" -le 0 ]]; then
     retention=24
 fi
+if [[ ! "${max_active_jobs}" =~ ^[0-9]+$ || "${max_active_jobs}" -le 0 || "${max_active_jobs}" -gt 64 ]]; then
+    printf '[错误] web.max_active_jobs 必须是 1-64 的整数。\n' >&2
+    exit 1
+fi
+if [[ ! "${job_timeout}" =~ ^[0-9]+$ || "${job_timeout}" -le 0 || "${job_timeout}" -gt 86400 ]]; then
+    printf '[错误] web.job_timeout_sec 必须是 1-86400 的整数。\n' >&2
+    exit 1
+fi
+if [[ ! "${max_job_attempts}" =~ ^[0-9]+$ || "${max_job_attempts}" -le 0 || "${max_job_attempts}" -gt 10 ]]; then
+    printf '[错误] web.max_job_attempts 必须是 1-10 的整数。\n' >&2
+    exit 1
+fi
+if [[ ! "${cancel_grace}" =~ ^[0-9]+$ || "${cancel_grace}" -gt 30 ]]; then
+    printf '[错误] web.cancel_grace_sec 必须是 0-30 的整数。\n' >&2
+    exit 1
+fi
 if [[ -z "${token}" ]]; then
     token="$(generate_token)"
     export LINUX_AGENT_WEB_TOKEN_EPHEMERAL=1
@@ -81,6 +91,10 @@ export LINUX_AGENT_WEB_HOST="${host}"
 export LINUX_AGENT_WEB_PORT="${port}"
 export LINUX_AGENT_WEB_TOKEN="${token}"
 export LINUX_AGENT_WEB_JOB_RETENTION_HOURS="${retention}"
+export LINUX_AGENT_WEB_MAX_ACTIVE_JOBS="${max_active_jobs}"
+export LINUX_AGENT_WEB_JOB_TIMEOUT_SEC="${job_timeout}"
+export LINUX_AGENT_WEB_MAX_JOB_ATTEMPTS="${max_job_attempts}"
+export LINUX_AGENT_WEB_CANCEL_GRACE_SEC="${cancel_grace}"
 
 if [[ "${LINUX_AGENT_REMOTE_MODE:-0}" == "1" ]]; then
     printf '[信息] SSH 转发示例: ssh -L %s:127.0.0.1:%s <user>@<remote-host>\n' "${port}" "${port}" >&2

@@ -5,19 +5,19 @@ set -euo pipefail
 linux_agent_detect_topic() {
     local user_input="$1"
     case "${user_input}" in
-        *磁盘*|*空间*|*垃圾*|*日志*|*大文件*)
+        *磁盘* | *空间* | *垃圾* | *日志* | *大文件*)
             printf 'disk\n'
             ;;
-        *cpu*|*CPU*|*内存*|*memory*|*Memory*|*资源*|*负载*|*load*|*Load*|*top*)
+        *cpu* | *CPU* | *内存* | *memory* | *Memory* | *资源* | *负载* | *load* | *Load* | *top*)
             printf 'resource\n'
             ;;
-        *进程*|*僵尸*|*ps*)
+        *进程* | *僵尸* | *ps*)
             printf 'process\n'
             ;;
-        *端口*|*网络*|*连接*)
+        *端口* | *网络* | *连接*)
             printf 'network\n'
             ;;
-        *服务*|*systemd*|*重启*)
+        *服务* | *systemd* | *重启*)
             printf 'service\n'
             ;;
         *)
@@ -144,7 +144,7 @@ linux_agent_sense_topic() {
         minimal)
             linux_agent_sense_minimal
             ;;
-        all|*)
+        all | *)
             jq -cn \
                 --argjson disk "$(linux_agent_sense_disk)" \
                 --argjson process "$(linux_agent_sense_process)" \

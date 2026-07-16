@@ -21,7 +21,7 @@ cp -a \
     "${tmp_root}/"
 cp "${tmp_root}/config/config.example.json" "${tmp_root}/config/config.json"
 mkdir -p "${tmp_root}/logs"
-printf '%s\n' '{"stage":"finished","payload":{"status":"ok"}}' > "${tmp_root}/logs/session_web_backup.jsonl"
+printf '%s\n' '{"stage":"finished","payload":{"status":"ok"}}' >"${tmp_root}/logs/session_web_backup.jsonl"
 
 LINUX_AGENT_ROOT="${tmp_root}" LINUX_AGENT_REMOTE_MODE=1 python3 - <<'PY'
 import importlib.util
@@ -86,7 +86,7 @@ PY
 
 outside_skills="${tmp_root}/outside-skills"
 config_tmp="${tmp_root}/config-with-outside-skills.json"
-jq --arg path "${outside_skills}" '.skills_dir = $path' "${tmp_root}/config/config.json" > "${config_tmp}"
+jq --arg path "${outside_skills}" '.skills_dir = $path' "${tmp_root}/config/config.json" >"${config_tmp}"
 mv "${config_tmp}" "${tmp_root}/config/config.json"
 resolved_skills_dir="$(
     cd "${tmp_root}"

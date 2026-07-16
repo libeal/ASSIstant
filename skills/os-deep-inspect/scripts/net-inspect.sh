@@ -28,12 +28,12 @@ if [[ -n "${port}" && ! "${port}" =~ ^[0-9]{1,5}$ ]]; then
     jq -cn --arg port "${port}" '{ok:false, tool:"system.net.inspect", port:$port, error:"port must be a number"}'
     exit 0
 fi
-if [[ -n "${port}" && ( "${port}" -lt 1 || "${port}" -gt 65535 ) ]]; then
+if [[ -n "${port}" && ("${port}" -lt 1 || "${port}" -gt 65535) ]]; then
     jq -cn --arg port "${port}" '{ok:false, tool:"system.net.inspect", port:$port, error:"port must be between 1 and 65535"}'
     exit 0
 fi
 case "${protocol}" in
-    all|tcp|udp) ;;
+    all | tcp | udp) ;;
     *)
         jq -cn --arg protocol "${protocol}" '{ok:false, tool:"system.net.inspect", protocol:$protocol, error:"protocol must be all, tcp, or udp"}'
         exit 0

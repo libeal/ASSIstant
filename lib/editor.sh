@@ -40,35 +40,32 @@ linux_agent_write_skill_index() {
                 skip=0
             }
             skip == 0 {print}
-        ' "${index_path}" > "${tmp_path}"
+        ' "${index_path}" >"${tmp_path}"
     else
         {
             printf '# Skill Index\n\n'
             printf '工作模式会把此文件作为可用 skill 摘要上传给 AI。脚本模式仅允许执行这里登记且在对应 `SKILL.md` 中说明的脚本。\n\n'
-        } > "${tmp_path}"
+        } >"${tmp_path}"
     fi
 
     {
         printf '\n## %s\n\n' "${skill_name}"
         printf '%s\n\n' "${description}"
         jq -r --arg skill "${skill_name}" '.[] | "- `\($skill)/\(.name | sub("\\.sh$"; ""))`: \(.description)"' <<<"${scripts_json}"
-    } >> "${tmp_path}"
+    } >>"${tmp_path}"
     mv "${tmp_path}" "${index_path}"
 }
 
 linux_agent_select_script_editor() {
-    local candidate
     if [[ -n "${EDITOR:-}" ]]; then
         printf '%s\n' "${EDITOR}"
         return 0
     fi
 
-    for candidate in vi; do
-        if command -v "${candidate}" >/dev/null 2>&1; then
-            printf '%s\n' "${candidate}"
-            return 0
-        fi
-    done
+    if command -v vi >/dev/null 2>&1; then
+        printf 'vi\n'
+        return 0
+    fi
 
     return 1
 }
@@ -290,8 +287,8 @@ linux_agent_edit_script_content() {
 
     original_file="$(mktemp "${LINUX_AGENT_TMP_DIR}/script.original.XXXXXX")"
     mkdir -p "$(dirname "${edit_file}")"
-    printf '%s\n' "${generated_content}" > "${original_file}"
-    printf '%s\n' "${generated_content}" > "${edit_file}"
+    printf '%s\n' "${generated_content}" >"${original_file}"
+    printf '%s\n' "${generated_content}" >"${edit_file}"
     before_stamp="$(linux_agent_file_stamp "${edit_file}")"
 
     printf '\n# AI 生成脚本: %s/%s\n\n' "${skill_name}" "${script_name}" >&2
@@ -416,7 +413,7 @@ linux_agent_review_edit_package() {
 linux_agent_apply_skill_edit_package_direct() {
     local edit_json="$1"
     local review_json skill_name description skill_dir scripts_json edit_root staging_skill_dir staging_scripts_dir candidate_index
-    local validation global_validation committed_scripts
+    local validation global_validation committed_scripts observer_gate observer_subject audit_rc audit_payload
     local script_items=()
 
     review_json="$(linux_agent_review_edit_package "${edit_json}")"
@@ -427,6 +424,12 @@ linux_agent_apply_skill_edit_package_direct() {
     fi
 
     skill_name="$(jq -r '.skill.name' <<<"${edit_json}")"
+    observer_subject="$(jq -cn --arg skill "${skill_name}" '{kind:"skill_edit_apply", skill:$skill}')"
+    if declare -F linux_agent_observer_execution_gate >/dev/null 2>&1 &&
+        ! observer_gate="$(linux_agent_observer_execution_gate "edit_apply" "${observer_subject}")"; then
+        printf '%s\n' "${observer_gate}"
+        return 0
+    fi
     description="$(jq -r '.skill.description' <<<"${edit_json}")"
     skill_dir="$(linux_agent_skills_dir)/${skill_name}"
     scripts_json="$(jq -c '.scripts' <<<"${edit_json}")"
@@ -446,11 +449,11 @@ linux_agent_apply_skill_edit_package_direct() {
         script_name="$(jq -r '.name' <<<"${script}")"
         content="$(jq -r '.content' <<<"${script}")"
         script_path="${staging_scripts_dir}/${script_name}"
-        printf '%s\n' "${content}" > "${script_path}"
+        printf '%s\n' "${content}" >"${script_path}"
         chmod +x "${script_path}"
     done
 
-    linux_agent_render_skill_md "${skill_name}" "${description}" "${scripts_json}" > "${staging_skill_dir}/SKILL.md"
+    linux_agent_render_skill_md "${skill_name}" "${description}" "${scripts_json}" >"${staging_skill_dir}/SKILL.md"
     if [[ -f "$(linux_agent_skill_index_path)" ]]; then
         cp "$(linux_agent_skill_index_path)" "${candidate_index}"
     fi
@@ -460,6 +463,15 @@ linux_agent_apply_skill_edit_package_direct() {
         rm -rf "${edit_root}"
         jq -cn --arg skill "${skill_name}" --argjson validation "${validation}" --argjson review "${review_json}" \
             '{ok:false, status:"validation_failed", skill:$skill, validation:$validation, review:$review}'
+        return 0
+    fi
+
+    audit_payload="$(jq -cn --arg skill "${skill_name}" --argjson scripts "${committed_scripts}" '{skill:$skill, scripts:$scripts}')"
+    audit_rc=0
+    linux_agent_audit_require_event "edit_commit_started" "${audit_payload}" || audit_rc=$?
+    if ((audit_rc != 0)); then
+        rm -rf "${edit_root}"
+        linux_agent_audit_failure_result "${audit_rc}" "edit_commit_started"
         return 0
     fi
 
@@ -484,9 +496,15 @@ linux_agent_apply_skill_edit_package_direct() {
 linux_agent_apply_skill_edit_package() {
     local edit_json="$1"
     local skill_name description skill_dir scripts_json edit_root staging_skill_dir staging_scripts_dir candidate_index
-    local validation global_validation committed_scripts
+    local validation global_validation committed_scripts observer_gate observer_subject audit_rc audit_payload
     local script_items=()
     skill_name="$(jq -r '.skill.name' <<<"${edit_json}")"
+    observer_subject="$(jq -cn --arg skill "${skill_name}" '{kind:"skill_edit_apply", skill:$skill}')"
+    if declare -F linux_agent_observer_execution_gate >/dev/null 2>&1 &&
+        ! observer_gate="$(linux_agent_observer_execution_gate "edit_apply" "${observer_subject}")"; then
+        printf '%s\n' "${observer_gate}"
+        return 0
+    fi
     description="$(jq -r '.skill.description' <<<"${edit_json}")"
     skill_dir="$(linux_agent_skills_dir)/${skill_name}"
     scripts_json="$(jq -c '.scripts' <<<"${edit_json}")"
@@ -551,11 +569,11 @@ linux_agent_apply_skill_edit_package() {
                 '{ok:false, status:"blocked", skill:$skill, script:$script, review:$review}'
             return 0
         fi
-        printf '%s\n' "${content}" > "${script_path}"
+        printf '%s\n' "${content}" >"${script_path}"
         chmod +x "${script_path}"
     done
 
-    linux_agent_render_skill_md "${skill_name}" "${description}" "${scripts_json}" > "${staging_skill_dir}/SKILL.md"
+    linux_agent_render_skill_md "${skill_name}" "${description}" "${scripts_json}" >"${staging_skill_dir}/SKILL.md"
     if [[ -f "$(linux_agent_skill_index_path)" ]]; then
         cp "$(linux_agent_skill_index_path)" "${candidate_index}"
     fi
@@ -565,6 +583,15 @@ linux_agent_apply_skill_edit_package() {
         rm -rf "${edit_root}"
         jq -cn --arg skill "${skill_name}" --argjson validation "${validation}" \
             '{ok:false, status:"validation_failed", skill:$skill, validation:$validation}'
+        return 0
+    fi
+
+    audit_payload="$(jq -cn --arg skill "${skill_name}" --argjson scripts "${committed_scripts}" '{skill:$skill, scripts:$scripts}')"
+    audit_rc=0
+    linux_agent_audit_require_event "edit_commit_started" "${audit_payload}" || audit_rc=$?
+    if ((audit_rc != 0)); then
+        rm -rf "${edit_root}"
+        linux_agent_audit_failure_result "${audit_rc}" "edit_commit_started"
         return 0
     fi
 

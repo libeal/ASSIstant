@@ -16,7 +16,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from ipaddress import collapse_addresses, ip_address, ip_interface, ip_network
+from ipaddress import collapse_addresses, ip_address, ip_network
 from pathlib import Path
 
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))

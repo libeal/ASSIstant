@@ -37,6 +37,8 @@ source "${ROOT_DIR}/lib/observer.sh"
 source "${ROOT_DIR}/lib/executor.sh"
 # shellcheck source=../lib/editor.sh
 source "${ROOT_DIR}/lib/editor.sh"
+# shellcheck source=../lib/workflow.sh
+source "${ROOT_DIR}/lib/workflow.sh"
 # shellcheck source=../lib/api.sh
 source "${ROOT_DIR}/lib/api.sh"
 # shellcheck source=../lib/interactive.sh
@@ -122,6 +124,8 @@ linux_agent_usage() {
   agent api <resource> <action> [json]
                                 机器可读 JSON API，供 Web 前端调用
   agent audit <session-id>      查看审计摘要
+  agent audit verify <session-id>
+                                校验审计日志 hash 链完整性
   agent backup <output.tar.gz>  导出 remote runtime 脱敏备份
 
 REPL 命令:
@@ -165,7 +169,7 @@ linux_agent_interactive() {
         fi
 
         case "${user_input}" in
-            /exit|exit)
+            /exit | exit)
                 linux_agent_log_control_event "exit" "${current_mode}" "${user_input}" "exited"
                 LINUX_AGENT_FINAL_STATUS="exited"
                 break
@@ -211,7 +215,7 @@ linux_agent_interactive() {
             break
         fi
         [[ -z "${user_input}" ]] && continue
-        linux_agent_log_turn_started "${current_mode}" "${user_input}"
+        linux_agent_log_turn_started "${current_mode}" "${user_input}" || return $?
         set +e
         if [[ "${current_mode}" == "terminal" ]]; then
             linux_agent_process_terminal_request "${user_input}"
@@ -342,6 +346,15 @@ main() {
                 linux_agent_print_error "请提供 session-id。"
                 exit 1
             fi
+            if [[ "$1" == "verify" ]]; then
+                shift || true
+                if [[ $# -eq 0 ]]; then
+                    linux_agent_print_error "请提供 session-id。"
+                    exit 1
+                fi
+                linux_agent_audit_verify_chain "$1"
+                return $?
+            fi
             linux_agent_show_audit "$1"
             ;;
         backup)
@@ -352,7 +365,7 @@ main() {
             fi
             linux_agent_backup_runtime "$1"
             ;;
-        -h|--help|help)
+        -h | --help | help)
             linux_agent_usage
             ;;
         *)
@@ -377,8 +390,8 @@ linux_agent_run() {
     fi
 
     LINUX_AGENT_MAIN_COMMAND="${command}"
-    linux_agent_start_session "agent ${command}"
-    linux_agent_log_command_started "${command}" "argument_count=${argument_count}"
+    linux_agent_start_session "agent ${command}" || return $?
+    linux_agent_log_command_started "${command}" "argument_count=${argument_count}" || return $?
 
     trap linux_agent_on_exit EXIT
     trap linux_agent_on_int INT

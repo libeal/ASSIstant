@@ -68,11 +68,11 @@ if command -v script >/dev/null 2>&1; then
         "${backspace_project}/"
     configure_fake_ai "${backspace_project}"
     tmp_config="$(mktemp)"
-    jq '.observer.enabled="disabled" | .approvals.auto.shell_readonly=true' "${backspace_project}/config/config.json" > "${tmp_config}"
+    jq '.observer.enabled="disabled" | .approvals.auto.shell_readonly=true' "${backspace_project}/config/config.json" >"${tmp_config}"
     mv "${tmp_config}" "${backspace_project}/config/config.json"
     backspace_typescript="${tmp_root}/backspace.typescript"
     (cd "${backspace_project}" && printf '/terminal\necho 中文AB\177\177CD\n/exit\n' | script -q -e -c "bash bin/agent" "${backspace_typescript}" >/dev/null)
-    backspace_output="$(tr -d '\r' < "${backspace_typescript}")"
+    backspace_output="$(tr -d '\r' <"${backspace_typescript}")"
     grep -q '\[terminal\]> echo 中文CD' <<<"${backspace_output}"
     grep -q '中文CD' <<<"${backspace_output}"
     ! grep -q '\[terminal\]> echo 中文ABCD' <<<"${backspace_output}"
@@ -122,7 +122,7 @@ grep -q '"event":"ctrl_z"' "${ctrlz_log}"
 project_edit="${tmp_root}/project-edit"
 copy_project "${project_edit}"
 editor_modify="${tmp_root}/editor-modify.sh"
-cat > "${editor_modify}" <<'EOF'
+cat >"${editor_modify}" <<'EOF'
 #!/usr/bin/env bash
 printf '\n# manual edit marker\n' >> "$1"
 EOF
@@ -150,7 +150,7 @@ grep -q '"ok": true' <<<"${edit_json_output}"
 project_blocked="${tmp_root}/project-blocked"
 copy_project "${project_blocked}"
 editor_block="${tmp_root}/editor-block.sh"
-cat > "${editor_block}" <<'EOF'
+cat >"${editor_block}" <<'EOF'
 #!/usr/bin/env bash
 printf '#!/usr/bin/env bash\nrm -rf /\n' > "$1"
 EOF
@@ -165,7 +165,7 @@ grep -q 'Skill 保存结果: 失败，status=blocked' <<<"${blocked_output}"
 project_failed="${tmp_root}/project-failed"
 copy_project "${project_failed}"
 editor_fail="${tmp_root}/editor-fail.sh"
-cat > "${editor_fail}" <<'EOF'
+cat >"${editor_fail}" <<'EOF'
 #!/usr/bin/env bash
 exit 1
 EOF
@@ -178,7 +178,7 @@ grep -q 'Skill 保存结果: 失败，status=editor_failed' <<<"${failed_output}
 project_cancelled="${tmp_root}/project-cancelled"
 copy_project "${project_cancelled}"
 editor_cancel="${tmp_root}/editor-cancel.sh"
-cat > "${editor_cancel}" <<'EOF'
+cat >"${editor_cancel}" <<'EOF'
 #!/usr/bin/env bash
 # 模拟 vi :q!：正常退出，但不保存文件。
 exit 0
@@ -193,7 +193,7 @@ grep -q '编辑器未保存脚本' <<<"${cancelled_output}"
 project_revised_edit="${tmp_root}/project-revised-edit"
 copy_project "${project_revised_edit}"
 editor_cancel_then_save="${tmp_root}/editor-cancel-then-save.sh"
-cat > "${editor_cancel_then_save}" <<'EOF'
+cat >"${editor_cancel_then_save}" <<'EOF'
 #!/usr/bin/env bash
 count_file="${EDITOR_COUNTER:?}"
 count="$(cat "${count_file}" 2>/dev/null || printf 0)"
@@ -207,10 +207,10 @@ EOF
 chmod +x "${editor_cancel_then_save}"
 
 revised_edit_output="$(
-    cd "${project_revised_edit}" && \
-    EDITOR_COUNTER="${tmp_root}/editor-count" \
-    EDITOR="${editor_cancel_then_save}" \
-    bash bin/agent edit "创建一个需要修改后保存的 skill" <<< $'请重新生成更简单的脚本\n' 2>&1
+    cd "${project_revised_edit}" &&
+        EDITOR_COUNTER="${tmp_root}/editor-count" \
+            EDITOR="${editor_cancel_then_save}" \
+            bash bin/agent edit "创建一个需要修改后保存的 skill" <<<$'请重新生成更简单的脚本\n' 2>&1
 )"
 grep -q '编辑器未保存脚本' <<<"${revised_edit_output}"
 grep -q 'Skill 保存结果: 成功' <<<"${revised_edit_output}"
@@ -222,7 +222,7 @@ project_vi="${tmp_root}/project-vi"
 copy_project "${project_vi}"
 fake_bin="${tmp_root}/fake-bin"
 mkdir -p "${fake_bin}"
-cat > "${fake_bin}/vi" <<'EOF'
+cat >"${fake_bin}/vi" <<'EOF'
 #!/usr/bin/env bash
 printf '\n# default vi marker\n' >> "$1"
 EOF

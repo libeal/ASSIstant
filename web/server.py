@@ -3,22 +3,19 @@
 import json
 import os
 import errno
-import http.client
 import secrets
 import signal
 import shutil
-import socket
+import sqlite3
 import subprocess
 import sys
 import threading
 import time
 import uuid
-import urllib.error
-import urllib.request
 from http import HTTPStatus
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import urlencode, unquote, urlparse, urlunparse
+from urllib.parse import unquote, urlparse
 
 
 ROOT = Path(os.environ.get("LINUX_AGENT_ROOT", Path(__file__).resolve().parents[1])).resolve()
@@ -31,8 +28,33 @@ from provider_security import (  # noqa: E402
     provider_url_error_message,
     validate_provider_url,
 )
+WEB_ROOT = ROOT / "web"
+if str(WEB_ROOT) not in sys.path:
+    sys.path.insert(0, str(WEB_ROOT))
+from jobs import (  # noqa: E402
+    IdempotencyConflict,
+    JobCapacityExceeded,
+    JobStore,
+    JobVersionConflict,
+)
+from domain import DomainContract, DomainValidationError  # noqa: E402
+from execution import ExecutionService  # noqa: E402
+from policy import PolicyService  # noqa: E402
+from provider import ProviderSecurityHelpers, ProviderService  # noqa: E402
+from sessions import JobSessionContext, SessionDataError, SessionStore  # noqa: E402
+from skills import SkillService  # noqa: E402
+from timeline import (  # noqa: E402
+    TimelineDataError,
+    legacy_timeline_unavailable,
+    timeline_from_turns,
+)
+from audit import (  # noqa: E402
+    AuditIntegrityError,
+    AuditWriteBlocked,
+    append_audit_event as append_web_audit_event,
+)
 STATIC_ROOT = ROOT / "web" / "static"
-JOBS_ROOT = ROOT / "tmp" / "web" / "jobs"
+JOBS_DB = ROOT / "tmp" / "web" / "jobs.db"
 POLICIES_ROOT = ROOT / "policies"
 SKILLS_ROOT = ROOT / "skills"
 CONFIG_PATH = ROOT / "config" / "config.json"
@@ -45,14 +67,18 @@ JOB_RETENTION_HOURS = int(os.environ.get("LINUX_AGENT_WEB_JOB_RETENTION_HOURS", 
 JOB_PROCESSES = {}
 JOB_PROCESSES_LOCK = threading.Lock()
 JOB_ADMISSION_LOCK = threading.Lock()
-JOB_RECORD_LOCKS = {}
-JOB_RECORD_LOCKS_GUARD = threading.Lock()
+JOB_CONTEXTS = {}
+JOB_CONTEXTS_LOCK = threading.Lock()
 WEB_AGENT_LOCK = threading.RLock()
+REQUEST_CONTEXT = threading.local()
 DEFAULT_STDERR_TEXT_LIMIT = 4000
 WORK_EXECUTION_FLOW_TEXT_LIMIT = 200000
-MODEL_LIST_RESPONSE_LIMIT = 1024 * 1024
 MAX_REQUEST_BODY_BYTES = 1024 * 1024
 MAX_ACTIVE_JOBS = int(os.environ.get("LINUX_AGENT_WEB_MAX_ACTIVE_JOBS", "4") or "4")
+JOB_TIMEOUT_SEC = int(os.environ.get("LINUX_AGENT_WEB_JOB_TIMEOUT_SEC", "900") or "900")
+MAX_JOB_ATTEMPTS = int(os.environ.get("LINUX_AGENT_WEB_MAX_JOB_ATTEMPTS", "3") or "3")
+CANCEL_GRACE_SEC = int(os.environ.get("LINUX_AGENT_WEB_CANCEL_GRACE_SEC", "2") or "2")
+REQUEST_ID_MAX_LENGTH = 128
 
 
 class RequestBodyTooLarge(ValueError):
@@ -61,10 +87,6 @@ class RequestBodyTooLarge(ValueError):
 
 SERVER_RUN_ID = uuid.uuid4().hex
 SERVER_STARTED_AT = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-WEB_AGENT_SESSION_ID = f"session_web_{SERVER_RUN_ID[:16]}"
-WEB_AGENT_AUDIT_LOG = ROOT / "logs" / f"{WEB_AGENT_SESSION_ID}.jsonl"
-WEB_AGENT_HISTORY_FILE = ROOT / "tmp" / "web" / "sessions" / f"{WEB_AGENT_SESSION_ID}.history.json"
-WEB_AGENT_RESTORED_FROM = ""
 API_KEY_PLACEHOLDER = "please-set-your-api-key"
 EPHEMERAL_TOKEN_FILE = ROOT / "tmp" / "web" / "auth-token"
 WEB_AUDIT_SESSION_ID = f"web_{SERVER_RUN_ID[:16]}"
@@ -90,16 +112,6 @@ def read_config():
         return {}
 
 
-def read_provider_registry():
-    try:
-        with PROVIDERS_PATH.open("r", encoding="utf-8") as handle:
-            payload = json.load(handle)
-    except (FileNotFoundError, json.JSONDecodeError):
-        payload = {"providers": []}
-    providers = payload.get("providers")
-    return providers if isinstance(providers, list) else []
-
-
 def load_domain_schema():
     try:
         with (ROOT / "schema" / "domain.json").open("r", encoding="utf-8") as handle:
@@ -112,80 +124,7 @@ def load_domain_schema():
 
 
 DOMAIN_SCHEMA = load_domain_schema()
-
-# Fallback used only if schema/domain.json is missing/unreadable.
-_FALLBACK_PROVIDER_ALIASES = {
-    "": "openai_compatible",
-    "zhipu": "zhipu_ai",
-    "zhipuai": "zhipu_ai",
-    "sarvam": "sarvam_ai",
-    "moonshot": "moonshot_ai",
-    "xai": "x_ai",
-}
-
-
-def normalize_provider_id(value):
-    normalized = str(value or "").strip().lower()
-    normalized = normalized.replace("-", "_").replace(" ", "_").replace("/", "_")
-    while "__" in normalized:
-        normalized = normalized.replace("__", "_")
-    rules = DOMAIN_SCHEMA.get("provider_normalization") if isinstance(DOMAIN_SCHEMA, dict) else None
-    if isinstance(rules, dict):
-        for rule in rules.get("prefix_rules") or []:
-            prefix = str(rule.get("prefix") or "")
-            if prefix and normalized.startswith(prefix):
-                return str(rule.get("canonical") or prefix)
-        aliases = rules.get("aliases") if isinstance(rules.get("aliases"), dict) else {}
-        if normalized in aliases:
-            return str(aliases[normalized])
-        if not normalized:
-            return str(aliases.get("", "openai_compatible"))
-        return normalized
-    # schema unavailable — inline fallback
-    if not normalized or normalized.startswith("openai_compatible"):
-        return "openai_compatible"
-    return _FALLBACK_PROVIDER_ALIASES.get(normalized, normalized)
-
-
-def provider_by_id(provider_id):
-    normalized = normalize_provider_id(provider_id)
-    for provider in read_provider_registry():
-        if normalize_provider_id(provider.get("id")) == normalized:
-            return provider
-    if normalized != "openai_compatible":
-        return provider_by_id("openai_compatible")
-    return {}
-
-
-def config_provider_id(config):
-    configured = normalize_provider_id(config.get("provider", ""))
-    known_ids = {normalize_provider_id(provider.get("id")) for provider in read_provider_registry()}
-    if configured in known_ids:
-        return configured
-    return "openai_compatible"
-
-
-def public_provider(provider):
-    models = provider.get("models") if isinstance(provider.get("models"), dict) else {}
-    return {
-        "id": str(provider.get("id") or ""),
-        "label": str(provider.get("label") or provider.get("id") or ""),
-        "api_url": str(provider.get("api_url") or ""),
-        "default_model": str(provider.get("default_model") or ""),
-        "custom_url": bool(provider.get("custom_url", False)),
-        "model_fetch_supported": bool(models.get("supported", False)),
-        "model_fetch_reason": str(models.get("reason") or ""),
-        "request_format": str(provider.get("request_format") or "openai_chat"),
-    }
-
-
-def providers_public_state():
-    providers = [
-        public_provider(provider)
-        for provider in read_provider_registry()
-        if isinstance(provider, dict) and provider.get("id")
-    ]
-    return {"ok": True, "status": "listed", "providers": providers}
+DOMAIN_CONTRACT = DomainContract(DOMAIN_SCHEMA)
 
 
 def write_config(config):
@@ -253,288 +192,47 @@ def configured_api_key(config, override=None):
     return "", "missing"
 
 
-def redacted_text(value, secret=""):
-    text = str(value or "")
-    if secret:
-        text = text.replace(secret, "[REDACTED]")
-    return text[:600]
+PROVIDER_SERVICE = ProviderService(
+    PROVIDERS_PATH,
+    lambda: DOMAIN_SCHEMA,
+    config_reader=read_config,
+    key_resolver=configured_api_key,
+    remote_mode=REMOTE_MODE,
+    security_helpers=ProviderSecurityHelpers(
+        policy_from_config=provider_security_policy,
+        validate_url=validate_provider_url,
+        inspect_url=inspect_provider_url,
+        error_message=provider_url_error_message,
+    ),
+)
 
 
-def derive_models_url(api_url):
-    parsed = urlparse(str(api_url or ""))
-    path = parsed.path.rstrip("/")
-    if path.endswith("/chat/completions"):
-        path = path[: -len("/chat/completions")] + "/models"
-    elif path.endswith("/messages"):
-        path = path[: -len("/messages")] + "/models"
-    else:
-        path = path + "/models"
-    return urlunparse((parsed.scheme, parsed.netloc, path, "", "", ""))
+def read_provider_registry():
+    return PROVIDER_SERVICE.read_registry()
 
 
-class NoRedirectHandler(urllib.request.HTTPRedirectHandler):
-    def redirect_request(self, req, fp, code, msg, headers, newurl):
-        return None
+def normalize_provider_id(value):
+    return PROVIDER_SERVICE.normalize_id(value)
 
 
-def provider_auth_headers(auth, api_key):
-    if auth == "anthropic":
-        return {
-            "x-api-key": api_key,
-            "anthropic-version": "2023-06-01",
-        }
-    if auth == "api_subscription_key":
-        return {"api-subscription-key": api_key}
-    if auth == "google_key_query":
-        return {}
-    return {"Authorization": f"Bearer {api_key}"}
+def provider_by_id(provider_id):
+    return PROVIDER_SERVICE.get_provider(provider_id)
 
 
-def model_list_request_url(provider, api_url, api_key):
-    models = provider.get("models") if isinstance(provider.get("models"), dict) else {}
-    if models.get("derive_from_api_url"):
-        url = derive_models_url(api_url)
-    else:
-        url = str(models.get("url") or "")
-    auth = str(models.get("auth") or provider.get("auth") or "bearer")
-    if auth == "google_key_query":
-        separator = "&" if urlparse(url).query else "?"
-        url = f"{url}{separator}{urlencode({'key': api_key})}"
-    return url, auth
+def config_provider_id(config):
+    return PROVIDER_SERVICE.configured_provider_id(config)
 
 
-def _pinned_socket(addresses, port, timeout):
-    last_error = None
-    for address in addresses:
-        try:
-            return socket.create_connection((address, port), timeout=timeout)
-        except OSError as exc:
-            last_error = exc
-    if last_error is not None:
-        raise last_error
-    raise OSError("Provider hostname did not resolve to a usable address.")
+def public_provider(provider):
+    return PROVIDER_SERVICE.public_provider(provider)
 
 
-class PinnedHTTPConnection(http.client.HTTPConnection):
-    def __init__(self, host, *args, resolved_addresses=None, **kwargs):
-        super().__init__(host, *args, **kwargs)
-        self.resolved_addresses = tuple(resolved_addresses or ())
-
-    def connect(self):
-        self.sock = _pinned_socket(self.resolved_addresses, self.port, self.timeout)
-        if self._tunnel_host:
-            self._tunnel()
-
-
-class PinnedHTTPSConnection(http.client.HTTPSConnection):
-    def __init__(self, host, *args, resolved_addresses=None, **kwargs):
-        super().__init__(host, *args, **kwargs)
-        self.resolved_addresses = tuple(resolved_addresses or ())
-
-    def connect(self):
-        self.sock = _pinned_socket(self.resolved_addresses, self.port, self.timeout)
-        if self._tunnel_host:
-            self._tunnel()
-        server_hostname = self._tunnel_host or self.host
-        self.sock = self._context.wrap_socket(self.sock, server_hostname=server_hostname)
-
-
-class PinnedHTTPHandler(urllib.request.HTTPHandler):
-    def __init__(self, resolved_addresses):
-        super().__init__()
-        self.resolved_addresses = tuple(resolved_addresses)
-
-    def http_open(self, request):
-        addresses = self.resolved_addresses
-
-        class Connection(PinnedHTTPConnection):
-            def __init__(self, host, *args, **kwargs):
-                super().__init__(host, *args, resolved_addresses=addresses, **kwargs)
-
-        return self.do_open(Connection, request)
-
-
-class PinnedHTTPSHandler(urllib.request.HTTPSHandler):
-    def __init__(self, resolved_addresses):
-        super().__init__()
-        self.resolved_addresses = tuple(resolved_addresses)
-
-    def https_open(self, request):
-        addresses = self.resolved_addresses
-
-        class Connection(PinnedHTTPSConnection):
-            def __init__(self, host, *args, **kwargs):
-                super().__init__(host, *args, resolved_addresses=addresses, **kwargs)
-
-        return self.do_open(
-            Connection,
-            request,
-            context=self._context,
-            check_hostname=self._check_hostname,
-        )
-
-
-def fetch_json_url(url, headers, timeout, secret, resolved_addresses=None):
-    request = urllib.request.Request(url, headers=headers, method="GET")
-    handlers = [NoRedirectHandler]
-    if resolved_addresses:
-        # Do not let an ambient HTTP proxy bypass the address pin selected by
-        # provider_security.inspect_provider_url().
-        handlers.extend(
-            [
-                urllib.request.ProxyHandler({}),
-                PinnedHTTPHandler(resolved_addresses),
-                PinnedHTTPSHandler(resolved_addresses),
-            ]
-        )
-    opener = urllib.request.build_opener(*handlers)
-    try:
-        with opener.open(request, timeout=timeout) as response:
-            body = response.read(MODEL_LIST_RESPONSE_LIMIT + 1)
-            if len(body) > MODEL_LIST_RESPONSE_LIMIT:
-                return None, {
-                    "ok": False,
-                    "status": "provider_response_too_large",
-                    "error": "Model list response is too large.",
-                }
-    except urllib.error.HTTPError as exc:
-        detail = ""
-        try:
-            detail = exc.read(400).decode("utf-8", errors="replace")
-        except OSError:
-            detail = str(exc)
-        return None, {
-            "ok": False,
-            "status": "provider_request_failed",
-            "error": f"Provider returned HTTP {exc.code}.",
-            "detail": redacted_text(detail, secret),
-        }
-    except urllib.error.URLError as exc:
-        return None, {
-            "ok": False,
-            "status": "provider_request_failed",
-            "error": "Provider model list request failed.",
-            "detail": redacted_text(exc.reason, secret),
-        }
-    except TimeoutError:
-        return None, {
-            "ok": False,
-            "status": "provider_request_timeout",
-            "error": "Provider model list request timed out.",
-        }
-    try:
-        return json.loads(body.decode("utf-8")), None
-    except (UnicodeDecodeError, json.JSONDecodeError):
-        return None, {
-            "ok": False,
-            "status": "provider_invalid_response",
-            "error": "Provider model list response is not valid JSON.",
-        }
-
-
-def extract_model_ids(payload, parser):
-    ids = []
-    if parser == "google_models":
-        items = payload.get("models") if isinstance(payload, dict) else []
-        if not isinstance(items, list):
-            return []
-        for item in items:
-            if not isinstance(item, dict):
-                continue
-            methods = item.get("supportedGenerationMethods")
-            if isinstance(methods, list) and "generateContent" not in methods:
-                continue
-            name = str(item.get("name") or item.get("id") or "")
-            if name.startswith("models/"):
-                name = name[len("models/") :]
-            ids.append(name)
-    elif parser == "models_name_or_id":
-        items = payload.get("models") if isinstance(payload, dict) else []
-        if not isinstance(items, list):
-            return []
-        for item in items:
-            if isinstance(item, dict):
-                ids.append(str(item.get("name") or item.get("id") or ""))
-            else:
-                ids.append(str(item or ""))
-    else:
-        items = payload.get("data") if isinstance(payload, dict) else []
-        if not isinstance(items, list):
-            return []
-        for item in items:
-            if isinstance(item, dict):
-                ids.append(str(item.get("id") or ""))
-            else:
-                ids.append(str(item or ""))
-    clean = []
-    seen = set()
-    for model_id in ids:
-        model_id = " ".join(str(model_id or "").split())
-        if not model_id or len(model_id) > 200 or model_id in seen:
-            continue
-        seen.add(model_id)
-        clean.append(model_id)
-    return sorted(clean)
+def providers_public_state():
+    return PROVIDER_SERVICE.public_state()
 
 
 def list_provider_models(body):
-    config = read_config()
-    remote = config.get("remote") if isinstance(config.get("remote"), dict) else {}
-    if REMOTE_MODE and not bool(remote.get("allow_api_key_transmission", False)):
-        return {
-            "ok": False,
-            "status": "secret_transmission_disabled",
-            "models": [],
-            "error": "Remote runtime has not allowed API key transmission.",
-        }
-    provider_id = normalize_provider_id(body.get("provider") or config.get("provider") or config_provider_id(config))
-    provider = provider_by_id(provider_id)
-    provider_id = normalize_provider_id(provider.get("id") or provider_id)
-    models = provider.get("models") if isinstance(provider.get("models"), dict) else {}
-    if not models.get("supported", False):
-        return {
-            "ok": False,
-            "status": "model_list_unavailable",
-            "provider": provider_id,
-            "models": [],
-            "error": models.get("reason") or "This provider does not expose a configured model list endpoint.",
-        }
-
-    api_url = str(body.get("api_url") or config.get("api_url") or provider.get("api_url") or "")
-    security = provider_security_policy(config)
-    if REMOTE_MODE:
-        security["require_https"] = True
-    if models.get("derive_from_api_url") or not models.get("url"):
-        api_url, url_error = validate_provider_url(api_url, security)
-        if url_error:
-            return {"ok": False, "status": url_error, "provider": provider_id, "models": [], "error": provider_url_error_message(url_error)}
-
-    api_key, key_source = configured_api_key(config, body.get("api_key"))
-    url, auth = model_list_request_url(provider, api_url, api_key)
-    url, url_error, resolved_addresses = inspect_provider_url(url, security)
-    if url_error:
-        return {"ok": False, "status": url_error, "provider": provider_id, "models": [], "error": provider_url_error_message(url_error)}
-    if auth != "none" and not api_key:
-        return {"ok": False, "status": "api_key_missing", "provider": provider_id, "models": [], "error": "API key is required to list models."}
-
-    timeout = min(max(safe_int(config.get("request_timeout_sec", 30) or 30, 30), 1), 60)
-    headers = {"Accept": "application/json"}
-    headers.update(provider_auth_headers(auth, api_key))
-    payload, error = fetch_json_url(url, headers, timeout, api_key, resolved_addresses)
-    if error:
-        error["provider"] = provider_id
-        error["models"] = []
-        return error
-    parser = str(models.get("parser") or "openai_data_id")
-    model_ids = extract_model_ids(payload, parser)
-    return {
-        "ok": True,
-        "status": "listed",
-        "provider": provider_id,
-        "key_source": key_source,
-        "models": [{"id": model_id} for model_id in model_ids],
-        "model_count": len(model_ids),
-    }
+    return PROVIDER_SERVICE.list_models(body)
 
 
 def config_public_state():
@@ -592,6 +290,7 @@ def config_public_state():
                 "enabled": observer.get("enabled", "auto"),
                 "privilege": observer.get("privilege", "sudo_interactive"),
                 "max_events": observer.get("max_events", 200),
+                "require": observer.get("require", False) is True,
             },
             "execution": {
                 "timeout_sec": safe_int(execution.get("timeout_sec", 300) or 300, 300),
@@ -612,6 +311,10 @@ def config_public_state():
                 "port": safe_int(web.get("port", PORT) or PORT, PORT),
                 "token_configured": bool(web.get("token") or TOKEN),
                 "job_retention_hours": safe_int(web.get("job_retention_hours", JOB_RETENTION_HOURS) or JOB_RETENTION_HOURS, JOB_RETENTION_HOURS),
+                "max_active_jobs": safe_int(web.get("max_active_jobs", MAX_ACTIVE_JOBS) or MAX_ACTIVE_JOBS, MAX_ACTIVE_JOBS),
+                "job_timeout_sec": safe_int(web.get("job_timeout_sec", JOB_TIMEOUT_SEC) or JOB_TIMEOUT_SEC, JOB_TIMEOUT_SEC),
+                "max_job_attempts": safe_int(web.get("max_job_attempts", MAX_JOB_ATTEMPTS) or MAX_JOB_ATTEMPTS, MAX_JOB_ATTEMPTS),
+                "cancel_grace_sec": safe_int(web.get("cancel_grace_sec", CANCEL_GRACE_SEC), CANCEL_GRACE_SEC),
             },
         },
     }
@@ -640,6 +343,7 @@ CONFIG_WRITABLE_FIELDS = {
     "observer.enabled": {"type": "enum", "values": {"auto", "auditd", "disabled"}},
     "observer.privilege": {"type": "enum", "values": {"sudo_interactive", "passwordless", "none"}},
     "observer.max_events": {"type": "int", "min": 1, "max": 100000},
+    "observer.require": {"type": "bool"},
     "execution.min_privilege_proxy": {"type": "bool"},
     "execution.timeout_sec": {"type": "int", "min": 1, "max": 3600},
     "execution.least_privilege_user": {"type": "str", "min": 1},
@@ -649,6 +353,10 @@ CONFIG_WRITABLE_FIELDS = {
     "providers_security.block_internal_addresses": {"type": "bool"},
     "providers_security.allowed_hosts": {"type": "host_list", "max_items": 64},
     "remote.allow_api_key_transmission": {"type": "bool"},
+    "web.max_active_jobs": {"type": "int", "min": 1, "max": 64},
+    "web.job_timeout_sec": {"type": "int", "min": 1, "max": 86400},
+    "web.max_job_attempts": {"type": "int", "min": 1, "max": 10},
+    "web.cancel_grace_sec": {"type": "int", "min": 0, "max": 30},
 }
 CONFIG_SECRET_FIELDS = {"api_key"}
 
@@ -822,10 +530,11 @@ def create_runtime_backup():
         result = {}
     if process.returncode != 0 or not result.get("ok") or not output_path.is_file():
         output_path.unlink(missing_ok=True)
+        stderr_text, _ = limited_text(process.stderr, 600)
         return {
             "ok": False,
             "status": str(result.get("status") or "backup_failed"),
-            "error": str(result.get("error") or redacted_text(process.stderr) or "Runtime backup failed."),
+            "error": str(result.get("error") or stderr_text or "Runtime backup failed."),
         }
     return {
         "ok": True,
@@ -882,13 +591,62 @@ def persist_ephemeral_token():
 
 
 def json_response(handler, status, payload):
+    request_id = str(getattr(handler, "request_id", "") or uuid.uuid4().hex)
+    if isinstance(payload, dict) and payload.get("ok") is False:
+        payload = normalize_error_payload(payload, request_id)
+        status = domain_error_http(str(payload.get("code") or ""), status)
     body = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
     handler.send_response(status)
     handler.send_header("Content-Type", "application/json; charset=utf-8")
     handler.send_header("Content-Length", str(len(body)))
     handler.send_header("Cache-Control", "no-store")
+    handler.send_header("X-Request-ID", request_id)
     handler.end_headers()
     handler.wfile.write(body)
+
+
+def normalize_error_payload(payload, request_id=""):
+    return DOMAIN_CONTRACT.normalize_error(payload, request_id)
+
+
+def domain_error(code, message="", request_id="", details=None, **extra):
+    codes = DOMAIN_SCHEMA.get("error_codes") if isinstance(DOMAIN_SCHEMA, dict) else {}
+    spec = codes.get(code) if isinstance(codes, dict) else None
+    payload = {
+        "ok": False,
+        "status": code,
+        "code": code,
+        "message": str(message or code),
+        "request_id": str(request_id or ""),
+        "details": details if isinstance(details, dict) else {},
+        "retryable": bool(spec.get("retryable", False)) if isinstance(spec, dict) else False,
+    }
+    if message:
+        payload["error"] = str(message)
+    payload.update(extra)
+    return payload
+
+
+def domain_error_http(code, default=HTTPStatus.INTERNAL_SERVER_ERROR):
+    codes = DOMAIN_SCHEMA.get("error_codes") if isinstance(DOMAIN_SCHEMA, dict) else {}
+    spec = codes.get(code) if isinstance(codes, dict) else None
+    try:
+        return HTTPStatus(int(spec.get("http"))) if isinstance(spec, dict) else default
+    except (TypeError, ValueError):
+        return default
+
+
+def json_domain_error(handler, code, message="", default=HTTPStatus.INTERNAL_SERVER_ERROR, **extra):
+    json_response(
+        handler,
+        domain_error_http(code, default),
+        domain_error(
+            code,
+            message,
+            request_id=str(getattr(handler, "request_id", "") or ""),
+            **extra,
+        ),
+    )
 
 
 def read_json_body(handler):
@@ -901,465 +659,240 @@ def read_json_body(handler):
             f"request body {length} bytes exceeds limit {MAX_REQUEST_BODY_BYTES} bytes"
         )
     raw = handler.rfile.read(length)
+    def reject_constant(value):
+        raise ValueError(f"non-finite JSON number is not allowed: {value}")
+
+    def reject_duplicates(pairs):
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError(f"duplicate JSON key is not allowed: {key}")
+            result[key] = value
+        return result
+
     try:
-        return json.loads(raw.decode("utf-8"))
+        value = json.loads(
+            raw.decode("utf-8"),
+            parse_constant=reject_constant,
+            object_pairs_hook=reject_duplicates,
+        )
+        if not isinstance(value, dict):
+            raise ValueError("request body must be a JSON object")
+        return value
     except json.JSONDecodeError as exc:
         raise ValueError(f"invalid JSON body: {exc}") from exc
 
 
-def job_path(job_id):
-    return JOBS_ROOT / f"{job_id}.json"
-
-
-def write_job(job_id, payload):
-    JOBS_ROOT.mkdir(parents=True, exist_ok=True)
-    path = job_path(job_id)
-    tmp_path = path.with_suffix(".json.tmp")
-    with tmp_path.open("w", encoding="utf-8") as handle:
-        json.dump(payload, handle, ensure_ascii=False, separators=(",", ":"))
-    tmp_path.replace(path)
+JOB_STORE = JobStore(
+    JOBS_DB,
+    allowed_statuses=DOMAIN_SCHEMA.get("job_status") or None,
+    schema_version=int(DOMAIN_SCHEMA.get("schema_version", 1) or 1),
+)
 
 
 def read_job(job_id):
-    path = job_path(job_id)
-    if not path.exists():
-        return None
-    with path.open("r", encoding="utf-8") as handle:
-        return json.load(handle)
-
-
-def _job_record_lock(job_id):
-    with JOB_RECORD_LOCKS_GUARD:
-        lock = JOB_RECORD_LOCKS.get(job_id)
-        if lock is None:
-            lock = threading.Lock()
-            JOB_RECORD_LOCKS[job_id] = lock
-        return lock
+    return JOB_STORE.read(job_id)
 
 
 def update_job(job_id, mutator):
-    """Serialized read-modify-write of a job record.
-
-    All concurrent writers to one job (started/partial-output/final/cancel) go
-    through the job's lock and a monotonic ``version`` counter, so a slow partial
-    update can never clobber a terminal result and vice versa. ``mutator(job)``
-    edits the dict in place; returning ``False`` aborts the write (no-op).
-    """
-    with _job_record_lock(job_id):
-        job = read_job(job_id)
-        if job is None:
-            return None
-        if mutator(job) is False:
-            return job
-        job["version"] = int(job.get("version", 0)) + 1
-        job["updated_at"] = now_iso()
-        write_job(job_id, job)
-        return job
-
-
-def discard_job_record_lock(job_id):
-    with JOB_RECORD_LOCKS_GUARD:
-        JOB_RECORD_LOCKS.pop(job_id, None)
+    return JOB_STORE.update(job_id, mutator)
 
 
 def cleanup_jobs():
-    JOBS_ROOT.mkdir(parents=True, exist_ok=True)
-    cutoff = time.time() - (JOB_RETENTION_HOURS * 3600)
-    for path in JOBS_ROOT.glob("*.json"):
-        try:
-            if path.stat().st_mtime < cutoff:
-                path.unlink()
-                discard_job_record_lock(path.stem)
-        except OSError:
-            continue
+    deleted = JOB_STORE.cleanup(JOB_RETENTION_HOURS)
+    for job_id in deleted:
+        SESSION_STORE.discard_job_artifacts(job_id)
+    return deleted
 
 
 def recover_interrupted_jobs():
-    """Finalize jobs left active by a previous Web process."""
+    recovered = []
+    for job in JOB_STORE.recover_interrupted(SESSION_STORE.read_job_completion):
+        job_id = str(job.get("job_id") or "")
+        recovered.append(job_id)
+        session_id = str(job.get("session_id") or "")
+        if session_id:
+            append_audit_event(
+                ROOT / "logs" / f"{session_id}.jsonl",
+                session_id,
+                "job_recovered",
+                {
+                    "status": job.get("result_status"),
+                    "job_id": job_id,
+                    "request_id": job.get("request_id"),
+                    "recovery_source": job.get("recovery_source"),
+                },
+            )
+    return recovered
 
-    for path in JOBS_ROOT.glob("*.json"):
-        job_id = path.stem
 
-        def mark_interrupted(job):
-            if not isinstance(job, dict) or job.get("status") not in ("queued", "running"):
-                return False
-            job["status"] = "failed"
-            job["finished_at"] = now_iso()
-            job["result"] = {
-                "ok": False,
-                "status": "server_restarted",
-                "error": "The Web server restarted before this job completed.",
-            }
-            job["result_ok"] = False
-            job["result_status"] = "server_restarted"
-            return None
+_POLICY_SERVICE = None
 
-        update_job(job_id, mark_interrupted)
+
+def policy_service():
+    global _POLICY_SERVICE
+    if _POLICY_SERVICE is None:
+        _POLICY_SERVICE = PolicyService(
+            ROOT,
+            config_reader=read_config,
+            config_writer=write_config,
+            agent_api=run_agent_api,
+            audit=record_web_audit_event,
+            config_public_state=config_public_state,
+        )
+    return _POLICY_SERVICE
 
 
 def safe_policy_path(relative_path):
-    if not isinstance(relative_path, str) or not relative_path:
-        raise ValueError("policy path is required")
-    candidate = Path(relative_path)
-    if candidate.is_absolute() or ".." in candidate.parts:
-        raise ValueError("policy path must be relative to policies/")
-    target = (POLICIES_ROOT / candidate).resolve()
-    target.relative_to(POLICIES_ROOT.resolve())
-    if target.suffix != ".json":
-        raise ValueError("only JSON policy files are editable from the web console")
-    return target
+    return policy_service().safe_path(relative_path)
 
 
 def list_policy_files():
-    POLICIES_ROOT.mkdir(parents=True, exist_ok=True)
-    files = []
-    for path in sorted(POLICIES_ROOT.glob("*.json")):
-        stat = path.stat()
-        files.append(
-            {
-                "path": path.relative_to(POLICIES_ROOT).as_posix(),
-                "size_bytes": stat.st_size,
-                "mtime": int(stat.st_mtime),
-            }
-        )
-    return files
+    return policy_service().list_files()
 
 
 def read_policy_file(relative_path):
-    target = safe_policy_path(relative_path)
-    if not target.exists() or not target.is_file():
-        return {"ok": False, "status": "not_found", "error": "Policy file not found."}
-    content = target.read_text(encoding="utf-8")
-    parsed = None
-    try:
-        parsed = json.loads(content)
-    except json.JSONDecodeError:
-        parsed = None
-    return {
-        "ok": True,
-        "status": "read",
-        "path": target.relative_to(POLICIES_ROOT).as_posix(),
-        "content": content,
-        "json": parsed,
-    }
+    return policy_service().read_file(relative_path)
 
 
 def sudo_check(password):
-    if os.geteuid() == 0:
-        return {"ok": True, "status": "sudo_ok", "method": "root"}
-    if not password:
-        return {"ok": False, "status": "sudo_required", "error": "sudo password is required."}
-    try:
-        process = subprocess.run(
-            ["sudo", "-S", "-p", "", "-v"],
-            input=f"{password}\n",
-            text=True,
-            capture_output=True,
-            timeout=10,
-            check=False,
-        )
-    except FileNotFoundError:
-        return {"ok": False, "status": "sudo_not_found", "error": "sudo is not installed."}
-    except subprocess.TimeoutExpired:
-        return {"ok": False, "status": "sudo_timeout", "error": "sudo validation timed out."}
-    if process.returncode == 0:
-        return {"ok": True, "status": "sudo_ok", "method": "sudo"}
-    return {
-        "ok": False,
-        "status": "sudo_denied",
-        "error": (process.stderr or "sudo validation failed").strip()[:400],
-    }
+    return policy_service().sudo_check(password)
 
 
 def update_command_guard(enabled, password):
-    if not isinstance(enabled, bool):
-        return {"ok": False, "status": "invalid_config_value", "error": "command_guard.enabled must be boolean."}
-
-    if os.geteuid() == 0:
-        method = "root"
-    else:
-        check = sudo_check(password)
-        if not check.get("ok"):
-            return check
-        method = str(check.get("method") or "sudo")
-
-    config = read_config()
-    command_guard = config.get("command_guard") if isinstance(config.get("command_guard"), dict) else {}
-    command_guard["enabled"] = enabled
-    config["command_guard"] = command_guard
-    try:
-        write_config(config)
-    except OSError as exc:
-        return {"ok": False, "status": "config_write_failed", "error": f"Could not save command guard setting: {exc}"}
-    result = config_public_state()
-    result["status"] = "updated"
-    result["method"] = method
-    result["command_guard"] = result["config"]["command_guard"]
-    record_web_audit_event(
-        "command_guard_updated",
-        {"enabled": enabled, "method": method},
-    )
-    return result
+    return policy_service().update_command_guard(enabled, password)
 
 
 def append_audit_event(log_path, session_id, stage, payload=None):
-    payload = payload if isinstance(payload, dict) else {}
-    log_path.parent.mkdir(parents=True, exist_ok=True)
-    event = {
-        "timestamp": now_iso(),
-        "session_id": session_id,
-        "stage": stage,
-        "payload": payload,
-    }
-    with log_path.open("a", encoding="utf-8") as handle:
-        handle.write(json.dumps(event, ensure_ascii=False, separators=(",", ":")))
-        handle.write("\n")
+    """Append through the shared Bash/Web audit implementation.
+
+    Block and integrity failures deliberately propagate: a Web operation must
+    not report success after its required audit record was refused.
+    """
+    outbox_event_id = (
+        payload.get("outbox_event_id")
+        if isinstance(payload, dict)
+        else None
+    )
+    return append_web_audit_event(
+        log_path,
+        session_id,
+        stage,
+        payload,
+        config=read_config(),
+        request_id=str(getattr(REQUEST_CONTEXT, "request_id", "") or ""),
+        # The shared audit writer may replace payloads in low-space degrade
+        # mode. Keep the transactional outbox identity in the envelope so a
+        # crash before the journal acknowledgement remains deduplicable.
+        outbox_event_id=str(outbox_event_id) if outbox_event_id else None,
+    )
 
 
 def record_web_audit_event(stage, payload=None):
     append_audit_event(WEB_AUDIT_LOG, WEB_AUDIT_SESSION_ID, stage, payload)
 
 
+SESSION_STORE = SessionStore(
+    ROOT,
+    SERVER_RUN_ID,
+    read_config,
+    append_audit_event,
+    lock=WEB_AGENT_LOCK,
+)
+
+
 def record_web_agent_session_event(stage, payload=None):
-    append_audit_event(WEB_AGENT_AUDIT_LOG, WEB_AGENT_SESSION_ID, stage, payload)
-
-
-def new_web_agent_session_id():
-    return f"session_web_{uuid.uuid4().hex[:16]}"
-
-
-def set_web_agent_session_paths(session_id):
-    global WEB_AGENT_SESSION_ID, WEB_AGENT_AUDIT_LOG, WEB_AGENT_HISTORY_FILE
-    WEB_AGENT_SESSION_ID = session_id
-    WEB_AGENT_AUDIT_LOG = ROOT / "logs" / f"{WEB_AGENT_SESSION_ID}.jsonl"
-    WEB_AGENT_HISTORY_FILE = ROOT / "tmp" / "web" / "sessions" / f"{WEB_AGENT_SESSION_ID}.history.json"
-
-
-def read_json_array(path):
-    try:
-        with path.open("r", encoding="utf-8") as handle:
-            value = json.load(handle)
-    except (FileNotFoundError, json.JSONDecodeError):
-        return []
-    return value if isinstance(value, list) else []
-
-
-def write_json_atomic(path, value):
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = path.with_suffix(f"{path.suffix}.tmp")
-    with tmp_path.open("w", encoding="utf-8") as handle:
-        json.dump(value, handle, ensure_ascii=False, separators=(",", ":"))
-        handle.write("\n")
-    tmp_path.replace(path)
-
-
-def context_turn_limit():
-    try:
-        value = int(read_config().get("context_turns", 6))
-    except (TypeError, ValueError):
-        value = 6
-    return max(0, value)
-
-
-def web_agent_session_state_locked():
-    history = read_json_array(WEB_AGENT_HISTORY_FILE)
-    turns = context_turn_limit()
-    window = history[-turns:] if turns else []
-    return {
-        "ok": True,
-        "status": "active",
-        "session_id": WEB_AGENT_SESSION_ID,
-        "audit_log": str(WEB_AGENT_AUDIT_LOG),
-        "history_file": str(WEB_AGENT_HISTORY_FILE),
-        "history_count": len(history),
-        "context_turns": turns,
-        "context_window_count": len(window),
-        "restored_from": WEB_AGENT_RESTORED_FROM,
-    }
+    return SESSION_STORE.record_current(stage, payload)
 
 
 def web_agent_session_state():
-    with WEB_AGENT_LOCK:
-        return web_agent_session_state_locked()
-
-
-def finish_current_web_agent_session_locked(status):
-    if not WEB_AGENT_SESSION_ID:
-        return
-    record_web_agent_session_event(
-        "session_finished",
-        {
-            "status": status,
-            "run_id": SERVER_RUN_ID,
-        },
-    )
-
-
-def start_web_agent_session_locked(history=None, restored_from="", start_reason="started", session_id=None):
-    global WEB_AGENT_RESTORED_FROM
-    next_session_id = session_id or new_web_agent_session_id()
-    set_web_agent_session_paths(next_session_id)
-    WEB_AGENT_RESTORED_FROM = restored_from
-    WEB_AGENT_AUDIT_LOG.parent.mkdir(parents=True, exist_ok=True)
-    WEB_AGENT_AUDIT_LOG.write_text("", encoding="utf-8")
-    write_json_atomic(WEB_AGENT_HISTORY_FILE, history if isinstance(history, list) else [])
-    record_web_agent_session_event(
-        "session_started",
-        {
-            "request": "agent-web",
-            "entrypoint": "web",
-            "run_id": SERVER_RUN_ID,
-            "started_at": now_iso(),
-            "audit_mode": read_config().get("audit_mode", "safe_summary"),
-            "restored_from": restored_from,
-            "start_reason": start_reason,
-            "history_count": len(history) if isinstance(history, list) else 0,
-        },
-    )
-    return web_agent_session_state_locked()
+    try:
+        state = SESSION_STORE.state()
+    except SessionDataError as exc:
+        return {
+            "ok": False,
+            "status": "persisted_session_invalid",
+            "error": str(exc),
+        }
+    try:
+        state["web_timeline"] = timeline_from_turns(
+            state["session_id"],
+            state.get("turns") or [],
+            DOMAIN_CONTRACT,
+        )
+    except TimelineDataError as exc:
+        return domain_error("persisted_turns_invalid", str(exc))
+    return state
 
 
 def initialize_web_agent_session():
-    with WEB_AGENT_LOCK:
-        return start_web_agent_session_locked(
-            history=[],
-            restored_from="",
-            start_reason="server_started",
-            session_id=f"session_web_{SERVER_RUN_ID[:16]}",
-        )
+    return SESSION_STORE.initialize()
 
 
-def rotate_web_agent_session(reason="rotated", history=None, restored_from=""):
-    with WEB_AGENT_LOCK:
-        finish_current_web_agent_session_locked(reason)
-        return start_web_agent_session_locked(
-            history=history if isinstance(history, list) else [],
-            restored_from=restored_from,
-            start_reason=reason,
-        )
+def reconcile_pending_job_audits():
+    reconciled = []
+    for pending_job in JOB_STORE.list_audit_pending():
+        job_id = str(pending_job.get("job_id") or "")
+        completion = SESSION_STORE.read_job_completion(job_id)
+        if completion is None:
+            continue
+
+        def mark_audit_complete(record):
+            if record.get("audit_state") != "pending":
+                return False
+            record["audit_state"] = "complete"
+            record.pop("audit_error", None)
+            return None
+
+        updated = update_job(job_id, mark_audit_complete)
+        if isinstance(updated, dict) and updated.get("audit_state") == "complete":
+            reconciled.append(job_id)
+    return reconciled
 
 
-def read_audit_events(session_id):
-    if not session_id or not all(ch.isalnum() or ch in "_.-" for ch in session_id):
-        raise ValueError("session_id is required and must be a safe file name.")
-    log_file = ROOT / "logs" / f"{session_id}.jsonl"
-    if not log_file.exists():
-        raise FileNotFoundError("Audit session not found.")
-    events = []
-    with log_file.open("r", encoding="utf-8") as handle:
-        for line in handle:
-            line = line.strip()
-            if not line:
-                continue
+def restore_web_agent_session(session_id):
+    # Lock order is admission -> session everywhere. This makes the active-Job
+    # check and workspace rotation one atomic decision with Job snapshot/admit.
+    with JOB_ADMISSION_LOCK:
+        with SESSION_STORE.lock:
+            active_jobs = count_active_jobs()
+            if active_jobs:
+                return domain_error(
+                    "session_busy",
+                    "Cannot restore a workspace while Jobs are active.",
+                    active_jobs=active_jobs,
+                )
             try:
-                event = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if isinstance(event, dict):
-                events.append(event)
-    return events
-
-
-def compact_history_text(value, limit=1200):
-    text = " ".join(str(value or "").split())
-    if len(text) > limit:
-        return text[:limit] + "[TRUNCATED]"
-    return text
-
-
-def audit_history_from_events(events):
-    history = []
-    turns = build_web_turns_from_audit("audit_restore", events)
-    for turn in turns:
-        result = turn.get("result") if isinstance(turn.get("result"), dict) else {}
-        response = result.get("response") if isinstance(result.get("response"), dict) else {}
-        timeline = result.get("timeline") if isinstance(result.get("timeline"), list) else []
-        executions = [item for item in timeline if isinstance(item, dict) and item.get("kind") == "execution"]
-        status = str(turn.get("status") or result.get("status") or "restored")
-        iteration = result.get("iteration")
-        plan_summary = response.get("summary") or ""
-        final_answer = ""
-        for block in result.get("output_blocks") if isinstance(result.get("output_blocks"), list) else []:
-            if isinstance(block, dict) and block.get("title") == "最终回答":
-                final_answer = str(block.get("text") or "")
-                break
-        if iteration is not None:
-            response_content = {
-                "iteration": iteration,
-                "status": status,
-                "result_count": len(executions),
-                "stopped_reason": response.get("continue_decision", {}).get("reason") if isinstance(response.get("continue_decision"), dict) else "",
-                "reflection_summary": final_answer or plan_summary,
-            }
-            response_text = json.dumps(response_content, ensure_ascii=False, separators=(",", ":"))
-            metadata = {
-                "source": "audit_restore",
-                "iteration": iteration,
-                "result_count": len(executions),
-                "plan_summary": plan_summary,
-                "reflection_summary": final_answer,
-            }
-            turn_type = "agent_loop_iteration"
-        else:
-            assistant_parts = []
-            if plan_summary:
-                assistant_parts.append(f"计划: {plan_summary}")
-            assistant_parts.append(f"执行状态: {status}; 结果数: {len(executions)}")
-            if final_answer:
-                assistant_parts.append(f"最终回答: {final_answer}")
-            response_text = "；".join(part for part in assistant_parts if part) or status
-            metadata = {"source": "audit_restore"}
-            turn_type = "request"
-        history.append(
-            {
-                "type": turn_type,
-                "mode": turn.get("mode") or "work",
-                "request": {"content": compact_history_text(turn.get("input", ""))},
-                "response": {
-                    "content": compact_history_text(response_text),
-                    "status": status,
-                },
-                "status": status,
-                "started_at": turn.get("created_at") or now_iso(),
-                "completed_at": turn.get("updated_at") or now_iso(),
-                "metadata": metadata,
-                **({"iteration": iteration} if iteration is not None else {}),
-            }
+                source_turns = SESSION_STORE.read_persisted_turns(session_id)
+                if source_turns:
+                    timeline_from_turns(session_id, source_turns, DOMAIN_CONTRACT)
+            except (TimelineDataError, SessionDataError) as exc:
+                return domain_error("persisted_turns_invalid", str(exc))
+            except ValueError as exc:
+                return domain_error("invalid_session_id", str(exc))
+            result = SESSION_STORE.restore(session_id)
+    if result.get("ok"):
+        restored_session = result.get("session") if isinstance(result.get("session"), dict) else {}
+        active_session_id = str(restored_session.get("session_id") or "")
+        result["web_timeline"] = timeline_from_turns(
+            active_session_id,
+            result.get("turns") or [],
+            DOMAIN_CONTRACT,
         )
-    return history
-
-
-def restore_web_agent_session_from_audit(session_id):
-    try:
-        events = read_audit_events(session_id)
-    except ValueError as exc:
-        return {"ok": False, "status": "invalid_session_id", "error": str(exc)}
-    except FileNotFoundError as exc:
-        return {"ok": False, "status": "not_found", "error": str(exc)}
-    history = audit_history_from_events(events)
-    session = rotate_web_agent_session(
-        reason="restored_from_audit",
-        history=history,
-        restored_from=session_id,
-    )
-    return {"ok": True, "status": "restored", "session": session, "history_count": len(history)}
+    return result
 
 
 def leave_web_agent_session():
-    with WEB_AGENT_LOCK:
-        restored = WEB_AGENT_RESTORED_FROM
-        finish_current_web_agent_session_locked("left_restored" if restored else "rotated")
-        session = start_web_agent_session_locked(
-            history=[],
-            restored_from="",
-            start_reason="left_restored" if restored else "rotated",
-        )
-    return {
-        "ok": True,
-        "status": "left_restored" if restored else "rotated",
-        "left_restored_from": restored,
-        "session": session,
-    }
+    with JOB_ADMISSION_LOCK:
+        with SESSION_STORE.lock:
+            active_jobs = count_active_jobs()
+            if active_jobs:
+                return domain_error(
+                    "session_busy",
+                    "Cannot rotate a workspace while Jobs are active.",
+                    active_jobs=active_jobs,
+                )
+            return SESSION_STORE.leave()
 
 
 def observer_runtime_config():
@@ -1378,6 +911,7 @@ def observer_runtime_config():
         "enabled": enabled,
         "privilege": privilege,
         "max_events": max_events,
+        "require": observer.get("require", False) is True,
     }
 
 
@@ -1589,152 +1123,30 @@ def public_observer_log_payload(result):
 
 
 def validate_policy_content(relative_path, content):
-    try:
-        safe_policy_path(relative_path)
-    except ValueError as exc:
-        return {"ok": False, "status": "invalid_path", "error": str(exc)}
-    return run_agent_api("policy", "validate", {"path": relative_path, "content": content}, timeout=60)
+    return policy_service().validate(relative_path, content)
 
 
 def write_policy_file(relative_path, content, password):
-    target = safe_policy_path(relative_path)
-    if not isinstance(content, str) or not content.strip():
-        return {"ok": False, "status": "empty_content", "error": "Policy content is empty."}
-    try:
-        parsed = json.loads(content)
-    except json.JSONDecodeError as exc:
-        return {"ok": False, "status": "invalid_json", "error": str(exc)}
+    return policy_service().write_file(relative_path, content, password)
 
-    normalized_content = json.dumps(parsed, ensure_ascii=False, indent=2) + "\n"
-    validation = validate_policy_content(relative_path, normalized_content)
-    if not validation.get("ok"):
-        return {
-            "ok": False,
-            "status": "validation_failed",
-            "error": "Policy validation failed.",
-            "validation": validation.get("validation", validation),
-        }
 
-    target.parent.mkdir(parents=True, exist_ok=True)
-    tmp_dir = ROOT / "tmp" / "web" / "policy-edits"
-    tmp_dir.mkdir(parents=True, exist_ok=True)
-    tmp_path = tmp_dir / f"{target.name}.{uuid.uuid4().hex}.tmp"
-    tmp_path.write_text(normalized_content, encoding="utf-8")
-
-    if os.geteuid() == 0:
-        tmp_path.replace(target)
-        return {"ok": True, "status": "saved", "path": target.relative_to(POLICIES_ROOT).as_posix(), "method": "root"}
-
-    check = sudo_check(password)
-    if not check.get("ok"):
-        try:
-            tmp_path.unlink()
-        except OSError:
-            pass
-        return check
-
-    try:
-        process = subprocess.run(
-            ["sudo", "-S", "-p", "", "install", "-m", "0644", str(tmp_path), str(target)],
-            input=f"{password}\n",
-            text=True,
-            capture_output=True,
-            timeout=10,
-            check=False,
-        )
-    except subprocess.TimeoutExpired:
-        process = None
-    finally:
-        try:
-            tmp_path.unlink()
-        except OSError:
-            pass
-
-    if process is None:
-        return {"ok": False, "status": "sudo_timeout", "error": "sudo install timed out."}
-    if process.returncode != 0:
-        return {
-            "ok": False,
-            "status": "sudo_write_failed",
-            "error": (process.stderr or "sudo install failed").strip()[:400],
-        }
-    return {"ok": True, "status": "saved", "path": target.relative_to(POLICIES_ROOT).as_posix(), "method": "sudo"}
+SKILL_SERVICE = SkillService(SKILLS_ROOT)
 
 
 def safe_skills_path(relative_path):
-    if not isinstance(relative_path, str) or not relative_path:
-        raise ValueError("skill path is required")
-    candidate = Path(relative_path)
-    if candidate.is_absolute() or ".." in candidate.parts:
-        raise ValueError("skill path must be relative to skills/")
-    target = (SKILLS_ROOT / candidate).resolve()
-    target.relative_to(SKILLS_ROOT.resolve())
-    if target.suffix not in (".md", ".sh"):
-        raise ValueError("only Markdown and shell skill files are readable from the web console")
-    return target
+    return SKILL_SERVICE.safe_path(relative_path)
 
 
 def build_skill_tree(path):
-    children = []
-    try:
-        entries = sorted(path.iterdir(), key=lambda item: (not item.is_dir(), item.name.lower()))
-    except FileNotFoundError:
-        entries = []
-    for child in entries:
-        if child.name.startswith("."):
-            continue
-        relative = child.relative_to(SKILLS_ROOT).as_posix()
-        if child.is_dir():
-            children.append({"type": "dir", "name": child.name, "path": relative, "children": build_skill_tree(child)})
-        elif child.suffix in (".md", ".sh"):
-            stat = child.stat()
-            children.append(
-                {
-                    "type": "file",
-                    "name": child.name,
-                    "path": relative,
-                    "kind": "markdown" if child.suffix == ".md" else "script",
-                    "size_bytes": stat.st_size,
-                    "mtime": int(stat.st_mtime),
-                }
-            )
-    return children
+    return SKILL_SERVICE.build_tree(path)
 
 
 def list_skill_files():
-    SKILLS_ROOT.mkdir(parents=True, exist_ok=True)
-    markdown = []
-    scripts = []
-    for path in sorted(SKILLS_ROOT.rglob("*")):
-        if not path.is_file() or path.name.startswith("."):
-            continue
-        relative = path.relative_to(SKILLS_ROOT).as_posix()
-        if path.suffix == ".md":
-            markdown.append(relative)
-        elif path.suffix == ".sh":
-            scripts.append(relative)
-    return {
-        "ok": True,
-        "status": "listed",
-        "root": "skills",
-        "tree": build_skill_tree(SKILLS_ROOT),
-        "markdown_files": markdown,
-        "script_files": scripts,
-    }
+    return SKILL_SERVICE.list_files()
 
 
 def read_skill_file(relative_path):
-    target = safe_skills_path(relative_path)
-    if not target.exists() or not target.is_file():
-        return {"ok": False, "status": "not_found", "error": "Skill file not found."}
-    content = target.read_text(encoding="utf-8")
-    return {
-        "ok": True,
-        "status": "read",
-        "path": target.relative_to(SKILLS_ROOT).as_posix(),
-        "kind": "markdown" if target.suffix == ".md" else "script",
-        "content": content,
-    }
+    return SKILL_SERVICE.read_file(relative_path)
 
 
 def limited_text(text, limit):
@@ -1778,6 +1190,7 @@ def update_job_partial_output(job_id, resource, stderr):
             "approval_card": None,
             "output_blocks": [block],
         }
+        job["partial_output"] = [block]
         job["result_ok"] = False
         job["result_status"] = "running"
         return None
@@ -1785,748 +1198,419 @@ def update_job_partial_output(job_id, resource, stderr):
     update_job(job_id, apply_partial)
 
 
-def terminate_job_process(process):
-    try:
-        os.killpg(process.pid, signal.SIGTERM)
-    except ProcessLookupError:
-        pass
-    except OSError:
-        process.terminate()
+_EXECUTION_SERVICE = None
 
 
-def register_job_process(job_id, process):
-    """Register a child only while its job is still running."""
-
-    try:
-        with JOB_PROCESSES_LOCK:
-            job = read_job(job_id)
-            if isinstance(job, dict) and job.get("status") == "running":
-                JOB_PROCESSES[job_id] = process
-                return True
-    except (OSError, json.JSONDecodeError):
-        pass
-    terminate_job_process(process)
-    return False
-
-
-def run_agent_api_job_process(command, env, resource, timeout, job_id):
-    process = subprocess.Popen(
-        command,
-        cwd=str(ROOT),
-        env=env,
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        start_new_session=True,
-    )
-    register_job_process(job_id, process)
-
-    stdout_chunks = []
-    stderr_chunks = []
-    last_partial_update = [0.0]
-
-    def read_stdout():
-        if process.stdout is None:
-            return
-        stdout_chunks.append(process.stdout.read() or "")
-
-    stdout_thread = threading.Thread(target=read_stdout, daemon=True)
-    stdout_thread.start()
-    start_time = time.monotonic()
-    returncode = None
-    try:
-        if process.stderr is not None:
-            for line in process.stderr:
-                stderr_chunks.append(line)
-                now = time.monotonic()
-                if now - last_partial_update[0] >= 0.25:
-                    update_job_partial_output(job_id, resource, "".join(stderr_chunks).strip())
-                    last_partial_update[0] = now
-                if timeout is not None and now - start_time > timeout:
-                    process.kill()
-                    break
-        if timeout is None:
-            returncode = process.wait()
-        else:
-            remaining = max(0.1, timeout - (time.monotonic() - start_time))
-            returncode = process.wait(timeout=remaining)
-    except subprocess.TimeoutExpired:
-        process.kill()
-        returncode = process.wait()
-    finally:
-        stdout_thread.join(timeout=1)
-        with JOB_PROCESSES_LOCK:
-            JOB_PROCESSES.pop(job_id, None)
-
-    stderr = "".join(stderr_chunks).strip()
-    update_job_partial_output(job_id, resource, stderr)
-    return "".join(stdout_chunks).strip(), stderr, returncode
-
-
-def run_agent_api(resource, action="", payload=None, timeout=None, job_id=None):
-    payload = payload or {}
-    command = ["bash", str(AGENT), "api", resource]
-    if action:
-        command.append(action)
-    command.append(json.dumps(payload, ensure_ascii=False, separators=(",", ":")))
-    env = agent_subprocess_env(include_api_key=(resource, action) in {("work", "run"), ("edit", "plan")})
-    with WEB_AGENT_LOCK:
-        session_id = WEB_AGENT_SESSION_ID
-        audit_log = str(WEB_AGENT_AUDIT_LOG)
-        history_file = str(WEB_AGENT_HISTORY_FILE)
-    env["LINUX_AGENT_SESSION_MANAGED_EXTERNALLY"] = "1"
-    env["LINUX_AGENT_SESSION_ID"] = session_id
-    env["LINUX_AGENT_AUDIT_LOG"] = audit_log
-    env["LINUX_AGENT_CONVERSATION_HISTORY_FILE"] = history_file
-    env["LINUX_AGENT_REQUEST_ID"] = uuid.uuid4().hex
-    if job_id:
-        env["LINUX_AGENT_JOB_ID"] = job_id
-    if job_id is None:
-        process = subprocess.run(
-            command,
-            cwd=str(ROOT),
-            env=env,
-            text=True,
-            capture_output=True,
-            timeout=timeout,
-            check=False,
+def execution_service():
+    global _EXECUTION_SERVICE
+    if _EXECUTION_SERVICE is None:
+        _EXECUTION_SERVICE = ExecutionService(
+            root=ROOT,
+            agent=AGENT,
+            env_builder=agent_subprocess_env,
+            session_store=SESSION_STORE,
+            job_reader=read_job,
+            partial_writer=update_job_partial_output,
+            workspace_lock=WEB_AGENT_LOCK,
+            process_registry=JOB_PROCESSES,
+            process_registry_lock=JOB_PROCESSES_LOCK,
+            cancel_grace=CANCEL_GRACE_SEC,
+            default_job_timeout=JOB_TIMEOUT_SEC,
         )
-        stdout = process.stdout.strip()
-        stderr = process.stderr.strip()
-        returncode = process.returncode
-    else:
-        stdout, stderr, returncode = run_agent_api_job_process(command, env, resource, timeout, job_id)
-    try:
-        result = json.loads(stdout) if stdout else {}
-    except json.JSONDecodeError:
-        result = {
-            "ok": False,
-            "status": "invalid_agent_output",
-            "timeline": [],
-            "approval_card": None,
-            "output_blocks": [
-                {"kind": "stdout", "title": "Agent stdout", "text": stdout[:4000], "truncated_bytes": max(0, len(stdout) - 4000)}
-            ],
-        }
-    if isinstance(result, dict):
-        if returncode is not None and returncode < 0:
-            result["ok"] = False
-            result["status"] = "cancelled"
-            result.setdefault("error", "Job process was terminated.")
-        result.setdefault("ok", returncode == 0 and result.get("ok", False))
-        result.setdefault("status", "completed" if returncode == 0 else "failed")
-        blocks = result.setdefault("output_blocks", [])
-        if not isinstance(blocks, list):
-            blocks = []
-            result["output_blocks"] = blocks
-        stderr_block = agent_stderr_block(resource, stderr)
-        if stderr_block:
-            blocks.append(stderr_block)
-        blocks.append({"kind": "meta", "title": "Agent runtime", "json": {"exit_code": returncode}})
-    return result
+    return _EXECUTION_SERVICE
 
 
-def run_job(job_id, job, resource, action, payload):
+def run_agent_api(resource, action="", payload=None, timeout=None, job_context=None, request_id=None):
+    if job_context is not None:
+        if not isinstance(job_context, JobSessionContext):
+            raise TypeError("job_context must be JobSessionContext")
+        return execution_service().run_job(
+            resource,
+            action,
+            payload,
+            context=job_context,
+            timeout=timeout,
+        )
+    effective_request_id = str(
+        request_id
+        or getattr(REQUEST_CONTEXT, "request_id", "")
+        or uuid.uuid4().hex
+    )
+    return execution_service().run_sync(
+        resource,
+        action,
+        payload,
+        timeout=timeout,
+        request_id=effective_request_id,
+    )
+
+
+def job_input_text(payload):
+    for key in ("input", "command", "ref"):
+        value = payload.get(key)
+        if value:
+            return str(value)
+    return ""
+
+
+def cancelled_job_result(record=None):
+    record = record if isinstance(record, dict) else {}
+    return {
+        "ok": False,
+        "status": "cancelled",
+        "error": "Job cancellation completed.",
+        "cancel_requested_at": str(record.get("cancel_requested_at") or ""),
+        "timeline": [],
+        "approval_card": None,
+        "output_blocks": [],
+    }
+
+
+def terminal_job_status(result):
+    if result.get("status") == "cancelled":
+        return "cancelled"
+    if result.get("ok") or result.get("status") == "approval_required":
+        return "succeeded"
+    return "failed"
+
+
+def run_job(job_id, job, resource, action, payload, job_context):
+    del job  # The durable store is authoritative after admission.
+    result = None
+    terminal_status = "failed"
+
     def mark_running(record):
-        # A cancel that landed while we were queued wins.
-        if record.get("status") == "cancelled":
+        if record.get("status") != "queued" or record.get("cancel_requested_at"):
             return False
         record["status"] = "running"
+        record["phase"] = "executing"
         record["started_at"] = now_iso()
         return None
 
-    if update_job(job_id, mark_running) is None:
-        return
-    current = read_job(job_id)
-    if isinstance(current, dict) and current.get("status") == "cancelled":
-        return
     try:
-        result = run_agent_api(resource, action, payload, timeout=None, job_id=job_id)
+        current = update_job(job_id, mark_running)
+        if current is None:
+            result = {"ok": False, "status": "not_found", "error": "Job disappeared."}
+        elif current.get("cancel_requested_at"):
+            result = cancelled_job_result(current)
+        else:
+            result = run_agent_api(
+                resource,
+                action,
+                payload,
+                timeout=JOB_TIMEOUT_SEC,
+                job_context=job_context,
+            )
+    except Exception as exc:  # noqa: BLE001 - persisted as a structured Job failure.
+        result = {"ok": False, "status": "job_exception", "error": str(exc)}
 
-        def apply_result(record):
-            # If a cancel already finalized this job, do not resurrect it.
-            if record.get("status") == "cancelled":
-                return False
-            if result.get("status") == "cancelled":
-                record["status"] = "cancelled"
+    if result is None:
+        result = {
+            "ok": False,
+            "status": "job_exception",
+            "error": "Job ended without a result.",
+        }
+    try:
+        result = DOMAIN_CONTRACT.enrich_execution_result(result)
+    except DomainValidationError as exc:
+        result = DOMAIN_CONTRACT.enrich_execution_result(
+            {
+                "ok": False,
+                "status": "invalid_agent_output",
+                "error": str(exc),
+                "timeline": [],
+                "approval_card": None,
+                "output_blocks": [],
+            }
+        )
+
+    # Close cancellation before durable Session state is written.  Once phase
+    # becomes finalizing, cancel_job rejects late cancellation so the persisted
+    # Turn and the eventual terminal Job cannot disagree.
+    def begin_finalization(record):
+        if record.get("status") not in ("queued", "running"):
+            return False
+        record["phase"] = "finalizing"
+        record["execution_finished_at"] = now_iso()
+        return None
+
+    finalizing_record = update_job(job_id, begin_finalization)
+    if isinstance(finalizing_record, dict) and finalizing_record.get("cancel_requested_at"):
+        result = DOMAIN_CONTRACT.enrich_execution_result(cancelled_job_result(finalizing_record))
+
+    terminal_status = terminal_job_status(result)
+    merge_history = terminal_status == "succeeded" and resource == "work"
+    session_completion = None
+    try:
+        session_completion = SESSION_STORE.complete_job(
+            job_context,
+            resource,
+            job_input_text(payload),
+            result,
+            merge_history=merge_history,
+        )
+    except Exception as exc:  # noqa: BLE001 - durable state is part of Job success.
+        result = {
+            "ok": False,
+            "status": "session_persistence_failed",
+            "error": str(exc),
+            "agent_result": result,
+        }
+        result = DOMAIN_CONTRACT.enrich_execution_result(result)
+        terminal_status = "failed"
+
+    def publish_terminal(record):
+        if record.get("status") not in ("queued", "running"):
+            return False
+        record["status"] = terminal_status
+        record["phase"] = "terminal"
+        record["result"] = result
+        record["partial_output"] = None
+        record["result_ok"] = bool(result.get("ok"))
+        record["result_status"] = str(result.get("status") or terminal_status)
+        record["finished_at"] = now_iso()
+        if isinstance(session_completion, dict):
+            record["audit_state"] = str(
+                session_completion.get("audit_state") or "complete"
+            )
+            audit_error = str(session_completion.get("audit_error") or "")
+            if audit_error:
+                record["audit_error"] = audit_error
             else:
-                record["status"] = "succeeded" if result.get("ok") or result.get("status") == "approval_required" else "failed"
-            record["result"] = result
-            record["result_ok"] = bool(result.get("ok"))
-            record["result_status"] = result.get("status", record["status"])
-            record["finished_at"] = now_iso()
-            return None
+                record.pop("audit_error", None)
+        return None
 
-        update_job(job_id, apply_result)
-    except Exception as exc:  # noqa: BLE001 - surfaced as a job failure.
-        def apply_failure(record):
-            if record.get("status") == "cancelled":
-                return False
-            record["status"] = "failed"
-            record["result"] = {"ok": False, "status": "job_exception", "error": str(exc)}
-            record["result_ok"] = False
-            record["result_status"] = "job_exception"
-            record["finished_at"] = now_iso()
-            return None
-
-        update_job(job_id, apply_failure)
+    try:
+        update_job(job_id, publish_terminal)
+    finally:
+        with JOB_CONTEXTS_LOCK:
+            JOB_CONTEXTS.pop(job_id, None)
 
 
 def count_active_jobs():
-    JOBS_ROOT.mkdir(parents=True, exist_ok=True)
-    active = 0
-    for path in JOBS_ROOT.glob("*.json"):
-        try:
-            with path.open("r", encoding="utf-8") as handle:
-                job = json.load(handle)
-        except (OSError, json.JSONDecodeError):
-            continue
-        if isinstance(job, dict) and job.get("status") in ("queued", "running"):
-            active += 1
-    return active
+    return JOB_STORE.count_active()
 
 
-def start_job(resource, action, payload):
+def start_job(
+    resource,
+    action,
+    payload,
+    idempotency_key=None,
+    request_id=None,
+    retry_of=None,
+    root_job_id=None,
+    attempt=1,
+    max_attempts=None,
+):
     cleanup_jobs()
-    now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    now = now_iso()
     with JOB_ADMISSION_LOCK:
-        if count_active_jobs() >= MAX_ACTIVE_JOBS:
-            return {
-                "ok": False,
-                "status": "too_many_jobs",
-                "error": f"活动 Job 数已达上限 ({MAX_ACTIVE_JOBS})，请稍后重试。",
-                "active_limit": MAX_ACTIVE_JOBS,
-            }
         job_id = uuid.uuid4().hex
+        effective_request_id = str(request_id or uuid.uuid4().hex)
+        effective_max_attempts = max(int(max_attempts or MAX_JOB_ATTEMPTS), int(attempt), 1)
         job = {
             "ok": True,
+            "schema_version": int(DOMAIN_SCHEMA.get("schema_version", 1) or 1),
             "job_id": job_id,
             "resource": resource,
             "action": action,
             "status": "queued",
+            "phase": "queued",
             "version": 0,
+            "attempt": int(attempt),
+            "max_attempts": effective_max_attempts,
             "created_at": now,
             "updated_at": now,
+            "request_id": effective_request_id,
+            "session_id": f"job_{job_id}",
+            "payload": payload,
+            "partial_output": None,
             "result": None,
             "result_ok": None,
             "result_status": None,
         }
-        write_job(job_id, job)
+        if retry_of:
+            job["retry_of"] = str(retry_of)
+            job["root_job_id"] = str(root_job_id or retry_of)
+        try:
+            stored, deduplicated = JOB_STORE.admit(
+                job,
+                idempotency_key=idempotency_key,
+                max_active=MAX_ACTIVE_JOBS,
+            )
+        except JobCapacityExceeded as exc:
+            return domain_error(
+                "too_many_jobs",
+                f"活动 Job 数已达上限 ({exc.max_active})，请稍后重试。",
+                active_jobs=exc.active,
+                active_limit=exc.max_active,
+            )
+        if deduplicated:
+            result = dict(stored)
+            result["deduplicated"] = True
+            return result
+        job = stored
+        try:
+            job_context = SESSION_STORE.create_job_context(job_id, effective_request_id)
+        except Exception as exc:
+            failure = {
+                "ok": False,
+                "status": "job_start_failed",
+                "error": f"Job session context could not be initialized: {exc}",
+            }
 
-    threading.Thread(target=run_job, args=(job_id, job, resource, action, payload), daemon=True).start()
+            def mark_context_failed(record):
+                if record.get("status") != "queued":
+                    return False
+                record["status"] = "failed"
+                record["phase"] = "terminal"
+                record["finished_at"] = now_iso()
+                record["result"] = failure
+                record["result_ok"] = False
+                record["result_status"] = "job_start_failed"
+                return None
+
+            update_job(job_id, mark_context_failed)
+            raise
+        with JOB_CONTEXTS_LOCK:
+            JOB_CONTEXTS[job_id] = job_context
+
+    try:
+        threading.Thread(
+            target=run_job,
+            args=(job_id, job, resource, action, payload, job_context),
+            daemon=True,
+        ).start()
+    except Exception:
+        with JOB_CONTEXTS_LOCK:
+            JOB_CONTEXTS.pop(job_id, None)
+        SESSION_STORE.discard_job_artifacts(job_context.job_id)
+        failure = {
+            "ok": False,
+            "status": "job_start_failed",
+            "error": "The background Job thread could not be started.",
+        }
+
+        def mark_start_failed(record):
+            if record.get("status") != "queued":
+                return False
+            record["status"] = "failed"
+            record["phase"] = "terminal"
+            record["finished_at"] = now_iso()
+            record["result"] = failure
+            record["result_ok"] = False
+            record["result_status"] = "job_start_failed"
+            return None
+
+        update_job(job_id, mark_start_failed)
+        raise
     return job
 
 
-def cancel_job(job_id):
-    job = read_job(job_id)
-    if job is None:
-        return {"ok": False, "status": "not_found"}
-    if job.get("status") not in ("queued", "running"):
-        return {"ok": False, "status": "not_running", "job": job}
-    with JOB_PROCESSES_LOCK:
-        process = JOB_PROCESSES.get(job_id)
-    if process is not None:
-        terminate_job_process(process)
+def retry_job(job_id, request_id=None, idempotency_key=None, expected_version=None):
+    parent = read_job(job_id)
+    if parent is None:
+        return domain_error("not_found", "Job not found.")
+    if expected_version is not None and int(parent.get("version", 0)) != int(expected_version):
+        raise JobVersionConflict(job_id, expected_version, int(parent.get("version", 0)))
+    if parent.get("status") not in ("failed", "cancelled"):
+        return domain_error(
+            "job_not_retryable",
+            "Only failed or cancelled Jobs can be retried.",
+            job=parent,
+        )
+    attempt = int(parent.get("attempt", 1) or 1) + 1
+    max_attempts = int(parent.get("max_attempts", MAX_JOB_ATTEMPTS) or MAX_JOB_ATTEMPTS)
+    if attempt > max_attempts:
+        return domain_error(
+            "job_retry_limit_reached",
+            f"Job retry limit reached ({max_attempts} attempts).",
+            job=parent,
+        )
+    retry_key = str(idempotency_key or f"retry:{job_id}:{parent.get('version', 0)}")
+    retried = start_job(
+        str(parent.get("resource") or ""),
+        str(parent.get("action") or ""),
+        parent.get("payload") if isinstance(parent.get("payload"), dict) else {},
+        idempotency_key=retry_key,
+        request_id=request_id,
+        retry_of=job_id,
+        root_job_id=str(parent.get("root_job_id") or job_id),
+        attempt=attempt,
+        max_attempts=max_attempts,
+    )
+    if retried.get("ok") and retried.get("retry_of") != job_id:
+        return domain_error(
+            "idempotency_conflict",
+            "The idempotency key is already bound to a different Job lineage.",
+            existing_job_id=retried.get("job_id"),
+        )
+    return retried
 
-    def apply_cancel(record):
-        if record.get("status") not in ("queued", "running"):
-            return False
-        record["status"] = "cancelled"
-        record["finished_at"] = now_iso()
-        record["result"] = {"ok": False, "status": "cancelled", "error": "Job cancellation requested."}
-        record["result_ok"] = False
-        record["result_status"] = "cancelled"
+
+def expected_job_version(body):
+    if not isinstance(body, dict) or "expected_version" not in body:
         return None
-
-    updated = update_job(job_id, apply_cancel)
-    if updated is None:
-        return {"ok": False, "status": "not_found"}
-    if updated.get("status") != "cancelled":
-        return {"ok": False, "status": "not_running", "job": updated}
-    with JOB_PROCESSES_LOCK:
-        process = JOB_PROCESSES.get(job_id)
-    if process is not None:
-        terminate_job_process(process)
-    return {"ok": True, "status": "cancelled", "job": updated}
-
-
-def compact_summary(value, limit=220):
-    text = " ".join(str(value or "").split())
-    if len(text) > limit:
-        return text[:limit] + "..."
-    return text
-
-
-def audit_stage(event):
-    if not isinstance(event, dict):
-        return "event"
-    return str(event.get("stage") or event.get("event") or event.get("type") or event.get("status") or "event")
-
-
-def audit_payload(event):
-    if isinstance(event, dict) and isinstance(event.get("payload"), dict):
-        return event["payload"]
-    return event if isinstance(event, dict) else {}
-
-
-def audit_plan_steps(payload):
-    if isinstance(payload.get("steps"), list):
-        return payload.get("steps") or []
-    plan = payload.get("plan") if isinstance(payload.get("plan"), dict) else {}
-    if isinstance(plan.get("steps"), list):
-        return plan.get("steps") or []
-    return []
-
-
-def audit_plan_summary(payload):
-    plan = payload.get("plan") if isinstance(payload.get("plan"), dict) else {}
-    return str(payload.get("summary_preview") or payload.get("summary") or plan.get("summary") or "")
-
-
-def audit_normalized_step(step, index, iteration=None):
-    step_id = str(step.get("id") or f"step-{index + 1}")
-    normalized = {
-        "id": step_id,
-        "title": step.get("title") or step_id,
-        "executor_type": step.get("executor_type"),
-        "skill_script": step.get("skill_script"),
-        "risk_level": step.get("risk_level") or "low",
-        "expected_effect": step.get("expected_effect") or "",
-        "reason": step.get("reason") or "",
-    }
-    normalized.update(step)
-    if iteration is not None:
-        normalized["iteration"] = iteration
+    value = body.get("expected_version")
+    if isinstance(value, bool):
+        raise ValueError("expected_version must be a non-negative integer")
+    try:
+        normalized = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("expected_version must be a non-negative integer") from exc
+    if normalized < 0 or str(value).strip() != str(normalized):
+        raise ValueError("expected_version must be a non-negative integer")
     return normalized
 
 
-def audit_step_status_rank(status):
-    status = str(status or "")
-    if status in {"succeeded", "executed", "failed", "rejected", "blocked", "skipped_user", "skipped_unexecuted", "terminated"}:
-        return 100
-    if status == "approval_required":
-        return 80
-    if status == "running":
-        return 70
-    if status in {"approved", "auto_approved"}:
-        return 50
-    if status == "policy_checked":
-        return 40
-    if status == "pending":
-        return 10
-    return 0
+def cancel_job(job_id, expected_version=None):
+    job = read_job(job_id)
+    if job is None:
+        return {"ok": False, "status": "not_found"}
+    if job.get("status") not in ("queued", "running") or job.get("phase") == "finalizing":
+        return {"ok": False, "status": "not_running", "job": job}
 
+    def request_cancel(record):
+        if (
+            record.get("status") not in ("queued", "running")
+            or record.get("phase") == "finalizing"
+        ):
+            return False
+        if not record.get("cancel_requested_at"):
+            record["cancel_requested_at"] = now_iso()
+        record["phase"] = "cancelling"
+        return None
 
-def build_web_timeline_from_audit(session_id, events, include_turns=True):
-    steps_by_scope = {}
-    planned_keys = set()
-    planned_steps = []
-    timeline_order = []
-    step_records = {}
-    summary = ""
-    final_answer_summary = ""
-    input_preview = ""
-    final_status = "restored"
-    current_request = 0
-    current_iteration = 0
-    step_statuses = {
-        "step_pending",
-        "step_policy_checked",
-        "step_approved",
-        "step_auto_approved",
-        "step_approval_required",
-        "step_blocked",
-        "step_rejected",
-        "step_running",
-        "step_succeeded",
-        "step_failed",
-        "step_skipped_user",
-        "step_skipped_unexecuted",
-        "step_terminated",
-    }
+    updated = JOB_STORE.update(job_id, request_cancel, expected_version=expected_version)
+    if updated is None:
+        return {"ok": False, "status": "not_found"}
+    if not updated.get("cancel_requested_at"):
+        return {"ok": False, "status": "not_running", "job": updated}
 
-    def store_plan_steps(payload, iteration):
-        nonlocal summary
-        plan_summary = audit_plan_summary(payload)
-        if plan_summary:
-            summary = plan_summary
-        normalized_steps = []
-        for index, step in enumerate(audit_plan_steps(payload)):
-            if not isinstance(step, dict):
-                continue
-            normalized = audit_normalized_step(step, index, iteration)
-            step_id = str(normalized.get("id") or f"step-{index + 1}")
-            key = (current_request, iteration, step_id)
-            steps_by_scope[key] = normalized
-            normalized_steps.append(normalized)
-            if key not in planned_keys:
-                planned_keys.add(key)
-                planned_steps.append(normalized)
-        return normalized_steps
+    execution_service().terminate(job_id)
 
-    def lifecycle_status(stage, payload):
-        status = str(payload.get("status") or stage.replace("step_", ""))
-        if stage == "step_policy_checked":
-            status = "policy_checked"
-        return status
-
-    def upsert_step_record(stage, payload):
-        step = payload.get("step") if isinstance(payload.get("step"), dict) else {}
-        iteration = safe_int(payload.get("iteration"), current_iteration or 1)
-        step_id = str(step.get("id") or f"{stage}-{len(timeline_order) + 1}")
-        key = (current_request, iteration, step_id)
-        merged_step = {**steps_by_scope.get(key, {}), **step}
-        if "id" not in merged_step:
-            merged_step["id"] = step_id
-        if "title" not in merged_step:
-            merged_step["title"] = step_id
-        status = lifecycle_status(stage, payload)
-        detail = payload.get("detail") if isinstance(payload.get("detail"), dict) else {}
-        findings = payload.get("findings") if isinstance(payload.get("findings"), list) else []
-        record = step_records.get(key)
-        if not record:
-            record = {
-                "request_index": current_request,
-                "iteration": iteration,
-                "step_id": step_id,
-                "step": merged_step,
-                "status": status,
-                "status_rank": -1,
-                "latest_stage": stage,
-                "detail": {},
-                "output_detail": {},
-                "findings": [],
-                "stages": [],
-            }
-            step_records[key] = record
-            timeline_order.append(("step", key))
-        else:
-            record["step"] = {**record.get("step", {}), **merged_step}
-        record["stages"].append({"stage": stage, "status": status})
-        rank = audit_step_status_rank(status)
-        if rank >= record.get("status_rank", -1):
-            record["status"] = status
-            record["status_rank"] = rank
-            record["latest_stage"] = stage
-            record["detail"] = detail
-        if detail.get("output_preview") or detail.get("stderr_preview"):
-            record["output_detail"] = detail
-        if findings:
-            record["findings"] = findings
-
-    def output_blocks_for_record(record):
-        detail = record.get("detail") if isinstance(record.get("detail"), dict) else {}
-        output_detail = record.get("output_detail") if isinstance(record.get("output_detail"), dict) else {}
-        preview = output_detail or detail
-        findings = record.get("findings") if isinstance(record.get("findings"), list) else []
-        blocks = []
-        if preview.get("output_preview"):
-            blocks.append({"kind": "stdout", "title": "审计输出预览", "text": str(preview.get("output_preview") or ""), "truncated_bytes": 0})
-        if preview.get("stderr_preview"):
-            blocks.append({"kind": "stderr", "title": "审计错误预览", "text": str(preview.get("stderr_preview") or ""), "truncated_bytes": 0})
-        blocks.append(
-            {
-                "kind": "meta",
-                "title": "审计恢复摘要",
-                "json": {
-                    "stage": record.get("latest_stage"),
-                    "status": record.get("status"),
-                    "iteration": record.get("iteration"),
-                    "request_index": record.get("request_index"),
-                    "detail": detail,
-                    "stages": record.get("stages") or [],
-                    "finding_count": len(findings),
-                },
-            }
-        )
-        if findings:
-            blocks.append({"kind": "review", "title": "策略审查 findings", "json": {"findings": findings}})
-        return blocks
-
-    def timeline_item_for_record(record):
-        detail = record.get("detail") if isinstance(record.get("detail"), dict) else {}
-        step = record.get("step") if isinstance(record.get("step"), dict) else {}
-        iteration = record.get("iteration")
-        request_index = record.get("request_index")
-        step_id = record.get("step_id")
-        return {
-            "id": f"execution-r{request_index}-i{iteration}-{step_id}",
-            "kind": "execution",
-            "status": record.get("status"),
-            "iteration": iteration,
-            "request_index": request_index,
-            "step_id": step_id,
-            "title": step.get("title") or step_id,
-            "summary": compact_summary(detail.get("status") or detail.get("action") or detail.get("tool") or record.get("status")),
-            "risk_level": step.get("risk_level"),
-            "step": step,
-            "output_blocks": output_blocks_for_record(record),
-        }
-
-    for event in events if isinstance(events, list) else []:
-        stage = audit_stage(event)
-        payload = audit_payload(event)
-        if stage == "received" and not input_preview:
-            input_preview = str(payload.get("input_preview") or payload.get("command") or payload.get("ref") or "")
-        if stage == "received":
-            current_request += 1
-            current_iteration = 0
-        elif stage == "planned":
-            planned_iteration = safe_int(payload.get("iteration"), current_iteration or 1)
-            store_plan_steps(payload, planned_iteration)
-        elif stage == "agent_loop_iteration_started":
-            current_iteration = safe_int(payload.get("iteration"), current_iteration + 1 if current_iteration else 1)
-            if isinstance(payload.get("plan"), dict):
-                store_plan_steps(payload, current_iteration)
-        elif stage == "agent_reflection_planned":
-            response_type = str(payload.get("response_type") or "")
-            if response_type == "answer":
-                final_answer_summary = str(payload.get("summary_preview") or payload.get("summary") or final_answer_summary)
-            elif response_type == "work_plan":
-                store_plan_steps(payload, (current_iteration or 0) + 1)
-        elif stage in {"finished", "session_finished", "command_finished", "agent_loop_finished"}:
-            final_status = str(payload.get("status") or final_status)
-
-        if stage in {"terminal_executed", "script_executed"}:
-            status = str(payload.get("status") or ("executed" if payload.get("ok") else "failed"))
-            iteration = current_iteration or None
-            output_blocks = []
-            if payload.get("output_preview"):
-                output_blocks.append({"kind": "stdout", "title": "审计输出预览", "text": str(payload.get("output_preview") or ""), "truncated_bytes": 0})
-            if payload.get("stderr_preview"):
-                output_blocks.append({"kind": "stderr", "title": "审计错误预览", "text": str(payload.get("stderr_preview") or ""), "truncated_bytes": 0})
-            output_blocks.append({"kind": "meta", "title": "审计恢复摘要", "json": {"stage": stage, "status": status, "payload": payload}})
-            timeline_order.append(
-                (
-                    "item",
-                    {
-                        "id": f"{stage}-r{current_request}-i{iteration or 0}-{len(timeline_order) + 1}",
-                        "kind": "execution",
-                        "status": status,
-                        "iteration": iteration,
-                        "request_index": current_request,
-                        "step_id": stage,
-                        "title": "终端执行" if stage == "terminal_executed" else "Skill 执行",
-                        "summary": compact_summary(payload.get("action") or status),
-                        "risk_level": None,
-                        "step": {
-                            "id": stage,
-                            "title": "终端执行" if stage == "terminal_executed" else "Skill 执行",
-                            "executor_type": "terminal" if stage == "terminal_executed" else "skill_script",
-                        },
-                        "output_blocks": output_blocks,
-                    },
-                )
-            )
-            continue
-
-        if stage not in step_statuses:
-            continue
-        upsert_step_record(stage, payload)
-
-    timeline = []
-    for item_type, value in timeline_order:
-        if item_type == "step":
-            record = step_records.get(value)
-            if record:
-                timeline.append(timeline_item_for_record(record))
-        else:
-            timeline.append(value)
-
-    output_blocks = []
-    if final_answer_summary:
-        output_blocks.append(
-            {
-                "kind": "markdown",
-                "title": "最终回答",
-                "text": final_answer_summary,
-                "truncated_bytes": 0,
-            }
-        )
-    output_blocks.append(
-        {
-            "kind": "meta",
-            "title": "Web 时间线恢复",
-            "json": {
-                "session_id": session_id,
-                "event_count": len(events) if isinstance(events, list) else 0,
-                "timeline_count": len(timeline),
-                "planned_step_count": len(planned_steps),
-            },
-        }
+    deadline = time.monotonic() + max(5.0, CANCEL_GRACE_SEC + 3.0)
+    current = updated
+    while time.monotonic() < deadline:
+        current = read_job(job_id)
+        if current is None:
+            return {"ok": False, "status": "not_found"}
+        if current.get("status") not in ("queued", "running"):
+            break
+        time.sleep(0.02)
+    if current.get("status") == "cancelled":
+        return {"ok": True, "status": "cancelled", "job": current}
+    if current.get("status") not in ("queued", "running"):
+        return {"ok": False, "status": "not_running", "job": current}
+    return domain_error(
+        "job_cancellation_failed",
+        "The process was signalled but the Job did not reach a durable cancelled state in time.",
+        job=current,
     )
-
-    restored = {
-        "ok": True,
-        "status": final_status,
-        "source": "audit",
-        "session_id": session_id,
-        "input": input_preview,
-        "response": {
-            "response_type": "work_plan" if planned_steps else "answer",
-            "summary": summary or f"审计恢复 {session_id}",
-            "steps": planned_steps,
-            "continue_decision": {"should_continue": False, "reason": "Restored from audit events for Web replay."},
-        },
-        "timeline": timeline,
-        "approval_card": None,
-        "output_blocks": output_blocks,
-    }
-    if include_turns:
-        restored["turns"] = build_web_turns_from_audit(session_id, events)
-    return restored
-
-
-def build_web_turns_from_audit(session_id, events):
-    turns = []
-    current_events = []
-    current_input = ""
-    current_mode = ""
-    current_started_at = ""
-
-    def cloned_event(event, stage=None, payload=None, timestamp=None):
-        cloned = dict(event) if isinstance(event, dict) else {}
-        if stage is not None:
-            cloned["stage"] = stage
-        if payload is not None:
-            cloned["payload"] = payload
-        if timestamp is not None:
-            cloned["timestamp"] = timestamp
-        return cloned
-
-    def planned_event_from_reflection(event, iteration):
-        payload = dict(audit_payload(event))
-        payload["iteration"] = iteration
-        if not payload.get("summary_preview") and payload.get("summary"):
-            payload["summary_preview"] = payload.get("summary")
-        return cloned_event(event, stage="planned", payload=payload)
-
-    def synthetic_finished_event(status, timestamp):
-        return {
-            "timestamp": timestamp or now_iso(),
-            "session_id": session_id,
-            "stage": "finished",
-            "payload": {"status": status},
-        }
-
-    def append_turn(turn_events, input_value, mode_value, started_at, iteration=None, status_override=""):
-        if not turn_events:
-            return
-        turn_number = len(turns) + 1
-        result = build_web_timeline_from_audit(session_id, turn_events, include_turns=False)
-        if iteration is not None:
-            result["iteration"] = iteration
-            result["loop_iteration"] = iteration
-        if status_override and result.get("status") == "restored":
-            result["status"] = status_override
-        status = result.get("status") or "restored"
-        turns.append(
-            {
-                "id": f"{session_id}-turn-{turn_number}",
-                "number": turn_number,
-                "mode": mode_value or "work",
-                "input": input_value,
-                "status": status,
-                "created_at": started_at,
-                "updated_at": str(turn_events[-1].get("timestamp") or started_at),
-                "source": "audit",
-                "result": result,
-            }
-        )
-
-    def append_request_turns(request_events, input_value, mode_value, started_at):
-        if not request_events:
-            return
-        iteration_starts = []
-        for index, event in enumerate(request_events):
-            if audit_stage(event) != "agent_loop_iteration_started":
-                continue
-            iteration = safe_int(audit_payload(event).get("iteration"), len(iteration_starts) + 1)
-            iteration_starts.append((index, iteration))
-        if len(iteration_starts) <= 1:
-            iteration = iteration_starts[0][1] if iteration_starts else None
-            append_turn(request_events, input_value, mode_value, started_at, iteration=iteration)
-            return
-
-        received_event = next((event for event in request_events if audit_stage(event) == "received"), None)
-        first_iteration_index = iteration_starts[0][0]
-        initial_plan_event = next(
-            (
-                event
-                for event in request_events[:first_iteration_index]
-                if audit_stage(event) == "planned"
-            ),
-            None,
-        )
-        for position, (start_index, iteration) in enumerate(iteration_starts):
-            next_start_index = iteration_starts[position + 1][0] if position + 1 < len(iteration_starts) else len(request_events)
-            seed_events = []
-            if received_event:
-                seed_events.append(received_event)
-            if iteration == 1 and initial_plan_event:
-                seed_events.append(initial_plan_event)
-            elif iteration > 1:
-                reflected_plan = next(
-                    (
-                        event
-                        for event in reversed(request_events[:start_index])
-                        if audit_stage(event) == "agent_reflection_planned"
-                        and str(audit_payload(event).get("response_type") or "") == "work_plan"
-                    ),
-                    None,
-                )
-                if reflected_plan:
-                    seed_events.append(planned_event_from_reflection(reflected_plan, iteration))
-
-            loop_events = []
-            for event in request_events[start_index:next_start_index]:
-                if audit_stage(event) == "agent_reflection_planned" and str(audit_payload(event).get("response_type") or "") == "work_plan":
-                    continue
-                loop_events.append(event)
-            if position + 1 < len(iteration_starts) and not any(audit_stage(event) in {"finished", "agent_loop_finished"} for event in loop_events):
-                last_timestamp = str(loop_events[-1].get("timestamp") if loop_events else started_at)
-                loop_events.append(synthetic_finished_event("executed", last_timestamp))
-            append_turn(seed_events + loop_events, input_value, mode_value, started_at, iteration=iteration, status_override="executed")
-
-    def finish_current():
-        nonlocal current_events, current_input, current_mode, current_started_at
-        if not current_events:
-            return
-        append_request_turns(current_events, current_input, current_mode, current_started_at)
-        current_events = []
-        current_input = ""
-        current_mode = ""
-        current_started_at = ""
-
-    for event in events if isinstance(events, list) else []:
-        stage = audit_stage(event)
-        payload = audit_payload(event)
-        if stage == "received":
-            finish_current()
-            current_events = [event]
-            current_input = str(payload.get("input_preview") or payload.get("command") or payload.get("ref") or "")
-            current_mode = str(payload.get("mode") or "")
-            current_started_at = str(event.get("timestamp") or "")
-            continue
-        if current_events:
-            current_events.append(event)
-            if stage == "finished":
-                finish_current()
-
-    finish_current()
-    return turns
 
 
 def terminate_running_jobs():
-    with JOB_PROCESSES_LOCK:
-        processes = list(JOB_PROCESSES.values())
-    for process in processes:
-        try:
-            os.killpg(process.pid, signal.SIGTERM)
-        except ProcessLookupError:
-            continue
-        except OSError:
-            process.terminate()
+    return execution_service().terminate_all()
 
 
 def shutdown_server_later(server):
@@ -2543,6 +1627,18 @@ def request_server_shutdown(server):
 class Handler(SimpleHTTPRequestHandler):
     server_version = "LinuxAgentWeb/1.0"
 
+    def begin_request(self):
+        supplied = str(self.headers.get("X-Request-ID") or "").strip()
+        if (
+            supplied
+            and len(supplied) <= REQUEST_ID_MAX_LENGTH
+            and all(ch.isalnum() or ch in "._:-" for ch in supplied)
+        ):
+            self.request_id = supplied
+        else:
+            self.request_id = uuid.uuid4().hex
+        REQUEST_CONTEXT.request_id = self.request_id
+
     def log_message(self, fmt, *args):
         print("%s - %s" % (self.address_string(), fmt % args), flush=True)
 
@@ -2558,10 +1654,16 @@ class Handler(SimpleHTTPRequestHandler):
     def require_auth(self):
         if self.authenticated():
             return True
-        json_response(self, HTTPStatus.UNAUTHORIZED, {"ok": False, "status": "unauthorized", "error": "Missing or invalid token."})
+        json_domain_error(
+            self,
+            "unauthorized",
+            "Missing or invalid token.",
+            default=HTTPStatus.UNAUTHORIZED,
+        )
         return False
 
     def do_GET(self):
+        self.begin_request()
         parsed = urlparse(self.path)
         if parsed.path.startswith("/api/"):
             if not self.require_auth():
@@ -2571,6 +1673,7 @@ class Handler(SimpleHTTPRequestHandler):
         self.serve_static(parsed.path)
 
     def do_POST(self):
+        self.begin_request()
         parsed = urlparse(self.path)
         if not parsed.path.startswith("/api/"):
             json_response(self, HTTPStatus.NOT_FOUND, {"ok": False, "status": "not_found"})
@@ -2580,12 +1683,37 @@ class Handler(SimpleHTTPRequestHandler):
         try:
             body = read_json_body(self)
         except RequestBodyTooLarge as exc:
-            json_response(self, HTTPStatus.REQUEST_ENTITY_TOO_LARGE, {"ok": False, "status": "request_too_large", "error": str(exc)})
+            json_domain_error(
+                self,
+                "request_too_large",
+                str(exc),
+                default=HTTPStatus.REQUEST_ENTITY_TOO_LARGE,
+            )
             return
         except ValueError as exc:
-            json_response(self, HTTPStatus.BAD_REQUEST, {"ok": False, "status": "invalid_json", "error": str(exc)})
+            json_domain_error(
+                self,
+                "invalid_json",
+                str(exc),
+                default=HTTPStatus.BAD_REQUEST,
+            )
             return
-        self.handle_api_post(parsed.path, body)
+        try:
+            self.handle_api_post(parsed.path, body)
+        except AuditWriteBlocked as exc:
+            json_domain_error(
+                self,
+                "audit_write_blocked",
+                str(exc),
+                default=HTTPStatus.INSUFFICIENT_STORAGE,
+            )
+        except AuditIntegrityError as exc:
+            json_domain_error(
+                self,
+                "audit_integrity_broken",
+                str(exc),
+                default=HTTPStatus.CONFLICT,
+            )
 
     def serve_static(self, path):
         if path in ("", "/"):
@@ -2668,7 +1796,13 @@ class Handler(SimpleHTTPRequestHandler):
         if not route:
             json_response(self, HTTPStatus.NOT_FOUND, {"ok": False, "status": "not_found"})
             return
-        result = run_agent_api(route[0], route[1], {}, timeout=120)
+        result = run_agent_api(
+            route[0],
+            route[1],
+            {},
+            timeout=120,
+            request_id=self.request_id,
+        )
         if path == "/api/health" and isinstance(result, dict):
             result["web_server"] = {
                 "run_id": SERVER_RUN_ID,
@@ -2724,13 +1858,45 @@ class Handler(SimpleHTTPRequestHandler):
             json_response(self, HTTPStatus.OK, result)
             return
         if path == "/api/audit/read":
-            result = run_agent_api("audit", "read", body, timeout=180)
+            result = run_agent_api(
+                "audit",
+                "read",
+                body,
+                timeout=180,
+                request_id=self.request_id,
+            )
             if isinstance(result, dict) and isinstance(result.get("events"), list):
-                result["web_timeline"] = build_web_timeline_from_audit(str(body.get("session_id") or result.get("session_id") or ""), result["events"])
+                audit_session_id = str(body.get("session_id") or result.get("session_id") or "")
+                try:
+                    persisted = SESSION_STORE.read_persisted_turns(audit_session_id)
+                except (SessionDataError, ValueError) as exc:
+                    result["web_timeline"] = None
+                    result["timeline_unavailable_reason"] = "persisted_turns_invalid"
+                    result["timeline_error"] = str(exc)
+                else:
+                    if persisted:
+                        try:
+                            result["web_timeline"] = timeline_from_turns(
+                                audit_session_id,
+                                persisted,
+                                DOMAIN_CONTRACT,
+                            )
+                        except TimelineDataError as exc:
+                            result["web_timeline"] = None
+                            result["timeline_unavailable_reason"] = "persisted_turns_invalid"
+                            result["timeline_error"] = str(exc)
+                    else:
+                        result.update(legacy_timeline_unavailable(audit_session_id))
             json_response(self, HTTPStatus.OK, result)
             return
         if path == "/api/audit/list":
-            result = run_agent_api("audit", "list", body, timeout=120)
+            result = run_agent_api(
+                "audit",
+                "list",
+                body,
+                timeout=120,
+                request_id=self.request_id,
+            )
             json_response(self, HTTPStatus.OK, result)
             return
         if path == "/api/config/update":
@@ -2752,11 +1918,22 @@ class Handler(SimpleHTTPRequestHandler):
             json_response(self, HTTPStatus.OK, result)
             return
         if path == "/api/session/restore":
-            result = restore_web_agent_session_from_audit(str(body.get("session_id") or ""))
-            json_response(self, HTTPStatus.OK, result)
+            result = restore_web_agent_session(str(body.get("session_id") or ""))
+            status = (
+                HTTPStatus.OK
+                if result.get("ok")
+                else domain_error_http(str(result.get("status") or ""), HTTPStatus.BAD_REQUEST)
+            )
+            json_response(self, status, result)
             return
         if path == "/api/session/leave":
-            json_response(self, HTTPStatus.OK, leave_web_agent_session())
+            result = leave_web_agent_session()
+            status = (
+                HTTPStatus.OK
+                if result.get("ok")
+                else domain_error_http(str(result.get("status") or ""), HTTPStatus.BAD_REQUEST)
+            )
+            json_response(self, status, result)
             return
         if path == "/api/skills/read":
             try:
@@ -2775,7 +1952,90 @@ class Handler(SimpleHTTPRequestHandler):
             if not job_id or not all(ch in "0123456789abcdef" for ch in job_id):
                 json_response(self, HTTPStatus.BAD_REQUEST, {"ok": False, "status": "invalid_job_id"})
                 return
-            json_response(self, HTTPStatus.OK, cancel_job(job_id))
+            try:
+                expected_version = expected_job_version(body)
+                cancelled = cancel_job(job_id, expected_version=expected_version)
+            except JobVersionConflict as exc:
+                json_domain_error(
+                    self,
+                    "job_version_conflict",
+                    str(exc),
+                    default=HTTPStatus.CONFLICT,
+                    details={
+                        "job_id": exc.job_id,
+                        "expected_version": exc.expected_version,
+                        "actual_version": exc.actual_version,
+                    },
+                )
+                return
+            except ValueError as exc:
+                json_domain_error(
+                    self,
+                    "invalid_job_version",
+                    str(exc),
+                    default=HTTPStatus.BAD_REQUEST,
+                )
+                return
+            json_response(self, HTTPStatus.OK, cancelled)
+            return
+        if path.startswith("/api/jobs/") and path.endswith("/retry"):
+            parts = path.split("/")
+            job_id = parts[-2] if len(parts) >= 4 else ""
+            if not job_id or not all(ch in "0123456789abcdef" for ch in job_id):
+                json_response(self, HTTPStatus.BAD_REQUEST, {"ok": False, "status": "invalid_job_id"})
+                return
+            retry_key = str(
+                body.get("idempotency_key") or self.headers.get("Idempotency-Key") or ""
+            ).strip()
+            if len(retry_key) > 256 or any(ord(ch) < 32 for ch in retry_key):
+                json_domain_error(
+                    self,
+                    "invalid_idempotency_key",
+                    "idempotency key must be at most 256 characters without control characters.",
+                    default=HTTPStatus.BAD_REQUEST,
+                )
+                return
+            try:
+                retried = retry_job(
+                    job_id,
+                    request_id=self.request_id,
+                    idempotency_key=retry_key or None,
+                    expected_version=expected_job_version(body),
+                )
+            except JobVersionConflict as exc:
+                json_domain_error(
+                    self,
+                    "job_version_conflict",
+                    str(exc),
+                    default=HTTPStatus.CONFLICT,
+                    details={
+                        "job_id": exc.job_id,
+                        "expected_version": exc.expected_version,
+                        "actual_version": exc.actual_version,
+                    },
+                )
+                return
+            except IdempotencyConflict as exc:
+                json_domain_error(
+                    self,
+                    "idempotency_conflict",
+                    str(exc),
+                    default=HTTPStatus.CONFLICT,
+                    details={"existing_job_id": exc.existing_job_id},
+                )
+                return
+            except ValueError as exc:
+                json_domain_error(
+                    self,
+                    "invalid_job_version",
+                    str(exc),
+                    default=HTTPStatus.BAD_REQUEST,
+                )
+                return
+            status = HTTPStatus.OK if retried.get("deduplicated") else HTTPStatus.ACCEPTED
+            if not retried.get("ok"):
+                status = domain_error_http(str(retried.get("status") or ""), HTTPStatus.CONFLICT)
+            json_response(self, status, retried)
             return
         if path == "/api/jobs":
             resource = str(body.get("resource") or "")
@@ -2793,24 +2053,89 @@ class Handler(SimpleHTTPRequestHandler):
             if (resource, action) not in allowed:
                 json_response(self, HTTPStatus.BAD_REQUEST, {"ok": False, "status": "unsupported_job"})
                 return
-            job = start_job(resource, action, payload)
-            if not job.get("ok") and job.get("status") == "too_many_jobs":
-                json_response(self, HTTPStatus.TOO_MANY_REQUESTS, job)
+            idempotency_key = str(
+                body.get("idempotency_key") or self.headers.get("Idempotency-Key") or ""
+            ).strip()
+            if len(idempotency_key) > 256 or any(ord(ch) < 32 for ch in idempotency_key):
+                json_domain_error(
+                    self,
+                    "invalid_idempotency_key",
+                    "idempotency key must be at most 256 characters without control characters.",
+                    default=HTTPStatus.BAD_REQUEST,
+                )
                 return
-            json_response(self, HTTPStatus.ACCEPTED, job)
+            try:
+                job = start_job(
+                    resource,
+                    action,
+                    payload,
+                    idempotency_key=idempotency_key or None,
+                    request_id=self.request_id,
+                )
+            except IdempotencyConflict as exc:
+                json_domain_error(
+                    self,
+                    "idempotency_conflict",
+                    str(exc),
+                    default=HTTPStatus.CONFLICT,
+                    details={
+                        "existing_job_id": exc.existing_job_id,
+                        "existing_fingerprint": exc.existing_fingerprint,
+                        "request_fingerprint": exc.request_fingerprint,
+                    },
+                )
+                return
+            except AuditWriteBlocked as exc:
+                json_domain_error(
+                    self,
+                    "audit_write_blocked",
+                    str(exc),
+                    default=HTTPStatus.INSUFFICIENT_STORAGE,
+                )
+                return
+            except AuditIntegrityError as exc:
+                json_domain_error(
+                    self,
+                    "audit_integrity_broken",
+                    str(exc),
+                    default=HTTPStatus.CONFLICT,
+                )
+                return
+            except (OSError, sqlite3.Error, SessionDataError) as exc:
+                json_domain_error(
+                    self,
+                    "job_persistence_failed",
+                    str(exc),
+                    default=HTTPStatus.INTERNAL_SERVER_ERROR,
+                )
+                return
+            if not job.get("ok") and job.get("status") == "too_many_jobs":
+                json_response(
+                    self,
+                    domain_error_http("too_many_jobs", HTTPStatus.TOO_MANY_REQUESTS),
+                    {**domain_error("too_many_jobs", job.get("error", "")), **job},
+                )
+                return
+            json_response(self, HTTPStatus.OK if job.get("deduplicated") else HTTPStatus.ACCEPTED, job)
             return
         route = sync_routes.get(path)
         if not route:
             json_response(self, HTTPStatus.NOT_FOUND, {"ok": False, "status": "not_found"})
             return
-        result = run_agent_api(route[0], route[1], body, timeout=180)
+        result = run_agent_api(
+            route[0],
+            route[1],
+            body,
+            timeout=180,
+            request_id=self.request_id,
+        )
         json_response(self, HTTPStatus.OK, result)
 
 
 def main():
     cleanup_jobs()
     STATIC_ROOT.mkdir(parents=True, exist_ok=True)
-    JOBS_ROOT.mkdir(parents=True, exist_ok=True)
+    JOBS_DB.parent.mkdir(parents=True, exist_ok=True)
     record_web_audit_event(
         "session_started",
         {
@@ -2831,8 +2156,9 @@ def main():
             print("[提示] web.host 不是当前机器可用地址。默认建议使用 127.0.0.1。", file=sys.stderr, flush=True)
         raise SystemExit(1) from exc
 
-    recover_interrupted_jobs()
     initialize_web_agent_session()
+    reconcile_pending_job_audits()
+    recover_interrupted_jobs()
     try:
         print(f"[信息] Web 控制台: http://{HOST}:{PORT}/", file=sys.stderr, flush=True)
         if AUTH_TOKEN_EPHEMERAL:
@@ -2868,13 +2194,7 @@ def main():
                 "run_id": SERVER_RUN_ID,
             },
         )
-        record_web_agent_session_event(
-            "session_finished",
-            {
-                "status": "stopped",
-                "run_id": SERVER_RUN_ID,
-            },
-        )
+        SESSION_STORE.finish("stopped")
         server.server_close()
 
 
