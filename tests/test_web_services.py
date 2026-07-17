@@ -422,3 +422,50 @@ class PolicyServiceTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class MetricsRegistryTests(unittest.TestCase):
+    def test_counter_and_prometheus_render(self):
+        from metrics import create_default_registry, normalize_route
+
+        registry = create_default_registry(process_start_time=1_700_000_000.0)
+        registry.inc(
+            "linux_agent_http_requests_total",
+            labels={"method": "GET", "route": "health", "status": "200"},
+        )
+        registry.inc(
+            "linux_agent_http_requests_total",
+            labels={"method": "GET", "route": "health", "status": "200"},
+        )
+        registry.inc(
+            "linux_agent_jobs_completed_total",
+            labels={"result": "succeeded"},
+        )
+        text = registry.render_prometheus_text(
+            extra_gauges=[
+                ("linux_agent_build_info", {"version": "v0.0.0-test"}, 1),
+                ("linux_agent_jobs", {"status": "running"}, 2),
+                ("linux_agent_jobs_active", {}, 2),
+            ]
+        )
+        self.assertIn("linux_agent_http_requests_total{method=\"GET\",route=\"health\",status=\"200\"} 2", text)
+        self.assertIn("linux_agent_build_info{version=\"v0.0.0-test\"} 1", text)
+        self.assertIn("linux_agent_jobs{status=\"running\"} 2", text)
+        self.assertIn("# TYPE linux_agent_jobs_completed_total counter", text)
+        self.assertEqual(normalize_route("/api/jobs/abc123"), "jobs_detail")
+        self.assertEqual(normalize_route("/api/jobs/abc123/cancel"), "jobs_cancel")
+        self.assertEqual(normalize_route("/api/config/web"), "config_web")
+
+    def test_registry_is_thread_safe_enough_for_concurrent_increments(self):
+        from concurrent.futures import ThreadPoolExecutor
+        from metrics import MetricsRegistry
+
+        registry = MetricsRegistry()
+        registry.register_counter("test_counter", "test")
+
+        def bump(_):
+            registry.inc("test_counter", labels={"k": "v"})
+
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            list(pool.map(bump, range(200)))
+        self.assertEqual(registry.get_counter("test_counter", labels={"k": "v"}), 200.0)

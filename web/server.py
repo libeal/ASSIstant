@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 
+import calendar
 import json
 import os
 import errno
 import secrets
 import signal
 import shutil
+import socket
 import sqlite3
 import subprocess
 import sys
@@ -41,7 +43,12 @@ from domain import DomainContract, DomainValidationError  # noqa: E402
 from execution import ExecutionService  # noqa: E402
 from policy import PolicyService  # noqa: E402
 from provider import ProviderSecurityHelpers, ProviderService  # noqa: E402
-from sessions import JobSessionContext, SessionDataError, SessionStore  # noqa: E402
+from sessions import (  # noqa: E402
+    JobSessionContext,
+    SessionDataError,
+    SessionStore,
+    result_context_eligible,
+)
 from skills import SkillService  # noqa: E402
 from timeline import (  # noqa: E402
     TimelineDataError,
@@ -53,7 +60,12 @@ from audit import (  # noqa: E402
     AuditWriteBlocked,
     append_audit_event as append_web_audit_event,
 )
+from metrics import (  # noqa: E402
+    create_default_registry,
+    normalize_route,
+)
 STATIC_ROOT = ROOT / "web" / "static"
+LOG_ROOT = (ROOT / "logs").resolve()
 JOBS_DB = ROOT / "tmp" / "web" / "jobs.db"
 POLICIES_ROOT = ROOT / "policies"
 SKILLS_ROOT = ROOT / "skills"
@@ -87,10 +99,14 @@ class RequestBodyTooLarge(ValueError):
 
 SERVER_RUN_ID = uuid.uuid4().hex
 SERVER_STARTED_AT = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+PROCESS_START_TIME = time.time()
+METRICS = create_default_registry(process_start_time=PROCESS_START_TIME)
+METRICS.set_gauge("linux_agent_process_start_time_seconds", PROCESS_START_TIME)
+
 API_KEY_PLACEHOLDER = "please-set-your-api-key"
 EPHEMERAL_TOKEN_FILE = ROOT / "tmp" / "web" / "auth-token"
 WEB_AUDIT_SESSION_ID = f"web_{SERVER_RUN_ID[:16]}"
-WEB_AUDIT_LOG = ROOT / "logs" / f"{WEB_AUDIT_SESSION_ID}.jsonl"
+WEB_AUDIT_LOG = LOG_ROOT / f"{WEB_AUDIT_SESSION_ID}.jsonl"
 OBSERVER_BOOTSTRAP_STATE = {
     "status": "pending",
     "ok": True,
@@ -247,6 +263,8 @@ def config_public_state():
     observer = config.get("observer") if isinstance(config.get("observer"), dict) else {}
     execution = config.get("execution") if isinstance(config.get("execution"), dict) else {}
     web = config.get("web") if isinstance(config.get("web"), dict) else {}
+    metrics_configured = web.get("metrics_enabled", True)
+    metrics_public = metrics_configured if isinstance(metrics_configured, bool) else False
     remote = config.get("remote") if isinstance(config.get("remote"), dict) else {}
     key_state = api_key_state(config)
     provider_id = config_provider_id(config)
@@ -315,6 +333,7 @@ def config_public_state():
                 "job_timeout_sec": safe_int(web.get("job_timeout_sec", JOB_TIMEOUT_SEC) or JOB_TIMEOUT_SEC, JOB_TIMEOUT_SEC),
                 "max_job_attempts": safe_int(web.get("max_job_attempts", MAX_JOB_ATTEMPTS) or MAX_JOB_ATTEMPTS, MAX_JOB_ATTEMPTS),
                 "cancel_grace_sec": safe_int(web.get("cancel_grace_sec", CANCEL_GRACE_SEC), CANCEL_GRACE_SEC),
+                "metrics_enabled": metrics_public,
             },
         },
     }
@@ -357,6 +376,7 @@ CONFIG_WRITABLE_FIELDS = {
     "web.job_timeout_sec": {"type": "int", "min": 1, "max": 86400},
     "web.max_job_attempts": {"type": "int", "min": 1, "max": 10},
     "web.cancel_grace_sec": {"type": "int", "min": 0, "max": 30},
+    "web.metrics_enabled": {"type": "bool"},
 }
 CONFIG_SECRET_FIELDS = {"api_key"}
 
@@ -590,6 +610,98 @@ def persist_ephemeral_token():
     os.chmod(EPHEMERAL_TOKEN_FILE, 0o600)
 
 
+def metrics_enabled(config=None):
+    cfg = config if isinstance(config, dict) else read_config()
+    web = cfg.get("web") if isinstance(cfg.get("web"), dict) else {}
+    if "metrics_enabled" not in web:
+        return True
+    value = web.get("metrics_enabled")
+    return value if isinstance(value, bool) else False
+
+
+def build_version_label(config=None):
+    cfg = config if isinstance(config, dict) else read_config()
+    remote = cfg.get("remote") if isinstance(cfg.get("remote"), dict) else {}
+    version = str(
+        remote.get("release_version")
+        or os.environ.get("LINUX_AGENT_REMOTE_RELEASE_VERSION")
+        or "local"
+    ).strip() or "local"
+    return version
+
+
+def record_http_request(method, path, status_code):
+    METRICS.inc(
+        "linux_agent_http_requests_total",
+        labels={
+            "method": str(method or "GET").upper(),
+            "route": normalize_route(path),
+            "status": str(int(status_code)),
+        },
+    )
+
+
+def record_job_completion(record, terminal_status):
+    result_label = str(terminal_status or record.get("status") or "failed")
+    METRICS.inc(
+        "linux_agent_jobs_completed_total",
+        labels={"result": result_label},
+    )
+    started = str(record.get("started_at") or record.get("created_at") or "")
+    finished = str(record.get("finished_at") or "")
+    duration = None
+    if started and finished:
+        try:
+            # ISO Z timestamps produced by now_iso()
+            def parse_iso(value):
+                return calendar.timegm(time.strptime(value, "%Y-%m-%dT%H:%M:%SZ"))
+
+            duration = max(0.0, parse_iso(finished) - parse_iso(started))
+        except (TypeError, ValueError, OverflowError):
+            duration = None
+    if duration is not None:
+        METRICS.inc("linux_agent_job_duration_seconds_sum", amount=duration)
+        METRICS.inc("linux_agent_job_duration_seconds_count")
+
+
+def job_status_gauges():
+    try:
+        counts = JOB_STORE.status_counts()
+    except Exception:  # noqa: BLE001 - metrics scrape must not fail the process
+        counts = {}
+    gauges = []
+    total_active = 0
+    for status in sorted(set(list(counts) + ["queued", "running", "succeeded", "failed", "cancelled"])):
+        value = int(counts.get(status, 0) or 0)
+        gauges.append(("linux_agent_jobs", {"status": status}, value))
+        if status in ("queued", "running"):
+            total_active += value
+    gauges.append(("linux_agent_jobs_active", {}, total_active))
+    return gauges
+
+
+def render_metrics_text():
+    version = build_version_label()
+    extra = [
+        ("linux_agent_build_info", {"version": version}, 1),
+        ("linux_agent_process_start_time_seconds", {}, PROCESS_START_TIME),
+    ]
+    extra.extend(job_status_gauges())
+    return METRICS.render_prometheus_text(extra_gauges=extra)
+
+
+def write_plain_response(handler, status, body, content_type="text/plain; charset=utf-8"):
+    data = body if isinstance(body, (bytes, bytearray)) else str(body).encode("utf-8")
+    handler.send_response(status)
+    handler.send_header("Content-Type", content_type)
+    handler.send_header("Content-Length", str(len(data)))
+    handler.send_header("Cache-Control", "no-store")
+    request_id = str(getattr(handler, "request_id", "") or uuid.uuid4().hex)
+    handler.send_header("X-Request-ID", request_id)
+    handler.end_headers()
+    handler.wfile.write(data)
+
+
 def json_response(handler, status, payload):
     request_id = str(getattr(handler, "request_id", "") or uuid.uuid4().hex)
     if isinstance(payload, dict) and payload.get("ok") is False:
@@ -713,7 +825,7 @@ def recover_interrupted_jobs():
         session_id = str(job.get("session_id") or "")
         if session_id:
             append_audit_event(
-                ROOT / "logs" / f"{session_id}.jsonl",
+                LOG_ROOT / f"{session_id}.jsonl",
                 session_id,
                 "job_recovered",
                 {
@@ -774,8 +886,15 @@ def append_audit_event(log_path, session_id, stage, payload=None):
         if isinstance(payload, dict)
         else None
     )
-    return append_web_audit_event(
-        log_path,
+    candidate = Path(log_path)
+    resolved_parent = candidate.parent.resolve()
+    if resolved_parent != LOG_ROOT:
+        raise AuditIntegrityError(
+            f"Web audit path escapes the managed log directory: {candidate}"
+        )
+    resolved_log_path = resolved_parent / candidate.name
+    result = append_web_audit_event(
+        resolved_log_path,
         session_id,
         stage,
         payload,
@@ -786,10 +905,12 @@ def append_audit_event(log_path, session_id, stage, payload=None):
         # crash before the journal acknowledgement remains deduplicable.
         outbox_event_id=str(outbox_event_id) if outbox_event_id else None,
     )
+    METRICS.inc("linux_agent_web_audit_events_total")
+    return result
 
 
 def record_web_audit_event(stage, payload=None):
-    append_audit_event(WEB_AUDIT_LOG, WEB_AUDIT_SESSION_ID, stage, payload)
+    return append_audit_event(WEB_AUDIT_LOG, WEB_AUDIT_SESSION_ID, stage, payload)
 
 
 SESSION_STORE = SessionStore(
@@ -1339,7 +1460,7 @@ def run_job(job_id, job, resource, action, payload, job_context):
         result = DOMAIN_CONTRACT.enrich_execution_result(cancelled_job_result(finalizing_record))
 
     terminal_status = terminal_job_status(result)
-    merge_history = terminal_status == "succeeded" and resource == "work"
+    merge_history = result_context_eligible(resource, result)
     session_completion = None
     try:
         session_completion = SESSION_STORE.complete_job(
@@ -1381,7 +1502,11 @@ def run_job(job_id, job, resource, action, payload, job_context):
         return None
 
     try:
-        update_job(job_id, publish_terminal)
+        terminal_record = update_job(job_id, publish_terminal)
+        if isinstance(terminal_record, dict):
+            record_job_completion(terminal_record, terminal_status)
+        else:
+            record_job_completion({"status": terminal_status}, terminal_status)
     finally:
         with JOB_CONTEXTS_LOCK:
             JOB_CONTEXTS.pop(job_id, None)
@@ -1624,10 +1749,21 @@ def request_server_shutdown(server):
     return {"ok": True, "status": "shutting_down"}
 
 
+def notify_service_ready():
+    notify_socket = os.environ.get("NOTIFY_SOCKET", "")
+    if not notify_socket:
+        return
+    address = "\0" + notify_socket[1:] if notify_socket.startswith("@") else notify_socket
+    with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as client:
+        client.connect(address)
+        client.sendall(b"READY=1\nSTATUS=Web console is ready")
+
+
 class Handler(SimpleHTTPRequestHandler):
     server_version = "LinuxAgentWeb/1.0"
 
     def begin_request(self):
+        self._metrics_recorded = False
         supplied = str(self.headers.get("X-Request-ID") or "").strip()
         if (
             supplied
@@ -1638,6 +1774,17 @@ class Handler(SimpleHTTPRequestHandler):
         else:
             self.request_id = uuid.uuid4().hex
         REQUEST_CONTEXT.request_id = self.request_id
+
+    def send_response(self, code, message=None):
+        super().send_response(code, message)
+        if getattr(self, "_metrics_recorded", False):
+            return
+        self._metrics_recorded = True
+        try:
+            path = urlparse(getattr(self, "path", "") or "").path
+            record_http_request(getattr(self, "command", "GET"), path, int(code))
+        except Exception:
+            pass
 
     def log_message(self, fmt, *args):
         print("%s - %s" % (self.address_string(), fmt % args), flush=True)
@@ -1746,6 +1893,23 @@ class Handler(SimpleHTTPRequestHandler):
         self.wfile.write(data)
 
     def handle_api_get(self, path):
+        if path == "/api/metrics":
+            if not metrics_enabled():
+                json_domain_error(
+                    self,
+                    "metrics_disabled",
+                    "Prometheus 指标端点已关闭。",
+                    default=HTTPStatus.NOT_FOUND,
+                )
+                return
+            body = render_metrics_text()
+            write_plain_response(
+                self,
+                HTTPStatus.OK,
+                body,
+                content_type="text/plain; version=0.0.4; charset=utf-8",
+            )
+            return
         routes = {
             "/api/health": ("health", "get"),
             "/api/config/web": ("config", "web"),
@@ -2171,6 +2335,7 @@ def main():
         else:
             print("[信息] 使用 config/config.json 中配置的 web.token 认证。", file=sys.stderr, flush=True)
         print(f"[info] serving {STATIC_ROOT} on http://{HOST}:{PORT}/", flush=True)
+        notify_service_ready()
 
         def handle_shutdown_signal(_signum, _frame):
             terminate_running_jobs()

@@ -307,6 +307,17 @@ def _validate_history_entries(history, description="session history"):
     return history
 
 
+def result_context_eligible(resource, result):
+    """Return whether a completed result may enter future model context."""
+
+    return (
+        resource == "work"
+        and isinstance(result, dict)
+        and result.get("ok") is True
+        and result.get("status") in {"answered", "executed"}
+    )
+
+
 def history_from_turns(turns):
     """Build model context from authoritative turn results, never audit events."""
 

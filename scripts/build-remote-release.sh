@@ -12,7 +12,7 @@ if [[ ! "${VERSION}" =~ ^v[0-9A-Za-z][0-9A-Za-z._-]*$ ]]; then
     exit 2
 fi
 
-for command_name in bash jq tar gzip sha256sum stat find sort cp mktemp readlink grep sed awk head basename chmod; do
+for command_name in bash jq tar gzip sha256sum stat find sort cp mktemp readlink grep sed awk head basename chmod date; do
     command -v "${command_name}" >/dev/null 2>&1 || {
         printf 'missing build command: %s\n' "${command_name}" >&2
         exit 1
@@ -91,11 +91,12 @@ asset_json() {
 }
 
 core_stage="${tmp_root}/core"
-mkdir -p "${core_stage}/bin" "${core_stage}/lib" "${core_stage}/config" "${core_stage}/skills" "${core_stage}/schema"
+mkdir -p "${core_stage}/bin" "${core_stage}/lib" "${core_stage}/config" "${core_stage}/skills" "${core_stage}/schema" "${core_stage}/packaging"
 cp -a "${ROOT_DIR}/bin/agent" "${core_stage}/bin/agent"
 cp -a "${ROOT_DIR}/lib/"*.sh "${ROOT_DIR}/lib/"*.py "${core_stage}/lib/"
 cp -a "${ROOT_DIR}/config/config.example.json" "${ROOT_DIR}/config/ai-providers.json" "${core_stage}/config/"
 cp -a "${ROOT_DIR}/schema/domain.json" "${core_stage}/schema/domain.json"
+cp -a "${ROOT_DIR}/packaging/linux-agent-web.service" "${ROOT_DIR}/packaging/权限边界.md" "${core_stage}/packaging/"
 copy_tree_without_cache "${ROOT_DIR}/mcp" "${core_stage}/mcp"
 copy_tree_without_cache "${ROOT_DIR}/policies" "${core_stage}/policies"
 copy_tree_without_cache "${ROOT_DIR}/prompts" "${core_stage}/prompts"
@@ -170,21 +171,59 @@ done < <(find "${ROOT_DIR}/skills" -mindepth 1 -maxdepth 1 -type d | sort)
     sed '1d' "${ROOT_DIR}/remote/bootstrap.sh"
 } >"${OUTPUT_DIR}/linux-agent-web.sh"
 chmod 0755 "${OUTPUT_DIR}/linux-agent-cli.sh" "${OUTPUT_DIR}/linux-agent-web.sh"
+cp -a "${ROOT_DIR}/scripts/install.sh" "${OUTPUT_DIR}/linux-agent-install.sh"
+chmod 0755 "${OUTPUT_DIR}/linux-agent-install.sh"
+
+created_at="$(date -u --date="@${SOURCE_EPOCH}" '+%Y-%m-%dT%H:%M:%SZ')" || {
+    printf 'SOURCE_DATE_EPOCH must be a valid Unix timestamp: %s\n' "${SOURCE_EPOCH}" >&2
+    exit 1
+}
+sbom_files='[]'
+sbom_relationships='[
+    {"spdxElementId":"SPDXRef-DOCUMENT","relationshipType":"DESCRIBES","relatedSpdxElement":"SPDXRef-Package-linux-agent"},
+    {"spdxElementId":"SPDXRef-Package-linux-agent","relationshipType":"DEPENDS_ON","relatedSpdxElement":"SPDXRef-Package-bash"},
+    {"spdxElementId":"SPDXRef-Package-linux-agent","relationshipType":"DEPENDS_ON","relatedSpdxElement":"SPDXRef-Package-curl"},
+    {"spdxElementId":"SPDXRef-Package-linux-agent","relationshipType":"DEPENDS_ON","relatedSpdxElement":"SPDXRef-Package-jq"},
+    {"spdxElementId":"SPDXRef-Package-linux-agent","relationshipType":"DEPENDS_ON","relatedSpdxElement":"SPDXRef-Package-python3"}
+]'
+while IFS= read -r name; do
+    file_sha="$(sha256sum "${OUTPUT_DIR}/${name}" | awk '{print $1}')"
+    file_id="SPDXRef-File-${file_sha}"
+    sbom_files="$(jq -cn \
+        --argjson prior "${sbom_files}" \
+        --arg name "${name}" \
+        --arg id "${file_id}" \
+        --arg sha "${file_sha}" \
+        '$prior + [{fileName:$name, SPDXID:$id, checksums:[{algorithm:"SHA256", checksumValue:$sha}], licenseConcluded:"NOASSERTION", copyrightText:"NOASSERTION"}]')"
+    sbom_relationships="$(jq -cn \
+        --argjson prior "${sbom_relationships}" \
+        --arg id "${file_id}" \
+        '$prior + [{spdxElementId:"SPDXRef-Package-linux-agent", relationshipType:"CONTAINS", relatedSpdxElement:$id}]')"
+done < <(find "${OUTPUT_DIR}" -maxdepth 1 -type f -printf '%f\n' | sort)
 
 jq -S -n \
     --arg version "${VERSION}" \
-    --argjson bootstrap_cli "$(asset_json linux-agent-cli.sh)" \
-    --argjson bootstrap_web "$(asset_json linux-agent-web.sh)" \
-    --argjson core "$(asset_json linux-agent-core.tar.gz)" \
-    --argjson web "$(asset_json linux-agent-web.tar.gz)" \
-    --argjson skills "${skills_json}" \
+    --arg created "${created_at}" \
+    --arg namespace "https://github.com/libeal/ASSIstant/releases/download/${VERSION}/sbom.spdx.json" \
+    --argjson files "${sbom_files}" \
+    --argjson relationships "${sbom_relationships}" \
     '{
-        schema_version:1,
-        version:$version,
-        repository:"libeal/ASSIstant",
-        assets:{bootstrap_cli:$bootstrap_cli, bootstrap_web:$bootstrap_web, core:$core, web:$web},
-        skills:$skills
-    }' >"${OUTPUT_DIR}/release-manifest.json"
+        spdxVersion:"SPDX-2.3",
+        dataLicense:"CC0-1.0",
+        SPDXID:"SPDXRef-DOCUMENT",
+        name:("linux-agent-" + $version),
+        documentNamespace:$namespace,
+        creationInfo:{created:$created, creators:["Tool: linux-agent-release-builder"]},
+        packages:[
+            {name:"linux-agent", SPDXID:"SPDXRef-Package-linux-agent", versionInfo:$version, downloadLocation:$namespace, filesAnalyzed:false, licenseConcluded:"NOASSERTION", licenseDeclared:"NOASSERTION", copyrightText:"NOASSERTION", comment:"Linux 运维 Agent 发布物；运行时零 npm/pip 依赖。"},
+            {name:"bash", SPDXID:"SPDXRef-Package-bash", downloadLocation:"NOASSERTION", filesAnalyzed:false, licenseConcluded:"NOASSERTION", licenseDeclared:"NOASSERTION", copyrightText:"NOASSERTION", comment:"系统运行时依赖"},
+            {name:"curl", SPDXID:"SPDXRef-Package-curl", downloadLocation:"NOASSERTION", filesAnalyzed:false, licenseConcluded:"NOASSERTION", licenseDeclared:"NOASSERTION", copyrightText:"NOASSERTION", comment:"系统运行时依赖"},
+            {name:"jq", SPDXID:"SPDXRef-Package-jq", downloadLocation:"NOASSERTION", filesAnalyzed:false, licenseConcluded:"NOASSERTION", licenseDeclared:"NOASSERTION", copyrightText:"NOASSERTION", comment:"系统运行时依赖"},
+            {name:"python3", SPDXID:"SPDXRef-Package-python3", downloadLocation:"NOASSERTION", filesAnalyzed:false, licenseConcluded:"NOASSERTION", licenseDeclared:"NOASSERTION", copyrightText:"NOASSERTION", comment:"系统运行时依赖"}
+        ],
+        files:$files,
+        relationships:$relationships
+    }' >"${OUTPUT_DIR}/sbom.spdx.json"
 
 (
     cd "${OUTPUT_DIR}"
@@ -193,5 +232,34 @@ jq -S -n \
         while IFS= read -r name; do sha256sum "${name}"; done \
             >SHA256SUMS
 )
+
+# The signed manifest is generated last so it can authenticate the SBOM and
+# SHA256SUMS without introducing a self-reference. SHA256SUMS intentionally
+# covers the release payload and SBOM; cosign authenticates the manifest itself.
+jq -S -n \
+    --arg version "${VERSION}" \
+    --argjson bootstrap_cli "$(asset_json linux-agent-cli.sh)" \
+    --argjson bootstrap_web "$(asset_json linux-agent-web.sh)" \
+    --argjson core "$(asset_json linux-agent-core.tar.gz)" \
+    --argjson web "$(asset_json linux-agent-web.tar.gz)" \
+    --argjson installer "$(asset_json linux-agent-install.sh)" \
+    --argjson sbom "$(asset_json sbom.spdx.json)" \
+    --argjson checksums "$(asset_json SHA256SUMS)" \
+    --argjson skills "${skills_json}" \
+    '{
+        schema_version:1,
+        version:$version,
+        repository:"libeal/ASSIstant",
+        assets:{
+            bootstrap_cli:$bootstrap_cli,
+            bootstrap_web:$bootstrap_web,
+            core:$core,
+            web:$web,
+            installer:$installer,
+            sbom:$sbom,
+            checksums:$checksums
+        },
+        skills:$skills
+    }' >"${OUTPUT_DIR}/release-manifest.json"
 
 printf 'remote release built: %s\n' "${OUTPUT_DIR}"

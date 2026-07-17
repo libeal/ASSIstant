@@ -1280,18 +1280,10 @@ linux_agent_finalize_work_precondition_block() {
         "${prior_step_states}"
 }
 
-linux_agent_require_audit_event_result() {
-    local stage="$1"
-    local payload="${2:-{}}"
-    local audit_rc=0
+linux_agent_audit_precondition_failure_result() {
+    local audit_rc="${1:-4}"
+    local stage="${2:-audit}"
 
-    if ! declare -F linux_agent_audit_require_event >/dev/null 2>&1; then
-        return 0
-    fi
-    linux_agent_audit_require_event "${stage}" "${payload}" || audit_rc=$?
-    if ((audit_rc == 0)); then
-        return 0
-    fi
     if declare -F linux_agent_audit_failure_result >/dev/null 2>&1; then
         linux_agent_audit_failure_result "${audit_rc}" "${stage}"
     else
@@ -1306,19 +1298,39 @@ linux_agent_require_audit_event_result() {
                 details:{audit_stage:$stage}
             }'
     fi
+}
+
+linux_agent_require_audit_event_result() {
+    local stage="$1"
+    local payload="${2:-}"
+    local audit_rc=0
+    [[ -n "${payload}" ]] || payload='{}'
+
+    if ! declare -F linux_agent_audit_require_event >/dev/null 2>&1; then
+        return 0
+    fi
+    linux_agent_audit_require_event "${stage}" "${payload}" || audit_rc=$?
+    if ((audit_rc == 0)); then
+        return 0
+    fi
+    linux_agent_audit_precondition_failure_result "${audit_rc}" "${stage}"
     return 1
 }
 
 linux_agent_require_step_status_event() {
     local step_json="$1"
     local status="$2"
-    local detail="${3:-{}}"
+    local detail="${3:-}"
     local payload
-    payload="$(jq -cn \
+    [[ -n "${detail}" ]] || detail='{}'
+    if ! payload="$(jq -cn \
         --arg status "${status}" \
         --argjson step "${step_json}" \
         --argjson detail "${detail}" \
-        '{status:$status, step:$step, detail:$detail}')"
+        '{status:$status, step:$step, detail:$detail}' 2>/dev/null)"; then
+        linux_agent_audit_precondition_failure_result 4 "step_${status}"
+        return 1
+    fi
     linux_agent_require_audit_event_result "step_${status}" "${payload}"
 }
 

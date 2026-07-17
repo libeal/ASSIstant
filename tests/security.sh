@@ -140,6 +140,16 @@ linux_agent_validate_work_response "${normalized_string_args_response}"
 encoded_step_args="$(linux_agent_step_arguments_json "$(jq -cn --arg args '{"top_n":2}' '{arguments:$args}')")"
 grep -q '"top_n":2' <<<"${encoded_step_args}"
 
+unmanaged_root="${tmp_root}/unmanaged-root"
+unmanaged_logs="${tmp_root}/unmanaged-logs"
+mkdir -p "${unmanaged_root}" "${unmanaged_logs}"
+ln -s "${unmanaged_logs}" "${unmanaged_root}/logs"
+if linux_agent_init_env "${unmanaged_root}" 2>"${tmp_root}/unmanaged-log.err"; then
+    printf 'common init unexpectedly accepted an unmanaged audit-log symlink\n' >&2
+    exit 1
+fi
+grep -q '不符合受管安装布局' "${tmp_root}/unmanaged-log.err"
+
 cleanup_root="$(mktemp -d)"
 linux_agent_init_env "${cleanup_root}"
 mkdir -p "${LINUX_AGENT_TMP_DIR}/nested"

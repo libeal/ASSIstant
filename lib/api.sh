@@ -739,6 +739,20 @@ linux_agent_api_dispatch_raw() {
                          else "integrity_broken" end),
                  report:$report}'
             ;;
+        audit:export)
+            local export_selector export_output
+            if [[ "$(jq -r '.all // false' <<<"${payload}")" == "true" ]]; then
+                export_selector="--all"
+            else
+                export_selector="$(jq -r '.session_id // empty' <<<"${payload}")"
+            fi
+            export_output="$(jq -r '.output // empty' <<<"${payload}")"
+            if [[ -n "${export_output}" ]]; then
+                linux_agent_audit_export "${export_selector}" --output "${export_output}"
+            else
+                linux_agent_audit_export "${export_selector}"
+            fi
+            ;;
         work:run)
             if ! linux_agent_remote_api_key_transmission_allowed; then
                 linux_agent_api_error "secret_transmission_disabled" "Remote runtime 未允许向 AI Provider 传输 API key。"

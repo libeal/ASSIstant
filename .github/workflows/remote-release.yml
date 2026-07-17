@@ -12,7 +12,7 @@ on:
         type: string
 
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
   group: remote-release-${{ inputs.tag || github.ref_name }}
@@ -21,21 +21,27 @@ concurrency:
 jobs:
   build-and-release:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
     env:
       RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
     steps:
       - name: Check out release tooling for manual reruns
         if: ${{ github.event_name == 'workflow_dispatch' }}
-        uses: actions/checkout@v4
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           ref: ${{ github.ref }}
 
       - name: Preserve release publisher for manual reruns
         if: ${{ github.event_name == 'workflow_dispatch' }}
-        run: cp scripts/publish-remote-release.sh "${RUNNER_TEMP}/publish-remote-release.sh"
+        run: |
+          cp scripts/publish-remote-release.sh "${RUNNER_TEMP}/publish-remote-release.sh"
+          cp scripts/prepare-release-signature.sh "${RUNNER_TEMP}/prepare-release-signature.sh"
 
       - name: Check out tagged source
-        uses: actions/checkout@v4
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           ref: ${{ inputs.tag || github.ref_name }}
 
@@ -58,6 +64,9 @@ jobs:
       - name: Run syntax and lint checks
         run: bash scripts/lint.sh
 
+      - name: Install cosign
+        uses: sigstore/cosign-installer@d58896d6a1865668819e1d91763c7751a165e159 # v3.9.2
+
       - name: Run regression suite
         run: |
           for test_file in \
@@ -78,7 +87,8 @@ jobs:
             tests/remote_release.sh \
             tests/remote_runtime.sh \
             tests/remote_web_security.sh \
-            tests/backup.sh; do
+            tests/backup.sh \
+            tests/install.sh; do
             echo "::group::${test_file}"
             if ! bash "${test_file}"; then
               echo "::error title=Regression failed::${test_file} failed"
@@ -88,13 +98,35 @@ jobs:
           done
 
           python3 -m unittest discover -s tests -p 'test_web_*.py' -v
-          node tests/web_api_client.mjs
-          node tests/web_timeline.mjs
+          bash tests/web_frontend.sh
+
+          # Optional coverage report (no threshold / non-gating).
+          if python3 -m pip install --user coverage >/dev/null 2>&1; then
+            python3 -m coverage run -m unittest discover -s tests -p 'test_web_*.py' -q
+            python3 -m coverage report || true
+          else
+            echo 'coverage package unavailable; skipping optional report'
+          fi
 
       - name: Build deterministic remote assets
         env:
           SOURCE_DATE_EPOCH: "0"
         run: bash scripts/build-remote-release.sh "${RELEASE_TAG}" dist/remote
+
+      - name: Prepare release manifest signature
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          signer="scripts/prepare-release-signature.sh"
+          if [[ ! -f "${signer}" ]]; then
+            signer="${RUNNER_TEMP}/prepare-release-signature.sh"
+          fi
+          bash "${signer}" "${RELEASE_TAG}" dist/remote
+
+      - name: Attest release provenance
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
+        with:
+          subject-path: dist/remote/*
 
       - name: Publish and verify tag assets
         env:
@@ -105,6 +137,24 @@ jobs:
             publisher="${RUNNER_TEMP}/publish-remote-release.sh"
           fi
           bash "${publisher}" "${RELEASE_TAG}" dist/remote
+
+      - name: Verify published signature and provenance
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          manifest="${RUNNER_TEMP}/release-manifest.json"
+          bundle="${RUNNER_TEMP}/release-manifest.json.sigstore.json"
+          core="${RUNNER_TEMP}/linux-agent-core.tar.gz"
+          release_url="https://github.com/${GITHUB_REPOSITORY}/releases/download/${RELEASE_TAG}"
+          curl -fsSL --proto '=https' --tlsv1.2 "${release_url}/release-manifest.json" -o "${manifest}"
+          curl -fsSL --proto '=https' --tlsv1.2 "${release_url}/release-manifest.json.sigstore.json" -o "${bundle}"
+          curl -fsSL --proto '=https' --tlsv1.2 "${release_url}/linux-agent-core.tar.gz" -o "${core}"
+          cosign verify-blob \
+            --bundle "${bundle}" \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+            --certificate-identity-regexp '^https://github.com/libeal/ASSIstant/\.github/workflows/remote-release\.yml@refs/tags/v.*$' \
+            "${manifest}"
+          gh attestation verify "${core}" --repo "${GITHUB_REPOSITORY}"
 
       - name: Smoke test published CLI entrypoint
         run: |

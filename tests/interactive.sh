@@ -111,6 +111,20 @@ audit_output="$(cd "${project_session}" && bash bin/agent audit "${session_id}")
 grep -q '# 审计报告' <<<"${audit_output}"
 [[ "$(find "${project_session}/logs" -name '*.jsonl' | wc -l | tr -d ' ')" -eq 1 ]]
 
+project_context="${tmp_root}/project-context"
+copy_project "${project_context}"
+context_output="$(cd "${project_context}" && printf '第一轮上下文测试\n第二轮上下文测试\n/exit\n' | bash bin/agent 2>&1)"
+grep -q '已收到请求：第一轮上下文测试' <<<"${context_output}"
+grep -q '已收到请求：第二轮上下文测试' <<<"${context_output}"
+context_log="$(find "${project_context}/logs" -name '*.jsonl' -print -quit)"
+mapfile -t context_turn_counts < <(
+    jq -r 'select(.stage == "request_context_built") | .payload.conversation_turns' "${context_log}"
+)
+[[ "${#context_turn_counts[@]}" -eq 2 ]]
+[[ "${context_turn_counts[0]}" == "0" ]]
+[[ "${context_turn_counts[1]}" == "1" ]]
+[[ -z "$(find "${project_context}/tmp" -name conversation-history.json -print -quit)" ]]
+
 project_ctrlz="${tmp_root}/project-ctrlz"
 copy_project "${project_ctrlz}"
 ctrlz_output="$(cd "${project_ctrlz}" && printf '\032\n' | bash bin/agent 2>&1)"

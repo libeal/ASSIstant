@@ -14,6 +14,7 @@ LINUX_AGENT_TMP_DIR=""
 # shellcheck disable=SC2034
 linux_agent_init_env() {
     local root_dir="$1"
+    local resolved_log_dir resolved_root releases_dir install_prefix expected_log_dir
     LINUX_AGENT_ROOT="${root_dir}"
     LINUX_AGENT_LOG_DIR="${root_dir}/logs"
     LINUX_AGENT_CONFIG_FILE="${root_dir}/config/config.json"
@@ -28,6 +29,27 @@ linux_agent_init_env() {
         "${LINUX_AGENT_MCP_DIR}" \
         "${LINUX_AGENT_TMP_ROOT}" \
         "${root_dir}/config"
+
+    # Production installs intentionally expose releases/<version>/logs as a
+    # root-owned symlink to the persistent data directory. Resolve that trusted
+    # directory once so audit_chain.py can retain O_NOFOLLOW on log/lock files.
+    resolved_log_dir="$(readlink -f -- "${root_dir}/logs" 2>/dev/null || true)"
+    if [[ -z "${resolved_log_dir}" || ! -d "${resolved_log_dir}" ]]; then
+        linux_agent_print_error "无法解析审计日志目录: ${root_dir}/logs"
+        return 1
+    fi
+    if [[ -L "${root_dir}/logs" ]]; then
+        resolved_root="$(readlink -f -- "${root_dir}" 2>/dev/null || true)"
+        releases_dir="$(dirname -- "${resolved_root}")"
+        install_prefix="$(dirname -- "${releases_dir}")"
+        expected_log_dir="$(readlink -f -- "${install_prefix}/data/logs" 2>/dev/null || true)"
+        if [[ "$(basename -- "${releases_dir}")" != "releases" ||
+        -z "${expected_log_dir}" || "${resolved_log_dir}" != "${expected_log_dir}" ]]; then
+            linux_agent_print_error "审计日志符号链接不符合受管安装布局: ${root_dir}/logs"
+            return 1
+        fi
+    fi
+    LINUX_AGENT_LOG_DIR="${resolved_log_dir}"
 }
 
 linux_agent_use_session_tmp_dir() {

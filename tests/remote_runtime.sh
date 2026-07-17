@@ -5,11 +5,16 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 tmp_root="$(mktemp -d)"
 web_pid=""
+release_http_pid=""
 
 cleanup() {
     if [[ -n "${web_pid}" ]] && kill -0 "${web_pid}" >/dev/null 2>&1; then
         kill -TERM "${web_pid}" >/dev/null 2>&1 || true
         wait "${web_pid}" 2>/dev/null || true
+    fi
+    if [[ -n "${release_http_pid}" ]] && kill -0 "${release_http_pid}" >/dev/null 2>&1; then
+        kill "${release_http_pid}" >/dev/null 2>&1 || true
+        wait "${release_http_pid}" 2>/dev/null || true
     fi
     rm -rf "${tmp_root}"
 }
@@ -27,14 +32,62 @@ run_remote_cli() {
         bash "${release_dir}/linux-agent-cli.sh" "$@"
 }
 
-doctor_json="$(run_remote_cli doctor)"
+latest_stderr="${tmp_root}/latest.stderr"
+doctor_json="$(run_remote_cli doctor 2>"${latest_stderr}")"
 jq -e '
     .ok == true
     and .skills_ok == true
     and .remote.enabled == true
     and .remote.release_version == "v0.0.0-test"
 ' <<<"${doctor_json}" >/dev/null
+grep -q '浮动 latest' "${latest_stderr}"
 [[ -z "$(find "${runtime_base}" -mindepth 1 -maxdepth 1 -print -quit)" ]]
+
+fixed_stderr="${tmp_root}/fixed.stderr"
+fixed_doctor_json="$(LINUX_AGENT_VERSION=v0.0.0-test run_remote_cli doctor 2>"${fixed_stderr}")"
+jq -e '.ok == true and .remote.release_version == "v0.0.0-test"' <<<"${fixed_doctor_json}" >/dev/null
+! grep -q '浮动 latest' "${fixed_stderr}"
+
+# A real HTTP 404 must take the documented old-release SHA256 fallback path.
+# A fake cosign proves the verifier is not invoked when no bundle exists.
+fake_bin="${tmp_root}/fake-bin"
+mkdir -p "${fake_bin}"
+apply_marker="${tmp_root}/fake-cosign-invoked"
+printf '%s\n' '#!/usr/bin/env bash' ': >"${FAKE_COSIGN_MARKER:?}"' 'exit 1' >"${fake_bin}/cosign"
+chmod 0755 "${fake_bin}/cosign"
+release_http_port="$((22000 + RANDOM % 1000))"
+python3 -m http.server "${release_http_port}" --bind 127.0.0.1 --directory "${release_dir}" \
+    >"${tmp_root}/release-http.stdout" 2>"${tmp_root}/release-http.stderr" &
+release_http_pid="$!"
+for _ in $(seq 1 80); do
+    if curl --noproxy '*' -fsS "http://127.0.0.1:${release_http_port}/release-manifest.json" >/dev/null 2>&1; then
+        break
+    fi
+    sleep 0.1
+done
+http_fallback_stderr="${tmp_root}/http-fallback.stderr"
+http_fallback_json="$(
+    PATH="${fake_bin}:${PATH}" \
+        FAKE_COSIGN_MARKER="${apply_marker}" \
+        XDG_RUNTIME_DIR="${runtime_base}" \
+        LINUX_AGENT_ALLOW_INSECURE_TEST_URL=1 \
+        LINUX_AGENT_RELEASE_BASE_URL="http://127.0.0.1:${release_http_port}" \
+        LINUX_AGENT_VERSION=v0.0.0-test \
+        bash "${release_dir}/linux-agent-cli.sh" doctor 2>"${http_fallback_stderr}"
+)"
+jq -e '.ok == true and .remote.release_version == "v0.0.0-test"' <<<"${http_fallback_json}" >/dev/null
+grep -q '未提供签名 bundle' "${http_fallback_stderr}"
+[[ ! -e "${apply_marker}" ]]
+kill "${release_http_pid}"
+wait "${release_http_pid}" 2>/dev/null || true
+release_http_pid=""
+
+set +e
+LINUX_AGENT_REQUIRE_SIGNATURE=1 run_remote_cli doctor >"${tmp_root}/required-signature.stdout" 2>"${tmp_root}/required-signature.stderr"
+required_signature_status="$?"
+set -e
+[[ "${required_signature_status}" -ne 0 ]]
+grep -Eq '签名 bundle 下载失败|未安装 cosign' "${tmp_root}/required-signature.stderr"
 
 piped_doctor_json="$(curl -fsSL "file://${release_dir}/linux-agent-cli.sh" |
     XDG_RUNTIME_DIR="${runtime_base}" \
@@ -197,5 +250,42 @@ unsafe_failure="$(run_remote_cli api skills materialize '{"skill":"os-deep-inspe
 jq -e '.ok == false and .status == "skill_package_invalid"' <<<"${unsafe_failure}" >/dev/null
 [[ ! -e "${tmp_root}/escaped" ]]
 [[ -z "$(find "${runtime_base}" -mindepth 1 -maxdepth 1 -print -quit)" ]]
+
+if command -v cosign >/dev/null 2>&1; then
+    signed_release="${tmp_root}/signed-release"
+    cp -a "${release_dir}" "${signed_release}"
+    cosign_dir="${tmp_root}/cosign"
+    mkdir -p "${cosign_dir}"
+    (
+        cd "${cosign_dir}"
+        COSIGN_PASSWORD=remote-runtime-test cosign generate-key-pair >/dev/null
+        COSIGN_PASSWORD=remote-runtime-test cosign sign-blob --yes --tlog-upload=false --key cosign.key \
+            --bundle "${signed_release}/release-manifest.json.sigstore.json" \
+            "${signed_release}/release-manifest.json" >/dev/null
+    )
+    signed_doctor="$(XDG_RUNTIME_DIR="${runtime_base}" \
+        LINUX_AGENT_ALLOW_INSECURE_TEST_URL=1 \
+        LINUX_AGENT_RELEASE_BASE_URL="file://${signed_release}" \
+        LINUX_AGENT_REQUIRE_SIGNATURE=1 \
+        LINUX_AGENT_SIGNATURE_PUBKEY="${cosign_dir}/cosign.pub" \
+        bash "${signed_release}/linux-agent-cli.sh" doctor)"
+    jq -e '.ok == true and .remote.release_version == "v0.0.0-test"' <<<"${signed_doctor}" >/dev/null
+
+    printf ' ' >>"${signed_release}/release-manifest.json"
+    set +e
+    XDG_RUNTIME_DIR="${runtime_base}" \
+        LINUX_AGENT_ALLOW_INSECURE_TEST_URL=1 \
+        LINUX_AGENT_RELEASE_BASE_URL="file://${signed_release}" \
+        LINUX_AGENT_REQUIRE_SIGNATURE=1 \
+        LINUX_AGENT_SIGNATURE_PUBKEY="${cosign_dir}/cosign.pub" \
+        bash "${signed_release}/linux-agent-cli.sh" doctor \
+        >"${tmp_root}/tampered-signature.stdout" 2>"${tmp_root}/tampered-signature.stderr"
+    tampered_signature_status="$?"
+    set -e
+    [[ "${tampered_signature_status}" -ne 0 ]]
+    grep -q '签名验证失败' "${tmp_root}/tampered-signature.stderr"
+else
+    printf 'remote_runtime: cosign not installed; signature verification scenarios skipped\n'
+fi
 
 printf 'remote_runtime: ok\n'

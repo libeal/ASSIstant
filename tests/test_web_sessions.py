@@ -26,6 +26,7 @@ from sessions import (  # noqa: E402
     read_json_array,
     read_last_turn,
     read_turns,
+    result_context_eligible,
     write_turns_atomic,
     write_json_atomic,
 )
@@ -165,6 +166,53 @@ class SessionStoreTransactionTest(unittest.TestCase):
         self.assertEqual(turn_payload(private_turn), turn_payload(workspace_turn))
         self.assertTrue(completion["turn_persisted"])
         self.assertFalse(completion["context_eligible"])
+
+    def test_approval_required_work_waits_for_final_result_before_context_merge(self):
+        context = self.context_with_history("b2c4")
+        result = {
+            "ok": False,
+            "status": "approval_required",
+            "timeline": [],
+            "approval_card": {"title": "approval"},
+            "output_blocks": [],
+        }
+
+        self.assertFalse(result_context_eligible("work", result))
+        completion = self.store.complete_job(
+            context,
+            "work",
+            "approve this",
+            result,
+            merge_history=result_context_eligible("work", result),
+        )
+
+        self.assertEqual([], read_json_array(context.workspace.history_file))
+        private_turn = read_turns(context.private.turns_file)[0]
+        workspace_turn = read_turns(context.workspace.turns_file)[0]
+        self.assertEqual("approval_required", private_turn["status"])
+        self.assertFalse(private_turn["context_eligible"])
+        self.assertEqual(0, private_turn["history_merged_count"])
+        self.assertEqual(turn_payload(private_turn), turn_payload(workspace_turn))
+        self.assertFalse(completion["context_eligible"])
+
+    def test_result_context_eligibility_requires_a_final_successful_work_result(self):
+        self.assertTrue(
+            result_context_eligible("work", {"ok": True, "status": "answered"})
+        )
+        self.assertTrue(
+            result_context_eligible("work", {"ok": True, "status": "executed"})
+        )
+        self.assertFalse(
+            result_context_eligible(
+                "work", {"ok": True, "status": "approval_required"}
+            )
+        )
+        self.assertFalse(
+            result_context_eligible("work", {"ok": False, "status": "executed"})
+        )
+        self.assertFalse(
+            result_context_eligible("audit", {"ok": True, "status": "executed"})
+        )
 
     def test_restore_preserves_an_existing_valid_empty_history(self):
         source = self.store.paths_for("session_empty_history_restore")

@@ -18,6 +18,14 @@ source "${ROOT_DIR}/lib/api.sh"
 
 linux_agent_init_env "${ROOT_DIR}"
 
+linux_agent_config_validate_web_metrics '{}'
+linux_agent_config_validate_web_metrics '{"web":{"metrics_enabled":true}}'
+linux_agent_config_validate_web_metrics '{"web":{"metrics_enabled":false}}'
+if linux_agent_config_validate_web_metrics '{"web":{"metrics_enabled":"false"}}'; then
+    printf 'web.metrics_enabled string unexpectedly passed strict validation\n' >&2
+    exit 1
+fi
+
 # 1) schema/domain.json is the single source of truth and must be well-formed.
 jq -e '
     . as $schema
@@ -33,6 +41,8 @@ jq -e '
         "audit_degraded",
         "audit_write_blocked",
         "audit_integrity_broken",
+        "audit_export_failed",
+        "metrics_disabled",
         "sudo_required",
         "auditctl_not_found",
         "provider_request_failed",

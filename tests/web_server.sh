@@ -168,8 +168,8 @@ grep -q 'aria-current="page"' <<<"${index_html}"
 grep -q 'id="mainContent"' <<<"${index_html}"
 grep -q '<h1 id="screenTitle"' <<<"${index_html}"
 [[ "$(grep -o '<h1' <<<"${index_html}" | wc -l)" -eq 1 ]]
-grep -q 'on("workInput", "keydown"' "${project}/web/static/app.js"
-grep -q 'event.shiftKey' "${project}/web/static/app.js"
+grep -q 'on("workInput", "keydown"' "${project}/web/static/modules/app-bindings.js"
+grep -q 'event.shiftKey' "${project}/web/static/modules/app-bindings.js"
 grep -q 'scrollActiveNavigationIntoView' "${project}/web/static/app.js"
 grep -q 'overscroll-behavior-inline: contain' "${project}/web/static/styles.css"
 grep -q 'grid-template-columns: 180px minmax(0, 1fr)' "${project}/web/static/styles.css"
@@ -177,24 +177,24 @@ grep -q '"Noto Sans CJK SC"' "${project}/web/static/styles.css"
 grep -q 'flex: 0 0 44px' "${project}/web/static/styles.css"
 grep -q 'env(safe-area-inset-bottom)' "${project}/web/static/styles.css"
 grep -q '@media (prefers-reduced-motion: reduce)' "${project}/web/static/styles.css"
-grep -q 'userOutputBlocks(blocks)' "${project}/web/static/app.js"
+grep -q 'userOutputBlocks(blocks)' "${project}/web/static/modules/render-output.js"
 grep -q '低风险 Skill 自动运行' "${project}/web/static/modules/policy-config.js"
 grep -q '低风险 Shell 自动运行' "${project}/web/static/modules/policy-config.js"
 grep -q 'Work 自动续写' "${project}/web/static/modules/policy-config.js"
 grep -q '文件匹配自动运行' "${project}/web/static/modules/policy-config.js"
 grep -q '最小权限代理' "${project}/web/static/modules/policy-config.js"
 grep -q '允许远程传输 API Key' "${project}/web/static/modules/policy-config.js"
-grep -q 'materializeSkill' "${project}/web/static/app.js"
-grep -q 'downloadRuntimeBackup' "${project}/web/static/app.js"
-grep -q '开：' "${project}/web/static/app.js"
-grep -q '关：' "${project}/web/static/app.js"
-grep -q 'state.terminalSubmitting' "${project}/web/static/app.js"
-grep -q 'session-turn' "${project}/web/static/app.js"
-grep -q 'renderSharedExecutionOutput' "${project}/web/static/app.js"
-grep -q 'work-plan-preview' "${project}/web/static/app.js"
-grep -q 'prepareNewWorkRun' "${project}/web/static/app.js"
-grep -q 'execution_state' "${project}/web/static/app.js"
-grep -q 'data-config-model-fetch' "${project}/web/static/app.js"
+grep -q 'materializeSkill' "${project}/web/static/modules/view-skills.js"
+grep -q 'downloadRuntimeBackup' "${project}/web/static/modules/view-audit.js"
+grep -q '开：' "${project}/web/static/modules/view-config.js"
+grep -q '关：' "${project}/web/static/modules/view-config.js"
+grep -q 'state.terminalSubmitting' "${project}/web/static/modules/view-workbench.js"
+grep -q 'session-turn' "${project}/web/static/modules/view-workbench.js"
+grep -q 'renderSharedExecutionOutput' "${project}/web/static/modules/render-output.js"
+grep -q 'work-plan-preview' "${project}/web/static/modules/view-workbench.js"
+grep -q 'prepareNewWorkRun' "${project}/web/static/modules/view-workbench.js"
+grep -q 'execution_state' "${project}/web/static/modules/view-workbench.js"
+grep -q 'data-config-model-fetch' "${project}/web/static/modules/app-bindings.js"
 grep -q 'loadMcpRegistry' "${project}/web/static/app.js"
 grep -q 'type: "provider"' "${project}/web/static/modules/policy-config.js"
 grep -q 'type: "model"' "${project}/web/static/modules/policy-config.js"
@@ -228,6 +228,34 @@ oversized_code="$(curl --noproxy '*' -sS -o "${tmp_root}/oversized-resp.json" -w
 jq -e '.status == "request_too_large"' "${tmp_root}/oversized-resp.json" >/dev/null
 
 health="$(curl --noproxy '*' -sS -H "Authorization: Bearer ${token}" "${base_url}/api/health")"
+
+metrics="$(curl --noproxy '*' -sS -H "Authorization: Bearer ${token}" "${base_url}/api/metrics")"
+printf '%s\n' "${metrics}" | grep -Eq 'linux_agent_build_info\{version='
+printf '%s\n' "${metrics}" | grep -Eq 'linux_agent_process_start_time_seconds'
+printf '%s\n' "${metrics}" | grep -Eq 'linux_agent_http_requests_total\{.*route="health"'
+printf '%s\n' "${metrics}" | grep -Eq 'linux_agent_http_requests_total\{.*route="static".*status="200"'
+printf '%s\n' "${metrics}" | grep -Eq 'linux_agent_jobs\{status='
+printf '%s\n' "${metrics}" | grep -Eq 'linux_agent_jobs_active '
+printf '%s\n' "${metrics}" | grep -Eq 'linux_agent_web_audit_events_total [1-9][0-9]*'
+
+metrics_unauth_code="$(curl --noproxy '*' -sS -o "${tmp_root}/metrics-unauth.body" -w '%{http_code}' "${base_url}/api/metrics" || true)"
+[[ "${metrics_unauth_code}" == "401" ]]
+
+jq '.web.metrics_enabled = false' "${project}/config/config.json" >"${project}/config/config.metrics-off.json"
+mv "${project}/config/config.metrics-off.json" "${project}/config/config.json"
+metrics_disabled_body="${tmp_root}/metrics-disabled.body"
+metrics_disabled_code="$(curl --noproxy '*' -sS -o "${metrics_disabled_body}" -w '%{http_code}' -H "Authorization: Bearer ${token}" "${base_url}/api/metrics" || true)"
+[[ "${metrics_disabled_code}" == "404" ]]
+jq -e '.ok == false and .code == "metrics_disabled"' <"${metrics_disabled_body}" >/dev/null
+jq '.web.metrics_enabled = "false"' "${project}/config/config.json" >"${project}/config/config.metrics-invalid.json"
+mv "${project}/config/config.metrics-invalid.json" "${project}/config/config.json"
+metrics_invalid_code="$(curl --noproxy '*' -sS -o /dev/null -w '%{http_code}' -H "Authorization: Bearer ${token}" "${base_url}/api/metrics" || true)"
+[[ "${metrics_invalid_code}" == "404" ]]
+invalid_metrics_config="$(curl --noproxy '*' -sS -H "Authorization: Bearer ${token}" "${base_url}/api/config")"
+jq -e '.config.web.metrics_enabled == false' <<<"${invalid_metrics_config}" >/dev/null
+jq '.web.metrics_enabled = true' "${project}/config/config.json" >"${project}/config/config.metrics-on.json"
+mv "${project}/config/config.metrics-on.json" "${project}/config/config.json"
+
 jq -e '.ok == true and .root != "" and .web_server.run_id != "" and .web_server.started_at != ""' <<<"${health}" >/dev/null
 
 observer_bootstrap="$(curl --noproxy '*' -sS -H "Authorization: Bearer ${token}" "${base_url}/api/observer/bootstrap")"
@@ -543,7 +571,7 @@ grep -q 'id="policyEditVaultBtn"' "${project}/web/static/index.html"
 grep -q 'id="policyInspectBtn"' "${project}/web/static/index.html"
 grep -q 'id="policyFileDialog"' "${project}/web/static/index.html"
 grep -q 'id="policyGuardToggleBtn"' "${project}/web/static/index.html"
-grep -q 'file-vault.json' "${project}/web/static/app.js"
+grep -q 'file-vault.json' "${project}/web/static/modules/view-policy.js"
 
 command_guard_state="$(curl --noproxy '*' -sS \
     -H "Authorization: Bearer ${token}" \
@@ -606,6 +634,10 @@ done
 jq -e '.result_status == "executed" and .result_ok == true
     and ([.result.timeline[]? | select(.kind == "execution") | .output_blocks[]? | select(.kind == "json") | .json | select(.tool == "system.resource.inspect")] | length) > 0
     and ([.result.output_blocks[]? | select(.title == "执行流程") | .text | contains("# 工作计划") and contains("步骤输出")] | any)' <<<"${work_result_one}" >/dev/null
+completed_metrics="$(curl --noproxy '*' -sS -H "Authorization: Bearer ${token}" "${base_url}/api/metrics")"
+printf '%s\n' "${completed_metrics}" | grep -Eq 'linux_agent_jobs\{status="succeeded"\} [1-9][0-9]*'
+printf '%s\n' "${completed_metrics}" | grep -Eq 'linux_agent_jobs_completed_total\{result="succeeded"\} [1-9][0-9]*'
+printf '%s\n' "${completed_metrics}" | grep -Eq 'linux_agent_job_duration_seconds_count [1-9][0-9]*'
 
 slow_work_payload="$(jq -cn '{resource:"work", action:"run", payload:{input:"慢速实时输出检查"}}')"
 slow_work_job="$(curl --noproxy '*' -sS \
@@ -1154,6 +1186,86 @@ retry_limit_code="$(curl --noproxy '*' -sS -o "${retry_limit_file}" -w '%{http_c
     "${base_url}/api/jobs/${retry_two_id}/retry")"
 [[ "${retry_limit_code}" == "409" ]]
 jq -e '.status == "job_retry_limit_reached"' "${retry_limit_file}" >/dev/null
+
+# A pending approval remains visible as a Turn but must not enter model context.
+approval_state_before="$(curl --noproxy '*' -sS -H "Authorization: Bearer ${token}" "${base_url}/api/session/state")"
+approval_history_before="$(jq -r '.history_count' <<<"${approval_state_before}")"
+approval_turns_before="$(jq -r '.turn_count' <<<"${approval_state_before}")"
+approval_payload="$(jq -cn '{resource:"work", action:"run", payload:{input:"帮我检查磁盘空间是否异常"}}')"
+approval_job="$(curl --noproxy '*' -sS \
+    -H "Authorization: Bearer ${token}" \
+    -H "Content-Type: application/json" \
+    -d "${approval_payload}" \
+    "${base_url}/api/jobs")"
+approval_job_id="$(jq -r '.job_id' <<<"${approval_job}")"
+for _ in $(seq 1 100); do
+    approval_result="$(curl --noproxy '*' -sS -H "Authorization: Bearer ${token}" "${base_url}/api/jobs/${approval_job_id}")"
+    approval_job_status="$(jq -r '.status' <<<"${approval_result}")"
+    if [[ "${approval_job_status}" != "queued" && "${approval_job_status}" != "running" ]]; then
+        break
+    fi
+    sleep 0.2
+done
+jq -e '.status == "succeeded" and .result_status == "approval_required"
+    and .result.ok == false
+    and (.result.execution_state | type) == "object"' <<<"${approval_result}" >/dev/null
+
+approval_state_pending="$(curl --noproxy '*' -sS -H "Authorization: Bearer ${token}" "${base_url}/api/session/state")"
+jq -e \
+    --argjson history_before "${approval_history_before}" \
+    --argjson turns_before "${approval_turns_before}" '
+    .history_count == $history_before
+    and .turn_count == ($turns_before + 1)
+    and .turns[-1].status == "approval_required"
+    and .turns[-1].context_eligible == false
+    and .turns[-1].history_merged_count == 0
+' <<<"${approval_state_pending}" >/dev/null
+
+approval_resume_payload="$(jq -cn \
+    --arg input "帮我检查磁盘空间是否异常" \
+    --argjson response "$(jq -c '.result.response' <<<"${approval_result}")" \
+    --argjson context "$(jq -c '.result.context' <<<"${approval_result}")" \
+    --argjson execution_state "$(jq -c '.result.execution_state' <<<"${approval_result}")" '
+    {
+        resource:"work",
+        action:"run",
+        payload:{
+            input:$input,
+            response:$response,
+            context:$context,
+            execution_state:$execution_state,
+            decisions:["y"]
+        }
+    }
+')"
+approval_resume_job="$(curl --noproxy '*' -sS \
+    -H "Authorization: Bearer ${token}" \
+    -H "Content-Type: application/json" \
+    -d "${approval_resume_payload}" \
+    "${base_url}/api/jobs")"
+approval_resume_job_id="$(jq -r '.job_id' <<<"${approval_resume_job}")"
+for _ in $(seq 1 100); do
+    approval_resume_result="$(curl --noproxy '*' -sS -H "Authorization: Bearer ${token}" "${base_url}/api/jobs/${approval_resume_job_id}")"
+    approval_resume_status="$(jq -r '.status' <<<"${approval_resume_result}")"
+    if [[ "${approval_resume_status}" != "queued" && "${approval_resume_status}" != "running" ]]; then
+        break
+    fi
+    sleep 0.2
+done
+jq -e '.status == "succeeded" and .result_status == "executed" and .result_ok == true' <<<"${approval_resume_result}" >/dev/null
+
+approval_state_final="$(curl --noproxy '*' -sS -H "Authorization: Bearer ${token}" "${base_url}/api/session/state")"
+jq -e \
+    --argjson history_before "${approval_history_before}" \
+    --argjson turns_before "${approval_turns_before}" '
+    .history_count > $history_before
+    and .turn_count == ($turns_before + 2)
+    and .turns[-2].status == "approval_required"
+    and .turns[-2].context_eligible == false
+    and .turns[-1].status == "executed"
+    and .turns[-1].context_eligible == true
+    and .turns[-1].history_merged_count > 0
+' <<<"${approval_state_final}" >/dev/null
 
 # SQLite(WAL) job store is the durable backend.
 [[ -f "${project}/tmp/web/jobs.db" ]]

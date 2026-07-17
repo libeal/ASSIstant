@@ -20,7 +20,8 @@ Linux 运维 Agent 是一个以 Bash CLI 为核心的本机运维助手。它把
 | Skills | `bash bin/agent skills validate` | 校验 skill 目录、`SKILL.md`、脚本和索引登记一致性。 |
 | MCP | `bash bin/agent mcp list` / `bash bin/agent mcp validate` / `bash bin/agent mcp tools` | 列出、校验并发现 `mcp/` 下安装的外部 MCP server tools。 |
 | Policy | `bash bin/agent policy validate [file]` | 校验 `policies/` 下策略 JSON、正则和审计边界。 |
-| Audit | `bash bin/agent audit <session-id>` / `bash bin/agent audit verify <session-id>` | 读取历史 JSONL 审计会话，或校验跨轮转文件的 SHA-256 hash chain。 |
+| Audit | `bash bin/agent audit <session-id>` / `bash bin/agent audit verify <session-id>` / `bash bin/agent audit export <session-id>\|--all [--output <目录>]` | 读取历史 JSONL 审计会话、校验跨轮转 SHA-256 hash chain，或导出带完整性证明的离线证据包。 |
+| Backup | `bash bin/agent backup <output.tar.gz>` | 导出脱敏配置、运行日志和用户 skill，用于诊断或迁移。 |
 | API | `bash bin/agent api <resource> <action> [json]` | 给 Web 后端调用的机器可读 JSON 接口。 |
 
 交互式 REPL 支持 `/work`、`/edit`、`/script`、`/terminal`、`/mode`、`/help`、`/exit`。输入 `/` 或 `/前缀` 后回车会打开命令菜单。
@@ -65,23 +66,83 @@ Web 视图包括：
 
 ### 远程临时运行
 
-CLI 版本：
+CLI 固定版本：
+
+```bash
+curl -fsSL https://github.com/libeal/ASSIstant/releases/download/vX.Y.Z/linux-agent-cli.sh \
+  | LINUX_AGENT_VERSION=vX.Y.Z bash
+```
+
+Web 固定版本：
+
+```bash
+curl -fsSL https://github.com/libeal/ASSIstant/releases/download/vX.Y.Z/linux-agent-web.sh \
+  | LINUX_AGENT_VERSION=vX.Y.Z bash
+```
+
+仅临时诊断时可使用浮动 `latest`；bootstrap 会在 stderr 显示实际解析版本和生产环境警告：
 
 ```bash
 curl -fsSL https://github.com/libeal/ASSIstant/releases/latest/download/linux-agent-cli.sh | bash
 ```
 
-Web 版本：
-
-```bash
-curl -fsSL https://github.com/libeal/ASSIstant/releases/latest/download/linux-agent-web.sh | bash
-```
-
 两条命令都只从同一个 GitHub Release 获取 manifest 和已登记资产。Bootstrap 不保存到本机；core、Web 和按需加载的完整 skill 包优先物化到 `$XDG_RUNTIME_DIR` 或 `/dev/shm`，必要时回退权限为 `0700` 的 `/tmp` 子目录，并在退出或收到信号时清理。
 
-Remote CLI 会从 `/dev/tty` 读取审批和可选 API key，密钥不写入配置文件。Remote Web 强制监听 `127.0.0.1`，从其他机器访问时使用启动日志打印的 SSH 转发命令；本次运行的临时 token 写入运行时目录下权限 `0600` 的 `tmp/web/auth-token`（不在终端回显）。固定版本可把 URL 中的 `latest/download` 替换为 `download/<tag>`，并在管道右侧设置相同的 `LINUX_AGENT_VERSION=<tag>`。Remote 部署会自动把 `providers_security.require_https` 置为 `true`（仅允许 HTTPS Provider）。
+Remote CLI 会从 `/dev/tty` 读取审批和可选 API key，密钥不写入配置文件。Remote Web 强制监听 `127.0.0.1`，从其他机器访问时使用启动日志打印的 SSH 转发命令；本次运行的临时 token 写入运行时目录下权限 `0600` 的 `tmp/web/auth-token`（不在终端回显）。Remote 部署会自动把 `providers_security.require_https` 置为 `true`（仅允许 HTTPS Provider）。
 
 Remote 模式默认禁止向 AI Provider 传输 API key。CLI 会在需要 AI 时询问；Web 需在配置中心开启“允许远程传输 API Key”。Terminal、Doctor、Audit 和不需要模型的 Skill 不受此开关影响。运行日志、脱敏配置和用户生成的 skill 可通过 `agent backup <output.tar.gz>` 或 Web“下载运行时备份”按钮显式保存。
+
+### 生产部署（systemd）
+
+生产环境下载固定版本安装器，并要求 cosign 验证 release manifest。安装器把版本化代码放到 `/opt/linux-agent/releases/`，通过原子 `current` 符号链接切换版本；配置、日志和临时状态持久化在 `/opt/linux-agent/data/`。
+
+```bash
+curl -fsSLO https://github.com/libeal/ASSIstant/releases/download/vX.Y.Z/linux-agent-install.sh
+sudo bash linux-agent-install.sh install --version vX.Y.Z --require-signature
+sudo bash linux-agent-install.sh upgrade --version vX.Y.NEW --require-signature
+sudo bash linux-agent-install.sh rollback
+sudo bash linux-agent-install.sh health
+sudo bash linux-agent-install.sh status
+```
+
+### Prometheus 指标
+
+Web 控制台提供 `GET /api/metrics`（Prometheus 文本格式，Bearer token 保护）。默认开启，可在配置中设置 `web.metrics_enabled=false` 关闭。
+
+```bash
+curl -fsS -H "Authorization: Bearer $LINUX_AGENT_WEB_TOKEN" \
+  http://127.0.0.1:8765/api/metrics
+```
+
+Prometheus scrape 示例（自定义 Authorization header）：
+
+```yaml
+scrape_configs:
+  - job_name: linux-agent-web
+    metrics_path: /api/metrics
+    authorization:
+      type: Bearer
+      credentials: <web-token>
+    static_configs:
+      - targets: ["127.0.0.1:8765"]
+```
+
+`upgrade` 切换后会重启服务并轮询认证后的 `/api/health`，失败时自动恢复旧版本。默认保留最近两个版本，可用 `--keep` 调整；`uninstall` 默认保留 `data/`，只有 `uninstall --purge-data` 会删除持久数据。systemd 模式的自定义 `--prefix` 应位于 `/opt`、`/srv` 等系统服务目录，安装器会拒绝被 `ProtectHome` 或 `PrivateTmp` 隐藏的 `/home`、`/root`、`/run/user`、`/tmp` 和 `/var/tmp`。容器和测试环境可使用 `--no-systemd --prefix <目录>`，本地发布演练可增加 `--from-dist <目录>`。
+
+bootstrap 和 installer 的签名策略相同：系统存在 cosign 且 release 带 bundle 时必须验证成功；未安装 cosign 时默认提示并继续 SHA256 校验；`LINUX_AGENT_REQUIRE_SIGNATURE=1` 或 `--require-signature` 会在 cosign、bundle 或验证缺失时拒绝运行。私有部署可设置 `LINUX_AGENT_SIGNATURE_PUBKEY=<公钥路径>`，内部会以 `--offline --insecure-ignore-tlog` 验证未上传公共 Rekor 的本地密钥签名；fork 可通过 `LINUX_AGENT_SIGNATURE_IDENTITY` 和 `LINUX_AGENT_SIGNATURE_ISSUER` 收窄 keyless 身份。
+
+Release 同时提供 SPDX 2.3 SBOM、Sigstore bundle 和 GitHub build provenance。签名 manifest 登记全部业务资产、SBOM 与 `SHA256SUMS`；`SHA256SUMS` 校验业务资产和 SBOM，manifest 本身由 cosign 验证，避免摘要自引用：
+
+```bash
+cosign verify-blob \
+  --bundle release-manifest.json.sigstore.json \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+  --certificate-identity-regexp '^https://github.com/libeal/ASSIstant/\.github/workflows/remote-release\.yml@refs/tags/v.*$' \
+  release-manifest.json
+sha256sum -c SHA256SUMS
+gh attestation verify linux-agent-core.tar.gz --repo libeal/ASSIstant
+jq '.packages, .files' sbom.spdx.json
+```
 
 ### 本地运行
 
@@ -131,9 +192,13 @@ bash bin/agent mcp tools
 bash bin/agent policy validate
 bash bin/agent audit <session-id>
 bash bin/agent audit verify <session-id>
+bash bin/agent audit export <session-id> --output /secure/evidence
+bash bin/agent audit export --all --output /secure/evidence
 ```
 
 审计 hash chain 是强制不变量，不能通过配置或 CLI 关闭；每个事件始终包含 `seq`、`prev_hash` 和 `hash`。升级配置如果仍含旧的 `audit.integrity_chain` 字段，CLI/Web 会要求删除该字段后再启动。追加只校验最后一个非空事件及其自身 hash，写入成本不随历史事件数增长。跨分段全链检查是显式职责：取证、导出或合规检查前运行 `audit verify`；中间事件或旧归档损坏会由该命令报告，但不会阻止后续追加。
+
+`agent backup` 面向诊断和迁移，导出脱敏配置、运行日志与用户 skill；`agent audit export` 只导出审计 session、全部轮转段、逐 session 完整性报告、文件摘要 manifest 和 `SHA256SUMS`，适合交给 SIEM、对象存储或合规采集流程。导出先取得加锁快照，因此不会把写入中的不同链尾混入同一证据包。
 
 机器可读 API 示例：
 
@@ -163,7 +228,7 @@ bash bin/agent api terminal run '{"command":"printf api-ok"}' | jq '.timeline, .
 ```text
 Linux 运维 Agent
 ├─ 入口层
-│  ├─ bin/agent              CLI 主入口，加载 lib 并路由 work/edit/script/terminal/doctor/sense/tools/skills/mcp/api/audit
+│  ├─ bin/agent              CLI 主入口，加载 lib 并路由 work/edit/script/terminal/doctor/sense/tools/skills/mcp/policy/api/audit/backup
 │  └─ bin/agent-web          Web 启动入口，读取 Web 配置并启动 Python 后端
 ├─ 核心 Bash 层 lib/
 │  ├─ 基础设施
@@ -171,6 +236,7 @@ Linux 运维 Agent
 │  │  ├─ config.sh           配置读取和默认值
 │  │  ├─ audit.sh            JSONL 审计和审计报告
 │  │  ├─ audit_chain.py      hash chain、fsync、轮转、磁盘策略与校验器
+│  │  ├─ backup.sh            运行时脱敏备份
 │  │  └─ context.sh          会话历史和模型上下文
 │  ├─ 感知与校验
 │  │  ├─ sense.sh            环境采集
@@ -188,6 +254,8 @@ Linux 运维 Agent
 │  │  ├─ editor.sh           skill edit/staging/提交
 │  │  ├─ observer.sh         auditd observer 和降级记录
 │  │  ├─ api.sh              机器可读 API
+│  │  ├─ mcp_client.py       MCP stdio/SSE/Streamable HTTP 客户端
+│  │  ├─ provider_security.py Provider URL 校验、SSRF 防护与地址解析
 │  │  ├─ workflow.sh         CLI/API 共用的 Work 准备与执行选择
 │  │  └─ interactive.sh      REPL 菜单和模式选择
 ├─ Web 外壳层 web/
@@ -196,6 +264,7 @@ Linux 运维 Agent
 │  ├─ sessions.py            工作台/Job 私有上下文、合并事务和持久化 turns
 │  ├─ execution.py           子进程、超时、取消、输出与环境隔离
 │  ├─ audit.py               Web 审计适配器（复用 audit_chain）
+│  ├─ metrics.py             Prometheus 指标注册、低基数路由和文本渲染
 │  ├─ domain.py              schema/domain.json 运行时契约校验
 │  ├─ timeline.py            只消费持久化 protocol turns 的时间线视图
 │  ├─ provider.py            Provider 配置与模型服务
@@ -204,7 +273,7 @@ Linux 运维 Agent
 │  └─ static/
 │     ├─ index.html          Web 页面结构
 │     ├─ app.js              前端工作台入口
-│     ├─ modules/            无构建 ES modules：api、state、timeline、approval、output-blocks、audit、policy/config
+│     ├─ modules/            无构建 ES modules：API、状态、布局、Job、Work/Skill/Policy/Audit/Config 视图及纯函数测试模块
 │     ├─ styles.css          页面样式
 │     └─ mark.svg            Web 图标
 ├─ 策略与提示层
@@ -223,6 +292,8 @@ Linux 运维 Agent
 │  └─ network-ops-tools/     运维/网络工程常用诊断、查询、扫描和计算 skill
 ├─ MCP 能力层 mcp/
 │  └─ <server-id>/mcp.json    外部 MCP server manifest，支持 stdio、sse、streamable_http
+├─ 领域契约 schema/
+│  └─ domain.json             API、Job、turn、步骤和错误状态的共享 JSON schema
 ├─ 配置层
 │  ├─ config/config.example.json 模板配置
 │  ├─ config/ai-providers.json AI 厂商预设、鉴权方式和模型列表规则
@@ -230,7 +301,13 @@ Linux 运维 Agent
 ├─ 测试层 tests/
 │  ├─ fake_ai_server.py      测试用 Chat Completions 兼容服务
 │  ├─ helpers.sh             测试辅助函数
-│  └─ *.sh                   CLI、Web、策略、安全、observer、交互和工作流测试
+│  ├─ *.sh                   CLI、Web、策略、安全、observer、交互、安装和发布测试
+│  ├─ test_web_*.py          Web 服务与领域模块单元测试
+│  └─ web_*.mjs              无 npm 依赖的前端模块和协议测试
+├─ 发布与部署 packaging/、remote/、scripts/
+│  ├─ packaging/             systemd 单元和权限边界说明
+│  ├─ remote/bootstrap.sh    CLI/Web 临时 Remote runtime bootstrap
+│  └─ scripts/               发布构建、签名、发布、安装和 lint 工具
 └─ 运行时产物
    ├─ logs/                  JSONL 审计日志，忽略提交
    ├─ tmp/                   session 临时目录和 Web job 状态，忽略提交
@@ -280,12 +357,14 @@ Web MCP 页和 `agent api mcp list|validate|tools` 会隐藏 Authorization、tok
 9. `lib/observer.sh` 在可用时安装 auditd syscall 观察规则，执行结束后汇总 `ausearch` 事件；`observer.require=true` 时每次真实执行前复核规则并 fail closed。
 10. `lib/audit.sh` 与 `lib/audit_chain.py` 负责审计脱敏、0600 写入、hash chain、fsync、轮转、磁盘策略、session 收尾和校验/报告。
 
+CLI 会话历史只在当前 `agent` 进程内有效，存放于该 session 的私有临时目录，并随进程退出清理；重新启动 CLI 不会自动继承上一轮会话。
+
 ### Web 调用关系
 
 1. `bin/agent-web` 读取 `config/config.json` 的 `web` 段，导出环境变量并启动 `web/server.py`。
 2. `web/server.py` 提供静态文件、token 校验、策略/配置/skill 文件 API、异步 Job API，并把状态服务委托给平级模块。
 3. 对 CLI 核心能力，Web 后端调用 `bash bin/agent api ...`，不复制业务逻辑。
-4. 长任务通过 `/api/jobs` 启动，状态事务化写入 `tmp/web/jobs.db`；每个 Job 使用独立 session、history、audit 和临时目录，完成后串行合并工作台历史/turn。
+4. 长任务通过 `/api/jobs` 启动，状态事务化写入 `tmp/web/jobs.db`；每个 Job 使用独立 session、history、audit 和临时目录，完成后串行合并工作台历史/turn。`approval_required` turn 会持久化供界面和审计展示，但只有审批续跑得到最终 `answered` 或 `executed` 结果后才进入模型上下文。
 5. 前端轮询 `/api/jobs/<job-id>`，终态后重新读取服务端持久化 turns；审计证据不参与业务状态重建。
 
 ## 运行逻辑
@@ -367,7 +446,7 @@ Web 版 edit 使用浏览器内联编辑器，但保存前仍调用同一套 `ed
     git tag -a vX.Y.Z -m "Release vX.Y.Z"
     git push ASSIstant vX.Y.Z
 
-GitHub Actions 会构建、发布并实际执行 CLI/Web bootstrap smoke test。若某次发布已经创建了同名 Release 但运行中断，可以在 Actions 的 `Remote Release` workflow 中手动输入该 tag 重跑；流程会复用并校验已有资产，只补齐缺失文件，不覆盖内容不一致的资产。
+GitHub Actions 会构建确定性资产与 SPDX 2.3 SBOM，使用 GitHub OIDC 对 manifest 做 cosign keyless 签名，为资产生成 build provenance，发布后再执行签名、provenance 和 CLI/Web bootstrap smoke test。若某次发布已经创建了同名 Release 但运行中断，可以在 Actions 的 `Remote Release` workflow 中手动输入该 tag 重跑；流程会复用并校验已有资产，只补齐缺失文件，不覆盖内容不一致的资产。
 
 启动时只获取 core、策略、prompt 和 skill 索引。首次执行或在 Web 中点击加载某个 skill 时，resolver 才下载该 skill 的完整归档，拒绝路径穿越、链接、设备文件、摘要错误和登记不一致，再原子加入运行时 registry。`skills validate` 只校验目录和已经物化的包，不会偷偷下载全部 skill。
 
@@ -385,6 +464,7 @@ GitHub Actions 会构建、发布并实际执行 CLI/Web bootstrap smoke test。
 | `model` | 模型名称。 |
 | `request_timeout_sec` | AI 请求超时时间。 |
 | `context_turns` | 会话历史窗口大小。 |
+| `command_guard.enabled` | 是否启用 Python AST/Token 命令守卫；默认开启，关闭或重新开启需通过 Web Policy 页面完成 sudo 核对。 |
 | `agent_loop.enabled_for_work` | 是否启用 work 反思续写循环。 |
 | `agent_loop.observation_text_limit` | observation 文本摘要上限。 |
 | `agent_loop.thinking_trace_enabled` | 是否保存并展示简短 `thinking_summary`。 |
@@ -412,6 +492,12 @@ GitHub Actions 会构建、发布并实际执行 CLI/Web bootstrap smoke test。
 | `execution.timeout_sec` | 单个执行步骤的硬超时，范围 1–3600 秒，默认 300 秒；超时会记录 `timed_out`。 |
 | `skills_dir` | 自定义 skill 根目录，空值使用项目内 `skills/`。 |
 | `remote_script_policy` | 远程脚本策略，支持 `download_review` 和 `disabled`。 |
+| `providers_security.require_https` | 是否只允许 HTTPS Provider URL；Remote runtime 会强制为 `true`。 |
+| `providers_security.block_internal_addresses` | 是否阻止 Provider 解析到本机、私网、回环、链路本地等内部地址。 |
+| `providers_security.allowed_hosts` | Provider 允许列表；为空表示不额外限制主机名。 |
+| `remote.enabled` | 是否以 Remote runtime 语义运行。 |
+| `remote.release_version` | Remote 运行时的固定 release 版本，用于 health、日志和指标元数据。 |
+| `remote.storage_backend` | Remote 状态存储后端；当前支持 `local`。 |
 | `remote.allow_api_key_transmission` | Remote runtime 是否允许向配置的 AI Provider 发送 API key；默认 `false`，本地模式不受影响。 |
 | `web.enabled` | 是否允许启动 Web。 |
 | `web.host` | Web 监听地址。 |
@@ -422,6 +508,7 @@ GitHub Actions 会构建、发布并实际执行 CLI/Web bootstrap smoke test。
 | `web.job_timeout_sec` | 后台 Job 硬超时。 |
 | `web.max_job_attempts` | Job 重试次数上限。 |
 | `web.cancel_grace_sec` | 取消时从 SIGTERM 升级到 SIGKILL 的等待秒数。 |
+| `web.metrics_enabled` | 是否开启带 Bearer token 保护的 `/api/metrics` Prometheus 文本端点，默认 `true`。 |
 
 环境变量：
 
@@ -430,6 +517,10 @@ GitHub Actions 会构建、发布并实际执行 CLI/Web bootstrap smoke test。
 | `EDITOR` | Edit 模式打开脚本确认文件的编辑器，未设置时使用 `vi`。 |
 | `LINUX_AGENT_API_KEY` | 推荐的模型 API 密钥来源，优先级高于 `config.api_key`。 |
 | `LINUX_AGENT_OUTPUT_JSON=1` | 将 CLI 业务输出切换为机器可读 JSON。 |
+| `LINUX_AGENT_VERSION` | Remote bootstrap 使用的固定版本；应与 release URL 中的 `vX.Y.Z` 一致。 |
+| `LINUX_AGENT_REQUIRE_SIGNATURE=1` | 要求 Remote bootstrap 验证 release manifest 的 cosign/Sigstore 签名。 |
+| `LINUX_AGENT_SIGNATURE_PUBKEY` | 私有部署的 cosign 公钥路径；使用离线 key 签名验证。 |
+| `LINUX_AGENT_SIGNATURE_IDENTITY` / `LINUX_AGENT_SIGNATURE_ISSUER` | 收窄 keyless release 签名的证书身份和 OIDC issuer。 |
 
 内部变量如 `LINUX_AGENT_TMP_DIR`、`LINUX_AGENT_SESSION_ID`、`LINUX_AGENT_AUDIT_LOG`、`LINUX_AGENT_FILE_VAULT_POLICY_PATH` 由程序设置，不建议外部手工使用。
 
@@ -445,9 +536,12 @@ GitHub Actions 会构建、发布并实际执行 CLI/Web bootstrap smoke test。
 - `network-ops-tools` 中的扫描、SNMP、WOL、hosts/firewall 等工具即使由 work 模式调用，也按 `SKILL.md` 声明提升为 `medium` 或 `high` 风险，不能作为 low 风险自动执行。
 - Remote script 只能 HTTPS 下载后审查，不允许流式管道执行。
 - Web `/api/` 全部需要 Bearer token。
+- `/api/metrics` 默认开启但同样需要 Bearer token；指标只使用低基数 route/status 标签，不记录 token、API key 或 Job ID。
 - Web 启动后会在浏览器中申请一次服务器权限以启用 auditd observer；未启用会记录审计日志，`observer.require=true` 时同时阻断真实执行。
 - Web 策略编辑只允许 `policies/` 下 JSON 文件，保存前做策略校验，写入前做 sudo 校验。
 - 审计文本和上下文会脱敏并截断。
+- Remote bootstrap 和 installer 先校验 release manifest、资产大小与 SHA-256；存在 cosign bundle 时验证签名，`LINUX_AGENT_REQUIRE_SIGNATURE=1` 或 `--require-signature` 时缺失签名会拒绝运行。
+- systemd 生产安装使用专用非 root 用户、只读版本目录、独立持久数据目录和沙箱单元；升级健康检查失败会自动回滚，卸载默认保留 `data/`。
 - 当前 session 的临时目录只在当前进程结束时清理。
 
 ## 测试与验证
@@ -463,6 +557,7 @@ bash test_config.sh --live
 
 ```bash
 bash tests/smoke.sh
+bash tests/context.sh
 bash tests/security.sh
 bash tests/workflow.sh
 bash tests/policy.sh
@@ -476,32 +571,26 @@ bash tests/remote_release.sh
 bash tests/remote_runtime.sh
 bash tests/remote_web_security.sh
 bash tests/backup.sh
+bash tests/install.sh
+bash tests/web_frontend.sh
 ```
 
 完整回归：
 
 ```bash
-for test in \
-  tests/smoke.sh \
-  tests/security.sh \
-  tests/workflow.sh \
-  tests/policy.sh \
-  tests/tools.sh \
-  tests/observer.sh \
-  tests/mcp.sh \
-  tests/interactive.sh \
-  tests/web_api.sh \
-  tests/web_server.sh \
-  tests/remote_release.sh \
-  tests/remote_runtime.sh \
-  tests/remote_web_security.sh \
-  tests/backup.sh
-do
-  bash "$test"
+for test in policy tools context security workflow workflow_unit observer audit_integrity \
+            smoke mcp contract web_api web_server interactive remote_release remote_runtime \
+            remote_web_security backup install; do
+  bash "tests/$test.sh"
 done
+python3 -m unittest discover -s tests -p 'test_web_*.py' -v
+bash tests/web_frontend.sh
+bash scripts/lint.sh
 ```
 
-`tests/web_api.sh` 和 `tests/web_server.sh` 需要绑定 `127.0.0.1` 本地端口。如果沙箱或 CI 禁止监听本地端口，这两项会因环境权限失败。
+`tests/web_api.sh`、`tests/web_server.sh` 和 `tests/install.sh` 的健康检查需要绑定 `127.0.0.1` 本地端口。如果沙箱或 CI 禁止监听本地端口，这些检查会因环境权限失败。`tests/web_frontend.sh` 只需要 Node.js，不需要 npm 或浏览器。
+
+前端测试保持零 npm 依赖：纯函数和协议行为由 `tests/web_frontend.sh` 下的 Node 标准库单测覆盖，HTTP 端到端由 `tests/web_server.sh` 覆盖。本项目计划性不引入 Playwright、Puppeteer 等浏览器自动化框架。
 
 ## 文件职责
 
@@ -564,10 +653,11 @@ done
 | `web/sessions.py` | 工作台 session、Job 快照/串行合并事务和不可变 protocol turns。 |
 | `web/execution.py` | Agent 子进程环境隔离、并发管道读取、超时、取消和进程组回收。 |
 | `web/audit.py` / `web/domain.py` / `web/timeline.py` | Web 审计适配、领域契约校验和持久化时间线读取。 |
+| `web/metrics.py` | 仅使用 Python 标准库的线程安全 Prometheus counter/gauge 注册和文本渲染。 |
 | `web/provider.py` / `web/policy.py` / `web/skills.py` | Provider、Policy 和 Skill 文件服务。 |
-| `web/static/index.html` | Web 控制台 HTML 页面，包含 Work、Skill、Policy、Audit、Config 五个主视图。 |
+| `web/static/index.html` | Web 控制台 HTML 页面，包含 Workbench、Skill、MCP、Policy、Audit、Config 六个主视图。 |
 | `web/static/app.js` | Web 前端入口，组合无构建 ES modules 并驱动工作台交互。 |
-| `web/static/modules/` | 前端 API、state、timeline、approval、output-blocks、audit、policy/config 模块。 |
+| `web/static/modules/` | 前端 API、状态、布局、Job 客户端、输出渲染、turn 处理及 Workbench/Skill/Policy/Audit/Config 视图模块；模块由 `tests/web_frontend.sh` 直接用 Node 检查。 |
 | `web/static/styles.css` | Web 控制台样式。 |
 | `web/static/mark.svg` | Web 控制台图标资源。 |
 
@@ -585,6 +675,27 @@ done
 | `policies/redaction-rules.json` | 脱敏规则文件，集中覆盖 Bearer、sk、AKIA、JWT、长 hex、私钥、敏感 key/value 和内网 IP。 |
 | `policies/audit-boundaries.json` | audit 和 observer 边界文件，定义审计事件范围、payload 模式、文本限制、observer syscall、observer 字段和事件上限。 |
 | `policies/file-vault.json` | 文件保险箱策略，列出用户自定义的敏感文件绝对路径（支持末尾 `/*` 目录通配），默认路径列表为空表示不启用。 |
+
+### `mcp/` 与 `schema/`
+
+| 文件 | 功能 |
+| --- | --- |
+| `mcp/README.md` | MCP manifest registry 的格式、传输方式和安全边界说明。 |
+| `mcp/<server-id>/mcp.json` | 外部 MCP server 的 manifest；支持 stdio、legacy SSE 和 Streamable HTTP。 |
+| `schema/domain.json` | CLI、Web/API 和前端共享的领域契约、状态展示、错误码及可编辑配置 schema。 |
+
+### `packaging/`、`remote/` 与 `scripts/`
+
+| 文件 | 功能 |
+| --- | --- |
+| `packaging/linux-agent-web.service` | 生产 Web systemd 单元，包含非 root 身份、只读代码、可写数据目录和资源沙箱。 |
+| `packaging/权限边界.md` | Terminal、Skill、MCP、远程脚本、文件编辑和 AI 调用的权限与密钥边界。 |
+| `remote/bootstrap.sh` | CLI/Web Remote runtime 的自包含 bootstrap；固定版本下载 manifest 和资产并在本机临时运行。 |
+| `scripts/build-remote-release.sh` | 构建确定性 core/Web/skill/installer 资产、SPDX 2.3 SBOM、`SHA256SUMS` 和 release manifest。 |
+| `scripts/install.sh` | systemd 安装、升级、自动回滚、健康检查、状态查询和卸载；支持本地 `--from-dist` 演练。 |
+| `scripts/prepare-release-signature.sh` | 为 release manifest 准备 Sigstore/cosign bundle。 |
+| `scripts/publish-remote-release.sh` | 发布并校验 Remote release 资产。 |
+| `scripts/lint.sh` | 运行 Bash、Python、JavaScript、JSON、ShellCheck、格式和可选 JSDoc/TypeScript 检查。 |
 
 ### `skills/`
 
@@ -656,12 +767,16 @@ done
 | `tests/policy.sh` | 覆盖风险规则、保护路径、远程脚本阻断、文件保险箱访问判定和风险合并。 |
 | `tests/tools.sh` | 覆盖本地工具、skill 登记、日志清理边界和 doctor。 |
 | `tests/observer.sh` | 覆盖 observer 禁用、mock auditd、事件汇总和失败降级。 |
-| `tests/audit_integrity.sh` | 覆盖审计链、篡改、权限、轮转、磁盘策略和并发写入。 |
+| `tests/audit_integrity.sh` | 覆盖审计链、篡改、权限、轮转、磁盘策略、并发写入和离线证据导出。 |
+| `tests/install.sh` | 无 root 覆盖发布物校验、安装、升级、回滚、持久数据、版本保留和健康检查。 |
 | `tests/workflow_unit.sh` | 覆盖 CLI/API 共享 Work 工作流边界。 |
+| `tests/contract.sh` | 覆盖 API/domain schema、状态和错误码契约。 |
 | `tests/test_web_*.py` | 覆盖 JobStore、Session 事务、Execution、Domain 与拆分后的 Web 服务。 |
 | `tests/interactive.sh` | 覆盖 REPL 菜单、模式切换、terminal 模式和 edit 模式。 |
 | `tests/web_api.sh` | 覆盖机器可读 API 的 work、script、terminal、edit、audit 等路径。 |
-| `tests/web_server.sh` | 覆盖 Web token 拦截、health、静态页面、config、skill、policy、job、shutdown 和新增 Web 入口。 |
+| `tests/web_server.sh` | 覆盖 Web token 拦截、health、静态页面、config、skill、policy、job、shutdown、metrics 和新增 Web 入口。 |
+| `tests/web_frontend.sh` | 按固定顺序执行全部 `tests/web_*.mjs` 前端模块、协议、XSS、Job、turn、配置和 JSDoc 测试。 |
+| `tests/web_*.mjs` | 使用 Node 标准库覆盖前端纯函数和协议行为，不引入 Playwright/Puppeteer。 |
 
 ### 运行时目录和生成文件
 

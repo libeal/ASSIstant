@@ -8,6 +8,21 @@ linux_agent_context_turns() {
     linux_agent_config_get_default '.context_turns' '6'
 }
 
+linux_agent_prepare_conversation_history_file() {
+    if [[ -n "${LINUX_AGENT_CONVERSATION_HISTORY_FILE:-}" ]]; then
+        return 0
+    fi
+    if [[ -z "${LINUX_AGENT_TMP_DIR:-}" ]]; then
+        linux_agent_print_error "无法初始化会话历史：session 临时目录未设置。"
+        return 1
+    fi
+    if ! mkdir -p "${LINUX_AGENT_TMP_DIR}"; then
+        linux_agent_print_error "无法创建会话历史目录：${LINUX_AGENT_TMP_DIR}"
+        return 1
+    fi
+    LINUX_AGENT_CONVERSATION_HISTORY_FILE="${LINUX_AGENT_TMP_DIR}/conversation-history.json"
+}
+
 linux_agent_conversation_history_file() {
     [[ -n "${LINUX_AGENT_CONVERSATION_HISTORY_FILE:-}" ]] || return 1
     printf '%s\n' "${LINUX_AGENT_CONVERSATION_HISTORY_FILE}"

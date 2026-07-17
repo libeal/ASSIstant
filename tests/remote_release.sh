@@ -21,7 +21,9 @@ required_assets=(
     linux-agent-web.sh
     linux-agent-core.tar.gz
     linux-agent-web.tar.gz
+    linux-agent-install.sh
     release-manifest.json
+    sbom.spdx.json
     SHA256SUMS
 )
 for asset in "${required_assets[@]}"; do
@@ -30,6 +32,7 @@ for asset in "${required_assets[@]}"; do
 done
 
 (cd "${first}" && sha256sum -c SHA256SUMS)
+! grep -q 'release-manifest.json' "${first}/SHA256SUMS"
 
 jq -e '
     .schema_version == 1
@@ -39,18 +42,46 @@ jq -e '
     and (.assets.bootstrap_web.name == "linux-agent-web.sh")
     and (.assets.core.name == "linux-agent-core.tar.gz")
     and (.assets.web.name == "linux-agent-web.tar.gz")
+    and (.assets.installer.name == "linux-agent-install.sh")
+    and (.assets.sbom.name == "sbom.spdx.json")
+    and (.assets.checksums.name == "SHA256SUMS")
     and ([.skills | keys[]] | length > 0)
     and ([.skills[] | select((.refs | length) == 0)] | length == 0)
     and ([.skills[] | select((.description | length) == 0 or (.risk | IN("low", "medium", "high", "critical") | not))] | length == 0)
 ' "${first}/release-manifest.json" >/dev/null
 
 registered_assets="$(jq -r '[.assets[].name, .skills[].asset.name] | sort | .[]' "${first}/release-manifest.json")"
-actual_assets="$(find "${first}" -maxdepth 1 -type f ! -name release-manifest.json ! -name SHA256SUMS -printf '%f\n' | sort)"
+actual_assets="$(find "${first}" -maxdepth 1 -type f ! -name release-manifest.json -printf '%f\n' | sort)"
 if [[ "${registered_assets}" != "${actual_assets}" ]]; then
     printf 'release contains unregistered or missing assets\n' >&2
     diff -u <(printf '%s\n' "${registered_assets}") <(printf '%s\n' "${actual_assets}") || true
     exit 1
 fi
+
+while IFS=$'\t' read -r asset_name expected_sha expected_size; do
+    [[ -f "${first}/${asset_name}" ]]
+    [[ "$(sha256sum "${first}/${asset_name}" | awk '{print $1}')" == "${expected_sha}" ]]
+    [[ "$(stat -c '%s' "${first}/${asset_name}")" -eq "${expected_size}" ]]
+done < <(jq -r '[.assets[], .skills[].asset] | .[] | [.name, .sha256, .size_bytes] | @tsv' \
+    "${first}/release-manifest.json")
+
+tampered_sbom="${tmp_root}/tampered-sbom.spdx.json"
+cp "${first}/sbom.spdx.json" "${tampered_sbom}"
+printf ' ' >>"${tampered_sbom}"
+[[ "$(sha256sum "${tampered_sbom}" | awk '{print $1}')" != "$(jq -r '.assets.sbom.sha256' "${first}/release-manifest.json")" ]]
+
+jq -e '
+    . as $document
+    | .spdxVersion == "SPDX-2.3"
+    and .SPDXID == "SPDXRef-DOCUMENT"
+    and .creationInfo.created == "1970-01-01T00:00:00Z"
+    and ([.packages[].name] | sort == ["bash", "curl", "jq", "linux-agent", "python3"])
+    and ([.files[].checksums[] | select(.algorithm == "SHA256")] | length == ($document.files | length))
+' "${first}/sbom.spdx.json" >/dev/null
+sbom_files="$(jq -r '.files[].fileName' "${first}/sbom.spdx.json" | sort)"
+sbom_expected="$(find "${first}" -maxdepth 1 -type f \
+    ! -name release-manifest.json ! -name SHA256SUMS ! -name sbom.spdx.json -printf '%f\n' | sort)"
+[[ "${sbom_files}" == "${sbom_expected}" ]]
 
 core_listing="$(tar -tzf "${first}/linux-agent-core.tar.gz")"
 if grep -Eq '^skills/[^/]+/' <<<"${core_listing}"; then
@@ -83,5 +114,125 @@ grep -q 'publish-remote-release.sh' "${ROOT_DIR}/.github/workflows/remote-releas
 grep -q 'RUNNER_TEMP}/publish-remote-release.sh' "${ROOT_DIR}/.github/workflows/remote-release.yml"
 ! grep -q 'Authorization Bearer token:' "${ROOT_DIR}/.github/workflows/remote-release.yml"
 grep -q 'agent/tmp/web/auth-token' "${ROOT_DIR}/.github/workflows/remote-release.yml"
+grep -q 'id-token: write' "${ROOT_DIR}/.github/workflows/remote-release.yml"
+grep -q 'prepare-release-signature.sh' "${ROOT_DIR}/.github/workflows/remote-release.yml"
+grep -q 'cosign sign-blob' "${ROOT_DIR}/scripts/prepare-release-signature.sh"
+grep -q 'attest-build-provenance@' "${ROOT_DIR}/.github/workflows/remote-release.yml"
+grep -q 'curl -fsSL.*max-time.*max-filesize' "${ROOT_DIR}/remote/bootstrap.sh"
+grep -q 'curl -fsSL.*proto.*max-time.*max-filesize' "${ROOT_DIR}/scripts/install.sh"
+if grep -E '^[[:space:]]*uses:[[:space:]]+[^@[:space:]]+@' "${ROOT_DIR}/.github/workflows/remote-release.yml" |
+    grep -Ev '@[0-9a-f]{40}([[:space:]]|$)' >/dev/null; then
+    printf 'workflow contains an action that is not pinned to a 40-character commit SHA\n' >&2
+    exit 1
+fi
+
+if command -v cosign >/dev/null 2>&1; then
+    cosign_dir="${tmp_root}/cosign"
+    mkdir -p "${cosign_dir}"
+    (
+        cd "${cosign_dir}"
+        COSIGN_PASSWORD=remote-release-test cosign generate-key-pair >/dev/null
+        COSIGN_PASSWORD=remote-release-test cosign sign-blob --yes --tlog-upload=false --key cosign.key \
+            --bundle manifest.sigstore.json "${first}/release-manifest.json" >/dev/null
+        cosign verify-blob --offline --insecure-ignore-tlog \
+            --key cosign.pub --bundle manifest.sigstore.json \
+            "${first}/release-manifest.json" >/dev/null
+    )
+else
+    printf 'remote_release: cosign not installed; signature roundtrip skipped\n'
+fi
+
+fake_bin="${tmp_root}/fake-release-bin"
+fake_release="${tmp_root}/published-release"
+reuse_dist="${tmp_root}/reuse-dist"
+new_dist="${tmp_root}/new-signature-dist"
+signature_log="${tmp_root}/signature.log"
+mkdir -p "${fake_bin}" "${fake_release}" "${reuse_dist}" "${new_dist}"
+cp "${first}/release-manifest.json" "${fake_release}/release-manifest.json"
+cp "${first}/release-manifest.json" "${reuse_dist}/release-manifest.json"
+cp "${first}/release-manifest.json" "${new_dist}/release-manifest.json"
+printf 'published-stable-bundle\n' >"${fake_release}/release-manifest.json.sigstore.json"
+
+cat >"${fake_bin}/gh" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+
+[[ "${1:-}" == "release" ]] || exit 2
+case "${2:-}" in
+    view)
+        [[ "${FAKE_RELEASE_EXISTS:-0}" == "1" ]] || exit 1
+        if [[ " $* " == *" --json assets "* ]]; then
+            printf '%s\n' release-manifest.json release-manifest.json.sigstore.json
+        fi
+        ;;
+    download)
+        pattern=""
+        destination=""
+        shift 2
+        [[ $# -gt 0 ]] && shift
+        while [[ $# -gt 0 ]]; do
+            case "$1" in
+                --pattern)
+                    pattern="$2"
+                    shift 2
+                    ;;
+                --dir)
+                    destination="$2"
+                    shift 2
+                    ;;
+                *) shift ;;
+            esac
+        done
+        cp -- "${FAKE_RELEASE_DIR}/${pattern}" "${destination}/${pattern}"
+        ;;
+    *) exit 2 ;;
+esac
+SH
+cat >"${fake_bin}/cosign" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+
+case "${1:-}" in
+    verify-blob)
+        printf 'verify\n' >>"${FAKE_SIGNATURE_LOG}"
+        ;;
+    sign-blob)
+        printf 'sign\n' >>"${FAKE_SIGNATURE_LOG}"
+        bundle=""
+        shift
+        while [[ $# -gt 0 ]]; do
+            if [[ "$1" == "--bundle" ]]; then
+                bundle="$2"
+                shift 2
+            else
+                shift
+            fi
+        done
+        [[ -n "${bundle}" ]]
+        printf 'new-bundle\n' >"${bundle}"
+        ;;
+    *) exit 2 ;;
+esac
+SH
+chmod 0755 "${fake_bin}/gh" "${fake_bin}/cosign"
+
+FAKE_RELEASE_EXISTS=1 \
+    FAKE_RELEASE_DIR="${fake_release}" \
+    FAKE_SIGNATURE_LOG="${signature_log}" \
+    PATH="${fake_bin}:${PATH}" \
+    bash "${ROOT_DIR}/scripts/prepare-release-signature.sh" v0.0.0-test "${reuse_dist}"
+cmp "${fake_release}/release-manifest.json.sigstore.json" \
+    "${reuse_dist}/release-manifest.json.sigstore.json"
+grep -qx 'verify' "${signature_log}"
+! grep -q 'sign' "${signature_log}"
+
+: >"${signature_log}"
+FAKE_RELEASE_EXISTS=0 \
+    FAKE_RELEASE_DIR="${fake_release}" \
+    FAKE_SIGNATURE_LOG="${signature_log}" \
+    PATH="${fake_bin}:${PATH}" \
+    bash "${ROOT_DIR}/scripts/prepare-release-signature.sh" v0.0.0-test "${new_dist}"
+grep -qx 'new-bundle' "${new_dist}/release-manifest.json.sigstore.json"
+grep -qx 'sign' "${signature_log}"
 
 printf 'remote_release: ok\n'

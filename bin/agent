@@ -126,6 +126,8 @@ linux_agent_usage() {
   agent audit <session-id>      查看审计摘要
   agent audit verify <session-id>
                                 校验审计日志 hash 链完整性
+  agent audit export <session-id>|--all [--output <目录>]
+                                导出审计日志、完整性报告与校验清单
   agent backup <output.tar.gz>  导出 remote runtime 脱敏备份
 
 REPL 命令:
@@ -355,6 +357,15 @@ main() {
                 linux_agent_audit_verify_chain "$1"
                 return $?
             fi
+            if [[ "$1" == "export" ]]; then
+                shift || true
+                if [[ $# -eq 0 ]]; then
+                    linux_agent_print_error "请提供 session-id 或 --all。"
+                    exit 1
+                fi
+                linux_agent_audit_export "$@"
+                return $?
+            fi
             linux_agent_show_audit "$1"
             ;;
         backup)
@@ -391,6 +402,7 @@ linux_agent_run() {
 
     LINUX_AGENT_MAIN_COMMAND="${command}"
     linux_agent_start_session "agent ${command}" || return $?
+    linux_agent_prepare_conversation_history_file || return $?
     linux_agent_log_command_started "${command}" "argument_count=${argument_count}" || return $?
 
     trap linux_agent_on_exit EXIT

@@ -1,0 +1,70 @@
+export const LAYOUT_STORAGE_PREFIX = "assistant.panelLayout.v1";
+export const SIDEBAR_STORAGE_KEY = "assistant.sidebarCollapsed.v1";
+export const THINKING_TRACE_KEY = "agent_loop.thinking_trace_enabled";
+export const REMOTE_API_KEY_TRANSMISSION_KEY = "remote.allow_api_key_transmission";
+
+export const titles = {
+  workbench: "工作台",
+  skills: "Skill 库",
+  mcp: "MCP",
+  policy: "策略",
+  audit: "审计与回放",
+  config: "配置中心",
+};
+
+export const outputLabelMap = {
+  status: "状态",
+  failed: "失败服务",
+  load: "系统负载",
+  load_summary: "系统负载",
+  memory: "内存",
+  memory_summary: "内存",
+  top_processes: "高占用进程",
+  disk_usage: "磁盘使用",
+  df_summary: "磁盘使用",
+  top_dirs: "目录占用",
+  top_files: "大文件",
+  processes: "进程列表",
+  zombies: "僵尸进程",
+  error: "错误",
+  stdout: "标准输出",
+  stderr: "错误输出",
+  exit_code: "退出码",
+  command: "命令",
+  result: "结果",
+  results: "步骤结果",
+  output: "输出",
+  review: "审查结果",
+  edit: "编辑包",
+  scripts: "脚本",
+  path: "路径",
+  content: "内容",
+  summary: "摘要",
+  thinking_summary: "thinking_summary",
+  config_updated: "配置已更新",
+  value: "值",
+  execution_proxy: "执行代理",
+  auto_approved: "自动批准",
+  risk_level: "风险",
+  executor_type: "执行器",
+  skill_script: "Skill",
+  mcp_server: "MCP server",
+  mcp_tool: "MCP tool",
+};
+
+export const hiddenOutputKeys = new Set([
+  "ok",
+  "tool",
+  "job_id",
+  "response_type",
+  "execution_proxy",
+  "observer",
+  "auto_approved",
+  "root_pid",
+  "session_status",
+  "backend",
+  "lifecycle",
+  "scope",
+  "subject",
+  "step",
+]);

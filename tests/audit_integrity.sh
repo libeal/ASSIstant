@@ -641,4 +641,69 @@ report = audit_chain.verify_chain(path)
 assert report["ok"] and report["events"] == 2, report
 PY
 
+# --- Part N: offline export snapshots rotations and ships verifiable checksums ---
+export_session="session_export_rotated"
+export_log="${LINUX_AGENT_LOG_DIR}/${export_session}.jsonl"
+for i in 1 2 3; do
+    printf '{"timestamp":"e%s","session_id":"%s","stage":"event","payload":{"index":%s}}' \
+        "${i}" "${export_session}" "${i}" |
+        python3 "${CHAIN}" append "${export_log}" --max-bytes 1 >/dev/null
+done
+second_export_session="session_export_second"
+printf '%s' '{"timestamp":"e1","session_id":"session_export_second","stage":"event","payload":{}}' |
+    python3 "${CHAIN}" append "${LINUX_AGENT_LOG_DIR}/${second_export_session}.jsonl" >/dev/null
+
+export_dir="${tmp_root}/exports"
+export_result="$(linux_agent_audit_export "${export_session}" --output "${export_dir}")"
+jq -e --arg session_id "${export_session}" '
+    .ok == true and .status == "exported" and .verified == true
+    and .sessions == [$session_id]
+' <<<"${export_result}" >/dev/null
+export_archive="$(jq -r '.archive' <<<"${export_result}")"
+[[ -f "${export_archive}" && "$(stat -c '%a' "${export_archive}")" == "600" ]]
+export_extract="${tmp_root}/export-extract"
+mkdir -p "${export_extract}"
+tar -xzf "${export_archive}" -C "${export_extract}"
+(cd "${export_extract}" && sha256sum -c SHA256SUMS >/dev/null)
+[[ -f "${export_extract}/logs/${export_session}.jsonl.1" ]]
+[[ -f "${export_extract}/logs/${export_session}.jsonl.2" ]]
+jq -e '
+    .ok == true and .events == 3 and .segments == 3
+' "${export_extract}/reports/${export_session}.verify.json" >/dev/null
+jq -e --arg session_id "${export_session}" '
+    .schema_version == 1 and .verified == true
+    and .sessions == [{
+        session_id:$session_id,
+        verified:true,
+        events:3,
+        files:[
+            ("logs/" + $session_id + ".jsonl.1"),
+            ("logs/" + $session_id + ".jsonl.2"),
+            ("logs/" + $session_id + ".jsonl")
+        ]
+    }]
+    and (.files | length) == 4
+' "${export_extract}/export-manifest.json" >/dev/null
+printf ' ' >>"${export_extract}/logs/${export_session}.jsonl"
+if (cd "${export_extract}" && sha256sum -c SHA256SUMS >/dev/null 2>&1); then
+    printf 'audit export checksum unexpectedly accepted a tampered copy\n' >&2
+    exit 1
+fi
+
+all_export_result="$(linux_agent_audit_export --all --output "${export_dir}")"
+jq -e --arg first "${export_session}" --arg second "${second_export_session}" '
+    .ok == true and .status == "exported"
+    and (.sessions | index($first)) != null
+    and (.sessions | index($second)) != null
+' <<<"${all_export_result}" >/dev/null
+
+cli_export_dir="${tmp_root}/cli-exports"
+cli_export="$(bash "${project}/bin/agent" audit export "${second_export_session}" --output "${cli_export_dir}")"
+jq -e '.ok == true and .status == "exported" and .verified == true' <<<"${cli_export}" >/dev/null
+
+api_export_dir="${tmp_root}/api-exports"
+api_payload="$(jq -cn --arg session_id "${second_export_session}" --arg output "${api_export_dir}" '{session_id:$session_id,output:$output}')"
+api_export="$(linux_agent_api_dispatch audit export "${api_payload}")"
+jq -e '.ok == true and .status == "exported" and .verified == true and .schema_version == 1' <<<"${api_export}" >/dev/null
+
 printf 'audit_integrity: ok\n'

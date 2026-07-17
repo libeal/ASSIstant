@@ -29,6 +29,10 @@ linux_agent_load_config() {
         linux_agent_print_error "observer.require 必须是 JSON boolean（true 或 false）。"
         return 1
     fi
+    if ! linux_agent_config_validate_web_metrics "${config_json}"; then
+        linux_agent_print_error "web.metrics_enabled 必须是 JSON boolean（true 或 false）。"
+        return 1
+    fi
     if ! linux_agent_config_validate_audit "${config_json}"; then
         linux_agent_print_error "audit 配置非法：fsync 必须是 boolean，max_bytes/min_free_bytes 必须是 0-${LINUX_AGENT_JSON_SAFE_INTEGER_MAX} 的整数，on_full 仅支持 degrade 或 block。"
         return 1
@@ -39,6 +43,21 @@ linux_agent_load_config() {
     fi
 
     LINUX_AGENT_CONFIG_JSON="${config_json}"
+}
+
+linux_agent_config_validate_web_metrics() {
+    local config_json="${1:-${LINUX_AGENT_CONFIG_JSON:-}}"
+
+    jq -e '
+        type == "object"
+        and (
+            if (.web? == null) then true
+            elif (.web | type) != "object" then false
+            elif (.web | has("metrics_enabled") | not) then true
+            else (.web.metrics_enabled | type) == "boolean"
+            end
+        )
+    ' >/dev/null 2>&1 <<<"${config_json}"
 }
 
 linux_agent_config_has_removed_integrity_chain() {

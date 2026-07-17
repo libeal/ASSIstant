@@ -209,6 +209,184 @@ linux_agent_audit_verify_chain() {
     python3 "$(linux_agent_audit_chain_writer)" verify "${log_file}"
 }
 
+linux_agent_audit_export_error() {
+    local message="$1"
+    jq -cn --arg message "${message}" '{
+        ok:false,
+        status:"audit_export_failed",
+        code:"audit_export_failed",
+        error:$message,
+        message:$message,
+        retryable:true
+    }'
+}
+
+linux_agent_audit_export() {
+    local selector="${1:-}" output_dir="${LINUX_AGENT_ROOT}/tmp/audit-export"
+    local stage_root archive_tmp archive_path timestamp suffix=0
+    local session_id snapshot_path verify_path verify_report verify_rc
+    local session_files file_path relative_path file_sha file_size
+    local sessions_json='[]' files_json='[]' all_verified=true
+    local -a session_ids=() archive_entries=()
+    shift || true
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --output)
+                [[ $# -ge 2 ]] || {
+                    linux_agent_audit_export_error '--output 缺少目录参数。'
+                    return 1
+                }
+                output_dir="$2"
+                shift 2
+                ;;
+            *)
+                linux_agent_audit_export_error "未知审计导出参数: $1"
+                return 1
+                ;;
+        esac
+    done
+
+    if [[ "${selector}" == "--all" ]]; then
+        while IFS= read -r file_path; do
+            session_id="$(basename "${file_path}" .jsonl)"
+            [[ "${session_id}" =~ ^[A-Za-z0-9._-]+$ ]] || continue
+            session_ids+=("${session_id}")
+        done < <(find "${LINUX_AGENT_LOG_DIR}" -maxdepth 1 -type f -name '*.jsonl' -print | LC_ALL=C sort)
+    elif [[ "${selector}" =~ ^[A-Za-z0-9._-]+$ ]]; then
+        session_ids+=("${selector}")
+    else
+        jq -cn '{ok:false,status:"invalid_session_id",code:"invalid_session_id",error:"session_id 非法。",message:"session_id 非法。",retryable:false}'
+        return 1
+    fi
+
+    if [[ ${#session_ids[@]} -eq 0 ]]; then
+        linux_agent_audit_export_error '没有可导出的审计 session。'
+        return 1
+    fi
+    if [[ -L "${output_dir}" || (-e "${output_dir}" && ! -d "${output_dir}") ]]; then
+        linux_agent_audit_export_error '审计导出目录必须是普通目录且不能是符号链接。'
+        return 1
+    fi
+    if ! mkdir -p "${output_dir}" || [[ ! -w "${output_dir}" ]]; then
+        linux_agent_audit_export_error '无法创建或写入审计导出目录。'
+        return 1
+    fi
+    chmod 0700 "${output_dir}" 2>/dev/null || true
+    output_dir="$(readlink -f "${output_dir}")"
+    stage_root="$(mktemp -d "${output_dir}/.audit-export-stage.XXXXXX")" || {
+        linux_agent_audit_export_error '无法创建审计导出 staging 目录。'
+        return 1
+    }
+    chmod 0700 "${stage_root}"
+    mkdir -p "${stage_root}/logs" "${stage_root}/reports"
+
+    for session_id in "${session_ids[@]}"; do
+        if ! snapshot_path="$(linux_agent_audit_snapshot "${session_id}" "${stage_root}/logs" 2>/dev/null)"; then
+            rm -rf "${stage_root}"
+            linux_agent_audit_export_error "无法取得审计 session 快照: ${session_id}"
+            return 1
+        fi
+        verify_path="${stage_root}/reports/${session_id}.verify.json"
+        verify_rc=0
+        linux_agent_audit_verify_chain "${session_id}" "${snapshot_path}" >"${verify_path}" || verify_rc=$?
+        if ! jq -e 'type == "object" and (.ok | type) == "boolean"' "${verify_path}" >/dev/null 2>&1; then
+            rm -rf "${stage_root}"
+            linux_agent_audit_export_error "审计校验未生成有效报告: ${session_id}"
+            return 1
+        fi
+        rm -f "${snapshot_path}.lock"
+        chmod 0600 "${verify_path}"
+        if [[ "${verify_rc}" -ne 0 || "$(jq -r '.ok' "${verify_path}")" != "true" ]]; then
+            all_verified=false
+        fi
+
+        session_files='[]'
+        while IFS= read -r file_path; do
+            relative_path="logs/$(basename "${file_path}")"
+            session_files="$(jq -cn --argjson prior "${session_files}" --arg path "${relative_path}" '$prior + [$path]')"
+        done < <(linux_agent_audit_segment_paths "${snapshot_path}")
+        verify_report="$(cat "${verify_path}")"
+        sessions_json="$(jq -cn \
+            --argjson prior "${sessions_json}" \
+            --arg session_id "${session_id}" \
+            --argjson verified "$(jq -c '.ok' <<<"${verify_report}")" \
+            --argjson events "$(jq -c '.events // 0' <<<"${verify_report}")" \
+            --argjson files "${session_files}" \
+            '$prior + [{session_id:$session_id, verified:$verified, events:$events, files:$files}]')"
+    done
+
+    while IFS= read -r file_path; do
+        relative_path="${file_path#"${stage_root}"/}"
+        file_sha="$(sha256sum "${file_path}" | awk '{print $1}')"
+        file_size="$(stat -c '%s' "${file_path}")"
+        files_json="$(jq -cn \
+            --argjson prior "${files_json}" \
+            --arg path "${relative_path}" \
+            --arg sha256 "${file_sha}" \
+            --argjson size_bytes "${file_size}" \
+            '$prior + [{path:$path, sha256:$sha256, size_bytes:$size_bytes}]')"
+    done < <(find "${stage_root}/logs" "${stage_root}/reports" -type f -print | LC_ALL=C sort)
+
+    jq -S -n \
+        --arg exported_at "$(linux_agent_now_iso)" \
+        --arg agent_version "$(linux_agent_config_get_default '.remote.release_version' 'local')" \
+        --argjson verified "${all_verified}" \
+        --argjson sessions "${sessions_json}" \
+        --argjson files "${files_json}" '
+        {
+            schema_version:1,
+            exported_at:$exported_at,
+            agent_version:(if $agent_version == "" then "local" else $agent_version end),
+            verified:$verified,
+            sessions:$sessions,
+            files:$files
+        }
+    ' >"${stage_root}/export-manifest.json"
+    chmod 0600 "${stage_root}/export-manifest.json"
+    (
+        cd "${stage_root}"
+        mapfile -t checksum_paths < <(find . -type f ! -name SHA256SUMS -printf '%P\n' | LC_ALL=C sort)
+        : >SHA256SUMS
+        for relative_path in "${checksum_paths[@]}"; do
+            sha256sum "${relative_path}" >>SHA256SUMS
+        done
+        chmod 0600 SHA256SUMS
+    )
+
+    timestamp="$(date -u +'%Y%m%dT%H%M%SZ')"
+    archive_path="${output_dir}/audit-export-${timestamp}.tar.gz"
+    while [[ -e "${archive_path}" || -L "${archive_path}" ]]; do
+        suffix=$((suffix + 1))
+        archive_path="${output_dir}/audit-export-${timestamp}-${suffix}.tar.gz"
+    done
+    archive_tmp="$(mktemp "${output_dir}/.audit-export.XXXXXX.tmp")" || {
+        rm -rf "${stage_root}"
+        linux_agent_audit_export_error '无法创建审计导出 archive 临时文件。'
+        return 1
+    }
+    mapfile -t archive_entries < <(find "${stage_root}" -mindepth 1 -maxdepth 1 -printf '%f\n' | LC_ALL=C sort)
+    if ! tar --sort=name --owner=0 --group=0 --numeric-owner -C "${stage_root}" -czf "${archive_tmp}" "${archive_entries[@]}"; then
+        rm -f "${archive_tmp}"
+        rm -rf "${stage_root}"
+        linux_agent_audit_export_error '无法创建审计导出 archive。'
+        return 1
+    fi
+    chmod 0600 "${archive_tmp}"
+    if ! mv "${archive_tmp}" "${archive_path}"; then
+        rm -f "${archive_tmp}"
+        rm -rf "${stage_root}"
+        linux_agent_audit_export_error '无法提交审计导出 archive。'
+        return 1
+    fi
+    rm -rf "${stage_root}"
+    jq -cn \
+        --arg archive "${archive_path}" \
+        --argjson sessions "$(jq -c '[.[].session_id]' <<<"${sessions_json}")" \
+        --argjson verified "${all_verified}" \
+        '{ok:true,status:"exported",archive:$archive,sessions:$sessions,verified:$verified}'
+}
+
 linux_agent_audit_boundary_default_config() {
     cat <<'JSON'
 {
@@ -726,12 +904,12 @@ linux_agent_audit_safe_summary() {
         elif $stage == "step_policy_checked" then
             {
                 step:step_summary(.step),
-                review:{
-                    approved:(.review.approved // null),
-                    approval_required:(.review.approval_required // null),
-                    risk_level:(.review.risk_level // null),
-                    finding_count:(if (.review.findings? | type) == "array" then (.review.findings | length) else 0 end)
-                }
+                review:((.detail // .review // {}) as $review | {
+                    approved:($review.approved // null),
+                    approval_required:($review.approval_required // null),
+                    risk_level:($review.risk_level // null),
+                    finding_count:(if ($review.findings? | type) == "array" then ($review.findings | length) else 0 end)
+                })
             }
         elif $stage == "step_revision_requested" then
             {

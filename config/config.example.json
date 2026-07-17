@@ -67,6 +67,7 @@
     "max_active_jobs": 4,
     "job_timeout_sec": 900,
     "max_job_attempts": 3,
-    "cancel_grace_sec": 2
+    "cancel_grace_sec": 2,
+    "metrics_enabled": true
   }
 }

@@ -873,6 +873,19 @@ class JobStore:
         with self._connection() as conn:
             return self._count_active_in_connection(conn)
 
+
+    def status_counts(self):
+        """Return {status: count} for all jobs currently retained in SQLite."""
+        with self._connection() as conn:
+            rows = conn.execute(
+                "SELECT status, COUNT(*) FROM jobs GROUP BY status"
+            ).fetchall()
+        counts = {}
+        for status, count in rows:
+            key = str(status or "")
+            counts[key] = int(count or 0)
+        return counts
+
     def cleanup(self, retention_hours):
         cutoff = time.strftime(
             "%Y-%m-%dT%H:%M:%SZ",

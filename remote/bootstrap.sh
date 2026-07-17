@@ -125,6 +125,68 @@ RELEASE_VERSION="$(jq -r '.version' "${manifest_path}")"
 if [[ "${VERSION}" != "latest" && "${RELEASE_VERSION}" != "${VERSION}" ]]; then
     fail '固定版本与 release manifest version 不一致'
 fi
+if [[ "${VERSION}" == "latest" ]]; then
+    printf '[remote:warn] 正在使用浮动 latest（实际解析为 %s）；生产环境必须显式设置 LINUX_AGENT_VERSION=%s 固定版本，latest 仅供临时诊断。\n' \
+        "${RELEASE_VERSION}" "${RELEASE_VERSION}" >&2
+fi
+
+verify_release_signature() {
+    local require_signature="${LINUX_AGENT_REQUIRE_SIGNATURE:-0}"
+    local public_key="${LINUX_AGENT_SIGNATURE_PUBKEY:-}"
+    local identity="${LINUX_AGENT_SIGNATURE_IDENTITY:-^https://github.com/libeal/ASSIstant/\.github/workflows/remote-release\.yml@refs/tags/v.*$}"
+    local issuer="${LINUX_AGENT_SIGNATURE_ISSUER:-https://token.actions.githubusercontent.com}"
+    local bundle_path="${download_dir}/release-manifest.json.sigstore.json"
+    local bundle_url="${RELEASE_BASE}/release-manifest.json.sigstore.json"
+    local http_code curl_status
+
+    [[ "${require_signature}" == "0" || "${require_signature}" == "1" ]] || fail 'LINUX_AGENT_REQUIRE_SIGNATURE 只能为 0 或 1'
+    if ! command -v cosign >/dev/null 2>&1; then
+        if [[ "${require_signature}" == "1" ]]; then
+            fail '已要求验证 release 签名，但系统未安装 cosign'
+        fi
+        printf '[remote:warn] 未安装 cosign，跳过 release 签名验证并继续执行 SHA256 校验。\n' >&2
+        return 0
+    fi
+
+    set +e
+    if [[ "${LINUX_AGENT_ALLOW_INSECURE_TEST_URL:-0}" == "1" ]]; then
+        http_code="$(curl -fsSL --max-time 60 --max-filesize 10485760 \
+            -w '%{http_code}' "${bundle_url}" -o "${bundle_path}")"
+        curl_status="$?"
+    else
+        http_code="$(curl -fsSL --proto '=https' --tlsv1.2 --max-time 60 --max-filesize 10485760 \
+            -w '%{http_code}' "${bundle_url}" -o "${bundle_path}")"
+        curl_status="$?"
+    fi
+    set -e
+    if [[ "${curl_status}" -ne 0 ]]; then
+        rm -f -- "${bundle_path}"
+        if [[ "${require_signature}" == "1" ]]; then
+            fail '已要求验证 release 签名，但签名 bundle 下载失败'
+        fi
+        if [[ "${http_code}" == "404" || "${LINUX_AGENT_ALLOW_INSECURE_TEST_URL:-0}" == "1" ]]; then
+            printf '[remote:warn] release 未提供签名 bundle（可能是旧版本），回退到 SHA256 校验。\n' >&2
+            return 0
+        fi
+        fail 'release 签名 bundle 下载失败'
+    fi
+    [[ -s "${bundle_path}" && "$(stat -c '%s' "${bundle_path}")" -le 10485760 ]] || fail 'release 签名 bundle 大小非法'
+
+    if [[ -n "${public_key}" ]]; then
+        [[ -f "${public_key}" && ! -L "${public_key}" ]] || fail 'LINUX_AGENT_SIGNATURE_PUBKEY 必须指向普通文件'
+        cosign verify-blob --offline --insecure-ignore-tlog \
+            --key "${public_key}" --bundle "${bundle_path}" "${manifest_path}" >/dev/null ||
+            fail 'release manifest 签名验证失败'
+    else
+        cosign verify-blob \
+            --bundle "${bundle_path}" \
+            --certificate-oidc-issuer "${issuer}" \
+            --certificate-identity-regexp "${identity}" \
+            "${manifest_path}" >/dev/null || fail 'release manifest keyless 签名验证失败'
+    fi
+}
+
+verify_release_signature
 
 download_asset() {
     local selector="$1"

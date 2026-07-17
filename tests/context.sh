@@ -21,8 +21,21 @@ trap cleanup EXIT
 
 LINUX_AGENT_CONFIG_JSON='{"context_turns":2,"agent_loop":{"checkpoint_turns":10,"thinking_trace_enabled":false,"observation_text_limit":1000}}'
 
+LINUX_AGENT_TMP_DIR="${tmp_root}/session-default"
+mkdir -p "${LINUX_AGENT_TMP_DIR}"
+unset LINUX_AGENT_CONVERSATION_HISTORY_FILE
+linux_agent_prepare_conversation_history_file
+[[ "${LINUX_AGENT_CONVERSATION_HISTORY_FILE}" == "${LINUX_AGENT_TMP_DIR}/conversation-history.json" ]]
+(linux_agent_record_conversation_turn "work" "默认文件请求" "默认文件响应" "answered" "request")
+linux_agent_history_window | jq -e 'length == 1
+    and .[0].request.content == "默认文件请求"
+    and .[0].response.content == "默认文件响应"' >/dev/null
+[[ "$(stat -c '%a' "${LINUX_AGENT_CONVERSATION_HISTORY_FILE}")" == "600" ]]
+
 history_file="${tmp_root}/conversation-history.json"
 LINUX_AGENT_CONVERSATION_HISTORY_FILE="${history_file}"
+linux_agent_prepare_conversation_history_file
+[[ "${LINUX_AGENT_CONVERSATION_HISTORY_FILE}" == "${history_file}" ]]
 linux_agent_record_conversation_turn "work" "第一轮请求" "第一轮完成" "executed" "request"
 linux_agent_record_conversation_turn "work" "第二轮请求" "第二轮完成" "executed" "request"
 linux_agent_record_conversation_turn "work" "第三轮请求" "第三轮完成" "executed" "request"

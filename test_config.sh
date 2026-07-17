@@ -162,7 +162,7 @@ validate_config() {
     fi
 
     local api_url api_key api_key_src model timeout context_turns audit_mode audit_text_limit remote_policy skills_dir
-    local web_enabled web_host web_port web_token web_retention web_max_active web_job_timeout web_max_attempts web_cancel_grace remote_api_key_transmission
+    local web_enabled web_host web_port web_token web_retention web_max_active web_job_timeout web_max_attempts web_cancel_grace web_metrics_enabled remote_api_key_transmission
     local loop_enabled observation_limit thinking_trace checkpoint_turns max_iterations execution_timeout
     local approval_skill approval_shell approval_file_match approval_file_patch approval_file_download approval_local_analyze approval_remote_script
     local audit_fsync audit_max_bytes audit_min_free audit_on_full observer_require
@@ -185,6 +185,7 @@ validate_config() {
     web_job_timeout="$(json_get '.web.job_timeout_sec')"
     web_max_attempts="$(json_get '.web.max_job_attempts')"
     web_cancel_grace="$(json_get '.web.cancel_grace_sec')"
+    web_metrics_enabled="$(json_get '.web.metrics_enabled')"
     loop_enabled="$(json_get '.agent_loop.enabled_for_work')"
     observation_limit="$(json_get '.agent_loop.observation_text_limit')"
     thinking_trace="$(json_get '.agent_loop.thinking_trace_enabled')"
@@ -392,6 +393,13 @@ validate_config() {
             print_ok "web.enabled 合法: ${web_enabled:-默认 true}"
         else
             print_error "web.enabled 必须是 true 或 false"
+            failures=$((failures + 1))
+        fi
+
+        if jq -e '(.web | has("metrics_enabled") | not) or ((.web.metrics_enabled | type) == "boolean")' "${CONFIG_FILE}" >/dev/null 2>&1; then
+            print_ok "web.metrics_enabled 合法: ${web_metrics_enabled:-默认 true}"
+        else
+            print_error "web.metrics_enabled 必须是 true 或 false"
             failures=$((failures + 1))
         fi
 

@@ -2,7 +2,8 @@
 #
 # 统一静态检查基线：本地与 CI 共用。
 # 必备检查（缺依赖即失败）：bash -n、python3 -m py_compile、node --check。
-# 可选检查（未安装则跳过并提示）：shellcheck、shfmt、pyflakes/ruff。
+# 可选工具（未安装则跳过并提示）：shellcheck、shfmt、pyflakes/ruff、tsc。
+# tsc 一旦存在，checkJs 诊断会作为失败处理。
 
 set -uo pipefail
 
@@ -93,9 +94,25 @@ else
     warn "ruff/pyflakes 未安装"
 fi
 
+# —— 可选依赖：TypeScript checkJs（本机有 tsc 时作为质量门禁）——
+if command -v tsc >/dev/null 2>&1; then
+    note "tsc --noEmit --checkJs"
+    mapfile -d '' -t CHECK_JS_FILES < <(find web/static -type f -name '*.js' -print0 | sort -z)
+    if [[ "${#CHECK_JS_FILES[@]}" -gt 0 ]]; then
+        # Exported APIs are covered by JSDoc checks; internal callbacks remain
+        # ordinary JavaScript while structural, DOM and nullability errors fail.
+        tsc --noEmit --allowJs --checkJs --noImplicitAny false --target ES2020 \
+            --module NodeNext --moduleResolution NodeNext --pretty false \
+            "${CHECK_JS_FILES[@]}" || fail "tsc checkJs reported issues"
+    fi
+else
+    warn "tsc 未安装，跳过可选 JSDoc/checkJs 检查"
+fi
+
 if [[ "${status}" -eq 0 ]]; then
-    note "所有必备检查通过"
+    note "所有检查通过"
 else
     printf '[lint] 存在失败项\n' >&2
 fi
+
 exit "${status}"

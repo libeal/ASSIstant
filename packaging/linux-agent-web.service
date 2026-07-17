@@ -4,15 +4,9 @@
 # 并施加 systemd 沙箱与 cgroup 资源约束。远程访问一律通过 SSH 端口转发到
 # 127.0.0.1:8765，不直接暴露到 LAN/公网。
 #
-# 安装步骤（示例）：
-#   sudo useradd --system --home-dir /opt/linux-agent --shell /usr/sbin/nologin linux-agent
-#   sudo mkdir -p /opt/linux-agent && sudo cp -a <repo>/. /opt/linux-agent/
-#   sudo chown -R linux-agent:linux-agent /opt/linux-agent
-#   sudo install -o linux-agent -g linux-agent -m 600 \
-#        /opt/linux-agent/config/config.example.json /opt/linux-agent/config/config.json
-#   # 在 config.json 写入 web.token、api_key，并确认 providers_security.require_https=true
-#   sudo cp <repo>/packaging/linux-agent-web.service /etc/systemd/system/
-#   sudo systemctl daemon-reload && sudo systemctl enable --now linux-agent-web
+# 安装步骤：下载固定版本的 linux-agent-install.sh 后执行：
+#   sudo bash linux-agent-install.sh install --version vX.Y.Z --require-signature
+# 升级、回滚和健康检查分别使用 upgrade、rollback、health 子命令。
 #
 # 访问：ssh -L 8765:127.0.0.1:8765 <user>@<target-host>，然后浏览器打开 127.0.0.1:8765。
 
@@ -23,12 +17,12 @@ After=network-online.target
 Wants=network-online.target
 
 [Service]
-Type=simple
+Type=notify
 # —— 身份边界：专用非 root 账户，禁止提权 ——
 User=linux-agent
 Group=linux-agent
-WorkingDirectory=/opt/linux-agent
-ExecStart=/usr/bin/env bash /opt/linux-agent/bin/agent-web
+WorkingDirectory=/opt/linux-agent/current
+ExecStart=/usr/bin/env bash /opt/linux-agent/current/bin/agent-web
 Restart=on-failure
 RestartSec=3s
 
@@ -40,7 +34,7 @@ NoNewPrivileges=yes
 ProtectSystem=strict
 ProtectHome=yes
 # 代码、Provider registry、schema 和提示词保持只读；仅开放运行时数据目录。
-ReadWritePaths=/opt/linux-agent/config /opt/linux-agent/logs /opt/linux-agent/tmp
+ReadWritePaths=/opt/linux-agent/data
 PrivateTmp=yes
 ProtectControlGroups=yes
 ProtectKernelModules=yes
