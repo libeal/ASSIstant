@@ -60,15 +60,20 @@ export function createLayoutController(state) {
     return state.layoutStorageKey || "";
   }
 
+  /** @returns {{containers: Record<string, string[]>, children: Record<string, string[]>}} */
   function readCurrentLayout() {
+    /** @type {Record<string, string[]>} */
     const containers = {};
+    /** @type {Record<string, string[]>} */
     const children = {};
     queryHtmlElements(document, "[data-layout-container]").forEach((container) => {
       const containerId = container.dataset.layoutContainer;
+      if (!containerId) return;
       const childElements = [...container.children].filter(isHtmlElement);
       containers[containerId] = childElements
         .filter((child) => child.dataset?.layoutPanel)
-        .map((child) => child.dataset.layoutPanel);
+        .map((child) => child.dataset.layoutPanel)
+        .filter((panelId) => typeof panelId === "string");
       children[containerId] = childElements
         .map(layoutChildToken)
         .filter(Boolean);
