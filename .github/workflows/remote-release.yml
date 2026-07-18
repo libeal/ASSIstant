@@ -63,7 +63,9 @@ jobs:
       - name: Install cosign for compatibility regressions
         uses: sigstore/cosign-installer@d58896d6a1865668819e1d91763c7751a165e159 # v3.9.2
         with:
-          cosign-release: v3.1.1
+          # Use the installer bootstrap release so it can verify the binary
+          # without relying on a detached .sig asset from a custom release.
+          cosign-release: v2.5.3
 
       - name: Run syntax and lint checks
         run: bash scripts/lint.sh
@@ -155,7 +157,9 @@ jobs:
         uses: sigstore/cosign-installer@d58896d6a1865668819e1d91763c7751a165e159 # v3.9.2
         with:
           # Pin CLI used for release signing; keep local/CI verification aligned.
-          cosign-release: v3.1.1
+          # Keep this equal to the installer bootstrap release so installation
+          # does not depend on a detached .sig asset from a custom release.
+          cosign-release: v2.5.3
 
 
       - name: Build deterministic remote assets

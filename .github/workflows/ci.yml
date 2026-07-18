@@ -30,7 +30,9 @@ jobs:
       - name: Install cosign
         uses: sigstore/cosign-installer@d58896d6a1865668819e1d91763c7751a165e159 # v3.9.2
         with:
-          cosign-release: v3.1.1
+          # Use the installer bootstrap release so it can verify the binary
+          # without relying on a detached .sig asset from a custom release.
+          cosign-release: v2.5.3
 
       - name: Lint
         run: bash scripts/lint.sh
