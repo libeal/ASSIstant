@@ -13,6 +13,8 @@ import json
 import os
 import queue
 import select
+import signal
+import socket
 import subprocess
 import sys
 import threading
@@ -23,6 +25,11 @@ import urllib.request
 from pathlib import Path
 from typing import Any
 
+LIB_ROOT = Path(__file__).resolve().parent
+if str(LIB_ROOT) not in sys.path:
+    sys.path.insert(0, str(LIB_ROOT))
+from subprocess_env import apply_manifest_env, build_subprocess_env
+
 
 PROTOCOL_VERSION = "2025-11-25"
 SUPPORTED_PROTOCOL_VERSIONS = {
@@ -32,6 +39,12 @@ SUPPORTED_PROTOCOL_VERSIONS = {
     "2025-11-25",
 }
 DEFAULT_TIMEOUT_SEC = 15
+MAX_HTTP_RESPONSE_BYTES = 1_048_576
+MAX_HTTP_REQUEST_BYTES = 1_048_576
+MAX_STDIO_MESSAGE_BYTES = 1_048_576
+MAX_STDIO_STDERR_CHARS = 16_384
+MAX_SSE_EVENT_BYTES = 1_048_576
+MAX_SSE_QUEUED_RESPONSES = 32
 
 
 class McpError(Exception):
@@ -42,6 +55,77 @@ class RpcError(McpError):
     def __init__(self, error: dict[str, Any]):
         self.error = error
         super().__init__(str(error.get("message") or error))
+
+
+def read_limited_body(response, limit=MAX_HTTP_RESPONSE_BYTES) -> bytes:
+    """Read one finite HTTP body without allowing an unbounded allocation."""
+
+    body = response.read(limit + 1)
+    if len(body) > limit:
+        raise McpError(f"MCP HTTP response exceeds {limit} bytes")
+    return body
+
+
+def encode_limited_http_message(message, limit=MAX_HTTP_REQUEST_BYTES) -> bytes:
+    encoded = json.dumps(
+        message,
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    if len(encoded) > limit:
+        raise McpError(f"MCP HTTP request exceeds {limit} bytes")
+    return encoded
+
+
+def encode_limited_message(message, limit=MAX_STDIO_MESSAGE_BYTES) -> str:
+    encoded = json.dumps(
+        message,
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    if len(encoded.encode("utf-8")) > limit:
+        raise McpError(f"MCP stdio request exceeds {limit} bytes")
+    return encoded + "\n"
+
+
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, request, file_pointer, code, message, headers, new_url):
+        return None
+
+
+def open_http_request(request, timeout):
+    """Open one MCP request without ambient proxies or automatic redirects."""
+
+    opener = urllib.request.build_opener(
+        urllib.request.ProxyHandler({}),
+        _NoRedirectHandler(),
+    )
+    return opener.open(request, timeout=timeout)
+
+
+def http_origin(raw_url: str) -> tuple[str, str, int]:
+    try:
+        parsed = urllib.parse.urlparse(str(raw_url or ""))
+        port = parsed.port
+    except ValueError as exc:
+        raise McpError("MCP HTTP URL is invalid") from exc
+    scheme = parsed.scheme.lower()
+    host = (parsed.hostname or "").lower()
+    if (
+        scheme not in {"http", "https"}
+        or not host
+        or parsed.username is not None
+        or parsed.password is not None
+    ):
+        raise McpError("MCP HTTP URL must be credential-free http(s)")
+    return scheme, host, port or (443 if scheme == "https" else 80)
+
+
+def legacy_message_url(stream_url: str, candidate: str) -> str:
+    resolved = urllib.parse.urljoin(stream_url, str(candidate or ""))
+    if http_origin(resolved) != http_origin(stream_url):
+        raise McpError("MCP legacy SSE message endpoint must be same-origin")
+    return resolved
 
 
 def emit(payload: dict[str, Any], exit_code: int = 0) -> int:
@@ -173,22 +257,18 @@ class StdioClient(BaseClient):
         args = manifest.get("args") if isinstance(manifest.get("args"), list) else []
         if not all(isinstance(item, str) for item in args):
             raise McpError("stdio manifest args must be strings")
-        env = os.environ.copy()
-        # MCP stdio servers are untrusted; never leak agent AI secrets into them.
-        for secret_var in ("LINUX_AGENT_API_KEY", "LINUX_AGENT_API_KEY_SOURCE", "LINUX_AGENT_LAST_AI_PAYLOAD"):
-            env.pop(secret_var, None)
-        manifest_env = manifest.get("env")
-        if isinstance(manifest_env, dict):
-            for key, value in manifest_env.items():
-                if isinstance(key, str) and isinstance(value, str):
-                    env[key] = value
+        # MCP stdio servers are untrusted; use an explicit allowlist environment
+        # so ambient cloud credentials cannot leak into third-party processes.
+        env = build_subprocess_env(include_api_key=False)
+        apply_manifest_env(env, manifest.get("env"))
         manifest_dir = str(Path(manifest_path).resolve().parent)
         cwd_value = manifest.get("cwd")
         if isinstance(cwd_value, str) and cwd_value:
             cwd = cwd_value if os.path.isabs(cwd_value) else str(Path(manifest_dir, cwd_value).resolve())
         else:
             cwd = manifest_dir
-        self.stderr_lines: list[str] = []
+        self.stderr_text = ""
+        popen_options = {"start_new_session": True} if os.name == "posix" else {}
         self.process = subprocess.Popen(
             [command, *args],
             cwd=cwd,
@@ -199,23 +279,42 @@ class StdioClient(BaseClient):
             text=True,
             encoding="utf-8",
             bufsize=1,
+            **popen_options,
         )
+        self.stderr_stop_event = threading.Event()
         self.stderr_thread = threading.Thread(target=self._drain_stderr, daemon=True)
         self.stderr_thread.start()
 
     def _drain_stderr(self) -> None:
         if self.process.stderr is None:
             return
-        for line in self.process.stderr:
-            if len(self.stderr_lines) < 20:
-                self.stderr_lines.append(line.rstrip("\n"))
+        descriptor = self.process.stderr.fileno()
+        while not self.stderr_stop_event.is_set():
+            try:
+                readable, _, _ = select.select([descriptor], [], [], 0.2)
+            except (OSError, ValueError):
+                return
+            if not readable:
+                continue
+            try:
+                raw_chunk = os.read(descriptor, 4096)
+            except OSError:
+                return
+            if not raw_chunk:
+                return
+            chunk = raw_chunk.decode("utf-8", errors="replace")
+            if not chunk:
+                return
+            remaining = MAX_STDIO_STDERR_CHARS - len(self.stderr_text)
+            if remaining > 0:
+                self.stderr_text += chunk[:remaining]
 
     def send(self, message: dict[str, Any]) -> None:
         if self.process.stdin is None:
             raise McpError("stdio server stdin is unavailable")
         if self.process.poll() is not None:
             raise McpError(f"stdio server exited with code {self.process.returncode}")
-        self.process.stdin.write(json.dumps(message, ensure_ascii=False, separators=(",", ":")) + "\n")
+        self.process.stdin.write(encode_limited_message(message))
         self.process.stdin.flush()
 
     def read_response(self, message_id: int) -> dict[str, Any]:
@@ -229,9 +328,16 @@ class StdioClient(BaseClient):
             readable, _, _ = select.select([self.process.stdout], [], [], min(remaining, 0.2))
             if not readable:
                 continue
-            line = self.process.stdout.readline()
+            line = self.process.stdout.readline(MAX_STDIO_MESSAGE_BYTES + 1)
             if not line:
                 continue
+            if (
+                len(line) > MAX_STDIO_MESSAGE_BYTES
+                or len(line.encode("utf-8")) > MAX_STDIO_MESSAGE_BYTES
+            ):
+                raise McpError(
+                    f"MCP stdio response exceeds {MAX_STDIO_MESSAGE_BYTES} bytes"
+                )
             try:
                 payload = json.loads(line)
             except json.JSONDecodeError:
@@ -242,13 +348,59 @@ class StdioClient(BaseClient):
                 return payload
         raise McpError(f"timed out waiting for JSON-RPC response id {message_id}")
 
+    def _signal_process_tree(self, signum: int) -> None:
+        if os.name == "posix" and hasattr(os, "killpg"):
+            try:
+                os.killpg(self.process.pid, signum)
+                return
+            except ProcessLookupError:
+                return
+            except OSError:
+                pass
+        if self.process.poll() is not None:
+            return
+        try:
+            if signum == signal.SIGTERM:
+                self.process.terminate()
+            else:
+                self.process.kill()
+        except ProcessLookupError:
+            pass
+
+    @staticmethod
+    def _close_stream(stream) -> None:
+        if stream is None:
+            return
+        try:
+            stream.close()
+        except (BrokenPipeError, OSError, ValueError):
+            pass
+
     def close(self) -> None:
+        self._signal_process_tree(signal.SIGTERM)
         if self.process.poll() is None:
             try:
-                self.process.terminate()
                 self.process.wait(timeout=2)
-            except Exception:
-                self.process.kill()
+            except subprocess.TimeoutExpired:
+                self._signal_process_tree(signal.SIGKILL)
+                try:
+                    self.process.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    pass
+
+        # The direct server may already have exited while a descendant still
+        # owns stderr. Terminate its private group before touching the buffered
+        # stream, then let the drain thread observe EOF.
+        self.stderr_thread.join(timeout=0.25)
+        if self.stderr_thread.is_alive():
+            self._signal_process_tree(signal.SIGKILL)
+        self.stderr_stop_event.set()
+        self.stderr_thread.join(timeout=0.5)
+
+        for stream in (self.process.stdin, self.process.stdout):
+            self._close_stream(stream)
+        if not self.stderr_thread.is_alive():
+            self._close_stream(self.process.stderr)
 
 
 class StreamableHttpClient(BaseClient):
@@ -257,6 +409,7 @@ class StreamableHttpClient(BaseClient):
         url = manifest.get("url")
         if not isinstance(url, str) or not url:
             raise McpError("streamable_http manifest url is required")
+        http_origin(url)
         self.url = url
         self.session_id = ""
 
@@ -278,13 +431,13 @@ class StreamableHttpClient(BaseClient):
     def send(self, message: dict[str, Any]) -> None:
         # Streamable HTTP request/response handling is synchronous, so request()
         # overrides this method. Notifications still go through here.
-        data = json.dumps(message, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        data = encode_limited_http_message(message)
         request = urllib.request.Request(self.url, data=data, headers=self._headers("application/json,text/event-stream"), method="POST")
         try:
-            with urllib.request.urlopen(request, timeout=self.timeout) as response:
+            with open_http_request(request, timeout=self.timeout) as response:
                 if response.headers.get("MCP-Session-Id"):
                     self.session_id = response.headers.get("MCP-Session-Id", "")
-                response.read()
+                read_limited_body(response)
         except urllib.error.HTTPError as exc:
             if exc.code != 202:
                 raise McpError(f"HTTP notification failed with status {exc.code}") from exc
@@ -292,16 +445,16 @@ class StreamableHttpClient(BaseClient):
     def request(self, method: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
         message_id = self.next_message_id()
         message = json_rpc_request(message_id, method, params)
-        data = json.dumps(message, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        data = encode_limited_http_message(message)
         request = urllib.request.Request(self.url, data=data, headers=self._headers("application/json,text/event-stream"), method="POST")
         try:
-            with urllib.request.urlopen(request, timeout=self.timeout) as response:
+            with open_http_request(request, timeout=self.timeout) as response:
                 if response.headers.get("MCP-Session-Id"):
                     self.session_id = response.headers.get("MCP-Session-Id", "")
                 content_type = response.headers.get("Content-Type", "")
-                raw = response.read().decode("utf-8")
+                raw = read_limited_body(response).decode("utf-8")
         except urllib.error.HTTPError as exc:
-            detail = exc.read().decode("utf-8", errors="replace")[:500]
+            detail = exc.read(501).decode("utf-8", errors="replace")[:500]
             raise McpError(f"HTTP request failed with status {exc.code}: {detail}") from exc
         if "text/event-stream" in content_type:
             for _, data_text in parse_sse_payload(raw):
@@ -309,7 +462,7 @@ class StreamableHttpClient(BaseClient):
                     payload = json.loads(data_text)
                 except json.JSONDecodeError:
                     continue
-                if payload.get("id") == message_id:
+                if isinstance(payload, dict) and payload.get("id") == message_id:
                     if "error" in payload:
                         raise RpcError(payload["error"])
                     result = payload.get("result")
@@ -318,6 +471,8 @@ class StreamableHttpClient(BaseClient):
                     return result
             raise McpError(f"HTTP SSE stream did not include response id {message_id}")
         payload = json.loads(raw or "{}")
+        if not isinstance(payload, dict):
+            raise McpError("HTTP JSON-RPC response must be an object")
         if payload.get("id") != message_id:
             raise McpError(f"HTTP response id mismatch for {method}")
         if "error" in payload:
@@ -334,16 +489,27 @@ class LegacySseClient(BaseClient):
         url = manifest.get("url")
         if not isinstance(url, str) or not url:
             raise McpError("sse manifest url is required")
+        http_origin(url)
         self.url = url
         message_url = manifest.get("message_url")
-        self.message_url = message_url if isinstance(message_url, str) else ""
-        self.responses: "queue.Queue[dict[str, Any]]" = queue.Queue()
+        self.message_url = (
+            legacy_message_url(self.url, message_url)
+            if isinstance(message_url, str) and message_url
+            else ""
+        )
+        self.responses: "queue.Queue[dict[str, Any]]" = queue.Queue(
+            maxsize=MAX_SSE_QUEUED_RESPONSES
+        )
+        self.stream_error = ""
+        self.stream_response = None
         self.stop_event = threading.Event()
         self.stream_thread = threading.Thread(target=self._read_stream, daemon=True)
         self.stream_thread.start()
         if not self.message_url:
             deadline = time.monotonic() + self.timeout
             while not self.message_url and time.monotonic() < deadline:
+                if self.stream_error:
+                    raise McpError(self.stream_error)
                 time.sleep(0.05)
         if not self.message_url:
             raise McpError("legacy sse manifest requires message_url or endpoint event")
@@ -360,63 +526,107 @@ class LegacySseClient(BaseClient):
     def _read_stream(self) -> None:
         request = urllib.request.Request(self.url, headers=self._headers("text/event-stream"), method="GET")
         try:
-            with urllib.request.urlopen(request, timeout=self.timeout) as response:
+            with open_http_request(request, timeout=self.timeout) as response:
+                self.stream_response = response
                 event_name = "message"
                 data_lines: list[str] = []
+                event_bytes = 0
                 while not self.stop_event.is_set():
-                    raw_line = response.readline()
+                    raw_line = response.readline(MAX_SSE_EVENT_BYTES + 1)
                     if not raw_line:
                         break
+                    if len(raw_line) > MAX_SSE_EVENT_BYTES:
+                        raise McpError(
+                            f"MCP SSE line exceeds {MAX_SSE_EVENT_BYTES} bytes"
+                        )
+                    event_bytes += len(raw_line)
+                    if event_bytes > MAX_SSE_EVENT_BYTES:
+                        raise McpError(
+                            f"MCP SSE event exceeds {MAX_SSE_EVENT_BYTES} bytes"
+                        )
                     line = raw_line.decode("utf-8", errors="replace").rstrip("\r\n")
                     if line == "":
                         self._handle_event(event_name, "\n".join(data_lines))
                         event_name = "message"
                         data_lines = []
+                        event_bytes = 0
                     elif line.startswith("event:"):
                         event_name = line[6:].strip() or "message"
                     elif line.startswith("data:"):
                         data_lines.append(line[5:].lstrip())
         except Exception as exc:
-            self.responses.put({"jsonrpc": "2.0", "id": "__stream_error__", "error": {"code": -32000, "message": str(exc)}})
+            if not self.stop_event.is_set():
+                self.stream_error = str(exc)
+        finally:
+            self.stream_response = None
 
     def _handle_event(self, event_name: str, data_text: str) -> None:
         if not data_text:
             return
         if event_name == "endpoint" and not self.message_url:
-            self.message_url = urllib.parse.urljoin(self.url, data_text)
+            self.message_url = legacy_message_url(self.url, data_text)
             return
         try:
             payload = json.loads(data_text)
         except json.JSONDecodeError:
             return
         if isinstance(payload, dict):
-            self.responses.put(payload)
+            try:
+                self.responses.put_nowait(payload)
+            except queue.Full as exc:
+                raise McpError("MCP SSE response queue limit exceeded") from exc
 
     def send(self, message: dict[str, Any]) -> None:
-        data = json.dumps(message, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        data = encode_limited_http_message(message)
         request = urllib.request.Request(self.message_url, data=data, headers=self._headers(), method="POST")
         try:
-            with urllib.request.urlopen(request, timeout=self.timeout) as response:
-                response.read()
+            with open_http_request(request, timeout=self.timeout) as response:
+                read_limited_body(response)
         except urllib.error.HTTPError as exc:
-            detail = exc.read().decode("utf-8", errors="replace")[:500]
+            detail = exc.read(501).decode("utf-8", errors="replace")[:500]
             raise McpError(f"legacy SSE POST failed with status {exc.code}: {detail}") from exc
 
     def read_response(self, message_id: int) -> dict[str, Any]:
         deadline = time.monotonic() + self.timeout
         while time.monotonic() < deadline:
+            if self.stream_error:
+                raise McpError(self.stream_error)
             try:
                 payload = self.responses.get(timeout=0.2)
             except queue.Empty:
                 continue
-            if payload.get("id") == "__stream_error__":
-                raise McpError(payload.get("error", {}).get("message", "SSE stream failed"))
             if payload.get("id") == message_id:
                 return payload
         raise McpError(f"timed out waiting for legacy SSE response id {message_id}")
 
+    @staticmethod
+    def _interrupt_stream_response(response) -> bool:
+        for attributes in (
+            ("fp", "raw", "_sock"),
+            ("fp", "_sock"),
+            ("raw", "_sock"),
+            ("_sock",),
+        ):
+            candidate = response
+            for attribute in attributes:
+                candidate = getattr(candidate, attribute, None)
+                if candidate is None:
+                    break
+            if candidate is None or not hasattr(candidate, "shutdown"):
+                continue
+            try:
+                candidate.shutdown(socket.SHUT_RDWR)
+                return True
+            except OSError:
+                continue
+        return False
+
     def close(self) -> None:
         self.stop_event.set()
+        response = self.stream_response
+        if response is not None:
+            self._interrupt_stream_response(response)
+        self.stream_thread.join(timeout=1)
 
 
 def create_client(manifest: dict[str, Any], manifest_path: str) -> BaseClient:

@@ -65,6 +65,37 @@ def history_entry(label, status="executed"):
     }
 
 
+class SessionResourceBoundaryTest(unittest.TestCase):
+    def test_history_and_turn_files_have_hard_read_limits(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            history = root / "history.json"
+            history.write_text('["history-too-large"]\n', encoding="utf-8")
+            with (
+                mock.patch.object(sessions_module, "MAX_HISTORY_FILE_BYTES", 8),
+                self.assertRaisesRegex(SessionDataError, "history exceeds"),
+            ):
+                read_json_array(history)
+
+            turns = root / "turns.jsonl"
+            turns.write_bytes(b'{"payload":"' + b"x" * 64 + b'"}')
+            with (
+                mock.patch.object(sessions_module, "MAX_TURN_LINE_BYTES", 32),
+                self.assertRaisesRegex(SessionDataError, "turn exceeds"),
+            ):
+                read_last_turn(turns)
+
+    def test_turn_append_rejects_oversized_line_before_write(self):
+        with tempfile.TemporaryDirectory() as directory:
+            turns = Path(directory) / "turns.jsonl"
+            with (
+                mock.patch.object(sessions_module, "MAX_TURN_LINE_BYTES", 32),
+                self.assertRaisesRegex(SessionDataError, "turn exceeds"),
+            ):
+                append_turn(turns, {"payload": "x" * 64})
+            self.assertFalse(turns.exists())
+
+
 class SessionStoreTransactionTest(unittest.TestCase):
     def setUp(self):
         self.temp_dir = tempfile.TemporaryDirectory()

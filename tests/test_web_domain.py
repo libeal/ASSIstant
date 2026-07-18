@@ -153,6 +153,92 @@ class DomainContractTest(unittest.TestCase):
                 with self.assertRaisesRegex(DomainValidationError, "missing required"):
                     self.contract.validate_turn(broken)
 
+    def test_plan_approval_audit_and_skill_contracts_are_runtime_validated(self):
+        plan = {
+            "response_type": "work_plan",
+            "summary": "inspect host",
+            "continue_decision": {"should_continue": False, "reason": "done"},
+            "steps": [
+                {
+                    "id": "one",
+                    "title": "inspect",
+                    "executor_type": "shell",
+                    "command": "id",
+                    "arguments": {},
+                    "reason": "inspect",
+                    "expected_effect": "identity",
+                    "risk_level": "low",
+                    "rollback_hint": "none",
+                }
+            ],
+        }
+        self.assertIs(plan, self.contract.validate_plan(plan))
+        with self.assertRaises(DomainValidationError):
+            self.contract.validate_plan({**plan, "response_type": "invented"})
+
+        approval = {
+            "id": "approval-one",
+            "type": "terminal",
+            "subject": "restart service",
+            "risk_level": "high",
+            "actions": ["approve", "reject"],
+        }
+        self.assertIs(approval, self.contract.validate_approval(approval))
+        with self.assertRaises(DomainValidationError):
+            self.contract.validate_approval({**approval, "risk_level": "invented"})
+
+        audit_event = {
+            "schema_version": self.contract.schema_version,
+            "timestamp": "2026-07-18T00:00:00Z",
+            "session_id": "session-one",
+            "stage": "tested",
+            "payload": {},
+            "seq": 1,
+            "prev_hash": "0" * 64,
+            "hash": "a" * 64,
+            "request_id": "request-one",
+            "job_id": "",
+            "system_user": "operator",
+            "execution_user": "linux-agent",
+        }
+        self.assertIs(audit_event, self.contract.validate_audit_event(audit_event))
+        with self.assertRaises(DomainValidationError):
+            self.contract.validate_audit_event({**audit_event, "hash": "not-a-hash"})
+
+        manifest = {
+            "name": "ops-basic",
+            "description": "operations",
+            "scripts": [{"name": "resource-inspect.sh"}],
+        }
+        self.assertIs(manifest, self.contract.validate_skill_manifest(manifest))
+        with self.assertRaises(DomainValidationError):
+            self.contract.validate_skill_manifest({**manifest, "scripts": ["bad"]})
+
+    def test_execution_result_validates_embedded_work_plan(self):
+        result = self.result()
+        result["response"] = {
+            "response_type": "work_plan",
+            "summary": "inspect host",
+            "continue_decision": {"should_continue": False, "reason": "done"},
+            "steps": [
+                {
+                    "id": "one",
+                    "title": "inspect",
+                    "executor_type": "shell",
+                    "command": "id",
+                    "arguments": {},
+                    "reason": "inspect",
+                    "expected_effect": "identity",
+                    "risk_level": "low",
+                    "rollback_hint": "none",
+                }
+            ],
+        }
+        self.contract.validate_execution_result(result)
+        result["response"]["summary"] = ""
+        with self.assertRaisesRegex(DomainValidationError, "summary"):
+            self.contract.validate_execution_result(result)
+
 
 if __name__ == "__main__":
     unittest.main()

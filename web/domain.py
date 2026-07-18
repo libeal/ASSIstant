@@ -1,6 +1,7 @@
 """Runtime validation for the cross-language domain contract."""
 
 import json
+import re
 from pathlib import Path
 
 
@@ -34,6 +35,10 @@ class DomainContract:
             or schema.get("work_status")
             or ()
         )
+        self.risk_levels = frozenset(schema.get("risk_level") or ())
+        self.executor_types = frozenset(schema.get("executor_type") or ())
+        self.approval_types = frozenset(schema.get("approval_type") or ())
+        self.approval_actions = frozenset(schema.get("approval_action") or ())
         error_codes = schema.get("error_codes")
         self.error_codes = frozenset(error_codes if isinstance(error_codes, dict) else ())
         self.compatibility_statuses = frozenset().union(
@@ -106,7 +111,10 @@ class DomainContract:
             if step_id:
                 seen_step_ids.add(step_id)
         if result.get("approval_card") is not None:
-            self._require_fields("approval", result["approval_card"])
+            self.validate_approval(result["approval_card"])
+        response = result.get("response")
+        if isinstance(response, dict) and response.get("response_type") == "work_plan":
+            self.validate_plan(response)
         if not isinstance(result.get("output_blocks"), list):
             raise DomainValidationError("execution_result output_blocks must be an array")
         if result.get("timeline_semantics") != "step_projection":
@@ -128,6 +136,176 @@ class DomainContract:
         if not isinstance(job.get("payload"), dict):
             raise DomainValidationError("Job payload must be an object")
         return job
+
+    def validate_plan(self, plan):
+        self._require_fields("plan", plan)
+        contracts = self.schema.get("contracts")
+        contract = contracts.get("plan") if isinstance(contracts, dict) else {}
+        expected_type = str(contract.get("response_type") or "work_plan")
+        if plan.get("response_type") != expected_type:
+            raise DomainValidationError("plan response_type is unsupported")
+        if not isinstance(plan.get("summary"), str) or not plan["summary"].strip():
+            raise DomainValidationError("plan summary must be a non-empty string")
+        continue_decision = plan.get("continue_decision")
+        if not isinstance(continue_decision, dict):
+            raise DomainValidationError("plan continue_decision must be an object")
+        if not isinstance(continue_decision.get("should_continue"), bool):
+            raise DomainValidationError(
+                "plan continue_decision.should_continue must be a boolean"
+            )
+        if not isinstance(continue_decision.get("reason"), str):
+            raise DomainValidationError(
+                "plan continue_decision.reason must be a string"
+            )
+        steps = plan.get("steps")
+        if not isinstance(steps, list) or not steps or not all(isinstance(step, dict) for step in steps):
+            raise DomainValidationError("plan steps must be a non-empty array of objects")
+        step_ids = []
+        for index, step in enumerate(steps):
+            step_id = step.get("id")
+            if not isinstance(step_id, str) or not step_id.strip():
+                raise DomainValidationError(f"plan step {index} id must be a non-empty string")
+            step_ids.append(step_id)
+            for name in ("title", "reason", "expected_effect", "rollback_hint"):
+                if not isinstance(step.get(name), str):
+                    raise DomainValidationError(
+                        f"plan step {index} {name} must be a string"
+                    )
+            if not step["title"].strip():
+                raise DomainValidationError(
+                    f"plan step {index} title must be non-empty"
+                )
+            executor_type = str(step.get("executor_type") or "")
+            if self.executor_types and executor_type not in self.executor_types:
+                raise DomainValidationError(
+                    f"plan step {index} executor_type is unsupported"
+                )
+            if not isinstance(step.get("arguments"), dict):
+                raise DomainValidationError(
+                    f"plan step {index} arguments must be an object"
+                )
+            if self.risk_levels and str(step.get("risk_level") or "") not in self.risk_levels:
+                raise DomainValidationError(
+                    f"plan step {index} risk_level is unsupported"
+                )
+            executor_fields = {
+                "skill_script": ("skill_script",),
+                "shell": ("command",),
+                "remote_script": ("url", "command"),
+                "mcp_tool": ("mcp_server", "mcp_tool"),
+            }
+            required_any = executor_fields.get(executor_type, ())
+            present = [
+                name
+                for name in required_any
+                if isinstance(step.get(name), str) and step[name].strip()
+            ]
+            if executor_type == "mcp_tool" and len(present) != 2:
+                raise DomainValidationError(
+                    f"plan step {index} MCP target is incomplete"
+                )
+            if executor_type != "mcp_tool" and required_any and not present:
+                raise DomainValidationError(
+                    f"plan step {index} executor target is missing"
+                )
+        if len(step_ids) != len(set(step_ids)):
+            raise DomainValidationError("plan step ids must be unique")
+        return plan
+
+    def validate_approval(self, approval):
+        self._require_fields("approval", approval)
+        for name in ("id", "type", "subject"):
+            if not isinstance(approval.get(name), str) or not approval[name].strip():
+                raise DomainValidationError(f"approval {name} must be a non-empty string")
+        if self.approval_types and approval["type"] not in self.approval_types:
+            raise DomainValidationError("approval type is unsupported")
+        risk_level = str(approval.get("risk_level") or "")
+        if self.risk_levels and risk_level not in self.risk_levels:
+            raise DomainValidationError("approval risk_level is unsupported")
+        actions = approval.get("actions")
+        if not isinstance(actions, list) or not actions:
+            raise DomainValidationError("approval actions must be a non-empty array")
+        if not all(isinstance(action, str) and action for action in actions):
+            raise DomainValidationError("approval actions must contain non-empty strings")
+        if self.approval_actions and any(
+            action not in self.approval_actions for action in actions
+        ):
+            raise DomainValidationError("approval action is unsupported")
+        if len(actions) != len(set(actions)):
+            raise DomainValidationError("approval actions must be unique")
+        return approval
+
+    def validate_audit_event(self, event, *, chained=True):
+        if chained:
+            self._require_fields("audit_event", event)
+        else:
+            if not isinstance(event, dict):
+                raise DomainValidationError("audit_event must be an object")
+            required = set(self._required("audit_event")) - {"seq", "prev_hash", "hash"}
+            missing = [name for name in sorted(required) if name not in event]
+            if missing:
+                raise DomainValidationError(
+                    f"audit_event is missing required fields: {', '.join(missing)}"
+                )
+        if event.get("schema_version") != self.schema_version:
+            raise DomainValidationError("audit_event schema_version is unsupported")
+        for name in (
+            "timestamp",
+            "session_id",
+            "stage",
+            "request_id",
+            "job_id",
+            "system_user",
+            "execution_user",
+        ):
+            if not isinstance(event.get(name), str):
+                raise DomainValidationError(f"audit_event {name} must be a string")
+        if not event["timestamp"] or not event["session_id"] or not event["stage"]:
+            raise DomainValidationError("audit_event identity fields must be non-empty")
+        if not event["system_user"] or not event["execution_user"]:
+            raise DomainValidationError("audit_event user fields must be non-empty")
+        if not isinstance(event.get("payload"), dict):
+            raise DomainValidationError("audit_event payload must be an object")
+        if chained:
+            seq = event.get("seq")
+            if isinstance(seq, bool) or not isinstance(seq, int) or seq < 1:
+                raise DomainValidationError("audit_event seq must be a positive integer")
+            for name in ("prev_hash", "hash"):
+                value = event.get(name)
+                if not isinstance(value, str) or re.fullmatch(r"[0-9a-f]{64}", value) is None:
+                    raise DomainValidationError(f"audit_event {name} must be a SHA-256 hex string")
+        return event
+
+    def validate_skill_manifest(self, manifest):
+        self._require_fields("skill_manifest", manifest)
+        if re.fullmatch(r"[a-z0-9][a-z0-9-]*", str(manifest.get("name") or "")) is None:
+            raise DomainValidationError("skill_manifest name is unsupported")
+        for name in ("name", "description"):
+            if not isinstance(manifest.get(name), str) or not manifest[name].strip():
+                raise DomainValidationError(f"skill_manifest {name} must be a non-empty string")
+        scripts = manifest.get("scripts")
+        if (
+            not isinstance(scripts, list)
+            or not scripts
+            or not all(isinstance(script, dict) for script in scripts)
+        ):
+            raise DomainValidationError(
+                "skill_manifest scripts must be a non-empty array of objects"
+            )
+        script_names = []
+        for index, script in enumerate(scripts):
+            script_name = script.get("name")
+            if not isinstance(script_name, str) or re.fullmatch(
+                r"[a-z0-9][a-z0-9-]*\.sh",
+                script_name,
+            ) is None:
+                raise DomainValidationError(
+                    f"skill_manifest script {index} name is unsupported"
+                )
+            script_names.append(script_name)
+        if len(script_names) != len(set(script_names)):
+            raise DomainValidationError("skill_manifest script names must be unique")
+        return manifest
 
     def validate_turn(self, turn):
         self._require_fields("persisted_turn", turn)

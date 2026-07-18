@@ -1,7 +1,10 @@
+/** @typedef {import("./types.js").AppContext} AppContext */
+/** @typedef {import("./types.js").AuditView} AuditView */
+
 /**
- * @param {Record<string, any>} app
+ * @param {AppContext} app
  * @param {{restoreTimelineFromAudit: Function, showScreen: Function}} hooks
- * @returns {Record<string, Function>}
+ * @returns {AuditView}
  */
 export function createAuditView(app, hooks) {
   const state = app.state;
@@ -284,7 +287,7 @@ export function createAuditView(app, hooks) {
       return;
     }
     for (const event of observerEvents.slice(0, 12)) {
-      const payload = event.payload || event.data || event;
+      const payload = /** @type {Record<string, any>} */ (event.payload || event.data || event);
       const display = auditProtocol.auditEventDisplay(event, pretty);
       const status = payload.status || payload.lifecycle || auditProtocol.auditEventName(event);
       const row = document.createElement("tr");

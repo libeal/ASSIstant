@@ -220,6 +220,18 @@ class ExecutionServiceTest(unittest.TestCase):
         )
         self.assertEqual(0, runtime["json"]["exit_code"])
 
+    def test_external_command_uses_bounded_process_lifecycle(self):
+        outcome = self.service.run_external_sync(
+            [sys.executable, "-c", 'print("external-ok")'],
+            {"PATH": os.environ.get("PATH", "/usr/bin:/bin")},
+            timeout=2,
+            resource="backup",
+        )
+
+        self.assertEqual(outcome.returncode, 0)
+        self.assertEqual(outcome.stdout, "external-ok")
+        self.assertFalse(outcome.output_limit_exceeded)
+
     def test_silent_job_times_out_and_is_reaped(self):
         started = time.monotonic()
         result = self.service.run_job(
@@ -254,7 +266,12 @@ class ExecutionServiceTest(unittest.TestCase):
             result = future.result(timeout=3)
 
         self.assertTrue(termination["ok"])
-        self.assertTrue(termination["sigkill_sent"])
+        if not termination["sigkill_sent"]:
+            # 升级路径与子进程侧 SIGKILL 水位（liveness 管道 EOF / PDEATHSIG
+            # 的整组自杀）存在良性竞态：备用路径先清掉进程组时，terminate 发现
+            # 组已消失就不再补发 KILL。此时退出码必须证明死因是 SIGKILL——
+            # 若 fixture 竟死于被忽略的 TERM（真回归），退出码为 -SIGTERM，仍失败。
+            self.assertEqual(termination["returncode"], -signal.SIGKILL)
         self.assertTrue(termination["reaped"])
         self.assertIsNotNone(process.poll())
         self.assertEqual("cancelled", result["status"])
@@ -265,13 +282,18 @@ class ExecutionServiceTest(unittest.TestCase):
             os.kill(pid, 0)
 
     def test_partial_stderr_callback_receives_running_output(self):
-        result = self.service.run_job(
-            "work",
-            "run",
-            {"fixture": "partial"},
-            context=self.job_context("partial"),
-            timeout=2,
-        )
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(
+                self.service.run_job,
+                "work",
+                "run",
+                {"fixture": "partial"},
+                self.job_context("partial"),
+                2,
+            )
+            self.wait_for(lambda: self.partial_updates)
+            self.assertFalse(future.done(), "partial output arrived only after process exit")
+            result = future.result(timeout=3)
         self.assertTrue(result["ok"])
         self.assertTrue(self.partial_updates)
         self.assertEqual("partial", self.partial_updates[-1][0])
@@ -563,6 +585,38 @@ class ExecutionServiceTest(unittest.TestCase):
         time.sleep(1.2)
 
         self.assertFalse(marker_file.exists())
+
+
+    def test_oversized_stdout_is_hard_capped(self):
+        """Producer output must not be retained beyond max_output_bytes."""
+
+        service = ExecutionService(
+            root=self.root,
+            agent=self.agent,
+            env_builder=lambda include_api_key=False: os.environ.copy(),
+            session_store=FakeSessionStore(self.root),
+            job_reader=None,
+            partial_writer=None,
+            workspace_lock=threading.RLock(),
+            process_registry={},
+            process_registry_lock=threading.Lock(),
+            max_output_bytes=4096,
+        )
+        context = service.workspace_context(request_id="output-cap")
+        # Emit ~50 KiB so the hard cap is the only bound (not wall-clock timeout).
+        command = [
+            sys.executable,
+            "-c",
+            "import sys; sys.stdout.write(\"x\" * 50000); sys.stdout.flush()",
+        ]
+        outcome = service._execute(command, os.environ.copy(), context, "tools", timeout=10)
+        self.assertLessEqual(len(outcome.stdout.encode("utf-8")), 4096)
+        self.assertTrue(outcome.output_limit_exceeded)
+        self.assertGreater(outcome.stdout_truncated_bytes, 0)
+        self.assertIn("output capped", outcome.stderr)
+        result = service._result_envelope(outcome, "tools", 10)
+        self.assertEqual(result["status"], "output_limit_exceeded")
+        self.assertTrue(result["output_blocks"][-1]["json"]["output_limit_exceeded"])
 
     def test_api_key_presence_is_controlled_only_by_env_builder(self):
         terminal = self.service.run_sync(

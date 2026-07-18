@@ -10,12 +10,18 @@ from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "lib"))
 sys.path.insert(0, str(ROOT / "web"))
 
 from provider import (  # noqa: E402
     ProviderSecurityHelpers,
     ProviderService,
     extract_model_ids,
+)
+from provider_security import (  # noqa: E402
+    host_is_trusted,
+    provider_url_host,
+    trusted_provider_hosts,
 )
 import policy as policy_module  # noqa: E402
 from policy import PolicyService  # noqa: E402
@@ -80,6 +86,44 @@ class SkillServiceTests(unittest.TestCase):
             with self.subTest(path=path), self.assertRaises(ValueError):
                 self.service.safe_path(path)
 
+    def test_skill_packages_cross_the_manifest_validation_boundary(self):
+        package = self.root / "ops-basic"
+        scripts = package / "scripts"
+        scripts.mkdir(parents=True)
+        (package / "SKILL.md").write_text(
+            "---\nname: ops-basic\ndescription: Operations\n---\n",
+            encoding="utf-8",
+        )
+        (scripts / "inspect.sh").write_text("#!/usr/bin/env bash\n", encoding="utf-8")
+        validated = []
+        service = SkillService(self.root, manifest_validator=validated.append)
+
+        listing = service.list_files()
+
+        self.assertEqual(listing["manifests"], validated)
+        self.assertEqual(validated[0]["name"], "ops-basic")
+        self.assertEqual(validated[0]["scripts"], [{"name": "inspect.sh"}])
+
+    def test_incomplete_skill_package_fails_closed(self):
+        package = self.root / "broken"
+        (package / "scripts").mkdir(parents=True)
+        (package / "scripts" / "run.sh").write_text("#!/usr/bin/env bash\n", encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "incomplete"):
+            self.service.list_files()
+
+    def test_manifest_name_must_match_its_package_directory(self):
+        package = self.root / "ops-basic"
+        scripts = package / "scripts"
+        scripts.mkdir(parents=True)
+        (package / "SKILL.md").write_text(
+            "---\nname: another-skill\ndescription: Operations\n---\n",
+            encoding="utf-8",
+        )
+        (scripts / "inspect.sh").write_text("#!/usr/bin/env bash\n", encoding="utf-8")
+
+        with self.assertRaisesRegex(ValueError, "does not match"):
+            self.service.list_files()
+
 
 class ProviderServiceTests(unittest.TestCase):
     def setUp(self):
@@ -129,6 +173,9 @@ class ProviderServiceTests(unittest.TestCase):
             validate_url=lambda url, _security: (url, ""),
             inspect_url=inspect_url,
             error_message=lambda status: f"blocked: {status}",
+            url_host=provider_url_host,
+            trusted_hosts=trusted_provider_hosts,
+            host_is_trusted=host_is_trusted,
         )
 
     def tearDown(self):
@@ -194,12 +241,49 @@ class ProviderServiceTests(unittest.TestCase):
         self.assertEqual(self.fetches[0][4], ("203.0.113.10",))
         self.assertEqual(self.fetches[0][2], 60)
 
+
+    def test_credentialed_body_api_url_override_is_blocked(self):
+        """Body api_url to an untrusted public host must not receive the API key."""
+
+        result = self.service().list_models(
+            {
+                "provider": "openai_compatible",
+                "api_url": "https://attacker.example/v1/chat/completions",
+                "api_key": "request-secret",
+            }
+        )
+        self.assertFalse(result["ok"])
+        self.assertIn(
+            result["status"],
+            {"provider_url_override_blocked", "provider_host_not_allowed"},
+        )
+        self.assertEqual(self.fetches, [])
+
+    def test_allowlisted_body_api_url_override_is_permitted(self):
+        self.config["providers_security"] = {
+            "require_https": True,
+            "allowed_hosts": ["models.example"],
+        }
+        result = self.service().list_models(
+            {
+                "provider": "openai_compatible",
+                "api_url": "https://models.example/v1/chat/completions",
+                "api_key": "request-secret",
+            }
+        )
+        self.assertTrue(result["ok"], result)
+        self.assertTrue(self.fetches)
+        self.assertIn("models.example", self.fetches[0][0])
+
     def test_ssrf_rejection_stops_before_fetch(self):
         blocked_helpers = ProviderSecurityHelpers(
             policy_from_config=lambda _config: {"require_https": True},
             validate_url=lambda url, _security: (url, ""),
             inspect_url=lambda _url, _security: ("", "blocked_internal_address", []),
             error_message=lambda _status: "internal address blocked",
+            url_host=provider_url_host,
+            trusted_hosts=trusted_provider_hosts,
+            host_is_trusted=host_is_trusted,
         )
         result = self.service(security_helpers=blocked_helpers).list_models(
             {"provider": "openai_compatible"}

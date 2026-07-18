@@ -25,6 +25,10 @@ from audit_chain import (  # noqa: E402
     append_event,
     verify_chain,
 )
+from domain import DomainContract  # noqa: E402
+
+
+DOMAIN_CONTRACT = DomainContract(ROOT / "schema" / "domain.json")
 
 
 DEFAULT_AUDIT_OPTIONS = {
@@ -128,7 +132,7 @@ def append_audit_event(log_path, session_id, stage, payload=None, config=None, *
         or system_user
     )
     event = {
-        "schema_version": 1,
+        "schema_version": DOMAIN_CONTRACT.schema_version,
         "timestamp": now_iso(),
         "session_id": str(session_id),
         "stage": str(stage),
@@ -146,6 +150,7 @@ def append_audit_event(log_path, session_id, stage, payload=None, config=None, *
     for key, value in metadata.items():
         if value is not None and key not in reserved:
             event[key] = value
+    DOMAIN_CONTRACT.validate_audit_event(event, chained=False)
     effective_config = read_project_config() if config is None else config
     return append_event(
         os.fspath(log_path),

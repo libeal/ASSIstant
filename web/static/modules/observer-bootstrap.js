@@ -1,4 +1,7 @@
-/** @param {Record<string, any>} app @returns {Record<string, Function>} */
+/** @typedef {import("./types.js").AppContext} AppContext */
+/** @typedef {import("./types.js").ObserverBootstrapView} ObserverBootstrapView */
+
+/** @param {AppContext} app @returns {ObserverBootstrapView} */
 export function createObserverBootstrap(app) {
   const state = app.state;
   const api = app.request;

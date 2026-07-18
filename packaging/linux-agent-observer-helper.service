@@ -1,0 +1,37 @@
+[Unit]
+Description=Linux Agent privileged observer helper
+Requires=linux-agent-observer-helper.socket
+After=linux-agent-observer-helper.socket
+PartOf=linux-agent-web.service
+
+[Service]
+Type=simple
+User=root
+Group=root
+ExecStart=/usr/bin/python3 /opt/linux-agent/current/lib/observer_helper.py serve
+NoNewPrivileges=yes
+CapabilityBoundingSet=CAP_AUDIT_CONTROL CAP_AUDIT_READ CAP_DAC_READ_SEARCH
+AmbientCapabilities=CAP_AUDIT_CONTROL CAP_AUDIT_READ CAP_DAC_READ_SEARCH
+RestrictAddressFamilies=AF_UNIX AF_NETLINK
+IPAddressDeny=any
+ProtectSystem=strict
+# ProtectSystem=strict 将 /run 挂为只读；helper 必须能写
+# /run/linux-agent/observer-capabilities.json（capability 状态持久化），
+# 该目录由 socket 单元创建，这里仅放行写权限。
+ReadWritePaths=/run/linux-agent
+ProtectHome=yes
+PrivateTmp=yes
+ProtectControlGroups=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectKernelLogs=yes
+ProtectClock=yes
+PrivateDevices=yes
+LockPersonality=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+StandardOutput=journal
+StandardError=journal

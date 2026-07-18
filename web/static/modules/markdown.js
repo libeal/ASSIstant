@@ -21,6 +21,11 @@ function renderInlineMarkdown(value) {
     .join("");
 }
 
+/**
+ * Render the supported Markdown subset as escaped HTML.
+ * @param {unknown} markdown
+ * @returns {string}
+ */
 export function renderMarkdown(markdown) {
   const html = [];
   const paragraph = [];

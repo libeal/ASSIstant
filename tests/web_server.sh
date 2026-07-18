@@ -227,6 +227,18 @@ oversized_code="$(curl --noproxy '*' -sS -o "${tmp_root}/oversized-resp.json" -w
 [[ "${oversized_code}" == "413" ]]
 jq -e '.status == "request_too_large"' "${tmp_root}/oversized-resp.json" >/dev/null
 
+negative_length_code="$(curl --noproxy '*' -sS -o "${tmp_root}/negative-length.json" -w '%{http_code}' \
+    -X POST -H "Authorization: Bearer ${token}" -H "Content-Type: application/json" \
+    -H 'Content-Length: -1' --data-binary '{}' "${base_url}/api/terminal/review" || true)"
+[[ "${negative_length_code}" == "400" ]]
+jq -e '.status == "invalid_json"' "${tmp_root}/negative-length.json" >/dev/null
+
+chunked_code="$(curl --noproxy '*' -sS -o "${tmp_root}/chunked.json" -w '%{http_code}' \
+    -X POST -H "Authorization: Bearer ${token}" -H "Content-Type: application/json" \
+    -H 'Transfer-Encoding: chunked' --data-binary '{}' "${base_url}/api/terminal/review" || true)"
+[[ "${chunked_code}" == "400" ]]
+jq -e '.status == "invalid_json"' "${tmp_root}/chunked.json" >/dev/null
+
 health="$(curl --noproxy '*' -sS -H "Authorization: Bearer ${token}" "${base_url}/api/health")"
 
 metrics="$(curl --noproxy '*' -sS -H "Authorization: Bearer ${token}" "${base_url}/api/metrics")"
@@ -390,6 +402,35 @@ execution_timeout_update="$(curl --noproxy '*' -sS \
     -d "${execution_timeout_payload}" \
     "${base_url}/api/config/update")"
 jq -e '.ok == true and .updated["execution.timeout_sec"] == 120 and .config.execution.timeout_sec == 120' <<<"${execution_timeout_update}" >/dev/null
+
+resilience_batch_payload="$(jq -cn '{changes:{
+    "provider_resilience.max_attempts":4,
+    "provider_resilience.backoff_initial_ms":100,
+    "provider_resilience.backoff_max_ms":500
+}}')"
+resilience_batch_update="$(curl --noproxy '*' -sS \
+    -H "Authorization: Bearer ${token}" \
+    -H "Content-Type: application/json" \
+    -d "${resilience_batch_payload}" \
+    "${base_url}/api/config/update")"
+jq -e '.ok == true
+    and .updated["provider_resilience.max_attempts"] == 4
+    and .config.provider_resilience.max_attempts == 4
+    and .config.provider_resilience.backoff_initial_ms == 100
+    and .config.provider_resilience.backoff_max_ms == 500' <<<"${resilience_batch_update}" >/dev/null
+
+invalid_resilience_payload="$(jq -cn '{changes:{
+    "provider_resilience.backoff_initial_ms":900,
+    "provider_resilience.backoff_max_ms":100
+}}')"
+invalid_resilience_update="$(curl --noproxy '*' -sS \
+    -H "Authorization: Bearer ${token}" \
+    -H "Content-Type: application/json" \
+    -d "${invalid_resilience_payload}" \
+    "${base_url}/api/config/update")"
+jq -e '.ok == false and .status == "invalid_config_value"' <<<"${invalid_resilience_update}" >/dev/null
+jq -e '.provider_resilience.backoff_initial_ms == 100 and .provider_resilience.backoff_max_ms == 500' \
+    "${project}/config/config.json" >/dev/null
 
 api_key_value="test-web-updated-key-12345"
 api_key_payload="$(jq -cn --arg value "${api_key_value}" '{key:"api_key", value:$value}')"

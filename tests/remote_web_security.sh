@@ -16,6 +16,7 @@ cp -a \
     "${ROOT_DIR}/mcp" \
     "${ROOT_DIR}/policies" \
     "${ROOT_DIR}/prompts" \
+    "${ROOT_DIR}/schema" \
     "${ROOT_DIR}/skills" \
     "${ROOT_DIR}/web" \
     "${tmp_root}/"
@@ -51,6 +52,21 @@ key, source = module.configured_api_key(module.read_config())
 assert key == "memory-only-secret"
 assert source == "runtime"
 
+os.environ["BACKUP_PROVIDER_API_KEY"] = "backup-memory-only-secret"
+config = module.read_config()
+config.setdefault("provider_resilience", {})["failover"] = [
+    {
+        "provider": "openai_compatible",
+        "api_url": "https://backup.example/v1/chat/completions",
+        "model": "backup-model",
+        "api_key_env": "BACKUP_PROVIDER_API_KEY",
+    }
+]
+module.write_config(config)
+blocked_ai_env = module.agent_subprocess_env(include_api_key=True)
+assert "LINUX_AGENT_API_KEY" not in blocked_ai_env
+assert "BACKUP_PROVIDER_API_KEY" not in blocked_ai_env
+
 module.update_config_value("remote.allow_api_key_transmission", True)
 assert module.config_public_state()["config"]["remote"]["allow_api_key_transmission"] is True
 
@@ -75,6 +91,7 @@ env = module.agent_subprocess_env()
 assert "LINUX_AGENT_API_KEY" not in env
 ai_env = module.agent_subprocess_env(include_api_key=True)
 assert ai_env["LINUX_AGENT_API_KEY"] == "memory-only-secret"
+assert ai_env["BACKUP_PROVIDER_API_KEY"] == "backup-memory-only-secret"
 
 backup = module.create_runtime_backup()
 assert backup["ok"] is True, backup
@@ -102,7 +119,7 @@ resolved_skills_dir="$(
 [[ "${resolved_skills_dir}" == "${tmp_root}/skills" ]]
 [[ ! -e "${outside_skills}" ]]
 
-if grep -R -Eq -- 'memory-only-secret|request-secret' "${tmp_root}"; then
+if grep -R -Eq -- 'memory-only-secret|backup-memory-only-secret|request-secret' "${tmp_root}"; then
     printf 'remote web secret was persisted to disk\n' >&2
     exit 1
 fi

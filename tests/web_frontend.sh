@@ -3,10 +3,16 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+shopt -s nullglob
+test_files=("${ROOT_DIR}"/tests/web_*.mjs)
+[[ "${#test_files[@]}" -gt 0 ]] || {
+    printf 'web_frontend: no web_*.mjs tests found\n' >&2
+    exit 1
+}
 
-while IFS= read -r test_file; do
-    printf '[web_frontend] %s\n' "$(basename "${test_file}")"
+for test_file in "${test_files[@]}"; do
+    printf '[web_frontend] %s\n' "$(basename -- "${test_file}")"
     node "${test_file}"
-done < <(find "${ROOT_DIR}/tests" -maxdepth 1 -type f -name 'web_*.mjs' | LC_ALL=C sort)
+done
 
 printf 'web_frontend: ok\n'

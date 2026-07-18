@@ -33,6 +33,15 @@ apply_change = bool(args.get("apply", True))
 backup = bool(args.get("backup", True))
 max_file_bytes = int(args.get("max_file_bytes") or 2 * 1024 * 1024)
 
+if apply_change and not backup:
+    emit({
+        "ok": False,
+        "tool": "controlled.file.patch",
+        "status": "backup_required",
+        "error": "真实文件变更必须保留事务性备份。",
+    })
+    raise SystemExit(0)
+
 try:
     expected_count = int(args.get("expected_count"))
 except (TypeError, ValueError):
@@ -122,11 +131,23 @@ try:
     if backup:
         backup_path = str(path.with_name(f"{path.name}.bak.{time.strftime('%Y%m%d_%H%M%S')}.{time.time_ns()}"))
         shutil.copy2(path, backup_path)
+        os.chmod(backup_path, 0o600)
     with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=str(path.parent), prefix=f".{path.name}.", suffix=".tmp", delete=False) as handle:
         tmp_name = handle.name
         handle.write(patched)
+        handle.flush()
+        os.fsync(handle.fileno())
     os.chmod(tmp_name, stat.st_mode & 0o777)
     os.replace(tmp_name, path)
+    try:
+        directory_fd = os.open(path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    except OSError:
+        directory_fd = -1
+    if directory_fd >= 0:
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
 except OSError as exc:
     if tmp_name:
         try:

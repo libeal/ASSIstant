@@ -3,6 +3,8 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# shellcheck source=tests/cosign_compat.sh
+source "${ROOT_DIR}/tests/cosign_compat.sh"
 tmp_root="$(mktemp -d)"
 web_pid=""
 notify_pid=""
@@ -81,12 +83,23 @@ bash "${ROOT_DIR}/scripts/install.sh" install \
 [[ -x "${prefix}/current/bin/agent" && -x "${prefix}/current/bin/agent-web" ]]
 grep -q '^Type=notify$' "${prefix}/current/packaging/linux-agent-web.service"
 grep -q '^ReadWritePaths=/opt/linux-agent/data$' "${prefix}/current/packaging/linux-agent-web.service"
+grep -q '^CapabilityBoundingSet=CAP_AUDIT_CONTROL CAP_AUDIT_READ CAP_DAC_READ_SEARCH$' \
+    "${prefix}/current/packaging/linux-agent-observer-helper.service"
+grep -q '^SocketMode=0660$' "${prefix}/current/packaging/linux-agent-observer-helper.socket"
+grep -q '^DirectoryMode=0755$' "${prefix}/current/packaging/linux-agent-observer-helper.socket"
+grep -q '^IPAddressDeny=any$' "${prefix}/current/packaging/dropins/10-provider-egress.conf.example"
 [[ "$(readlink "${prefix}/releases/v0.0.0-test/config")" == "../../data/config" ]]
 [[ "$(stat -c '%a' "${prefix}/data/config/config.json")" == "600" ]]
 jq -e '.remote.enabled == true and .remote.release_version == "v0.0.0-test"' \
     "${prefix}/data/config/config.json" >/dev/null
 health_json="$(bash "${prefix}/current/bin/agent" api health)"
 jq -e '.ok == true and .version == "v0.0.0-test"' <<<"${health_json}" >/dev/null
+skills_json="$(bash "${prefix}/current/bin/agent" api skills validate '{}')"
+jq -e '.ok == true' <<<"${skills_json}" >/dev/null
+while IFS= read -r skill_name; do
+    [[ -f "${prefix}/current/skills/${skill_name}/SKILL.md" ]]
+    [[ -d "${prefix}/current/skills/${skill_name}/scripts" ]]
+done < <(jq -r '.skills | keys[]' "${dist_one}/release-manifest.json")
 
 printf 'persistent-marker\n' >"${prefix}/data/logs/marker"
 bash "${ROOT_DIR}/scripts/install.sh" upgrade \
@@ -118,6 +131,40 @@ fi
 grep -q '资产大小校验失败\|资产 SHA256 校验失败' "${tmp_root}/bad.stderr"
 [[ ! -e "${bad_prefix}/current" ]]
 [[ -z "$(find "${bad_prefix}" -maxdepth 1 -name '.install-staging.*' -print -quit 2>/dev/null)" ]]
+
+bomb_dist="${tmp_root}/bomb-dist"
+bomb_stage="${tmp_root}/bomb-stage"
+bomb_prefix="${tmp_root}/bomb-prefix"
+cp -a "${dist_one}" "${bomb_dist}"
+mkdir -p "${bomb_stage}"
+truncate -s $((65 * 1024 * 1024)) "${bomb_stage}/oversized.bin"
+tar --sort=name --owner=0 --group=0 --numeric-owner -C "${bomb_stage}" -czf \
+    "${bomb_dist}/linux-agent-core.tar.gz" oversized.bin
+bomb_core_sha="$(sha256sum "${bomb_dist}/linux-agent-core.tar.gz" | awk '{print $1}')"
+bomb_core_size="$(stat -c '%s' "${bomb_dist}/linux-agent-core.tar.gz")"
+jq --arg sha "${bomb_core_sha}" --argjson size "${bomb_core_size}" \
+    '.assets.core.sha256 = $sha | .assets.core.size_bytes = $size' \
+    "${bomb_dist}/release-manifest.json" >"${bomb_dist}/release-manifest.json.tmp"
+mv "${bomb_dist}/release-manifest.json.tmp" "${bomb_dist}/release-manifest.json"
+if bash "${ROOT_DIR}/scripts/install.sh" install \
+    --version v0.0.0-test --from-dist "${bomb_dist}" --prefix "${bomb_prefix}" --no-systemd \
+    >"${tmp_root}/bomb.stdout" 2>"${tmp_root}/bomb.stderr"; then
+    printf 'install unexpectedly accepted an archive expansion bomb\n' >&2
+    exit 1
+fi
+grep -q 'archive member is too large' "${tmp_root}/bomb.stderr"
+[[ ! -e "${bomb_prefix}/current" ]]
+
+tampered_installer="${tmp_root}/tampered-installer.sh"
+cp "${ROOT_DIR}/scripts/install.sh" "${tampered_installer}"
+printf '\n# tampered installer\n' >>"${tampered_installer}"
+if bash "${tampered_installer}" install \
+    --version v0.0.0-test --from-dist "${dist_one}" --prefix "${tmp_root}/tampered-installer-prefix" --no-systemd \
+    >"${tmp_root}/tampered-installer.stdout" 2>"${tmp_root}/tampered-installer.stderr"; then
+    printf 'install unexpectedly accepted an installer not registered by the manifest\n' >&2
+    exit 1
+fi
+grep -q '当前安装器与签名 manifest 登记' "${tmp_root}/tampered-installer.stderr"
 
 signature_prefix="${tmp_root}/signature-prefix"
 if bash "${ROOT_DIR}/scripts/install.sh" install \
@@ -155,6 +202,12 @@ if bash "${ROOT_DIR}/scripts/install.sh" status --prefix "${protected_prefix}" \
 fi
 grep -q 'systemd 模式的 --prefix 不能位于' "${tmp_root}/protected-prefix.stderr"
 bash "${ROOT_DIR}/scripts/install.sh" status --prefix "${protected_prefix}" --no-systemd >/dev/null
+if bash "${ROOT_DIR}/scripts/install.sh" status --prefix "${protected_prefix}" --no-systemd \
+    --provider-cidr 203.0.113.7 >"${tmp_root}/egress-no-systemd.stdout" 2>"${tmp_root}/egress-no-systemd.stderr"; then
+    printf 'no-systemd mode unexpectedly accepted a Provider CIDR policy\n' >&2
+    exit 1
+fi
+grep -q '仅适用于 systemd 模式' "${tmp_root}/egress-no-systemd.stderr"
 
 if command -v cosign >/dev/null 2>&1; then
     signed_dist="${tmp_root}/signed-dist"
@@ -165,8 +218,8 @@ if command -v cosign >/dev/null 2>&1; then
     (
         cd "${cosign_dir}"
         COSIGN_PASSWORD=install-test cosign generate-key-pair >/dev/null
-        COSIGN_PASSWORD=install-test cosign sign-blob --yes --tlog-upload=false --key cosign.key \
-            --bundle "${signed_dist}/release-manifest.json.sigstore.json" \
+        COSIGN_PASSWORD=install-test linux_agent_test_cosign_sign_blob \
+            cosign.key "${signed_dist}/release-manifest.json.sigstore.json" \
             "${signed_dist}/release-manifest.json" >/dev/null
     )
     LINUX_AGENT_SIGNATURE_PUBKEY="${cosign_dir}/cosign.pub" \
@@ -278,15 +331,31 @@ SH
             --prefix "${managed_prefix}" --service-user root
     }
 
-    if ! run_managed_installer install --version v0.0.0-test --from-dist "${managed_dist_one}"; then
+    if run_managed_installer install --version v0.0.0-test --from-dist "${managed_dist_one}" \
+        >"${tmp_root}/missing-egress.stdout" 2>"${tmp_root}/missing-egress.stderr"; then
+        printf 'managed install unexpectedly accepted an implicit egress policy\n' >&2
+        exit 1
+    fi
+    grep -q '首次安装必须提供 --provider-cidr' "${tmp_root}/missing-egress.stderr"
+    if ! run_managed_installer install --version v0.0.0-test --from-dist "${managed_dist_one}" \
+        --provider-cidr 127.0.0.1; then
         printf 'managed install failed; fake systemd commands:\n' >&2
         sed -n '1,160p' "${fake_systemd_dir}/commands" >&2 2>/dev/null || true
         printf 'managed Web stderr:\n' >&2
         sed -n '1,200p' "${fake_systemd_dir}/web.stderr" >&2 2>/dev/null || true
         exit 1
     fi
+    managed_egress_path="${managed_prefix}/systemd/linux-agent-web.service.d/10-provider-egress.conf"
+    grep -q '^IPAddressDeny=any$' "${managed_egress_path}"
+    grep -q '^IPAddressAllow=localhost$' "${managed_egress_path}"
+    grep -q '^IPAddressAllow=127.0.0.1/32$' "${managed_egress_path}"
     run_managed_installer upgrade --version v0.0.1-test --from-dist "${managed_dist_two}"
     grep -q '^Environment=LINUX_AGENT_UNIT_MARKER=v2$' "${managed_unit_path}"
+    grep -q "^ExecStart=/usr/bin/python3 ${managed_prefix}/current/lib/observer_helper.py serve$" \
+        "${managed_prefix}/systemd/linux-agent-observer-helper.service"
+    grep -q '^SocketGroup=root$' "${managed_prefix}/systemd/linux-agent-observer-helper.socket"
+    grep -q '^DirectoryMode=0755$' "${managed_prefix}/systemd/linux-agent-observer-helper.socket"
+    managed_egress_sha="$(sha256sum "${managed_egress_path}" | awk '{print $1}')"
     if run_managed_installer upgrade --version v0.0.2-test --from-dist "${failing_dist_three}" \
         >"${tmp_root}/managed-failure.stdout" 2>"${tmp_root}/managed-failure.stderr"; then
         printf 'managed upgrade unexpectedly accepted an unhealthy release\n' >&2
@@ -296,6 +365,7 @@ SH
     [[ ! -e "${managed_prefix}/releases/v0.0.2-test" ]]
     jq -e '.remote.release_version == "v0.0.1-test"' "${managed_prefix}/data/config/config.json" >/dev/null
     grep -q '^Environment=LINUX_AGENT_UNIT_MARKER=v2$' "${managed_unit_path}"
+    [[ "$(sha256sum "${managed_egress_path}" | awk '{print $1}')" == "${managed_egress_sha}" ]]
     run_managed_installer upgrade --version v0.0.2-test --from-dist "${dist_three}"
     [[ "$(readlink "${managed_prefix}/current")" == "releases/v0.0.2-test" ]]
     ! grep -q 'LINUX_AGENT_UNIT_MARKER' "${managed_unit_path}"

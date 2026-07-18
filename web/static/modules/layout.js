@@ -52,8 +52,8 @@ export function initSidebarToggle() {
 
 /**
  * Build the per-process panel layout controller around the shared app state.
- * @param {Record<string, any>} state
- * @returns {{initPanelLayout: Function, setLayoutRunId: Function, bindPanelDrag: Function}}
+ * @param {import("./types.js").AppState} state
+ * @returns {{initPanelLayout: () => void, setLayoutRunId: (runId: string) => void, bindPanelDrag: () => void}}
  */
 export function createLayoutController(state) {
   function currentLayoutStorageKey() {
@@ -218,7 +218,7 @@ export function createLayoutController(state) {
       if (!handle) return;
       const panel = handle.closest("[data-layout-panel]");
       if (!(panel instanceof HTMLElement) || !event.dataTransfer) return;
-      state.draggedPanelId = panel.dataset.layoutPanel;
+      state.draggedPanelId = panel.dataset.layoutPanel || "";
       panel.classList.add("layout-dragging");
       event.dataTransfer.effectAllowed = "move";
       event.dataTransfer.setData("text/plain", state.draggedPanelId);

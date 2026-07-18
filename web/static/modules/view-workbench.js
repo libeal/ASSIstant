@@ -3,7 +3,10 @@ import {
   remoteSecretTransmissionBlocked as isRemoteSecretTransmissionBlocked,
 } from "./config-utils.js";
 
-/** @param {Record<string, any>} app @returns {Record<string, Function>} */
+/** @typedef {import("./types.js").AppContext} AppContext */
+/** @typedef {import("./types.js").WorkbenchView} WorkbenchView */
+
+/** @param {AppContext} app @returns {WorkbenchView} */
 export function createWorkbenchView(app) {
   const state = app.state;
   const api = app.request;
@@ -200,7 +203,7 @@ export function createWorkbenchView(app) {
             ["原因", step.reason || ""],
           ])}
         </div>
-        ${app.renderJsonDetails("策略审查 findings", state.pendingApproval.review?.findings || [], false)}
+        ${app.renderJsonDetails("策略审查 findings", state.pendingApproval?.review?.findings || [], false)}
         ${app.renderJsonDetails("步骤 JSON", step, false)}
       `;
     }

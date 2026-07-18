@@ -8,10 +8,13 @@ import {
   remoteSecretTransmissionBlocked,
 } from "./config-utils.js";
 
+/** @typedef {import("./types.js").AppContext} AppContext */
+/** @typedef {import("./types.js").ConfigView} ConfigView */
+
 /**
- * @param {Record<string, any>} app
+ * @param {AppContext} app
  * @param {{renderWorkbench?: Function, renderThinkingSummary?: Function, setThinkingSwitches?: Function, thinkingTraceEnabled?: Function, updateRemoteActionState?: Function}} [hooks]
- * @returns {Record<string, Function>}
+ * @returns {ConfigView}
  */
 export function createConfigView(app, hooks = {}) {
   const state = app.state;
@@ -52,6 +55,7 @@ export function createConfigView(app, hooks = {}) {
   const REMOTE_API_KEY_TRANSMISSION_KEY = app.REMOTE_API_KEY_TRANSMISSION_KEY;
   const hiddenOutputKeys = app.hiddenOutputKeys;
   const outputLabelMap = app.outputLabelMap;
+  const providerRules = () => state.domainSchema?.provider_normalization || null;
   // render-output helpers
   const primaryOutputObject = (...a) => app.primaryOutputObject(...a);
   const outputSummaryText = (...a) => app.outputSummaryText(...a);
@@ -89,9 +93,9 @@ export function createConfigView(app, hooks = {}) {
     const data = await app.api("/api/config");
     state.configSnapshot = data.config || {};
     state.commandGuardEnabled = state.configSnapshot?.command_guard?.enabled !== false;
-    state.configOriginal = collectEditableConfigValues(state.configSnapshot);
+    state.configOriginal = collectEditableConfigValues(state.configSnapshot || {}, CONFIG_GROUPS, providerRules());
     state.configDraft = { ...state.configOriginal };
-    renderConfigCenter(state.configSnapshot);
+    renderConfigCenter(state.configSnapshot || {});
     syncThinkingTraceFromConfig();
     hooks.renderWorkbench?.();
     setConfigDirtyState(false);
@@ -124,9 +128,9 @@ export function createConfigView(app, hooks = {}) {
       return;
     }
     state.configSnapshot = data.config || state.configSnapshot || {};
-    state.configOriginal = collectEditableConfigValues(state.configSnapshot);
+    state.configOriginal = collectEditableConfigValues(state.configSnapshot || {}, CONFIG_GROUPS, providerRules());
     state.configDraft = { ...state.configOriginal };
-    renderConfigCenter(state.configSnapshot);
+    renderConfigCenter(state.configSnapshot || {});
     syncThinkingTraceFromConfig();
     restoreConfigDraftChanges(preservedChanges);
     hooks.renderThinkingSummary?.();
@@ -205,7 +209,7 @@ export function createConfigView(app, hooks = {}) {
   }
 
   function renderConfigField(field, rawValue) {
-    const value = normalizeConfigFieldValue(field, rawValue);
+    const value = normalizeConfigFieldValue(field, rawValue, providerRules());
     if (field.type === "boolean") {
       const help = field.onEffect || field.offEffect
         ? `<div class="config-switch-effects small">
@@ -241,7 +245,7 @@ export function createConfigView(app, hooks = {}) {
           <span>${escapeHtml(field.label)}</span>
           <select class="select" id="${escapeHtml(configInputId(field.key))}" data-config-key="${escapeHtml(field.key)}">
             ${providers.map((provider) => {
-              const providerId = normalizeProviderId(provider.id);
+              const providerId = normalizeProviderId(provider.id, providerRules());
               return `<option value="${escapeHtml(providerId)}"${providerId === value ? " selected" : ""}>${escapeHtml(provider.label || providerId)}</option>`;
             }).join("")}
           </select>
@@ -252,7 +256,9 @@ export function createConfigView(app, hooks = {}) {
     if (field.type === "model") {
       const models = state.configModelsProvider === currentProviderId() ? state.configModels : [];
       const hasCurrent = models.some((model) => model.id === value);
-      const modelOptions = (value && !hasCurrent ? [{ id: value }] : []).concat(models);
+      const modelOptions = /** @type {Array<Record<string, any>>} */ (
+        value && !hasCurrent ? [{ id: value }] : []
+      ).concat(models);
       const control = modelOptions.length
         ? `<select class="select" id="${escapeHtml(configInputId(field.key))}" data-config-key="${escapeHtml(field.key)}">
             ${modelOptions.map((model) => `<option value="${escapeHtml(model.id)}"${model.id === value ? " selected" : ""}>${escapeHtml(model.id)}</option>`).join("")}
@@ -317,7 +323,7 @@ export function createConfigView(app, hooks = {}) {
   }
 
   function applyProviderPreset(providerId) {
-    const normalized = normalizeProviderId(providerId);
+    const normalized = normalizeProviderId(providerId, providerRules());
     const provider = findConfigProvider(normalized);
     state.configDraft.provider = normalized;
     if (provider) {
@@ -419,27 +425,28 @@ export function createConfigView(app, hooks = {}) {
       setConfigDirtyState(false);
       return;
     }
-    for (const [key, value] of changes) {
-      const data = await app.api("/api/config/update", {
-        method: "POST",
-        body: { key, value },
-      });
-      if (!data.ok) {
-        showToast(data.error || data.status || `保存 ${key} 失败`);
-        return;
-      }
+    const data = await app.api("/api/config/update", {
+      method: "POST",
+      body: { changes: Object.fromEntries(changes) },
+    });
+    if (!data.ok) {
+      showToast(data.error || data.status || "保存配置失败");
+      return;
     }
     await loadConfig();
     showToast("配置已保存");
   }
 
   function findConfigProvider(providerId) {
-    const normalized = normalizeProviderId(providerId);
-    return state.configProviders.find((provider) => normalizeProviderId(provider.id) === normalized) || null;
+    const normalized = normalizeProviderId(providerId, providerRules());
+    return state.configProviders.find((provider) => normalizeProviderId(provider.id, providerRules()) === normalized) || null;
   }
 
   function currentProviderId(config = state.configSnapshot || {}) {
-    return normalizeProviderId(state.configDraft?.provider || config.provider_id || config.provider);
+    return normalizeProviderId(
+      state.configDraft?.provider || config.provider_id || config.provider,
+      providerRules(),
+    );
   }
 
   function providerLabel(providerId) {

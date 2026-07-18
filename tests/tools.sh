@@ -25,6 +25,7 @@ controlled_link="${controlled_file}.link"
 ln -s "${controlled_file}" "${controlled_link}"
 match_result="$(bash "${CONTROLLED_SCRIPT_DIR}/file-match.sh" "$(jq -cn --arg path "${controlled_file}" '{path:$path, find:"needle", context_lines:1}')")"
 patch_preview="$(bash "${CONTROLLED_SCRIPT_DIR}/file-patch.sh" "$(jq -cn --arg path "${controlled_file}" '{path:$path, find:"needle", replacement:"patched", expected_count:1, apply:false}')")"
+patch_without_backup="$(bash "${CONTROLLED_SCRIPT_DIR}/file-patch.sh" "$(jq -cn --arg path "${controlled_file}" '{path:$path, find:"needle", replacement:"patched", expected_count:1, backup:false}')")"
 patch_result="$(bash "${CONTROLLED_SCRIPT_DIR}/file-patch.sh" "$(jq -cn --arg path "${controlled_file}" '{path:$path, find:"needle", replacement:"patched", expected_count:1, backup:true}')")"
 patched_content="$(cat "${controlled_file}")"
 patch_mismatch="$(bash "${CONTROLLED_SCRIPT_DIR}/file-patch.sh" "$(jq -cn --arg path "${controlled_file}" '{path:$path, find:"patched", replacement:"again", expected_count:2}')")"
@@ -127,10 +128,18 @@ assert_network_field hosts-file-editor "$(jq -cn --arg p "${hosts_tmp}" '{path:$
 rm -f "${hosts_tmp}"
 
 cleanup_file="$(mktemp /tmp/linux-agent-tools-cleanup.XXXXXX)"
+cleanup_backup_root="$(mktemp -d /tmp/linux-agent-tools-backups.XXXXXX)"
 printf '0123456789' >"${cleanup_file}"
-cleanup_false_result="$(bash "${SCRIPT_DIR}/safe-log-cleanup.sh" "$(jq -cn --arg path "${cleanup_file}" '{path:$path, max_size_mb:0, dry_run:false}')")"
-cleanup_false_size="$(stat -c '%s' "${cleanup_file}")"
-rm -f "${cleanup_file}"
+cleanup_without_backup="$(bash "${SCRIPT_DIR}/safe-log-cleanup.sh" "$(jq -cn --arg path "${cleanup_file}" '{path:$path, max_size_mb:0, dry_run:false}')")"
+cleanup_without_backup_size="$(stat -c '%s' "${cleanup_file}")"
+cleanup_backup_result="$(bash "${SCRIPT_DIR}/config-backup.sh" "$(jq -cn --arg path "${cleanup_file}" --arg root "${cleanup_backup_root}" '{path:$path, backup_root:$root}')")"
+cleanup_archive="$(jq -r '.archive' <<<"${cleanup_backup_result}")"
+cleanup_sha256="$(jq -r '.source_sha256' <<<"${cleanup_backup_result}")"
+cleanup_valid_result="$(bash "${SCRIPT_DIR}/safe-log-cleanup.sh" "$(jq -cn --arg path "${cleanup_file}" --arg archive "${cleanup_archive}" --arg sha256 "${cleanup_sha256}" '{path:$path, max_size_mb:0, dry_run:false, backup_archive:$archive, backup_sha256:$sha256}')")"
+cleanup_valid_size="$(stat -c '%s' "${cleanup_file}")"
+printf 'changed-after-backup\n' >"${cleanup_file}"
+cleanup_stale_result="$(bash "${SCRIPT_DIR}/safe-log-cleanup.sh" "$(jq -cn --arg path "${cleanup_file}" --arg archive "${cleanup_archive}" --arg sha256 "${cleanup_sha256}" '{path:$path, max_size_mb:0, dry_run:false, backup_archive:$archive, backup_sha256:$sha256}')")"
+rm -rf "${cleanup_file}" "${cleanup_backup_root}"
 
 cleanup_bad_number_file="$(mktemp /tmp/linux-agent-tools-bad-number.XXXXXX)"
 printf 'data' >"${cleanup_bad_number_file}"
@@ -158,8 +167,11 @@ grep -q '"tool": "system.logs.cleanup_plan"' <<<"$(jq . <<<"${cleanup_plan_resul
 grep -q '"ok": false' <<<"$(jq . <<<"${cleanup_plan_result}")"
 grep -q '"ok": false' <<<"$(jq . <<<"${cleanup_plan_bad_number}")"
 grep -q 'min_size_mb 必须是正整数' <<<"${cleanup_plan_bad_number}"
-grep -q '"action": "truncate"' <<<"$(jq . <<<"${cleanup_false_result}")"
-[[ "${cleanup_false_size}" -eq 0 ]]
+grep -q '"status": "backup_required"' <<<"$(jq . <<<"${cleanup_without_backup}")"
+[[ "${cleanup_without_backup_size}" -gt 0 ]]
+jq -e '.ok == true and .action == "truncate" and .backup_archive != null' <<<"${cleanup_valid_result}" >/dev/null
+[[ "${cleanup_valid_size}" -eq 0 ]]
+jq -e '.ok == false and .status == "backup_stale"' <<<"${cleanup_stale_result}" >/dev/null
 grep -q '"ok": false' <<<"$(jq . <<<"${cleanup_bad_number_result}")"
 grep -q 'max_size_mb 必须是非负整数' <<<"${cleanup_bad_number_result}"
 grep -q '"ok": false' <<<"$(jq . <<<"${cleanup_symlink_result}")"
@@ -174,6 +186,7 @@ grep -q '"journal_sample": ""' <<<"$(jq . <<<"${log_search_no_journal}")"
 grep -q '"tool": "controlled.file.match"' <<<"$(jq . <<<"${match_result}")"
 jq -e '.ok == true and .match_count == 1 and .matches[0].line == 2' <<<"${match_result}" >/dev/null
 jq -e '.ok == true and .status == "previewed" and (.diff | contains("patched"))' <<<"${patch_preview}" >/dev/null
+jq -e '.ok == false and .status == "backup_required"' <<<"${patch_without_backup}" >/dev/null
 jq -e '.ok == true and .status == "patched" and .backup_path != null' <<<"${patch_result}" >/dev/null
 grep -q 'patched' <<<"${patched_content}"
 jq -e '.ok == false and .status == "count_mismatch"' <<<"${patch_mismatch}" >/dev/null

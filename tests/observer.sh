@@ -72,6 +72,44 @@ timeout_meta="$(linux_agent_run_observed_process \
 jq -e '.exit_code == 124 and .timed_out == true and .observer.status == "timed_out"' <<<"${timeout_meta}" >/dev/null
 LINUX_AGENT_CONFIG_JSON="$(jq '.execution.timeout_sec=300' <<<"${LINUX_AGENT_CONFIG_JSON}")"
 
+# A daemonized descendant may outlive the direct command while retaining both
+# FIFO writers. The limiter must fail closed in bounded time instead of waiting
+# for that descendant to exit.
+linux_agent_start_session "observer detached output writer test"
+detached_stdout="${tmp_root}/detached.stdout"
+detached_stderr="${tmp_root}/detached.stderr"
+detached_pid_file="${tmp_root}/detached.pid"
+detached_started_at="${SECONDS}"
+detached_meta="$(linux_agent_run_observed_process \
+    "observer_detached_writer" \
+    '{"kind":"detached-writer-test"}' \
+    "${detached_stdout}" \
+    "${detached_stderr}" \
+    -- python3 -c '
+import os
+import sys
+import time
+
+child = os.fork()
+if child == 0:
+    os.setsid()
+    with open(sys.argv[1], "w", encoding="ascii") as handle:
+        handle.write(str(os.getpid()))
+    time.sleep(12)
+    os._exit(0)
+os._exit(0)
+' "${detached_pid_file}")"
+detached_elapsed=$((SECONDS - detached_started_at))
+[[ "${detached_elapsed}" -lt 8 ]]
+jq -e '.exit_code == 125
+    and .output_integrity_unknown == true
+    and .output_capped == false
+    and .observer.status == "guard_unavailable"' <<<"${detached_meta}" >/dev/null
+grep -q 'output integrity is unknown' "${detached_stderr}"
+[[ -s "${detached_pid_file}" ]]
+kill -KILL "$(<"${detached_pid_file}")" >/dev/null 2>&1 || true
+linux_agent_finish_session "invalid_output"
+
 fake_bin="${tmp_root}/fake-bin"
 mkdir -p "${fake_bin}"
 audit_calls="${tmp_root}/audit.calls"
@@ -763,5 +801,38 @@ jq -e '
 [[ ! -e "${execution_start_marker}" ]]
 grep -qx 'execution_started' "${audit_stage_calls}"
 unset TEST_AUDIT_FAIL_STAGE
+
+# The production non-root path must use the structured helper protocol and must
+# respect observer.privilege=none without falling back to helper or sudo.
+(
+    helper_calls="${tmp_root}/observer-helper.calls"
+    : >"${helper_calls}"
+    LINUX_AGENT_CONFIG_JSON="$(jq '.observer.enabled="auto" | .observer.privilege="sudo_interactive"' <<<"${LINUX_AGENT_CONFIG_JSON}")"
+    linux_agent_observer_helper_available() {
+        return 0
+    }
+    linux_agent_observer_helper_request() {
+        printf '%s\n' "$*" >>"${helper_calls}"
+        [[ "$1" != "status" ]] || printf 'enabled 1\n'
+    }
+    helper_preflight="$(linux_agent_observer_preflight)"
+    jq -e '.available == true and .privilege == "helper"' <<<"${helper_preflight}" >/dev/null
+    linux_agent_observer_install_syscall_rule 1001 linux_agent_test_key execve
+    linux_agent_observer_remove_syscall_rule 1001 linux_agent_test_key execve
+    linux_agent_observer_list_rules linux_agent_test_key >/dev/null
+    linux_agent_observer_ausearch -k linux_agent_test_key >/dev/null
+    grep -qx 'status' "${helper_calls}"
+    grep -qx 'add_rule --audit-uid 1001 --key linux_agent_test_key --syscall execve' "${helper_calls}"
+    grep -qx 'remove_rule --audit-uid 1001 --key linux_agent_test_key --syscall execve' "${helper_calls}"
+    grep -qx 'list_rules --key linux_agent_test_key' "${helper_calls}"
+    grep -qx 'search_key --key linux_agent_test_key' "${helper_calls}"
+
+    : >"${helper_calls}"
+    LINUX_AGENT_CONFIG_JSON="$(jq '.observer.privilege="none"' <<<"${LINUX_AGENT_CONFIG_JSON}")"
+    disabled_preflight="$(linux_agent_observer_preflight)"
+    jq -e '.available == false and .privilege == "none" and .reason_code == "observer_privilege_disabled"' \
+        <<<"${disabled_preflight}" >/dev/null
+    [[ ! -s "${helper_calls}" ]]
+)
 
 printf 'observer: ok\n'

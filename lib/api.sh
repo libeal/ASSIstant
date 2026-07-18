@@ -470,6 +470,7 @@ linux_agent_api_script_review() {
     material="$(printf 'skill_script=%s\narguments=%s\n%s\n' "${ref}" "${args}" "$(linux_agent_skill_script_content "${ref}")")"
     review="$(linux_agent_policy_review_text "script:${ref}" "${material}")"
     review="$(linux_agent_review_with_declared_skill_risk "${ref}" "${review}")"
+    review="$(linux_agent_backup_policy_review "${ref}" "${args}" "${review}")"
     jq -cn --arg ref "${ref}" --argjson arguments "${args}" --argjson review "${review}" --argjson output_blocks "$(linux_agent_output_blocks_from_review "${review}")" \
         '{
             ok:(($review.approved // false) == true),

@@ -3,6 +3,7 @@
 set -euo pipefail
 
 LINUX_AGENT_CONVERSATION_HISTORY='[]'
+LINUX_AGENT_HISTORY_MAX_BYTES=8388608
 
 linux_agent_context_turns() {
     linux_agent_config_get_default '.context_turns' '6'
@@ -29,25 +30,36 @@ linux_agent_conversation_history_file() {
 }
 
 linux_agent_load_conversation_history() {
-    local history_file
+    local history_file history_size
     history_file="$(linux_agent_conversation_history_file 2>/dev/null || true)"
     if [[ -z "${history_file}" || ! -f "${history_file}" ]]; then
         LINUX_AGENT_CONVERSATION_HISTORY='[]'
         return 0
     fi
+    history_size="$(stat -c '%s' "${history_file}" 2>/dev/null || printf '0')"
+    if [[ ! "${history_size}" =~ ^[0-9]+$ || "${history_size}" -gt "${LINUX_AGENT_HISTORY_MAX_BYTES}" ]]; then
+        linux_agent_print_error "会话历史超过 ${LINUX_AGENT_HISTORY_MAX_BYTES} 字节上限。"
+        return 1
+    fi
     if jq -e 'type == "array"' "${history_file}" >/dev/null 2>&1; then
         LINUX_AGENT_CONVERSATION_HISTORY="$(jq -c . "${history_file}")"
     else
-        LINUX_AGENT_CONVERSATION_HISTORY='[]'
+        linux_agent_print_error "会话历史不是合法 JSON array：${history_file}"
+        return 1
     fi
 }
 
 linux_agent_persist_conversation_history() {
-    local history_file dir tmp_file
+    local history_file dir tmp_file history_size
     history_file="$(linux_agent_conversation_history_file 2>/dev/null || true)"
     [[ -n "${history_file}" ]] || return 0
     dir="$(dirname "${history_file}")"
     mkdir -p "${dir}"
+    history_size="$(printf '%s' "${LINUX_AGENT_CONVERSATION_HISTORY}" | wc -c | tr -d ' ')"
+    if [[ ! "${history_size}" =~ ^[0-9]+$ || "${history_size}" -gt "${LINUX_AGENT_HISTORY_MAX_BYTES}" ]]; then
+        linux_agent_print_error "会话历史超过 ${LINUX_AGENT_HISTORY_MAX_BYTES} 字节上限，拒绝持久化。"
+        return 1
+    fi
     tmp_file="${history_file}.$$.$RANDOM.tmp"
     if ! (umask 077 && printf '%s\n' "${LINUX_AGENT_CONVERSATION_HISTORY}" >"${tmp_file}"); then
         rm -f "${tmp_file}"
@@ -131,7 +143,7 @@ linux_agent_normalized_conversation_history() {
 
 linux_agent_history_window() {
     local turns
-    linux_agent_load_conversation_history
+    linux_agent_load_conversation_history || return $?
     LINUX_AGENT_CONVERSATION_HISTORY="$(linux_agent_normalized_conversation_history)"
     turns="$(linux_agent_context_turns)"
     if [[ ! "${turns}" =~ ^[0-9]+$ ]]; then
@@ -169,8 +181,14 @@ linux_agent_record_conversation_turn() {
         linux_agent_audit_require_event "history_write_started" "${audit_payload}" || return $?
     fi
 
-    lock_dir="$(linux_agent_history_lock_acquire 2>/dev/null || true)"
-    linux_agent_load_conversation_history
+    if ! lock_dir="$(linux_agent_history_lock_acquire 2>/dev/null)"; then
+        linux_agent_print_error "无法获取会话历史写锁。"
+        return 1
+    fi
+    linux_agent_load_conversation_history || {
+        linux_agent_history_lock_release "${lock_dir}"
+        return 1
+    }
     LINUX_AGENT_CONVERSATION_HISTORY="$(linux_agent_normalized_conversation_history)"
     normalized_history="${LINUX_AGENT_CONVERSATION_HISTORY}"
     request_content="$(linux_agent_sanitize_text "${request_content}")"
@@ -201,7 +219,18 @@ linux_agent_record_conversation_turn() {
             else {}
             end
         ))]')"
-    linux_agent_persist_conversation_history
+    if [[ -z "${LINUX_AGENT_JOB_ID:-}" ]]; then
+        local context_limit
+        context_limit="$(linux_agent_context_turns)"
+        [[ "${context_limit}" =~ ^[0-9]+$ ]] || context_limit=6
+        LINUX_AGENT_CONVERSATION_HISTORY="$(jq -c --argjson limit "${context_limit}" \
+            'if $limit == 0 then [] else .[-$limit:] end' \
+            <<<"${LINUX_AGENT_CONVERSATION_HISTORY}")"
+    fi
+    if ! linux_agent_persist_conversation_history; then
+        linux_agent_history_lock_release "${lock_dir}"
+        return 1
+    fi
     linux_agent_history_lock_release "${lock_dir}"
 }
 
@@ -210,8 +239,14 @@ linux_agent_record_turn() {
     local content="$2"
     local status="${3:-}"
     local lock_dir
-    lock_dir="$(linux_agent_history_lock_acquire 2>/dev/null || true)"
-    linux_agent_load_conversation_history
+    if ! lock_dir="$(linux_agent_history_lock_acquire 2>/dev/null)"; then
+        linux_agent_print_error "无法获取会话历史写锁。"
+        return 1
+    fi
+    linux_agent_load_conversation_history || {
+        linux_agent_history_lock_release "${lock_dir}"
+        return 1
+    }
     content="$(linux_agent_sanitize_text "${content}")"
     LINUX_AGENT_CONVERSATION_HISTORY="$(jq -cn \
         --argjson prior "${LINUX_AGENT_CONVERSATION_HISTORY}" \
@@ -220,7 +255,18 @@ linux_agent_record_turn() {
         --arg status "${status}" \
         --arg ts "$(linux_agent_now_iso)" \
         '$prior + [{role:$role, content:$content, status:$status, timestamp:$ts}]')"
-    linux_agent_persist_conversation_history
+    if [[ -z "${LINUX_AGENT_JOB_ID:-}" ]]; then
+        local context_limit
+        context_limit="$(linux_agent_context_turns)"
+        [[ "${context_limit}" =~ ^[0-9]+$ ]] || context_limit=6
+        LINUX_AGENT_CONVERSATION_HISTORY="$(jq -c --argjson limit "${context_limit}" \
+            'if $limit == 0 then [] else .[-$limit:] end' \
+            <<<"${LINUX_AGENT_CONVERSATION_HISTORY}")"
+    fi
+    if ! linux_agent_persist_conversation_history; then
+        linux_agent_history_lock_release "${lock_dir}"
+        return 1
+    fi
     linux_agent_history_lock_release "${lock_dir}"
 }
 

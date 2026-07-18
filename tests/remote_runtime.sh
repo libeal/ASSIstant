@@ -3,6 +3,8 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# shellcheck source=tests/cosign_compat.sh
+source "${ROOT_DIR}/tests/cosign_compat.sh"
 tmp_root="$(mktemp -d)"
 web_pid=""
 release_http_pid=""
@@ -89,13 +91,28 @@ set -e
 [[ "${required_signature_status}" -ne 0 ]]
 grep -Eq '签名 bundle 下载失败|未安装 cosign' "${tmp_root}/required-signature.stderr"
 
+set +e
 piped_doctor_json="$(curl -fsSL "file://${release_dir}/linux-agent-cli.sh" |
     XDG_RUNTIME_DIR="${runtime_base}" \
         LINUX_AGENT_ALLOW_INSECURE_TEST_URL=1 \
         LINUX_AGENT_RELEASE_BASE_URL="file://${release_dir}" \
         bash -s -- doctor)"
-jq -e '.ok == true and .remote.enabled == true' <<<"${piped_doctor_json}" >/dev/null
-[[ -z "$(find "${runtime_base}" -mindepth 1 -maxdepth 1 -print -quit)" ]]
+piped_doctor_status="$?"
+set -e
+if [[ "${piped_doctor_status}" -ne 0 ]]; then
+    printf 'piped Remote doctor failed with status %s; stdout: %s\n' \
+        "${piped_doctor_status}" "${piped_doctor_json}" >&2
+    exit 1
+fi
+if ! jq -e '.ok == true and .remote.enabled == true' <<<"${piped_doctor_json}" >/dev/null; then
+    printf 'piped Remote doctor returned an invalid response: %s\n' "${piped_doctor_json}" >&2
+    exit 1
+fi
+if [[ -n "$(find "${runtime_base}" -mindepth 1 -maxdepth 1 -print -quit)" ]]; then
+    printf 'piped Remote doctor left runtime artifacts:\n' >&2
+    find "${runtime_base}" -mindepth 1 -maxdepth 3 -print >&2
+    exit 1
+fi
 
 web_stdout="${tmp_root}/remote-web.stdout"
 web_stderr="${tmp_root}/remote-web.stderr"
@@ -120,7 +137,11 @@ for _ in $(seq 1 100); do
     fi
     sleep 0.1
 done
-[[ -n "${web_token}" ]]
+if [[ -z "${web_token}" ]]; then
+    printf 'remote Web did not become healthy; stderr:\n' >&2
+    sed -n '1,200p' "${web_stderr}" >&2
+    exit 1
+fi
 if grep -Fq -- "${web_token}" "${web_stdout}" "${web_stderr}"; then
     printf 'remote Web token was echoed to stdout/stderr\n' >&2
     exit 1
@@ -186,7 +207,11 @@ for _ in $(seq 1 100); do
     fi
     sleep 0.1
 done
-[[ -n "${signal_token}" ]]
+if [[ -z "${signal_token}" ]]; then
+    printf 'remote Web signal test did not become healthy; stderr:\n' >&2
+    sed -n '1,200p' "${signal_stderr}" >&2
+    exit 1
+fi
 kill -TERM "${web_pid}"
 set +e
 wait "${web_pid}"
@@ -259,8 +284,8 @@ if command -v cosign >/dev/null 2>&1; then
     (
         cd "${cosign_dir}"
         COSIGN_PASSWORD=remote-runtime-test cosign generate-key-pair >/dev/null
-        COSIGN_PASSWORD=remote-runtime-test cosign sign-blob --yes --tlog-upload=false --key cosign.key \
-            --bundle "${signed_release}/release-manifest.json.sigstore.json" \
+        COSIGN_PASSWORD=remote-runtime-test linux_agent_test_cosign_sign_blob \
+            cosign.key "${signed_release}/release-manifest.json.sigstore.json" \
             "${signed_release}/release-manifest.json" >/dev/null
     )
     signed_doctor="$(XDG_RUNTIME_DIR="${runtime_base}" \

@@ -4,6 +4,7 @@ set -euo pipefail
 
 LINUX_AGENT_LAST_AI_PAYLOAD=""
 LINUX_AGENT_AI_FILE_MANIFEST='[]'
+LINUX_AGENT_AI_RESPONSE_MAX_BYTES=1048576
 
 linux_agent_ai_file_metadata() {
     local path="$1"
@@ -228,9 +229,9 @@ linux_agent_normalize_model_response() {
     printf '%s\n' "${response_json}"
 }
 
-linux_agent_ai_provider_id() {
-    local provider normalized schema_file result
-    provider="$(linux_agent_config_get '.provider')"
+linux_agent_ai_normalize_provider_id() {
+    local provider="$1"
+    local normalized schema_file result
     normalized="$(printf '%s' "${provider,,}" | sed -E 's#[-[:space:]/]+#_#g')"
 
     schema_file="${LINUX_AGENT_ROOT}/schema/domain.json"
@@ -271,6 +272,10 @@ linux_agent_ai_provider_id() {
             printf '%s\n' "${normalized}"
             ;;
     esac
+}
+
+linux_agent_ai_provider_id() {
+    linux_agent_ai_normalize_provider_id "$(linux_agent_config_get '.provider')"
 }
 
 linux_agent_ai_validate_provider_url() {
@@ -386,6 +391,246 @@ linux_agent_ai_response_content() {
     esac
 }
 
+linux_agent_ai_candidates() {
+    local provider_id provider_json api_url model entry key_source key_env
+
+    provider_id="$(linux_agent_ai_provider_id)"
+    provider_json="$(linux_agent_ai_provider_json "${provider_id}")"
+    api_url="$(linux_agent_config_get '.api_url')"
+    [[ -n "${api_url}" ]] || api_url="$(jq -r '.api_url // empty' <<<"${provider_json}")"
+    model="$(linux_agent_config_get '.model')"
+    [[ -n "${model}" ]] || model="$(jq -r '.default_model // empty' <<<"${provider_json}")"
+    jq -cn \
+        --arg role primary \
+        --arg provider_id "${provider_id}" \
+        --arg api_url "${api_url}" \
+        --arg model "${model}" \
+        --arg auth "$(jq -r '.auth // "bearer"' <<<"${provider_json}")" \
+        --arg request_format "$(jq -r '.request_format // "openai_chat"' <<<"${provider_json}")" \
+        '{role:$role,provider_id:$provider_id,api_url:$api_url,model:$model,auth:$auth,request_format:$request_format,key_source:"primary",api_key_env:""}'
+
+    [[ "$(linux_agent_provider_resilience_enabled)" == "true" ]] || return 0
+    while IFS= read -r entry; do
+        [[ -n "${entry}" ]] || continue
+        provider_id="$(linux_agent_ai_normalize_provider_id "$(jq -r '.provider' <<<"${entry}")")"
+        provider_json="$(linux_agent_ai_provider_json "${provider_id}")"
+        api_url="$(jq -r '.api_url // empty' <<<"${entry}")"
+        [[ -n "${api_url}" ]] || api_url="$(jq -r '.api_url // empty' <<<"${provider_json}")"
+        model="$(jq -r '.model // empty' <<<"${entry}")"
+        [[ -n "${model}" ]] || model="$(jq -r '.default_model // empty' <<<"${provider_json}")"
+        if [[ "$(jq -r '.reuse_primary_api_key // false' <<<"${entry}")" == "true" ]]; then
+            key_source="primary"
+            key_env=""
+        else
+            key_source="env"
+            key_env="$(jq -r '.api_key_env // empty' <<<"${entry}")"
+        fi
+        jq -cn \
+            --arg role failover \
+            --arg provider_id "${provider_id}" \
+            --arg api_url "${api_url}" \
+            --arg model "${model}" \
+            --arg auth "$(jq -r '.auth // "bearer"' <<<"${provider_json}")" \
+            --arg request_format "$(jq -r '.request_format // "openai_chat"' <<<"${provider_json}")" \
+            --arg key_source "${key_source}" \
+            --arg api_key_env "${key_env}" \
+            '{role:$role,provider_id:$provider_id,api_url:$api_url,model:$model,auth:$auth,request_format:$request_format,key_source:$key_source,api_key_env:$api_key_env}'
+    done < <(jq -c '.provider_resilience.failover[]? // empty' <<<"${LINUX_AGENT_CONFIG_JSON}")
+}
+
+linux_agent_ai_candidate_error() {
+    local provider_id="$1" status="$2" message="$3" detail="$4"
+    local retryable="$5" allow_failover="$6" attempts="$7"
+    jq -cn \
+        --arg provider_id "${provider_id}" \
+        --arg status "${status}" \
+        --arg error "${message}" \
+        --arg detail "$(linux_agent_sanitize_text "${detail}" 1000)" \
+        --argjson retryable "${retryable}" \
+        --argjson allow_failover "${allow_failover}" \
+        --argjson attempts "${attempts}" \
+        '{
+            ok:false,
+            provider_id:$provider_id,
+            status:$status,
+            error:$error,
+            retryable:$retryable,
+            allow_failover:$allow_failover,
+            attempts:$attempts
+        } + (if $detail == "" then {} else {detail:$detail} end)'
+}
+
+linux_agent_ai_call_candidate() {
+    local candidate="$1" api_key="$2" payload="$3" timeout_sec="$4" max_attempts="$5" resilience_enabled="$6"
+    local provider_id api_url auth_type request_format provider_url_check resolve_entry circuit_key allow_result
+    local attempt curl_status http_status response curl_detail content api_error
+    local failure_status failure_error failure_detail failure_retryable success=false
+    local response_file error_file header_file failure_result
+    local -a provider_url_resolve_args
+
+    provider_id="$(jq -r '.provider_id' <<<"${candidate}")"
+    api_url="$(jq -r '.api_url' <<<"${candidate}")"
+    auth_type="$(jq -r '.auth' <<<"${candidate}")"
+    request_format="$(jq -r '.request_format' <<<"${candidate}")"
+
+    provider_url_check="$(linux_agent_ai_validate_provider_url "${api_url}")"
+    if [[ "$(jq -r '.ok // false' <<<"${provider_url_check}")" != "true" ]]; then
+        linux_agent_ai_candidate_error \
+            "${provider_id}" \
+            "$(jq -r '.status // "provider_security_unavailable"' <<<"${provider_url_check}")" \
+            "$(jq -r '.error // "Provider URL is not allowed."' <<<"${provider_url_check}")" \
+            "" false false 0
+        return 0
+    fi
+    api_url="$(jq -r '.url' <<<"${provider_url_check}")"
+    provider_url_resolve_args=()
+    while IFS= read -r resolve_entry; do
+        [[ -n "${resolve_entry}" ]] || continue
+        provider_url_resolve_args+=(--resolve "${resolve_entry}")
+    done < <(jq -r '.curl_resolve[]? // empty' <<<"${provider_url_check}")
+
+    circuit_key="$(linux_agent_provider_circuit_key "${provider_id}" "${api_url}")"
+    if [[ "${resilience_enabled}" == "true" ]]; then
+        allow_result="$(linux_agent_provider_circuit_action allow "${circuit_key}")"
+        if [[ "$(jq -r '.allowed // false' <<<"${allow_result}" 2>/dev/null)" != "true" ]]; then
+            linux_agent_provider_resilience_event "ai_provider_circuit_open" "$(jq -cn \
+                --arg provider_id "${provider_id}" \
+                --arg state "$(jq -r '.state // "open"' <<<"${allow_result}" 2>/dev/null)" \
+                --argjson retry_after_sec "$(jq -r '.retry_after_sec // 0' <<<"${allow_result}" 2>/dev/null)" \
+                '{provider_id:$provider_id,state:$state,retry_after_sec:$retry_after_sec}')"
+            linux_agent_ai_candidate_error "${provider_id}" "ai_circuit_open" \
+                "AI Provider 熔断器处于开启状态。" \
+                "retry_after_sec=$(jq -r '.retry_after_sec // 0' <<<"${allow_result}" 2>/dev/null)" true true 0
+            return 0
+        fi
+        if [[ "$(jq -r '.state // "closed"' <<<"${allow_result}" 2>/dev/null)" == "half_open" ]]; then
+            linux_agent_provider_resilience_event "ai_provider_circuit_probe" \
+                "$(jq -cn --arg provider_id "${provider_id}" '{provider_id:$provider_id,state:"half_open"}')"
+        fi
+    fi
+
+    header_file="$(mktemp "${LINUX_AGENT_TMP_DIR:-${TMPDIR:-/tmp}}/ai-headers.XXXXXX")"
+    chmod 600 "${header_file}" 2>/dev/null || true
+    printf '%s\n' 'Content-Type: application/json' >"${header_file}"
+    case "${auth_type}" in
+        anthropic)
+            printf 'x-api-key: %s\nanthropic-version: 2023-06-01\n' "${api_key}" >>"${header_file}"
+            ;;
+        api_subscription_key)
+            printf 'api-subscription-key: %s\n' "${api_key}" >>"${header_file}"
+            ;;
+        *)
+            printf 'Authorization: Bearer %s\n' "${api_key}" >>"${header_file}"
+            ;;
+    esac
+
+    for ((attempt = 1; attempt <= max_attempts; attempt++)); do
+        response_file="$(mktemp "${LINUX_AGENT_TMP_DIR:-${TMPDIR:-/tmp}}/ai-response.XXXXXX")"
+        error_file="$(mktemp "${LINUX_AGENT_TMP_DIR:-${TMPDIR:-/tmp}}/ai-error.XXXXXX")"
+        chmod 600 "${response_file}" "${error_file}" 2>/dev/null || true
+        curl_status=0
+        set +e
+        http_status="$(curl -q -sS --noproxy '*' --max-time "${timeout_sec:-90}" \
+            --max-filesize "${LINUX_AGENT_AI_RESPONSE_MAX_BYTES}" \
+            --header "@${header_file}" \
+            "${provider_url_resolve_args[@]}" \
+            --data-binary @- \
+            --output "${response_file}" \
+            --write-out '%{http_code}' \
+            "${api_url}" 2>"${error_file}" <<<"${payload}")"
+        curl_status=$?
+        set -e
+        response="$(<"${response_file}")"
+        curl_detail="$(<"${error_file}")"
+        rm -f "${response_file}" "${error_file}"
+
+        success=false
+        failure_status="ai_request_failed"
+        failure_error="模型请求失败。"
+        failure_detail="${curl_detail}"
+        failure_retryable=false
+
+        if [[ "${curl_status}" -ne 0 ]]; then
+            if [[ "${curl_status}" -eq 63 ]]; then
+                failure_status="ai_response_too_large"
+                failure_error="模型响应超过 ${LINUX_AGENT_AI_RESPONSE_MAX_BYTES} 字节上限，已中止接收。"
+            elif linux_agent_provider_curl_retryable "${curl_status}"; then
+                failure_retryable=true
+            fi
+        elif [[ ! "${http_status}" =~ ^2[0-9]{2}$ ]]; then
+            api_error="$(jq -r '.error.message // empty' <<<"${response}" 2>/dev/null || true)"
+            failure_detail="${api_error:-${response}}"
+            if [[ "${http_status}" == "401" || "${http_status}" == "403" ]]; then
+                failure_status="ai_auth_failed"
+                failure_error="AI Provider 拒绝了认证凭据。"
+            else
+                failure_status="ai_http_error"
+                failure_error="AI Provider 返回 HTTP ${http_status:-unknown}。"
+                if linux_agent_provider_http_retryable "${http_status}"; then
+                    failure_retryable=true
+                fi
+            fi
+        elif ! content="$(linux_agent_ai_response_content "${request_format}" "${response}")"; then
+            failure_status="ai_invalid_response"
+            failure_error="模型接口返回的响应不是合法 JSON。"
+            failure_detail="${response}"
+            failure_retryable=true
+        elif [[ -z "${content}" ]]; then
+            api_error="$(jq -r '.error.message // empty' <<<"${response}" 2>/dev/null || true)"
+            failure_status="ai_empty_response"
+            failure_error="模型返回为空。"
+            failure_detail="${api_error:-${response}}"
+            failure_retryable=true
+        elif ! jq -e . <<<"${content}" >/dev/null 2>&1; then
+            failure_status="ai_invalid_json"
+            failure_error="模型返回的 content 不是合法 JSON。"
+            failure_detail="${content}"
+            failure_retryable=true
+        else
+            success=true
+        fi
+
+        if [[ "${success}" == "true" ]]; then
+            if [[ "${resilience_enabled}" == "true" ]]; then
+                linux_agent_provider_circuit_action success "${circuit_key}" >/dev/null || true
+            fi
+            jq -cn \
+                --arg provider_id "${provider_id}" \
+                --argjson attempts "${attempt}" \
+                --argjson content "${content}" \
+                '{ok:true,provider_id:$provider_id,attempts:$attempts,content:$content}'
+            rm -f "${header_file}"
+            return 0
+        fi
+
+        if [[ "${failure_retryable}" == "true" && "${resilience_enabled}" == "true" ]]; then
+            failure_result="$(linux_agent_provider_circuit_action failure "${circuit_key}")"
+            if [[ "$(jq -r '.state // "closed"' <<<"${failure_result}" 2>/dev/null)" == "open" ]]; then
+                linux_agent_provider_resilience_event "ai_provider_circuit_opened" "$(jq -cn \
+                    --arg provider_id "${provider_id}" \
+                    --argjson failures "$(jq -r '.failures // 0' <<<"${failure_result}" 2>/dev/null)" \
+                    '{provider_id:$provider_id,failures:$failures}')"
+            fi
+        fi
+        if [[ "${failure_retryable}" == "true" && "${attempt}" -lt "${max_attempts}" ]]; then
+            linux_agent_provider_resilience_event "ai_provider_retry" "$(jq -cn \
+                --arg provider_id "${provider_id}" \
+                --arg status "${failure_status}" \
+                --arg http_status "${http_status:-}" \
+                --argjson attempt "${attempt}" \
+                --argjson next_attempt "$((attempt + 1))" \
+                '{provider_id:$provider_id,status:$status,http_status:(if $http_status == "" then null else $http_status end),attempt:$attempt,next_attempt:$next_attempt}')"
+            linux_agent_provider_backoff_sleep "${attempt}"
+            continue
+        fi
+
+        linux_agent_ai_candidate_error "${provider_id}" "${failure_status}" "${failure_error}" \
+            "${failure_detail}" "${failure_retryable}" "${failure_retryable}" "${attempt}"
+        rm -f "${header_file}"
+        return 0
+    done
+}
+
 linux_agent_call_ai_with_context() {
     local current_request="$1"
     local request_context="$2"
@@ -409,92 +654,89 @@ linux_agent_call_ai_with_context() {
     payload_context="$(linux_agent_build_ai_payload_context "${safe_request_context}" "${runtime_context}")"
     payload_context="$(jq -c --arg current_request "${safe_current_request}" '.current_request = $current_request' <<<"${payload_context}")"
 
-    local provider_id provider_json request_format auth_type
-    provider_id="$(linux_agent_ai_provider_id)"
-    provider_json="$(linux_agent_ai_provider_json "${provider_id}")"
-    request_format="$(jq -r '.request_format // "openai_chat"' <<<"${provider_json}")"
-    auth_type="$(jq -r '.auth // "bearer"' <<<"${provider_json}")"
+    local primary_api_key timeout_sec system_prompt resilience_enabled max_attempts
+    local candidate candidate_result api_key key_source key_env api_url model request_format payload
+    local last_result='' attempted=0 candidate_index=0
+    local -a candidates
 
-    local api_url api_key model timeout_sec system_prompt payload response content provider_url_check resolve_entry
-    local -a provider_url_resolve_args
-    api_url="$(linux_agent_config_get '.api_url')"
-    if [[ -z "${api_url}" ]]; then
-        api_url="$(jq -r '.api_url // empty' <<<"${provider_json}")"
-    fi
-    provider_url_check="$(linux_agent_ai_validate_provider_url "${api_url}")"
-    if [[ "$(jq -r '.ok // false' <<<"${provider_url_check}")" != "true" ]]; then
-        linux_agent_ai_error \
-            "$(jq -r '.status // "provider_security_unavailable"' <<<"${provider_url_check}")" \
-            "$(jq -r '.error // "Provider URL is not allowed."' <<<"${provider_url_check}")"
-        return 0
-    fi
-    api_url="$(jq -r '.url' <<<"${provider_url_check}")"
-    provider_url_resolve_args=()
-    while IFS= read -r resolve_entry; do
-        [[ -n "${resolve_entry}" ]] || continue
-        provider_url_resolve_args+=(--resolve "${resolve_entry}")
-    done < <(jq -r '.curl_resolve[]? // empty' <<<"${provider_url_check}")
-    api_key="$(linux_agent_config_api_key)"
-    model="$(linux_agent_config_get '.model')"
-    if [[ -z "${model}" ]]; then
-        model="$(jq -r '.default_model // empty' <<<"${provider_json}")"
-    fi
+    primary_api_key="$(linux_agent_config_api_key)"
     timeout_sec="$(linux_agent_config_get_default '.request_timeout_sec' '90')"
     system_prompt="$(linux_agent_build_system_prompt | jq -r '.')"
-
-    if [[ -z "${api_url}" || -z "${api_key}" || -z "${model}" || "${api_key}" == "please-set-your-api-key" ]]; then
-        linux_agent_ai_error "ai_config_missing" "AI 配置不完整，请配置 api_url、api_key 和 model。"
-        return 0
+    resilience_enabled="$(linux_agent_provider_resilience_enabled)"
+    if [[ "${resilience_enabled}" == "true" ]]; then
+        max_attempts="$(linux_agent_provider_resilience_int max_attempts 3 1 5)"
+    else
+        max_attempts=1
     fi
+    mapfile -t candidates < <(linux_agent_ai_candidates)
 
-    payload="$(linux_agent_ai_build_payload "${request_format}" "${model}" "${system_prompt}" "${purpose}" "${payload_context}")"
-    # Callers that source this module may inspect the last payload for security
-    # assertions; it is also explicitly removed from child process environments.
-    # shellcheck disable=SC2034
-    LINUX_AGENT_LAST_AI_PAYLOAD="${payload}"
-
-    local -a curl_headers
-    curl_headers=(-H "Content-Type: application/json")
-    case "${auth_type}" in
-        anthropic)
-            curl_headers+=(-H "x-api-key: ${api_key}" -H "anthropic-version: 2023-06-01")
-            ;;
-        api_subscription_key)
-            curl_headers+=(-H "api-subscription-key: ${api_key}")
-            ;;
-        *)
-            curl_headers+=(-H "Authorization: Bearer ${api_key}")
-            ;;
-    esac
-
-    if ! response="$(curl -sS --noproxy '*' --max-time "${timeout_sec:-90}" \
-        "${curl_headers[@]}" \
-        "${provider_url_resolve_args[@]}" \
-        -d "${payload}" \
-        "${api_url}" 2>&1)"; then
-        linux_agent_ai_error "ai_request_failed" "模型请求失败。" "${response}"
-        return 0
-    fi
-
-    if ! content="$(linux_agent_ai_response_content "${request_format}" "${response}")"; then
-        linux_agent_ai_error "ai_invalid_response" "模型接口返回的响应不是合法 JSON。" "${response}"
-        return 0
-    fi
-    if [[ -z "${content}" ]]; then
-        local api_error
-        api_error="$(jq -r '.error.message // empty' <<<"${response}" 2>/dev/null || true)"
-        if [[ -n "${api_error}" ]]; then
-            linux_agent_ai_error "ai_empty_response" "模型返回为空。" "${api_error}"
+    for candidate in "${candidates[@]}"; do
+        key_source="$(jq -r '.key_source' <<<"${candidate}")"
+        key_env="$(jq -r '.api_key_env' <<<"${candidate}")"
+        api_url="$(jq -r '.api_url' <<<"${candidate}")"
+        model="$(jq -r '.model' <<<"${candidate}")"
+        request_format="$(jq -r '.request_format' <<<"${candidate}")"
+        if [[ "${key_source}" == "env" ]]; then
+            api_key="${!key_env-}"
         else
-            linux_agent_ai_error "ai_empty_response" "模型返回为空。" "${response}"
+            api_key="${primary_api_key}"
         fi
-        return 0
-    fi
 
-    if ! jq -e . <<<"${content}" >/dev/null 2>&1; then
-        linux_agent_ai_error "ai_invalid_json" "模型返回的 content 不是合法 JSON。" "${content}"
-        return 0
-    fi
+        if [[ -z "${api_url}" || -z "${api_key}" || -z "${model}" ||
+            "${api_key}" == *$'\n'* || "${api_key}" == *$'\r'* ]] ||
+            linux_agent_config_api_key_placeholder "${api_key}"; then
+            if [[ "$(jq -r '.role' <<<"${candidate}")" == "primary" ]]; then
+                linux_agent_ai_error "ai_config_missing" "AI 配置不完整，请配置 api_url、api_key 和 model。"
+                return 0
+            fi
+            linux_agent_provider_resilience_event "ai_provider_failover_skipped" "$(jq -cn \
+                --arg provider_id "$(jq -r '.provider_id' <<<"${candidate}")" \
+                --arg reason "candidate_config_missing" \
+                '{provider_id:$provider_id,reason:$reason}')"
+            candidate_index=$((candidate_index + 1))
+            continue
+        fi
 
-    jq -c . <<<"${content}"
+        payload="$(linux_agent_ai_build_payload "${request_format}" "${model}" "${system_prompt}" "${purpose}" "${payload_context}")"
+        # Sourced callers inspect this for secret-leakage assertions. It contains
+        # request data but never authentication material.
+        # shellcheck disable=SC2034
+        LINUX_AGENT_LAST_AI_PAYLOAD="${payload}"
+        attempted=$((attempted + 1))
+        candidate_result="$(linux_agent_ai_call_candidate \
+            "${candidate}" "${api_key}" "${payload}" "${timeout_sec}" "${max_attempts}" "${resilience_enabled}")"
+        if [[ "$(jq -r '.ok // false' <<<"${candidate_result}")" == "true" ]]; then
+            jq -c '.content' <<<"${candidate_result}"
+            return 0
+        fi
+        last_result="${candidate_result}"
+
+        if [[ "$(jq -r '.allow_failover // false' <<<"${candidate_result}")" != "true" ]]; then
+            linux_agent_ai_error \
+                "$(jq -r '.status // "ai_request_failed"' <<<"${candidate_result}")" \
+                "$(jq -r '.error // "模型请求失败。"' <<<"${candidate_result}")" \
+                "$(jq -r '.detail // empty' <<<"${candidate_result}")"
+            return 0
+        fi
+        if [[ "${candidate_index}" -lt "$((${#candidates[@]} - 1))" ]]; then
+            linux_agent_provider_resilience_event "ai_provider_failover" "$(jq -cn \
+                --arg from_provider "$(jq -r '.provider_id' <<<"${candidate}")" \
+                --arg status "$(jq -r '.status' <<<"${candidate_result}")" \
+                --argjson attempts "$(jq -r '.attempts // 0' <<<"${candidate_result}")" \
+                '{from_provider:$from_provider,status:$status,attempts:$attempts}')"
+        fi
+        candidate_index=$((candidate_index + 1))
+    done
+
+    if [[ -n "${last_result}" && "${#candidates[@]}" -le 1 ]]; then
+        linux_agent_ai_error \
+            "$(jq -r '.status // "ai_request_failed"' <<<"${last_result}")" \
+            "$(jq -r '.error // "模型请求失败。"' <<<"${last_result}")" \
+            "$(jq -r '.detail // empty' <<<"${last_result}")"
+    elif [[ -n "${last_result}" ]]; then
+        linux_agent_ai_error "ai_failover_exhausted" "所有已配置的 AI Provider 均调用失败。" \
+            "last_provider=$(jq -r '.provider_id // "unknown"' <<<"${last_result}"); last_status=$(jq -r '.status // "ai_request_failed"' <<<"${last_result}"); attempted=${attempted}"
+    else
+        linux_agent_ai_error "ai_config_missing" "没有可用的 AI Provider 配置。"
+    fi
 }

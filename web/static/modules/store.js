@@ -1,4 +1,6 @@
-/** @returns {Record<string, any>} */
+/** @typedef {import("./types.js").AppState} AppState */
+
+/** @returns {AppState} */
 export function createInitialState() {
   return {
     token: localStorage.getItem("linuxAgentToken") || "",
@@ -62,10 +64,11 @@ export function createInitialState() {
 
 /**
  * Create a shallow observable store for modules that do not need a reducer.
- * @param {Record<string, any>} initialState
- * @returns {{get: () => Record<string, any>, set: (patch: object|Function) => Record<string, any>, subscribe: (listener: Function) => Function}}
+ * @template {Record<string, unknown>} T
+ * @param {T} initialState
+ * @returns {{get: () => T, set: (patch: Partial<T>|((value: T) => Partial<T>)) => T, subscribe: (listener: (value: T, previous: T) => void) => () => boolean}}
  */
-export function createStore(initialState = {}) {
+export function createStore(initialState = /** @type {T} */ ({})) {
   let value = { ...initialState };
   const listeners = new Set();
 

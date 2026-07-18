@@ -2,10 +2,13 @@ import { $, on } from "./dom.js";
 import { THINKING_TRACE_KEY } from "./constants.js";
 import { configInputId } from "./config-utils.js";
 
+/** @typedef {import("./types.js").ApplicationController} ApplicationController */
+/** @typedef {import("./types.js").AppState} AppState */
+
 /**
  * Wire DOM event handlers. Handlers live on the shared app bag.
- * @param {any} app
- * @param {{ safeAction: Function, showScreen: Function, connect: Function, shutdownServer: Function, state: Record<string, any> }} shell
+ * @param {ApplicationController} app
+ * @param {{ safeAction: Function, showScreen: Function, connect: Function, shutdownServer: Function, state: AppState }} shell
  * @returns {void}
  */
 export function bindApplicationEvents(app, shell) {

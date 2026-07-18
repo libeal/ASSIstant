@@ -19,26 +19,22 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  build-and-release:
-    runs-on: ubuntu-latest
+  quality:
+    runs-on: ubuntu-24.04
     permissions:
-      contents: write
-      id-token: write
-      attestations: write
+      contents: read
     env:
       RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
     steps:
-      - name: Check out release tooling for manual reruns
-        if: ${{ github.event_name == 'workflow_dispatch' }}
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-        with:
-          ref: ${{ github.ref }}
-
-      - name: Preserve release publisher for manual reruns
+      - name: Require the selected tag ref for manual releases
         if: ${{ github.event_name == 'workflow_dispatch' }}
         run: |
-          cp scripts/publish-remote-release.sh "${RUNNER_TEMP}/publish-remote-release.sh"
-          cp scripts/prepare-release-signature.sh "${RUNNER_TEMP}/prepare-release-signature.sh"
+          set -euo pipefail
+          expected_ref="refs/tags/${RELEASE_TAG}"
+          if [[ "${GITHUB_REF}" != "${expected_ref}" ]]; then
+            echo "::error title=Wrong workflow ref::Select ${expected_ref} in the Run workflow ref picker; current ref is ${GITHUB_REF}"
+            exit 1
+          fi
 
       - name: Check out tagged source
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
@@ -52,23 +48,29 @@ jobs:
             exit 1
           fi
 
-      - name: Install lint tooling
+      - name: Install quality tooling
         run: |
+          set -euo pipefail
           sudo apt-get update
-          sudo apt-get install -y shellcheck
-          # shfmt via Go module cache is optional; skip if unavailable.
-          curl -fsSL https://github.com/mvdan/sh/releases/download/v3.8.0/shfmt_v3.8.0_linux_amd64 -o /usr/local/bin/shfmt \
-            && chmod +x /usr/local/bin/shfmt || echo "shfmt install skipped"
-          python3 -m pip install --quiet pyflakes || echo "pyflakes install skipped"
+          sudo apt-get install -y shellcheck shfmt python3-pyflakes
+          npm install --global 'typescript@5.7.3'
+          command -v shfmt
+          shfmt -version
+          command -v tsc
+          tsc --version
+          python3 -c 'import pyflakes; print(pyflakes.__version__)'
+
+      - name: Install cosign for compatibility regressions
+        uses: sigstore/cosign-installer@d58896d6a1865668819e1d91763c7751a165e159 # v3.9.2
+        with:
+          cosign-release: v3.1.1
 
       - name: Run syntax and lint checks
         run: bash scripts/lint.sh
 
-      - name: Install cosign
-        uses: sigstore/cosign-installer@d58896d6a1865668819e1d91763c7751a165e159 # v3.9.2
-
       - name: Run regression suite
         run: |
+          set -euo pipefail
           for test_file in \
             tests/policy.sh \
             tests/tools.sh \
@@ -90,23 +92,71 @@ jobs:
             tests/backup.sh \
             tests/install.sh; do
             echo "::group::${test_file}"
-            if ! bash "${test_file}"; then
-              echo "::error title=Regression failed::${test_file} failed"
-              exit 1
-            fi
+            bash "${test_file}"
             echo "::endgroup::"
           done
 
-          python3 -m unittest discover -s tests -p 'test_web_*.py' -v
+          python3 -m unittest discover -s tests -p 'test_*.py' -v
           bash tests/web_frontend.sh
 
-          # Optional coverage report (no threshold / non-gating).
-          if python3 -m pip install --user coverage >/dev/null 2>&1; then
-            python3 -m coverage run -m unittest discover -s tests -p 'test_web_*.py' -q
-            python3 -m coverage report || true
-          else
-            echo 'coverage package unavailable; skipping optional report'
+      - name: Report optional Python coverage
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          sudo apt-get install -y python3-coverage
+          python3 -m coverage run -m unittest discover -s tests -p 'test_web_*.py' -q
+          python3 -m coverage report
+
+  build-and-release:
+    needs: quality
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    env:
+      RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+    steps:
+      - name: Require the selected tag ref for manual releases
+        if: ${{ github.event_name == 'workflow_dispatch' }}
+        run: |
+          set -euo pipefail
+          expected_ref="refs/tags/${RELEASE_TAG}"
+          if [[ "${GITHUB_REF}" != "${expected_ref}" ]]; then
+            echo "::error title=Wrong workflow ref::Select ${expected_ref} in the Run workflow ref picker; current ref is ${GITHUB_REF}"
+            exit 1
           fi
+
+      - name: Check out release tooling for manual reruns
+        if: ${{ github.event_name == 'workflow_dispatch' }}
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+
+      - name: Preserve release publisher for manual reruns
+        if: ${{ github.event_name == 'workflow_dispatch' }}
+        run: |
+          cp scripts/publish-remote-release.sh "${RUNNER_TEMP}/publish-remote-release.sh"
+          cp scripts/prepare-release-signature.sh "${RUNNER_TEMP}/prepare-release-signature.sh"
+
+      - name: Check out tagged source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ inputs.tag || github.ref_name }}
+
+      - name: Validate release tag
+        run: |
+          if [[ ! "${RELEASE_TAG}" =~ ^v[0-9A-Za-z][0-9A-Za-z._-]*$ ]]; then
+            echo "::error title=Invalid release tag::${RELEASE_TAG}"
+            exit 1
+          fi
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@d58896d6a1865668819e1d91763c7751a165e159 # v3.9.2
+        with:
+          # Pin CLI used for release signing; keep local/CI verification aligned.
+          cosign-release: v3.1.1
+
 
       - name: Build deterministic remote assets
         env:

@@ -62,10 +62,10 @@ linux_agent_audit_writer_stop() {
         return 0
     fi
     if [[ -n "${input_fd}" ]]; then
-        exec {input_fd}>&- 2>/dev/null || true
+        { exec {input_fd}>&-; } 2>/dev/null || true
     fi
     if [[ -n "${output_fd}" ]]; then
-        exec {output_fd}<&- 2>/dev/null || true
+        { exec {output_fd}<&-; } 2>/dev/null || true
     fi
     if [[ -n "${writer_pid}" ]]; then
         wait "${writer_pid}" 2>/dev/null || true
@@ -424,6 +424,7 @@ linux_agent_audit_boundary_default_config() {
       "terminal_executed",
       "edit_*",
       "ai_files_manifest",
+      "ai_provider_*",
       "execution_started",
       "execution_finished",
       "observer_*",
@@ -496,6 +497,7 @@ linux_agent_audit_boundary_default_config() {
       "edit_*",
       "script_manual_edit",
       "ai_files_manifest",
+      "ai_provider_*",
       "execution_started",
       "execution_finished",
       "observer_*",

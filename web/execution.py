@@ -23,6 +23,7 @@ from typing import Optional
 
 DEFAULT_STDERR_TEXT_LIMIT = 4000
 WORK_EXECUTION_FLOW_TEXT_LIMIT = 200000
+DEFAULT_OUTPUT_BYTE_LIMIT = 1_048_576
 API_KEY_ACTIONS = frozenset({("work", "run"), ("edit", "plan")})
 LINUX_PARENT_DEATH_SUPERVISOR = "--linux-parent-death-supervisor"
 PR_SET_PDEATHSIG = 1
@@ -146,6 +147,9 @@ class RequestContext:
 class _ProcessOutcome:
     stdout: str
     stderr: str
+    stdout_truncated_bytes: int
+    stderr_truncated_bytes: int
+    output_limit_exceeded: bool
     returncode: Optional[int]
     timed_out: bool
     cancelled: bool
@@ -167,6 +171,7 @@ class ExecutionService:
         process_registry_lock,
         cancel_grace=2,
         default_job_timeout=900,
+        max_output_bytes=DEFAULT_OUTPUT_BYTE_LIMIT,
     ):
         if not callable(env_builder):
             raise TypeError("env_builder must be callable")
@@ -192,6 +197,13 @@ class ExecutionService:
             "default_job_timeout",
             allow_none=True,
         )
+        try:
+            output_limit = int(max_output_bytes)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("max_output_bytes must be a positive integer") from exc
+        if output_limit <= 0:
+            raise ValueError("max_output_bytes must be a positive integer")
+        self.max_output_bytes = output_limit
         self._termination_requests = set()
 
     @staticmethod
@@ -326,6 +338,40 @@ class ExecutionService:
         )
         return self._result_envelope(outcome, str(resource), normalized_timeout)
 
+    def run_external_sync(
+        self,
+        command,
+        env,
+        *,
+        timeout,
+        resource="external",
+        request_id=None,
+    ):
+        """Run a trusted adapter command with the same bounded lifecycle."""
+
+        if not isinstance(command, (list, tuple)) or not command:
+            raise ValueError("command must be a non-empty sequence")
+        if not all(isinstance(item, str) and item for item in command):
+            raise ValueError("command items must be non-empty strings")
+        try:
+            normalized_env = dict(env)
+        except (TypeError, ValueError) as exc:
+            raise TypeError("env must be a mapping") from exc
+        normalized_timeout = self._positive_timeout(
+            timeout,
+            "timeout",
+            allow_none=False,
+        )
+        with self.workspace_lock:
+            context = self.workspace_context(request_id=request_id)
+            return self._execute(
+                list(command),
+                normalized_env,
+                context,
+                str(resource),
+                normalized_timeout,
+            )
+
     def _spawn(self, command, env):
         supervised_command = command
         liveness_fds = None
@@ -348,9 +394,6 @@ class ExecutionService:
                 supervised_command,
                 cwd=str(self.root),
                 env=env,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 **popen_options,
@@ -441,11 +484,27 @@ class ExecutionService:
         reader_errors = []
         last_partial_at = [0.0]
         last_partial_text = [""]
+        stdout_total_bytes = [0]
+        stderr_total_bytes = [0]
+        output_limit_event = threading.Event()
+        byte_limit = self.max_output_bytes
 
         def read_stdout():
             try:
-                if process.stdout is not None:
-                    stdout_chunks.append(process.stdout.read() or "")
+                if process.stdout is None:
+                    return
+                read_chunk = getattr(process.stdout, "read1", process.stdout.read)
+                while True:
+                    chunk = read_chunk(65536)
+                    if not chunk:
+                        break
+                    previous = stdout_total_bytes[0]
+                    stdout_total_bytes[0] += len(chunk)
+                    remaining = max(0, byte_limit - previous)
+                    if remaining:
+                        stdout_chunks.append(chunk[:remaining])
+                    if len(chunk) > remaining:
+                        output_limit_event.set()
             except Exception as exc:  # Drain failures are raised after cleanup.
                 reader_errors.append(exc)
 
@@ -453,12 +512,22 @@ class ExecutionService:
             try:
                 if process.stderr is None:
                     return
-                for line in process.stderr:
-                    stderr_chunks.append(line)
+                read_chunk = getattr(process.stderr, "read1", process.stderr.read)
+                while True:
+                    chunk = read_chunk(65536)
+                    if not chunk:
+                        break
+                    previous = stderr_total_bytes[0]
+                    stderr_total_bytes[0] += len(chunk)
+                    remaining = max(0, byte_limit - previous)
+                    if remaining:
+                        stderr_chunks.append(chunk[:remaining])
+                    if len(chunk) > remaining:
+                        output_limit_event.set()
                     now = time.monotonic()
                     if now - last_partial_at[0] < 0.25:
                         continue
-                    text = "".join(stderr_chunks).strip()
+                    text = b"".join(stderr_chunks).decode("utf-8", errors="replace").strip()
                     try:
                         self._emit_partial(context.job_id, resource, text)
                     except Exception as exc:
@@ -491,12 +560,25 @@ class ExecutionService:
                 if not registered:
                     cancelled = True
             if registered:
-                try:
-                    returncode = process.wait(timeout=timeout)
-                except subprocess.TimeoutExpired:
-                    timed_out = True
-                    termination = self._terminate_process(process)
-                    returncode = termination["returncode"]
+                deadline = None if timeout is None else time.monotonic() + timeout
+                while returncode is None:
+                    if output_limit_event.is_set():
+                        termination = self._terminate_process(process)
+                        returncode = termination["returncode"]
+                        break
+                    wait_timeout = 0.05
+                    if deadline is not None:
+                        remaining = deadline - time.monotonic()
+                        if remaining <= 0:
+                            timed_out = True
+                            termination = self._terminate_process(process)
+                            returncode = termination["returncode"]
+                            break
+                        wait_timeout = min(wait_timeout, remaining)
+                    try:
+                        returncode = process.wait(timeout=wait_timeout)
+                    except subprocess.TimeoutExpired:
+                        continue
             else:
                 returncode = process.poll()
         except BaseException as exc:
@@ -530,7 +612,8 @@ class ExecutionService:
                 or self._remove_registered_process(context.job_id, process)
             )
 
-        stderr = "".join(stderr_chunks).strip()
+        stdout = b"".join(stdout_chunks).decode("utf-8", errors="replace").strip()
+        stderr = b"".join(stderr_chunks).decode("utf-8", errors="replace").strip()
         if stderr and stderr != last_partial_text[0]:
             try:
                 self._emit_partial(context.job_id, resource, stderr)
@@ -540,9 +623,20 @@ class ExecutionService:
             raise execution_error
         if reader_errors:
             raise reader_errors[0]
+        stdout_truncated = max(0, stdout_total_bytes[0] - byte_limit)
+        stderr_truncated = max(0, stderr_total_bytes[0] - byte_limit)
+        output_limited = bool(stdout_truncated or stderr_truncated)
+        if output_limited:
+            notice = (
+                f"[output capped at {byte_limit} bytes per stream; process terminated]"
+            )
+            stderr = (stderr + "\n" + notice).strip() if stderr else notice
         return _ProcessOutcome(
-            stdout="".join(stdout_chunks).strip(),
+            stdout=stdout,
             stderr=stderr,
+            stdout_truncated_bytes=stdout_truncated,
+            stderr_truncated_bytes=stderr_truncated,
+            output_limit_exceeded=output_limited,
             returncode=returncode,
             timed_out=timed_out,
             cancelled=cancelled,
@@ -644,15 +738,15 @@ class ExecutionService:
 
     @staticmethod
     def _limited_text(text, limit):
-        raw = str(text or "")
+        raw = str(text or "").encode("utf-8", errors="replace")
         if limit <= 0:
             return "", len(raw)
         if len(raw) <= limit:
-            return raw, 0
-        return raw[:limit], len(raw) - limit
+            return raw.decode("utf-8", errors="replace"), 0
+        return raw[:limit].decode("utf-8", errors="replace"), len(raw) - limit
 
     @classmethod
-    def _stderr_block(cls, resource, stderr):
+    def _stderr_block(cls, resource, stderr, truncated_bytes=0):
         if not stderr:
             return None
         is_work = resource == "work"
@@ -661,40 +755,63 @@ class ExecutionService:
             if is_work
             else DEFAULT_STDERR_TEXT_LIMIT
         )
-        text, truncated = cls._limited_text(stderr, limit)
+        text, display_truncated = cls._limited_text(stderr, limit)
         return {
             "kind": "stdout" if is_work else "stderr",
             "title": "执行流程" if is_work else "Agent stderr",
             "text": text,
-            "truncated_bytes": truncated,
+            "truncated_bytes": int(truncated_bytes) + display_truncated,
         }
 
     @classmethod
     def _result_envelope(cls, outcome, resource, timeout):
-        try:
-            result = json.loads(outcome.stdout) if outcome.stdout else {}
-        except json.JSONDecodeError:
-            result = None
-        if not isinstance(result, dict):
+        if outcome.output_limit_exceeded:
             result = {
                 "ok": False,
-                "status": "invalid_agent_output",
+                "status": "output_limit_exceeded",
+                "code": "output_limit_exceeded",
+                "error": "Agent output exceeded execution.max_output_bytes and was terminated.",
                 "timeline": [],
                 "approval_card": None,
-                "output_blocks": [
+                "output_blocks": [],
+            }
+            if outcome.stdout:
+                text, display_truncated = cls._limited_text(outcome.stdout, 4000)
+                result["output_blocks"].append(
                     {
                         "kind": "stdout",
                         "title": "Agent stdout",
-                        "text": outcome.stdout[:4000],
-                        "truncated_bytes": max(0, len(outcome.stdout) - 4000),
+                        "text": text,
+                        "truncated_bytes": outcome.stdout_truncated_bytes + display_truncated,
                     }
-                ],
-            }
+                )
+        else:
+            try:
+                result = json.loads(outcome.stdout) if outcome.stdout else {}
+            except json.JSONDecodeError:
+                result = None
+            if not isinstance(result, dict):
+                text, display_truncated = cls._limited_text(outcome.stdout, 4000)
+                result = {
+                    "ok": False,
+                    "status": "invalid_agent_output",
+                    "timeline": [],
+                    "approval_card": None,
+                    "output_blocks": [
+                        {
+                            "kind": "stdout",
+                            "title": "Agent stdout",
+                            "text": text,
+                            "truncated_bytes": display_truncated,
+                        }
+                    ],
+                }
 
         cancelled = bool(
             outcome.cancelled
             or (
                 not outcome.timed_out
+                and not outcome.output_limit_exceeded
                 and outcome.returncode is not None
                 and outcome.returncode < 0
             )
@@ -724,7 +841,11 @@ class ExecutionService:
         if not isinstance(blocks, list):
             blocks = []
             result["output_blocks"] = blocks
-        stderr_block = cls._stderr_block(resource, outcome.stderr)
+        stderr_block = cls._stderr_block(
+            resource,
+            outcome.stderr,
+            outcome.stderr_truncated_bytes,
+        )
         if stderr_block:
             blocks.append(stderr_block)
         blocks.append(
@@ -735,6 +856,9 @@ class ExecutionService:
                     "exit_code": outcome.returncode,
                     "timed_out": bool(outcome.timed_out),
                     "cancelled": cancelled,
+                    "output_limit_exceeded": bool(outcome.output_limit_exceeded),
+                    "stdout_truncated_bytes": outcome.stdout_truncated_bytes,
+                    "stderr_truncated_bytes": outcome.stderr_truncated_bytes,
                 },
             }
         )

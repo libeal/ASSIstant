@@ -15,6 +15,8 @@ Description=Linux 运维 Agent Web 控制台
 Documentation=file:/opt/linux-agent/README.md
 After=network-online.target
 Wants=network-online.target
+Requires=linux-agent-observer-helper.socket
+After=linux-agent-observer-helper.socket
 
 [Service]
 Type=notify
@@ -52,12 +54,10 @@ SystemCallArchitectures=native
 SystemCallFilter=@system-service
 SystemCallFilter=~@privileged @resources @mount @swap @reboot @raw-io
 
-# —— 网络出口边界：默认仅回环 + 出站到 AI Provider ——
+# —— 网络出口边界 ——
 # Web 只监听 127.0.0.1（由 bin/agent-web 在 remote 模式强制）。
-# 如需限制出口到指定 Provider 网段，用 IPAddressAllow/Deny 配置。
-# IPAddressDeny=any
-# IPAddressAllow=localhost
-# IPAddressAllow=<provider-egress-cidr>
+# 生产环境按 packaging/dropins/10-provider-egress.conf.example 启用默认拒绝，
+# 再显式加入 Provider CIDR；域名解析与动态地址变更由运维侧维护。
 
 # —— cgroup 资源硬上限 ——
 CPUQuota=200%

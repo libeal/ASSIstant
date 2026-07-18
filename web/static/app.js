@@ -46,12 +46,14 @@ import { createAuditView } from "./modules/view-audit.js";
 import { createPolicyView } from "./modules/view-policy.js";
 import { bindApplicationEvents } from "./modules/app-bindings.js";
 
+/** @typedef {import("./modules/types.js").ApplicationController} ApplicationController */
+
 const state = createInitialState();
 const { initPanelLayout, setLayoutRunId, bindPanelDrag } = createLayoutController(state);
 let auditListReloadTimer = 0;
 
-/** @type {Record<string, any>} Shared runtime bag for view modules (view-* must not import each other). */
-const app = {
+/** Shared runtime controller assembled from typed view modules. */
+const app = /** @type {ApplicationController} */ (/** @type {unknown} */ ({
   state,
   get auditListReloadTimer() { return auditListReloadTimer; },
   set auditListReloadTimer(v) { auditListReloadTimer = v; },
@@ -96,7 +98,7 @@ const app = {
   upsertSessionTurnPure: workbenchTurns.upsertSessionTurn,
   contextTurnCapacityPure: workbenchTurns.contextTurnCapacity,
   contextMetaByTurnPure: workbenchTurns.contextMetaByTurn,
-};
+}));
 
 async function request(path, options = {}) {
   return requestJson(path, options, () => state.token);

@@ -25,6 +25,8 @@ source "${ROOT_DIR}/lib/skills.sh"
 source "${ROOT_DIR}/lib/mcp.sh"
 # shellcheck source=../lib/doctor.sh
 source "${ROOT_DIR}/lib/doctor.sh"
+# shellcheck source=../lib/provider_resilience.sh
+source "${ROOT_DIR}/lib/provider_resilience.sh"
 # shellcheck source=../lib/ai.sh
 source "${ROOT_DIR}/lib/ai.sh"
 # shellcheck source=../lib/policy.sh

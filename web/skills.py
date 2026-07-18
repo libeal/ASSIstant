@@ -15,8 +15,11 @@ READABLE_SUFFIXES = frozenset({".md", ".sh"})
 class SkillService:
     """List and read the Web-visible portion of a Skill directory."""
 
-    def __init__(self, skills_root):
+    def __init__(self, skills_root, manifest_validator=None):
         self.root = Path(skills_root).resolve()
+        if manifest_validator is not None and not callable(manifest_validator):
+            raise TypeError("manifest_validator must be callable")
+        self.manifest_validator = manifest_validator
 
     @staticmethod
     def _kind(path):
@@ -115,6 +118,62 @@ class SkillService:
             elif node.get("type") == "dir":
                 yield from SkillService._tree_file_paths(node.get("children") or [])
 
+    @staticmethod
+    def _manifest_metadata(skill_md):
+        lines = skill_md.read_text(encoding="utf-8").splitlines()
+        if not lines or lines[0].strip() != "---":
+            raise ValueError(f"Skill manifest has no frontmatter: {skill_md.name}")
+        metadata = {}
+        for line in lines[1:]:
+            if line.strip() == "---":
+                break
+            key, separator, value = line.partition(":")
+            if separator and key in {"name", "description"}:
+                metadata[key] = value.strip()
+        if not metadata.get("name") or not metadata.get("description"):
+            raise ValueError(f"Skill manifest frontmatter is incomplete: {skill_md.name}")
+        return metadata
+
+    def list_manifests(self):
+        """Build runtime SkillManifest contracts from visible Skill packages."""
+
+        manifests = []
+        for directory in self._visible_entries(self.root):
+            if not directory.is_dir():
+                continue
+            skill_md = directory / "SKILL.md"
+            scripts_dir = directory / "scripts"
+            if not skill_md.exists() and not scripts_dir.exists():
+                continue
+            if (
+                skill_md.is_symlink()
+                or not skill_md.is_file()
+                or scripts_dir.is_symlink()
+                or not scripts_dir.is_dir()
+            ):
+                raise ValueError(f"Skill package is incomplete: {directory.name}")
+            scripts = [
+                {"name": script.name}
+                for script in self._visible_entries(scripts_dir)
+                if script.is_file() and script.suffix == ".sh"
+            ]
+            if not scripts:
+                raise ValueError(f"Skill package has no scripts: {directory.name}")
+            metadata = self._manifest_metadata(skill_md)
+            if metadata["name"] != directory.name:
+                raise ValueError(
+                    f"Skill manifest name does not match its directory: {directory.name}"
+                )
+            manifest = {
+                "name": metadata["name"],
+                "description": metadata["description"],
+                "scripts": scripts,
+            }
+            if self.manifest_validator is not None:
+                self.manifest_validator(manifest)
+            manifests.append(manifest)
+        return manifests
+
     def list_files(self):
         tree = self.build_tree()
         markdown = []
@@ -131,6 +190,7 @@ class SkillService:
             "tree": tree,
             "markdown_files": sorted(markdown),
             "script_files": sorted(scripts),
+            "manifests": self.list_manifests(),
         }
 
     def read_file(self, relative_path):

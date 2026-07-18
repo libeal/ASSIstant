@@ -1,6 +1,9 @@
 import { remoteSecretTransmissionBlocked } from "./config-utils.js";
 
-/** @param {Record<string, any>} app @returns {Record<string, Function>} */
+/** @typedef {import("./types.js").AppContext} AppContext */
+/** @typedef {import("./types.js").SkillsView} SkillsView */
+
+/** @param {AppContext} app @returns {SkillsView} */
 export function createSkillsView(app) {
   const state = app.state;
   const api = app.request;

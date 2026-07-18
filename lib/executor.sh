@@ -92,6 +92,36 @@ linux_agent_execution_privilege_from_review() {
 
 # output_command_ref is a nameref used to populate the caller's command array.
 # shellcheck disable=SC2034
+linux_agent_build_execution_environment() {
+    local output_var="$1"
+    local target_user="${2:-}"
+    local -n output_env_ref="${output_var}"
+    local name value
+    local -a safe_names=(
+        PATH HOME USER LOGNAME SHELL PWD TMPDIR TMP TEMP TERM LANG LANGUAGE TZ
+        XDG_CONFIG_HOME XDG_CACHE_HOME XDG_DATA_HOME XDG_STATE_HOME
+        LC_ALL LC_COLLATE LC_CTYPE LC_MESSAGES LC_MONETARY LC_NUMERIC LC_TIME
+        LINUX_AGENT_ROOT LINUX_AGENT_LOG_DIR LINUX_AGENT_SKILLS_DIR
+        LINUX_AGENT_MCP_DIR LINUX_AGENT_TMP_ROOT LINUX_AGENT_TMP_DIR
+        LINUX_AGENT_REMOTE_MODE LINUX_AGENT_REMOTE_RELEASE_VERSION
+        LINUX_AGENT_REMOTE_STORAGE_BACKEND LINUX_AGENT_SESSION_ID
+        LINUX_AGENT_REQUEST_ID LINUX_AGENT_JOB_ID
+    )
+
+    output_env_ref=(env -i --)
+    for name in "${safe_names[@]}"; do
+        [[ -v "${name}" ]] || continue
+        value="${!name}"
+        [[ -n "${value}" ]] || continue
+        output_env_ref+=("${name}=${value}")
+    done
+    if [[ -n "${target_user}" ]] && command -v getent >/dev/null 2>&1; then
+        value="$(getent passwd "${target_user}" 2>/dev/null | awk -F: 'NR == 1 {print $6}')"
+        output_env_ref+=("HOME=${value:-/tmp}" "USER=${target_user}" "LOGNAME=${target_user}")
+    fi
+}
+
+# shellcheck disable=SC2034
 linux_agent_prepare_execution_command() {
     local requested_privilege="$1"
     local output_var="$2"
@@ -99,18 +129,16 @@ linux_agent_prepare_execution_command() {
     local -n output_command_ref="${output_var}"
     output_command_ref=()
 
-    # Strip AI secrets from every executed step. The key stays in this shell's
-    # environment (subsequent AI reflection iterations still need it) but must
-    # never reach skill / shell / MCP / remote-script child processes.
     local -a scrub_env
-    scrub_env=(env -u LINUX_AGENT_API_KEY -u LINUX_AGENT_API_KEY_SOURCE -u LINUX_AGENT_LAST_AI_PAYLOAD --)
 
     if [[ "${requested_privilege}" != "least" ]] || [[ "$(linux_agent_min_privilege_proxy_enabled)" != "true" ]]; then
+        linux_agent_build_execution_environment scrub_env
         output_command_ref=("${scrub_env[@]}" "$@")
         return 0
     fi
 
     if [[ "$(id -u)" -ne 0 ]]; then
+        linux_agent_build_execution_environment scrub_env
         output_command_ref=("${scrub_env[@]}" "$@")
         return 0
     fi
@@ -119,6 +147,7 @@ linux_agent_prepare_execution_command() {
     if ! target_user="$(linux_agent_least_privilege_user)"; then
         return 1
     fi
+    linux_agent_build_execution_environment scrub_env "${target_user}"
 
     if command -v runuser >/dev/null 2>&1; then
         output_command_ref=(runuser -u "${target_user}" -- "${scrub_env[@]}" "$@")
@@ -294,6 +323,89 @@ linux_agent_step_arguments_json() {
 
     raw_args="$(jq -c 'if has("arguments") then .arguments else {} end' <<<"${step_json}")"
     linux_agent_normalize_json_object_argument "${raw_args}" || printf '{}\n'
+}
+
+linux_agent_backup_policy_review() {
+    local ref="$1"
+    local args_json="$2"
+    local review_json="$3"
+    local finding=""
+    local apply backup dry_run backup_archive backup_sha256
+
+    case "${ref}" in
+        controlled-tools/file-patch)
+            apply="$(jq -r 'if has("apply") then (.apply | tostring) else "true" end' <<<"${args_json}")"
+            backup="$(jq -r 'if has("backup") then (.backup | tostring) else "true" end' <<<"${args_json}")"
+            if [[ "${apply}" == "true" && "${backup}" != "true" ]]; then
+                finding="$(jq -cn '{severity:"critical", code:"BACKUP_REQUIRED", category:"backup", action:"block", message:"真实文件变更必须启用 file-patch 的事务性备份。"}')"
+            fi
+            ;;
+        ops-basic/safe-log-cleanup)
+            dry_run="$(jq -r 'if has("dry_run") then (.dry_run | tostring) else "true" end' <<<"${args_json}")"
+            backup_archive="$(jq -r '.backup_archive // empty' <<<"${args_json}")"
+            backup_sha256="$(jq -r '.backup_sha256 // empty' <<<"${args_json}")"
+            if [[ "${dry_run}" == "false" && (-z "${backup_archive}" || ! "${backup_sha256}" =~ ^[0-9a-f]{64}$) ]]; then
+                finding="$(jq -cn '{severity:"critical", code:"BACKUP_REQUIRED", category:"backup", action:"block", message:"真实日志截断必须先完成 config-backup，并携带未改变目标的备份凭据。"}')"
+            fi
+            ;;
+    esac
+
+    if [[ -z "${finding}" ]]; then
+        printf '%s\n' "${review_json}"
+        return 0
+    fi
+    jq -c --argjson finding "${finding}" \
+        '.findings = ((.findings // []) + [$finding])
+        | .approval_required = true
+        | .approved = false
+        | .risk_level = "critical"' <<<"${review_json}"
+}
+
+linux_agent_prepare_backup_protected_step() {
+    local step_json="$1"
+    local prior_results="${2:-[]}"
+    local current_results="${3:-[]}"
+    local ref args dry_run path resolved all_results backup_result archive source_sha256
+
+    ref="$(jq -r '.skill_script // empty' <<<"${step_json}")"
+    [[ "${ref}" == "ops-basic/safe-log-cleanup" ]] || {
+        printf '%s\n' "${step_json}"
+        return 0
+    }
+    args="$(linux_agent_step_arguments_json "${step_json}")"
+    dry_run="$(jq -r 'if has("dry_run") then (.dry_run | tostring) else "true" end' <<<"${args}")"
+    [[ "${dry_run}" == "false" ]] || {
+        printf '%s\n' "${step_json}"
+        return 0
+    }
+    path="$(jq -r '.path // empty' <<<"${args}")"
+    if [[ -z "${path}" || -L "${path}" ]]; then
+        printf '%s\n' "${step_json}"
+        return 0
+    fi
+    resolved="$(realpath -e -- "${path}" 2>/dev/null || true)"
+    [[ -n "${resolved}" ]] || {
+        printf '%s\n' "${step_json}"
+        return 0
+    }
+    all_results="$(printf '%s\n%s\n' "${prior_results}" "${current_results}" | jq -cs '.[0] + .[1]' 2>/dev/null || printf '[]')"
+    backup_result="$(jq -c --arg path "${resolved}" '
+        [ .[]
+          | select((.result.ok // false) == true)
+          | select((.result.output.tool // "") == "system.config.backup")
+          | select((.result.output.path // "") == $path)
+          | select((.result.output.archive // "") != "")
+          | select((.result.output.source_sha256 // "") | test("^[0-9a-f]{64}$"))
+        ] | last // empty
+    ' <<<"${all_results}" 2>/dev/null || true)"
+    [[ -n "${backup_result}" ]] || {
+        printf '%s\n' "${step_json}"
+        return 0
+    }
+    archive="$(jq -r '.result.output.archive' <<<"${backup_result}")"
+    source_sha256="$(jq -r '.result.output.source_sha256' <<<"${backup_result}")"
+    jq -c --arg archive "${archive}" --arg source_sha256 "${source_sha256}" \
+        '.arguments = ((.arguments // {}) + {backup_archive:$archive, backup_sha256:$source_sha256})' <<<"${step_json}"
 }
 
 linux_agent_prompt_step_decision() {
@@ -661,7 +773,21 @@ linux_agent_compact_execution_result() {
 linux_agent_download_remote_script() {
     local url="$1"
     local output_path="$2"
-    curl -fsSL --max-time 30 "${url}" -o "${output_path}"
+    local check resolve_entry
+    local -a resolve_args=()
+    check="$(python3 "${LINUX_AGENT_ROOT}/lib/provider_security.py" validate \
+        "${url}" \
+        '{"require_https":true,"block_internal_addresses":true,"allowed_hosts":[]}')" || return 1
+    [[ "$(jq -r '.ok // false' <<<"${check}")" == "true" ]] || return 1
+    while IFS= read -r resolve_entry; do
+        [[ -n "${resolve_entry}" ]] || continue
+        resolve_args+=(--resolve "${resolve_entry}")
+    done < <(jq -r '.curl_resolve[]? // empty' <<<"${check}")
+    [[ "${#resolve_args[@]}" -gt 0 ]] || return 1
+    curl -q -fsS --noproxy '*' --proto '=https' --proto-redir '=https' \
+        --max-time 30 --max-filesize 262144 \
+        "${resolve_args[@]}" \
+        "${url}" -o "${output_path}"
 }
 
 linux_agent_remote_script_policy() {
@@ -726,21 +852,25 @@ linux_agent_prepare_remote_step() {
 
     tmp_path="${LINUX_AGENT_TMP_DIR}/remote_$(date +%Y%m%d_%H%M%S)_${RANDOM}.sh"
     if ! linux_agent_download_remote_script "${url}" "${tmp_path}"; then
+        rm -f -- "${tmp_path}"
         jq -cn --arg error "远程脚本下载失败。" --arg url "${url}" '{ok:false, error:$error, url:$url}'
         return 1
     fi
     sha="$(sha256sum "${tmp_path}" | awk '{print $1}')"
     size="$(wc -c <"${tmp_path}" | tr -d ' ')"
     if [[ ! "${size}" =~ ^[0-9]+$ || "${size}" -eq 0 ]]; then
+        rm -f -- "${tmp_path}"
         jq -cn --arg error "远程脚本为空。" --arg url "${url}" --arg sha256 "${sha}" '{ok:false, error:$error, url:$url, sha256:$sha256}'
         return 1
     fi
     if [[ "${size}" -gt 262144 ]]; then
+        rm -f -- "${tmp_path}"
         jq -cn --arg error "远程脚本超过 256KB 限制。" --arg url "${url}" --arg sha256 "${sha}" --argjson size "${size}" \
             '{ok:false, error:$error, url:$url, sha256:$sha256, size_bytes:$size}'
         return 1
     fi
     if ! grep -Iq . "${tmp_path}"; then
+        rm -f -- "${tmp_path}"
         jq -cn --arg error "远程脚本不是文本内容。" --arg url "${url}" --arg sha256 "${sha}" --argjson size "${size}" \
             '{ok:false, error:$error, url:$url, sha256:$sha256, size_bytes:$size}'
         return 1
@@ -812,8 +942,15 @@ linux_agent_execute_observed_command_output() {
     exit_code="$(jq -r '.exit_code' <<<"${run_meta}")"
     timed_out="$(jq -r '.timed_out // false' <<<"${run_meta}")"
     observer="$(jq -c '.observer' <<<"${run_meta}")"
-    stdout_text="$(cat "${stdout_file}" 2>/dev/null || true)"
-    stderr_text="$(cat "${stderr_file}" 2>/dev/null || true)"
+    local max_output_bytes output_truncated output_integrity_unknown
+    local stdout_truncated_bytes stderr_truncated_bytes
+    max_output_bytes="$(linux_agent_execution_max_output_bytes)"
+    output_truncated="$(jq -r '.output_capped // false' <<<"${run_meta}")"
+    output_integrity_unknown="$(jq -r '.output_integrity_unknown // false' <<<"${run_meta}")"
+    stdout_truncated_bytes="$(jq -r '.stdout_truncated_bytes // 0' <<<"${run_meta}")"
+    stderr_truncated_bytes="$(jq -r '.stderr_truncated_bytes // 0' <<<"${run_meta}")"
+    stdout_text="$(head -c "${max_output_bytes}" "${stdout_file}" 2>/dev/null || true)"
+    stderr_text="$(head -c "${max_output_bytes}" "${stderr_file}" 2>/dev/null || true)"
     rm -f "${stdout_file}" "${stderr_file}"
 
     combined="${stdout_text}"
@@ -825,6 +962,14 @@ linux_agent_execute_observed_command_output() {
         fi
     fi
 
+    if [[ "${output_truncated}" == "true" ]]; then
+        if [[ -n "${combined}" ]]; then
+            combined="${combined}"$'\n'"[output capped at ${max_output_bytes} bytes per stream]"
+        else
+            combined="[output capped at ${max_output_bytes} bytes per stream]"
+        fi
+    fi
+
     if printf '%s' "${combined}" | jq -e . >/dev/null 2>&1; then
         jq -cn \
             --argjson output "$(printf '%s' "${combined}" | jq -c .)" \
@@ -832,7 +977,11 @@ linux_agent_execute_observed_command_output() {
             --argjson timed_out "${timed_out}" \
             --argjson observer "${observer}" \
             --argjson proxy "${proxy_meta}" \
-            '{ok:($exit_code == 0), exit_code:$exit_code, timed_out:$timed_out, output:$output, observer:$observer, execution_proxy:$proxy} + (if $timed_out then {status:"timed_out"} else {} end)'
+            --argjson output_capped "${output_truncated}" \
+            --argjson output_integrity_unknown "${output_integrity_unknown}" \
+            --argjson stdout_truncated_bytes "${stdout_truncated_bytes}" \
+            --argjson stderr_truncated_bytes "${stderr_truncated_bytes}" \
+            '{ok:($exit_code == 0), exit_code:$exit_code, timed_out:$timed_out, output:$output, observer:$observer, execution_proxy:$proxy, output_capped:$output_capped, output_integrity_unknown:$output_integrity_unknown, stdout_truncated_bytes:$stdout_truncated_bytes, stderr_truncated_bytes:$stderr_truncated_bytes} + (if $output_integrity_unknown then {status:"invalid_output", code:"invalid_output", error_code:"invalid_output"} elif $output_capped then {status:"output_limit_exceeded", code:"output_limit_exceeded", error_code:"output_limit_exceeded"} elif $timed_out then {status:"timed_out"} else {} end)'
     else
         jq -cn \
             --arg output "${combined}" \
@@ -840,7 +989,11 @@ linux_agent_execute_observed_command_output() {
             --argjson timed_out "${timed_out}" \
             --argjson observer "${observer}" \
             --argjson proxy "${proxy_meta}" \
-            '{ok:($exit_code == 0), exit_code:$exit_code, timed_out:$timed_out, output:{raw:(if $timed_out and $output == "" then "执行超过配置的 execution.timeout_sec，已终止。" else $output end)}, observer:$observer, execution_proxy:$proxy} + (if $timed_out then {status:"timed_out"} else {} end)'
+            --argjson output_capped "${output_truncated}" \
+            --argjson output_integrity_unknown "${output_integrity_unknown}" \
+            --argjson stdout_truncated_bytes "${stdout_truncated_bytes}" \
+            --argjson stderr_truncated_bytes "${stderr_truncated_bytes}" \
+            '{ok:($exit_code == 0), exit_code:$exit_code, timed_out:$timed_out, output:{raw:(if $timed_out and $output == "" then "执行超过配置的 execution.timeout_sec，已终止。" else $output end)}, observer:$observer, execution_proxy:$proxy, output_capped:$output_capped, output_integrity_unknown:$output_integrity_unknown, stdout_truncated_bytes:$stdout_truncated_bytes, stderr_truncated_bytes:$stderr_truncated_bytes} + (if $output_integrity_unknown then {status:"invalid_output", code:"invalid_output", error_code:"invalid_output"} elif $output_capped then {status:"output_limit_exceeded", code:"output_limit_exceeded", error_code:"output_limit_exceeded"} elif $timed_out then {status:"timed_out"} else {} end)'
     fi
 }
 
@@ -1443,6 +1596,7 @@ linux_agent_execute_work_plan() {
                 "$(jq -r '.size_bytes' <<<"${step}")" >&2
         fi
 
+        step="$(linux_agent_prepare_backup_protected_step "${step}" "${prior_results}" "${results}")"
         linux_agent_print_step_for_approval "${step}" >&2
         if [[ "$(jq -r '.executor_type' <<<"${step}")" == "skill_script" ]] && ! linux_agent_skill_is_registered "$(jq -r '.skill_script' <<<"${step}")"; then
             local blocked_detail skipped_steps
@@ -1479,6 +1633,9 @@ linux_agent_execute_work_plan() {
         fi
         step_review_text="$(linux_agent_step_review_material "${step}")"
         review="$(linux_agent_policy_review_step "${step}" "${step_review_text}" "$(case "$(jq -r '.executor_type' <<<"${step}")" in remote_script) printf 'remote' ;; mcp_tool) printf 'mcp' ;; *) printf 'local' ;; esac)")"
+        if [[ "$(jq -r '.executor_type' <<<"${step}")" == "skill_script" ]]; then
+            review="$(linux_agent_backup_policy_review "$(jq -r '.skill_script // empty' <<<"${step}")" "$(linux_agent_step_arguments_json "${step}")" "${review}")"
+        fi
         if ! result="$(linux_agent_require_step_status_event "${step}" "policy_checked" "${review}")"; then
             linux_agent_finalize_work_precondition_block \
                 "${result}" "${step}" "${plan_json}" "${step_states}" "${i}" \

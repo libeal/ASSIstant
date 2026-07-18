@@ -17,6 +17,10 @@ if [[ ! "${RELEASE_TAG}" =~ ^v[0-9A-Za-z][0-9A-Za-z._-]*$ || -z "${DIST_DIR}" ]]
     exit 2
 fi
 
+if [[ "${GITHUB_ACTIONS:-false}" == "true" && "${GITHUB_REF:-}" != "refs/tags/${RELEASE_TAG}" ]]; then
+    fail "GitHub Actions signing must run from refs/tags/${RELEASE_TAG}, got ${GITHUB_REF:-missing}"
+fi
+
 for command_name in gh cosign cmp cp chmod mktemp rm; do
     command -v "${command_name}" >/dev/null 2>&1 || fail "missing command: ${command_name}"
 done

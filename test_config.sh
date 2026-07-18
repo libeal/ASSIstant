@@ -3,6 +3,8 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=lib/config.sh
+source "${ROOT_DIR}/lib/config.sh"
 CONFIG_FILE="${ROOT_DIR}/config/config.json"
 EXAMPLE_FILE="${ROOT_DIR}/config/config.example.json"
 LIVE_CHECK="false"
@@ -112,6 +114,13 @@ validate_config() {
         return 1
     fi
     print_ok "config/config.json JSON 格式合法"
+
+    if linux_agent_config_validate_provider_resilience "$(<"${CONFIG_FILE}")"; then
+        print_ok "provider_resilience 重试、退避、熔断和 failover 配置合法"
+    else
+        print_error "provider_resilience 配置非法：检查范围、退避上下限、failover 密钥来源及未知字段"
+        failures=$((failures + 1))
+    fi
 
     if jq -e --argjson max 9007199254740991 '
         type == "object"

@@ -26,6 +26,8 @@ source "${ROOT_DIR}/lib/context.sh"
 source "${ROOT_DIR}/lib/skills.sh"
 # shellcheck source=../lib/mcp.sh
 source "${ROOT_DIR}/lib/mcp.sh"
+# shellcheck source=../lib/provider_resilience.sh
+source "${ROOT_DIR}/lib/provider_resilience.sh"
 # shellcheck source=../lib/ai.sh
 source "${ROOT_DIR}/lib/ai.sh"
 # shellcheck source=../lib/policy.sh
@@ -78,6 +80,81 @@ blocked_provider_config="$(jq '
 blocked_provider_response="$(LINUX_AGENT_CONFIG_JSON="${blocked_provider_config}" linux_agent_call_ai_with_context "blocked provider" "${request_context}" "repair" '{"topic":"disk"}')"
 jq -e '.status == "blocked_internal_address" and .response_type == "error"' <<<"${blocked_provider_response}" >/dev/null
 LINUX_AGENT_CONFIG_JSON="${baseline_config_json}"
+
+oversized_ai_response="$(linux_agent_call_ai_with_context "超大AI响应" "${request_context}" "work_plan" '{"topic":"disk"}')"
+jq -e '.ok == false and .status == "ai_response_too_large" and .response_type == "error"' \
+    <<<"${oversized_ai_response}" >/dev/null
+
+# Provider resilience retries only transient failures, then uses explicitly
+# configured failover candidates and shares circuit state across calls.
+export LINUX_AGENT_PROVIDER_CIRCUIT_STATE="${tmp_root}/provider-circuits.json"
+flaky_api_url="${FAKE_AI_URL%/v1/chat/completions}/flaky-retry/v1/chat/completions"
+retry_config="$(jq --arg api_url "${flaky_api_url}" '
+    .api_url = $api_url
+    | .provider_resilience = {
+        enabled:true,
+        max_attempts:3,
+        backoff_initial_ms:0,
+        backoff_max_ms:0,
+        circuit_failure_threshold:5,
+        circuit_open_sec:60,
+        failover:[]
+    }
+' <<<"${baseline_config_json}")"
+retry_response="$(LINUX_AGENT_CONFIG_JSON="${retry_config}" linux_agent_call_ai_with_context "repair" "${request_context}" "repair" '{"topic":"disk"}')"
+jq -e '(.failure_context | fromjson).environment_context.topic == "disk"' <<<"${retry_response}" >/dev/null
+retry_counters="$(curl --noproxy '*' -sS "http://127.0.0.1:${FAKE_AI_PORT}/counters")"
+jq -e '.counters.flaky_retry == 3' <<<"${retry_counters}" >/dev/null
+
+failed_primary_url="${FAKE_AI_URL%/v1/chat/completions}/always-503/v1/chat/completions"
+fallback_api_url="${FAKE_AI_URL%/v1/chat/completions}/require-failover-key/v1/chat/completions"
+failover_config="$(jq --arg api_url "${failed_primary_url}" --arg fallback_url "${fallback_api_url}" '
+    .api_url = $api_url
+    | .provider_resilience = {
+        enabled:true,
+        max_attempts:1,
+        backoff_initial_ms:0,
+        backoff_max_ms:0,
+        circuit_failure_threshold:5,
+        circuit_open_sec:60,
+        failover:[{
+            provider:"openai_compatible",
+            api_url:$fallback_url,
+            model:"fake-chat-completions",
+            api_key_env:"TEST_FAILOVER_API_KEY"
+        }]
+    }
+' <<<"${baseline_config_json}")"
+export TEST_FAILOVER_API_KEY="TEST_FAILOVER_API_KEY_123456"
+LINUX_AGENT_CONFIG_JSON="${failover_config}" linux_agent_call_ai_with_context \
+    "repair" "${request_context}" "repair" '{"topic":"disk"}' >"${tmp_root}/failover-response.json"
+failover_response="$(<"${tmp_root}/failover-response.json")"
+unset TEST_FAILOVER_API_KEY
+jq -e '(.failure_context | fromjson).environment_context.topic == "disk"' <<<"${failover_response}" >/dev/null
+! grep -q 'TEST_FAILOVER_API_KEY_123456' <<<"${LINUX_AGENT_LAST_AI_PAYLOAD}"
+failover_counters="$(curl --noproxy '*' -sS "http://127.0.0.1:${FAKE_AI_PORT}/counters")"
+jq -e '.counters.always_503 == 1' <<<"${failover_counters}" >/dev/null
+
+circuit_api_url="${FAKE_AI_URL%/v1/chat/completions}/always-503-circuit/v1/chat/completions"
+circuit_config="$(jq --arg api_url "${circuit_api_url}" '
+    .api_url = $api_url
+    | .provider_resilience = {
+        enabled:true,
+        max_attempts:1,
+        backoff_initial_ms:0,
+        backoff_max_ms:0,
+        circuit_failure_threshold:1,
+        circuit_open_sec:60,
+        failover:[]
+    }
+' <<<"${baseline_config_json}")"
+circuit_first="$(LINUX_AGENT_CONFIG_JSON="${circuit_config}" linux_agent_call_ai_with_context "repair" "${request_context}" "repair" '{"topic":"disk"}')"
+circuit_second="$(LINUX_AGENT_CONFIG_JSON="${circuit_config}" linux_agent_call_ai_with_context "repair" "${request_context}" "repair" '{"topic":"disk"}')"
+jq -e '.ok == false and .status == "ai_http_error"' <<<"${circuit_first}" >/dev/null
+jq -e '.ok == false and .status == "ai_circuit_open"' <<<"${circuit_second}" >/dev/null
+circuit_counters="$(curl --noproxy '*' -sS "http://127.0.0.1:${FAKE_AI_PORT}/counters")"
+jq -e '.counters.always_503_circuit == 1' <<<"${circuit_counters}" >/dev/null
+unset LINUX_AGENT_PROVIDER_CIRCUIT_STATE
 
 config_key_state="$(linux_agent_api_key_state_json)"
 jq -e '.configured == true and .source == "config" and .config_configured == true and (.file_configured | not)' <<<"${config_key_state}" >/dev/null
@@ -272,14 +349,17 @@ linux_agent_prepare_execution_command "least" root_prepared bash -lc 'id -u'
 [[ "${root_prepared[1]}" == "-u" ]]
 [[ "${root_prepared[2]}" == "nobody" ]]
 [[ "${root_prepared[3]}" == "--" ]]
-# AI secrets are scrubbed from the step's child environment.
+# Child steps run under an explicit environment allowlist.
 [[ "${root_prepared[4]}" == "env" ]]
-printf '%s\n' "${root_prepared[@]}" | grep -qx 'LINUX_AGENT_API_KEY'
+[[ "${root_prepared[5]}" == "-i" ]]
+[[ "${root_prepared[6]}" == "--" ]]
+! printf '%s\n' "${root_prepared[@]}" | grep -q 'LINUX_AGENT_API_KEY'
 current_prepared=()
 linux_agent_prepare_execution_command "current" current_prepared bash -lc 'id -u'
 [[ "${current_prepared[0]}" == "env" ]]
-[[ "${current_prepared[1]}" == "-u" ]]
-[[ "${current_prepared[2]}" == "LINUX_AGENT_API_KEY" ]]
+[[ "${current_prepared[1]}" == "-i" ]]
+[[ "${current_prepared[2]}" == "--" ]]
+! printf '%s\n' "${current_prepared[@]}" | grep -q 'LINUX_AGENT_API_KEY'
 printf '%s\n' "${current_prepared[@]}" | grep -qx 'bash'
 proxy_meta="$(linux_agent_execution_proxy_metadata "least" "true")"
 jq -e '.enabled == true and .requested_privilege == "least" and .execution_user == "root" and .target_user == "nobody" and .prepared_root == true' <<<"${proxy_meta}" >/dev/null
@@ -288,6 +368,27 @@ PATH="${old_path}"
 linux_agent_init_env "${ROOT_DIR}"
 linux_agent_load_config
 low_review='{"approved":true,"approval_required":false,"risk_level":"low","findings":[]}'
+no_backup_cleanup_review="$(linux_agent_backup_policy_review \
+    "ops-basic/safe-log-cleanup" \
+    '{"path":"/tmp/example.log","dry_run":false}' \
+    "${low_review}")"
+jq -e '.approved == false and .risk_level == "critical" and ([.findings[] | select(.code == "BACKUP_REQUIRED")] | length) == 1' \
+    <<<"${no_backup_cleanup_review}" >/dev/null
+no_backup_patch_review="$(linux_agent_backup_policy_review \
+    "controlled-tools/file-patch" \
+    '{"path":"/tmp/example.conf","apply":true,"backup":false}' \
+    "${low_review}")"
+jq -e '.approved == false and .risk_level == "critical" and ([.findings[] | select(.code == "BACKUP_REQUIRED")] | length) == 1' \
+    <<<"${no_backup_patch_review}" >/dev/null
+backup_gate_target="$(mktemp /tmp/linux-agent-backup-gate.XXXXXX)"
+backup_gate_sha256="$(sha256sum "${backup_gate_target}" | awk '{print $1}')"
+backup_gate_results="$(jq -cn --arg path "${backup_gate_target}" --arg sha256 "${backup_gate_sha256}" '[{result:{ok:true,output:{tool:"system.config.backup",path:$path,archive:"/tmp/verified-backup.tar.gz",source_sha256:$sha256}}}]')"
+backup_gate_step="$(jq -cn --arg path "${backup_gate_target}" '{id:"cleanup",title:"cleanup",executor_type:"skill_script",skill_script:"ops-basic/safe-log-cleanup",arguments:{path:$path,dry_run:false}}')"
+prepared_backup_gate="$(linux_agent_prepare_backup_protected_step "${backup_gate_step}" '[]' "${backup_gate_results}")"
+jq -e --arg archive "/tmp/verified-backup.tar.gz" --arg sha256 "${backup_gate_sha256}" \
+    '.arguments.backup_archive == $archive and .arguments.backup_sha256 == $sha256' \
+    <<<"${prepared_backup_gate}" >/dev/null
+rm -f "${backup_gate_target}"
 readonly_skill_step='{"id":"auto-1","title":"resource","executor_type":"skill_script","skill_script":"ops-basic/resource-inspect","arguments":{},"reason":"test","expected_effect":"test","risk_level":"low","rollback_hint":"none"}'
 file_match_step='{"id":"auto-2","title":"match","executor_type":"skill_script","skill_script":"controlled-tools/file-match","arguments":{},"reason":"test","expected_effect":"test","risk_level":"low","rollback_hint":"none"}'
 file_patch_step='{"id":"auto-3","title":"patch","executor_type":"skill_script","skill_script":"controlled-tools/file-patch","arguments":{},"reason":"test","expected_effect":"test","risk_level":"low","rollback_hint":"none"}'
@@ -377,5 +478,50 @@ linux_agent_download_remote_script() {
 }
 large_result="$(linux_agent_prepare_remote_step "${https_step}" 2>&1 || true)"
 grep -q '超过 256KB' <<<"${large_result}"
+
+# Remote script review rejects private targets before curl and pins the public
+# address while enforcing protocol and byte limits during download.
+# shellcheck source=../lib/executor.sh
+source "${ROOT_DIR}/lib/executor.sh"
+if linux_agent_download_remote_script "https://127.0.0.1/private.sh" "${tmp_root}/private.sh"; then
+    printf 'remote script downloader accepted a private target\n' >&2
+    exit 1
+fi
+remote_curl_args="${tmp_root}/remote-curl.args"
+curl() {
+    printf '%s\n' "$@" >"${remote_curl_args}"
+    local prior=""
+    local value
+    for value in "$@"; do
+        if [[ "${prior}" == "-o" ]]; then
+            printf '#!/usr/bin/env bash\ntrue\n' >"${value}"
+        fi
+        prior="${value}"
+    done
+}
+linux_agent_download_remote_script "https://1.1.1.1/review.sh" "${tmp_root}/bounded.sh"
+unset -f curl
+grep -qx -- '--max-filesize' "${remote_curl_args}"
+grep -qx -- '262144' "${remote_curl_args}"
+grep -qx -- '--proto-redir' "${remote_curl_args}"
+grep -qx -- '=https' "${remote_curl_args}"
+grep -qx -- '--resolve' "${remote_curl_args}"
+grep -qx -- '1.1.1.1:443:1.1.1.1' "${remote_curl_args}"
+
+output_limit_config="${LINUX_AGENT_CONFIG_JSON}"
+LINUX_AGENT_CONFIG_JSON="$(jq '.execution.max_output_bytes=4096 | .observer.enabled="disabled" | .observer.require=false' <<<"${LINUX_AGENT_CONFIG_JSON}")"
+linux_agent_start_session 'execution output limit'
+export LINUX_AGENT_EXECUTION_PRIVILEGE=current
+limited_result="$(linux_agent_execute_observed_command_output \
+    terminal '{"command":"large-output"}' -- \
+    python3 -c 'import sys; sys.stdout.write("x" * 50000); sys.stdout.flush()')"
+unset LINUX_AGENT_EXECUTION_PRIVILEGE
+jq -e '.ok == false
+    and .status == "output_limit_exceeded"
+    and .output_capped == true
+    and .stdout_truncated_bytes > 0
+    and .observer.status == "output_capped"' <<<"${limited_result}" >/dev/null
+linux_agent_finish_session "output_limit_exceeded"
+LINUX_AGENT_CONFIG_JSON="${output_limit_config}"
 
 printf 'security: ok\n'

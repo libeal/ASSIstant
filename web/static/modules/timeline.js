@@ -1,5 +1,8 @@
 import { outputBlocksFrom, outputBlocksSummary } from "./output-blocks.js";
 
+/** @typedef {import("./types.js").StepEntry} StepEntry */
+
+/** @param {string} title @param {any} result @returns {StepEntry[]} */
 export function normalizeProtocolExecutionEntries(title, result) {
   const timeline = Array.isArray(result?.timeline) ? result.timeline : [];
   if (!timeline.length) return [];
@@ -17,6 +20,7 @@ export function normalizeProtocolExecutionEntries(title, result) {
   }));
 }
 
+/** @param {string} title @param {any} result @returns {StepEntry[]} */
 export function normalizeExecutionEntries(title, result) {
   // An empty authoritative timeline means there are no protocol steps to
   // render.  Root-level ok/status values describe the request envelope and
@@ -24,6 +28,7 @@ export function normalizeExecutionEntries(title, result) {
   return normalizeProtocolExecutionEntries(title, result);
 }
 
+/** @param {any} result @returns {number} */
 export function completedExecutionCount(result) {
   return (Array.isArray(result?.timeline) ? result.timeline : []).filter((item) => item.kind === "execution").length;
 }

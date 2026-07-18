@@ -33,6 +33,14 @@ linux_agent_load_config() {
         linux_agent_print_error "web.metrics_enabled 必须是 JSON boolean（true 或 false）。"
         return 1
     fi
+    if ! linux_agent_config_validate_execution "${config_json}"; then
+        linux_agent_print_error "execution 配置非法：timeout_sec 必须为 1-3600，max_output_bytes 必须为 4096-104857600，min_privilege_proxy 必须为 boolean。"
+        return 1
+    fi
+    if ! linux_agent_config_validate_provider_resilience "${config_json}"; then
+        linux_agent_print_error "provider_resilience 配置非法：检查重试、退避、熔断和 failover 条目。"
+        return 1
+    fi
     if ! linux_agent_config_validate_audit "${config_json}"; then
         linux_agent_print_error "audit 配置非法：fsync 必须是 boolean，max_bytes/min_free_bytes 必须是 0-${LINUX_AGENT_JSON_SAFE_INTEGER_MAX} 的整数，on_full 仅支持 degrade 或 block。"
         return 1
@@ -55,6 +63,85 @@ linux_agent_config_validate_web_metrics() {
             elif (.web | type) != "object" then false
             elif (.web | has("metrics_enabled") | not) then true
             else (.web.metrics_enabled | type) == "boolean"
+            end
+        )
+    ' >/dev/null 2>&1 <<<"${config_json}"
+}
+
+linux_agent_config_validate_execution() {
+    local config_json="${1:-${LINUX_AGENT_CONFIG_JSON:-}}"
+
+    jq -e '
+        type == "object"
+        and (
+            if (.execution? == null) then true
+            elif (.execution | type) != "object" then false
+            else
+                ((.execution | has("timeout_sec") | not) or (
+                    (.execution.timeout_sec | type) == "number"
+                    and .execution.timeout_sec == (.execution.timeout_sec | floor)
+                    and .execution.timeout_sec >= 1
+                    and .execution.timeout_sec <= 3600
+                ))
+                and ((.execution | has("max_output_bytes") | not) or (
+                    (.execution.max_output_bytes | type) == "number"
+                    and .execution.max_output_bytes == (.execution.max_output_bytes | floor)
+                    and .execution.max_output_bytes >= 4096
+                    and .execution.max_output_bytes <= 104857600
+                ))
+                and ((.execution | has("min_privilege_proxy") | not)
+                    or ((.execution.min_privilege_proxy | type) == "boolean"))
+                and ((.execution | has("least_privilege_user") | not)
+                    or ((.execution.least_privilege_user | type) == "string"
+                        and (.execution.least_privilege_user | test("^[A-Za-z_][A-Za-z0-9_.-]*[$]?$"))))
+            end
+        )
+    ' >/dev/null 2>&1 <<<"${config_json}"
+}
+
+linux_agent_config_validate_provider_resilience() {
+    local config_json="${1:-${LINUX_AGENT_CONFIG_JSON:-}}"
+
+    jq -e '
+        def bounded_integer($minimum; $maximum):
+            type == "number" and . == floor and . >= $minimum and . <= $maximum;
+        def optional_bounded_integer($object; $key; $minimum; $maximum):
+            ($object | has($key) | not) or ($object[$key] | bounded_integer($minimum; $maximum));
+        type == "object"
+        and (
+            if (.provider_resilience? == null) then true
+            elif (.provider_resilience | type) != "object" then false
+            else
+                .provider_resilience as $r
+                | (($r | keys) - ["enabled", "max_attempts", "backoff_initial_ms", "backoff_max_ms", "circuit_failure_threshold", "circuit_open_sec", "failover"] | length) == 0
+                and (($r | has("enabled") | not) or (($r.enabled | type) == "boolean"))
+                and optional_bounded_integer($r; "max_attempts"; 1; 5)
+                and optional_bounded_integer($r; "backoff_initial_ms"; 0; 60000)
+                and optional_bounded_integer($r; "backoff_max_ms"; 0; 60000)
+                and optional_bounded_integer($r; "circuit_failure_threshold"; 1; 100)
+                and optional_bounded_integer($r; "circuit_open_sec"; 1; 86400)
+                and (($r | has("backoff_initial_ms") | not) or ($r | has("backoff_max_ms") | not) or ($r.backoff_max_ms >= $r.backoff_initial_ms))
+                and (
+                    ($r | has("failover") | not)
+                    or (
+                        ($r.failover | type) == "array"
+                        and ($r.failover | length) <= 8
+                        and all($r.failover[];
+                            type == "object"
+                            and ((keys - ["provider", "api_url", "model", "api_key_env", "reuse_primary_api_key"]) | length) == 0
+                            and ((.provider | type) == "string" and (.provider | length) > 0)
+                            and ((has("api_url") | not) or ((.api_url | type) == "string" and (.api_url | length) > 0))
+                            and ((has("model") | not) or ((.model | type) == "string" and (.model | length) > 0))
+                            and ((has("api_key_env") | not) or (
+                                (.api_key_env | type) == "string"
+                                and (.api_key_env | test("^[A-Z_][A-Z0-9_]*_API_KEY$"))
+                                and .api_key_env != "LINUX_AGENT_API_KEY"
+                            ))
+                            and ((has("reuse_primary_api_key") | not) or ((.reuse_primary_api_key | type) == "boolean"))
+                            and (((.api_key_env // "") != "") or ((.reuse_primary_api_key // false) == true))
+                        )
+                    )
+                )
             end
         )
     ' >/dev/null 2>&1 <<<"${config_json}"
@@ -213,6 +300,18 @@ linux_agent_execution_timeout_sec() {
     value="$(linux_agent_config_positive_int_default '.execution.timeout_sec' '300')"
     if [[ "${value}" -gt 3600 ]]; then
         value=3600
+    fi
+    printf '%s\n' "${value}"
+}
+
+linux_agent_execution_max_output_bytes() {
+    local value
+    value="$(linux_agent_config_positive_int_default '.execution.max_output_bytes' '1048576')"
+    if [[ "${value}" -lt 4096 ]]; then
+        value=4096
+    fi
+    if [[ "${value}" -gt 104857600 ]]; then
+        value=104857600
     fi
     printf '%s\n' "${value}"
 }

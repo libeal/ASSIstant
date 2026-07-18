@@ -81,7 +81,7 @@ linux_agent_cleanup_tmp_dir() {
 
     if [[ "${resolved_tmp}" == "${resolved_root}" ]]; then
         mkdir -p "${resolved_tmp}"
-        find "${resolved_tmp}" -mindepth 1 -maxdepth 1 -exec rm -rf -- {} + 2>/dev/null || true
+        find "${resolved_tmp}" -mindepth 1 -maxdepth 1 ! -name '.shared' -exec rm -rf -- {} + 2>/dev/null || true
     else
         rm -rf -- "${resolved_tmp}" 2>/dev/null || true
     fi

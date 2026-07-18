@@ -9,7 +9,6 @@ import signal
 import shutil
 import socket
 import sqlite3
-import subprocess
 import sys
 import threading
 import time
@@ -25,11 +24,15 @@ LIB_ROOT = ROOT / "lib"
 if str(LIB_ROOT) not in sys.path:
     sys.path.insert(0, str(LIB_ROOT))
 from provider_security import (  # noqa: E402
+    host_is_trusted,
     inspect_provider_url,
     provider_security_policy,
+    provider_url_host,
     provider_url_error_message,
+    trusted_provider_hosts,
     validate_provider_url,
 )
+from subprocess_env import build_subprocess_env  # noqa: E402
 WEB_ROOT = ROOT / "web"
 if str(WEB_ROOT) not in sys.path:
     sys.path.insert(0, str(WEB_ROOT))
@@ -39,8 +42,17 @@ from jobs import (  # noqa: E402
     JobStore,
     JobVersionConflict,
 )
+from configuration import (  # noqa: E402
+    CONFIG_SECRET_FIELDS,
+    ConfigStore,
+    normalize_config_value,
+    provider_failover_api_key_envs,
+    validate_config_relationships,
+    write_nested_config_value,
+)
 from domain import DomainContract, DomainValidationError  # noqa: E402
 from execution import ExecutionService  # noqa: E402
+from observer import ObserverService  # noqa: E402
 from policy import PolicyService  # noqa: E402
 from provider import ProviderSecurityHelpers, ProviderService  # noqa: E402
 from sessions import (  # noqa: E402
@@ -86,6 +98,8 @@ REQUEST_CONTEXT = threading.local()
 DEFAULT_STDERR_TEXT_LIMIT = 4000
 WORK_EXECUTION_FLOW_TEXT_LIMIT = 200000
 MAX_REQUEST_BODY_BYTES = 1024 * 1024
+MAX_HTTP_WORKERS = 32
+HTTP_SOCKET_TIMEOUT_SEC = 30
 MAX_ACTIVE_JOBS = int(os.environ.get("LINUX_AGENT_WEB_MAX_ACTIVE_JOBS", "4") or "4")
 JOB_TIMEOUT_SEC = int(os.environ.get("LINUX_AGENT_WEB_JOB_TIMEOUT_SEC", "900") or "900")
 MAX_JOB_ATTEMPTS = int(os.environ.get("LINUX_AGENT_WEB_MAX_JOB_ATTEMPTS", "3") or "3")
@@ -107,25 +121,14 @@ API_KEY_PLACEHOLDER = "please-set-your-api-key"
 EPHEMERAL_TOKEN_FILE = ROOT / "tmp" / "web" / "auth-token"
 WEB_AUDIT_SESSION_ID = f"web_{SERVER_RUN_ID[:16]}"
 WEB_AUDIT_LOG = LOG_ROOT / f"{WEB_AUDIT_SESSION_ID}.jsonl"
-OBSERVER_BOOTSTRAP_STATE = {
-    "status": "pending",
-    "ok": True,
-    "method": "",
-    "error": "",
-    "diagnostic": "",
-    "updated_at": SERVER_STARTED_AT,
-}
 REMOTE_MODE = os.environ.get("LINUX_AGENT_REMOTE_MODE", "0") == "1"
 RUNTIME_SECRET_LOCK = threading.RLock()
 RUNTIME_API_KEY = ""
+CONFIG_STORE = ConfigStore(CONFIG_PATH)
 
 
 def read_config():
-    try:
-        with CONFIG_PATH.open("r", encoding="utf-8") as handle:
-            return json.load(handle)
-    except FileNotFoundError:
-        return {}
+    return CONFIG_STORE.read()
 
 
 def load_domain_schema():
@@ -144,14 +147,7 @@ DOMAIN_CONTRACT = DomainContract(DOMAIN_SCHEMA)
 
 
 def write_config(config):
-    CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = CONFIG_PATH.with_suffix(".json.tmp")
-    with tmp_path.open("w", encoding="utf-8") as handle:
-        json.dump(config, handle, ensure_ascii=False, indent=2)
-        handle.write("\n")
-    # config.json may hold the API key; keep it owner-only.
-    os.chmod(tmp_path, 0o600)
-    tmp_path.replace(CONFIG_PATH)
+    CONFIG_STORE.write(config)
 
 
 def safe_int(value, default):
@@ -219,6 +215,9 @@ PROVIDER_SERVICE = ProviderService(
         validate_url=validate_provider_url,
         inspect_url=inspect_provider_url,
         error_message=provider_url_error_message,
+        url_host=provider_url_host,
+        trusted_hosts=trusted_provider_hosts,
+        host_is_trusted=host_is_trusted,
     ),
 )
 
@@ -262,6 +261,8 @@ def config_public_state():
     auto_approvals = approvals.get("auto") if isinstance(approvals.get("auto"), dict) else {}
     observer = config.get("observer") if isinstance(config.get("observer"), dict) else {}
     execution = config.get("execution") if isinstance(config.get("execution"), dict) else {}
+    provider_resilience = config.get("provider_resilience") if isinstance(config.get("provider_resilience"), dict) else {}
+    provider_failover = provider_resilience.get("failover") if isinstance(provider_resilience.get("failover"), list) else []
     web = config.get("web") if isinstance(config.get("web"), dict) else {}
     metrics_configured = web.get("metrics_enabled", True)
     metrics_public = metrics_configured if isinstance(metrics_configured, bool) else False
@@ -280,6 +281,15 @@ def config_public_state():
             "api_key_configured_in_config": key_state["config_configured"],
             "model": config.get("model", ""),
             "request_timeout_sec": config.get("request_timeout_sec", 90),
+            "provider_resilience": {
+                "enabled": provider_resilience.get("enabled", True) is True,
+                "max_attempts": safe_int(provider_resilience.get("max_attempts", 3), 3),
+                "backoff_initial_ms": safe_int(provider_resilience.get("backoff_initial_ms", 250), 250),
+                "backoff_max_ms": safe_int(provider_resilience.get("backoff_max_ms", 2000), 2000),
+                "circuit_failure_threshold": safe_int(provider_resilience.get("circuit_failure_threshold", 5), 5),
+                "circuit_open_sec": safe_int(provider_resilience.get("circuit_open_sec", 60), 60),
+                "failover_count": len(provider_failover),
+            },
             "context_turns": config.get("context_turns", 6),
             "command_guard": {
                 "enabled": command_guard_enabled,
@@ -312,6 +322,7 @@ def config_public_state():
             },
             "execution": {
                 "timeout_sec": safe_int(execution.get("timeout_sec", 300) or 300, 300),
+                "max_output_bytes": safe_int(execution.get("max_output_bytes", 1048576) or 1048576, 1048576),
                 "min_privilege_proxy": bool(execution.get("min_privilege_proxy", True)),
                 "least_privilege_user": execution.get("least_privilege_user", "nobody"),
             },
@@ -339,157 +350,84 @@ def config_public_state():
     }
 
 
-CONFIG_WRITABLE_FIELDS = {
-    "provider": {"type": "str", "min": 1},
-    "api_url": {"type": "str", "min": 1},
-    "model": {"type": "str", "min": 1},
-    "request_timeout_sec": {"type": "int", "min": 1, "max": 600},
-    "context_turns": {"type": "int", "min": 1, "max": 50},
-    "agent_loop.enabled_for_work": {"type": "bool"},
-    "agent_loop.observation_text_limit": {"type": "int", "min": 200, "max": 200000},
-    "agent_loop.thinking_trace_enabled": {"type": "bool"},
-    "agent_loop.max_iterations": {"type": "int", "min": 1, "max": 100},
-    "agent_loop.checkpoint_turns": {"type": "int", "min": 0, "max": 100},
-    "approvals.auto.skill_readonly": {"type": "bool"},
-    "approvals.auto.shell_readonly": {"type": "bool"},
-    "approvals.auto.file_match": {"type": "bool"},
-    "approvals.auto.file_patch": {"type": "bool"},
-    "approvals.auto.file_download": {"type": "bool"},
-    "approvals.auto.local_analyze": {"type": "bool"},
-    "approvals.auto.remote_script": {"type": "bool"},
-    "audit_mode": {"type": "enum", "values": {"safe_summary", "redacted_verbose"}},
-    "audit_text_limit": {"type": "int", "min": 40, "max": 200000},
-    "observer.enabled": {"type": "enum", "values": {"auto", "auditd", "disabled"}},
-    "observer.privilege": {"type": "enum", "values": {"sudo_interactive", "passwordless", "none"}},
-    "observer.max_events": {"type": "int", "min": 1, "max": 100000},
-    "observer.require": {"type": "bool"},
-    "execution.min_privilege_proxy": {"type": "bool"},
-    "execution.timeout_sec": {"type": "int", "min": 1, "max": 3600},
-    "execution.least_privilege_user": {"type": "str", "min": 1},
-    "skills_dir": {"type": "str", "min": 0},
-    "remote_script_policy": {"type": "enum", "values": {"download_review", "disabled"}},
-    "providers_security.require_https": {"type": "bool"},
-    "providers_security.block_internal_addresses": {"type": "bool"},
-    "providers_security.allowed_hosts": {"type": "host_list", "max_items": 64},
-    "remote.allow_api_key_transmission": {"type": "bool"},
-    "web.max_active_jobs": {"type": "int", "min": 1, "max": 64},
-    "web.job_timeout_sec": {"type": "int", "min": 1, "max": 86400},
-    "web.max_job_attempts": {"type": "int", "min": 1, "max": 10},
-    "web.cancel_grace_sec": {"type": "int", "min": 0, "max": 30},
-    "web.metrics_enabled": {"type": "bool"},
-}
-CONFIG_SECRET_FIELDS = {"api_key"}
+def update_config_values(changes):
+    global RUNTIME_API_KEY
+    if not isinstance(changes, dict) or not changes or len(changes) > 64:
+        return {
+            "ok": False,
+            "status": "invalid_config_value",
+            "error": "changes must be a non-empty object with at most 64 entries.",
+        }
 
+    normalized_changes = {}
+    for raw_key, value in changes.items():
+        if not isinstance(raw_key, str) or not raw_key:
+            return {"ok": False, "status": "invalid_config_value", "error": "Configuration keys must be non-empty strings."}
+        key = raw_key
+        if REMOTE_MODE and key == "providers_security.require_https" and value is not True:
+            return {
+                "ok": False,
+                "status": "remote_security_policy_locked",
+                "error": "Remote runtime always requires HTTPS Provider URLs.",
+            }
+        if REMOTE_MODE and key == "skills_dir":
+            return {
+                "ok": False,
+                "status": "remote_config_read_only",
+                "error": "Remote runtime always keeps skills inside its ephemeral runtime root.",
+            }
+        if key == "api_key":
+            normalized_changes[key] = str(value or "")
+            continue
+        normalized, error = normalize_config_value(key, value)
+        if error:
+            return {"ok": False, "status": "invalid_config_value", "error": error}
+        normalized_changes[key] = normalized
 
-def normalize_config_value(key, value):
-    spec = CONFIG_WRITABLE_FIELDS.get(key)
-    if not spec:
-        return None, f"Unsupported writable config key: {key}"
-    value_type = spec["type"]
-    if value_type == "bool":
-        if not isinstance(value, bool):
-            return None, f"{key} must be boolean."
-        return value, ""
-    if value_type == "int":
-        if isinstance(value, bool):
-            return None, f"{key} must be integer."
-        try:
-            normalized = int(value)
-        except (TypeError, ValueError):
-            return None, f"{key} must be integer."
-        if normalized < spec.get("min", normalized) or normalized > spec.get("max", normalized):
-            return None, f"{key} is outside allowed range."
-        return normalized, ""
-    if value_type == "enum":
-        normalized = str(value)
-        if normalized not in spec["values"]:
-            return None, f"{key} must be one of: {', '.join(sorted(spec['values']))}."
-        return normalized, ""
-    if value_type == "host_list":
-        if not isinstance(value, list):
-            return None, f"{key} must be a list of hostnames."
-        max_items = spec.get("max_items", 64)
-        if len(value) > max_items:
-            return None, f"{key} allows at most {max_items} entries."
-        normalized_list = []
-        for item in value:
-            host = str(item).strip().lower()
-            if not host or len(host) > 255 or any(ch.isspace() for ch in host):
-                return None, f"{key} contains an invalid hostname."
-            normalized_list.append(host)
-        return normalized_list, ""
-    normalized = str(value)
-    if len(normalized) < spec.get("min", 0):
-        return None, f"{key} must not be empty."
-    return normalized, ""
+    file_changes = {
+        key: value
+        for key, value in normalized_changes.items()
+        if not (REMOTE_MODE and key == "api_key")
+    }
 
+    def apply_changes(config):
+        for key, value in file_changes.items():
+            if key == "api_key":
+                if value:
+                    config["api_key"] = value
+                else:
+                    config.pop("api_key", None)
+            else:
+                write_nested_config_value(config, key, value)
+        relationship_error = validate_config_relationships(config)
+        if relationship_error:
+            raise ValueError(relationship_error)
 
-def write_nested_config_value(config, key, value):
-    parts = key.split(".")
-    target = config
-    for part in parts[:-1]:
-        child = target.get(part)
-        if not isinstance(child, dict):
-            child = {}
-            target[part] = child
-        target = child
-    target[parts[-1]] = value
+    try:
+        if file_changes:
+            CONFIG_STORE.update(apply_changes)
+    except ValueError as exc:
+        return {"ok": False, "status": "invalid_config_value", "error": str(exc)}
+
+    if REMOTE_MODE and "api_key" in normalized_changes:
+        with RUNTIME_SECRET_LOCK:
+            RUNTIME_API_KEY = normalized_changes["api_key"]
+
+    result = config_public_state()
+    result["status"] = "updated"
+    result["updated"] = {
+        key: ("configured" if value else "cleared") if key in CONFIG_SECRET_FIELDS else value
+        for key, value in normalized_changes.items()
+    }
+    return result
 
 
 def write_api_key_secret(value):
-    global RUNTIME_API_KEY
-    secret = str(value or "")
-    config = read_config()
-
-    if REMOTE_MODE:
-        with RUNTIME_SECRET_LOCK:
-            RUNTIME_API_KEY = secret
-        result = config_public_state()
-        result["status"] = "updated"
-        result["updated"] = {"api_key": "configured" if secret else "cleared"}
-        return result
-
-    if not secret:
-        config.pop("api_key", None)
-        write_config(config)
-        result = config_public_state()
-        result["status"] = "updated"
-        result["updated"] = {"api_key": "cleared"}
-        return result
-
-    config["api_key"] = secret
-    write_config(config)
-    result = config_public_state()
-    result["status"] = "updated"
-    result["updated"] = {"api_key": "configured"}
-    return result
+    return update_config_values({"api_key": value})
 
 
 def update_config_value(key, value):
-    if key == "api_key":
-        return write_api_key_secret(value)
-    if REMOTE_MODE and key == "providers_security.require_https" and value is not True:
-        return {
-            "ok": False,
-            "status": "remote_security_policy_locked",
-            "error": "Remote runtime always requires HTTPS Provider URLs.",
-        }
-    if REMOTE_MODE and key == "skills_dir":
-        return {
-            "ok": False,
-            "status": "remote_config_read_only",
-            "error": "Remote runtime always keeps skills inside its ephemeral runtime root.",
-        }
-    normalized, error = normalize_config_value(key, value)
-    if error:
-        return {"ok": False, "status": "invalid_config_value", "error": error}
-    config = read_config()
-    write_nested_config_value(config, key, normalized)
-    write_config(config)
-    result = config_public_state()
-    result["status"] = "updated"
-    result["updated"] = {key: "configured" if key in CONFIG_SECRET_FIELDS else normalized}
-    return result
+    return update_config_values({key: value})
 
 
 def configured_token():
@@ -500,29 +438,36 @@ def configured_token():
 
 
 def agent_subprocess_env(include_api_key=False):
-    env = os.environ.copy()
-    env.setdefault("LINUX_AGENT_WEB", "1")
-    # Minimal-scope secret injection: strip the API key from every subprocess by
-    # default, then re-add it only for the dedicated AI-calling actions. This
-    # keeps the key out of skill / terminal / MCP / tools subprocesses in both
-    # remote and local modes.
-    env.pop("LINUX_AGENT_API_KEY", None)
-    env.pop("LINUX_AGENT_API_KEY_SOURCE", None)
+    # Explicit allowlist environment: never inherit ambient cloud credentials or
+    # tokens from the parent Web process. AI secrets are injected only for the
+    # dedicated AI-calling actions.
+    env = build_subprocess_env(include_api_key=False)
+    env["LINUX_AGENT_WEB"] = "1"
     if not include_api_key:
         return env
+    config = read_config()
     if REMOTE_MODE:
-        remote = read_config().get("remote", {})
+        remote = config.get("remote", {})
         transmission_allowed = isinstance(remote, dict) and bool(remote.get("allow_api_key_transmission", False))
         with RUNTIME_SECRET_LOCK:
             runtime_key = RUNTIME_API_KEY
         if transmission_allowed and secret_value_configured(runtime_key):
             env["LINUX_AGENT_API_KEY"] = runtime_key
+        if transmission_allowed:
+            for name in provider_failover_api_key_envs(config):
+                value = os.environ.get(name, "")
+                if secret_value_configured(value):
+                    env[name] = value
     else:
         # Local mode: the Bash core reads the key from config.json when it is not
         # in the environment, so we only forward an operator-supplied env key.
         parent_key = os.environ.get("LINUX_AGENT_API_KEY", "")
         if secret_value_configured(parent_key):
             env["LINUX_AGENT_API_KEY"] = parent_key
+        for name in provider_failover_api_key_envs(config):
+            value = os.environ.get(name, "")
+            if secret_value_configured(value):
+                env[name] = value
     return env
 
 
@@ -532,25 +477,32 @@ def create_runtime_backup():
     output_path = ROOT.parent / f"linux-agent-runtime-backup-{uuid.uuid4().hex}.tar.gz"
     backup_env = agent_subprocess_env()
     try:
-        process = subprocess.run(
+        outcome = execution_service().run_external_sync(
             ["bash", str(AGENT), "backup", str(output_path)],
-            cwd=str(ROOT),
-            env=backup_env,
-            text=True,
-            capture_output=True,
+            backup_env,
             timeout=180,
-            check=False,
+            resource="backup",
         )
-    except subprocess.TimeoutExpired:
+    except (OSError, RuntimeError, ValueError) as exc:
+        output_path.unlink(missing_ok=True)
+        return {"ok": False, "status": "backup_failed", "error": str(exc)}
+    if outcome.timed_out:
         output_path.unlink(missing_ok=True)
         return {"ok": False, "status": "backup_timeout", "error": "Runtime backup timed out."}
+    if outcome.output_limit_exceeded:
+        output_path.unlink(missing_ok=True)
+        return {
+            "ok": False,
+            "status": "output_limit_exceeded",
+            "error": "Runtime backup output exceeded execution.max_output_bytes.",
+        }
     try:
-        result = json.loads(process.stdout.strip()) if process.stdout.strip() else {}
+        result = json.loads(outcome.stdout.strip()) if outcome.stdout.strip() else {}
     except json.JSONDecodeError:
         result = {}
-    if process.returncode != 0 or not result.get("ok") or not output_path.is_file():
+    if outcome.returncode != 0 or not result.get("ok") or not output_path.is_file():
         output_path.unlink(missing_ok=True)
-        stderr_text, _ = limited_text(process.stderr, 600)
+        stderr_text, _ = limited_text(outcome.stderr, 600)
         return {
             "ok": False,
             "status": str(result.get("status") or "backup_failed"),
@@ -762,15 +714,29 @@ def json_domain_error(handler, code, message="", default=HTTPStatus.INTERNAL_SER
 
 
 def read_json_body(handler):
-    length = int(handler.headers.get("Content-Length", "0") or "0")
-    if length <= 0:
+    transfer_encoding = str(handler.headers.get("Transfer-Encoding") or "").strip()
+    if transfer_encoding:
+        raise ValueError("Transfer-Encoding request bodies are not supported")
+    raw_length = str(handler.headers.get("Content-Length", "0") or "0").strip()
+    try:
+        length = int(raw_length)
+    except ValueError as exc:
+        raise ValueError("Content-Length must be a non-negative integer") from exc
+    if length < 0:
+        raise ValueError("Content-Length must be a non-negative integer")
+    if length == 0:
         return {}
     if length > MAX_REQUEST_BODY_BYTES:
         # Drain and reject oversized bodies before allocating/parsing them.
         raise RequestBodyTooLarge(
             f"request body {length} bytes exceeds limit {MAX_REQUEST_BODY_BYTES} bytes"
         )
-    raw = handler.rfile.read(length)
+    try:
+        raw = handler.rfile.read(length)
+    except (OSError, TimeoutError) as exc:
+        raise ValueError("request body could not be read completely") from exc
+    if len(raw) != length:
+        raise ValueError("request body ended before Content-Length bytes were received")
     def reject_constant(value):
         raise ValueError(f"non-finite JSON number is not allowed: {value}")
 
@@ -848,9 +814,11 @@ def policy_service():
             ROOT,
             config_reader=read_config,
             config_writer=write_config,
+            config_updater=CONFIG_STORE.update,
             agent_api=run_agent_api,
             audit=record_web_audit_event,
             config_public_state=config_public_state,
+            env_builder=agent_subprocess_env,
         )
     return _POLICY_SERVICE
 
@@ -911,6 +879,17 @@ def append_audit_event(log_path, session_id, stage, payload=None):
 
 def record_web_audit_event(stage, payload=None):
     return append_audit_event(WEB_AUDIT_LOG, WEB_AUDIT_SESSION_ID, stage, payload)
+
+
+OBSERVER_SERVICE = ObserverService(
+    config_reader=read_config,
+    audit=record_web_audit_event,
+    sudo_check=sudo_check,
+    env_builder=agent_subprocess_env,
+    lib_root=LIB_ROOT,
+    server_started_at=SERVER_STARTED_AT,
+    now_iso=now_iso,
+)
 
 
 SESSION_STORE = SessionStore(
@@ -1017,230 +996,19 @@ def leave_web_agent_session():
 
 
 def observer_runtime_config():
-    config = read_config()
-    observer = config.get("observer") if isinstance(config.get("observer"), dict) else {}
-    enabled = str(observer.get("enabled") or "auto")
-    if enabled not in {"auto", "auditd", "disabled"}:
-        enabled = "auto"
-    privilege = str(observer.get("privilege") or "sudo_interactive")
-    if privilege not in {"sudo_interactive", "passwordless", "none"}:
-        privilege = "sudo_interactive"
-    max_events = safe_int(observer.get("max_events", 200) or 200, 200)
-    if max_events <= 0:
-        max_events = 200
-    return {
-        "enabled": enabled,
-        "privilege": privilege,
-        "max_events": max_events,
-        "require": observer.get("require", False) is True,
-    }
-
-
-def observer_requires_permission(observer):
-    return observer.get("enabled") != "disabled" and observer.get("privilege") != "none"
+    return OBSERVER_SERVICE.runtime_config()
 
 
 def observer_bootstrap_public_state(force_ok=None, extra=None):
-    observer = observer_runtime_config()
-    state = dict(OBSERVER_BOOTSTRAP_STATE)
-    if observer.get("enabled") == "disabled":
-        state.update(
-            {
-                "status": "disabled",
-                "ok": True,
-                "method": "config",
-                "diagnostic": "observer.enabled is disabled in config.",
-            }
-        )
-    state.update(extra or {})
-    ok = bool(state.get("ok", True)) if force_ok is None else bool(force_ok)
-    return {
-        "ok": ok,
-        "status": state.get("status", "pending"),
-        "method": state.get("method", ""),
-        "error": state.get("error", ""),
-        "diagnostic": state.get("diagnostic", ""),
-        "updated_at": state.get("updated_at", SERVER_STARTED_AT),
-        "requires_permission": observer_requires_permission(observer),
-        "observer": observer,
-    }
-
-
-def update_observer_bootstrap_state(status, ok, method="", error="", diagnostic=""):
-    OBSERVER_BOOTSTRAP_STATE.update(
-        {
-            "status": status,
-            "ok": bool(ok),
-            "method": method,
-            "error": str(error or "")[:400],
-            "diagnostic": str(diagnostic or "")[:600],
-            "updated_at": now_iso(),
-        }
-    )
-    return observer_bootstrap_public_state(force_ok=ok)
-
-
-def sudo_cached():
-    if not shutil.which("sudo"):
-        return False
-    try:
-        process = subprocess.run(
-            ["sudo", "-n", "true"],
-            text=True,
-            capture_output=True,
-            timeout=5,
-            check=False,
-        )
-    except (FileNotFoundError, subprocess.TimeoutExpired):
-        return False
-    return process.returncode == 0
-
-
-def auditctl_preflight_command():
-    if os.geteuid() == 0:
-        return ["auditctl", "-s"], "root"
-    return ["sudo", "-n", "auditctl", "-s"], "sudo"
+    return OBSERVER_SERVICE.public_state(force_ok=force_ok, extra=extra)
 
 
 def observer_bootstrap_skip():
-    result = update_observer_bootstrap_state(
-        "skipped",
-        True,
-        method="user",
-        diagnostic="User skipped web observer bootstrap; later jobs will record observer_unavailable if sudo credentials are not available.",
-    )
-    record_web_audit_event(
-        "observer_bootstrap_skipped",
-        {
-            "status": result["status"],
-            "method": result["method"],
-            "diagnostic": result["diagnostic"],
-            "observer": result["observer"],
-        },
-    )
-    result["logged"] = True
-    return result
+    return OBSERVER_SERVICE.skip()
 
 
 def observer_bootstrap_enable(password):
-    observer = observer_runtime_config()
-    if observer.get("enabled") == "disabled":
-        result = update_observer_bootstrap_state(
-            "observer_disabled",
-            False,
-            method="config",
-            error="observer.enabled is disabled.",
-            diagnostic="Enable observer.enabled before starting auditd observer bootstrap.",
-        )
-        record_web_audit_event("observer_bootstrap_failed", public_observer_log_payload(result))
-        return result
-    if observer.get("privilege") == "none" and os.geteuid() != 0:
-        result = update_observer_bootstrap_state(
-            "sudo_required",
-            False,
-            method="none",
-            error="observer.privilege is set to none.",
-            diagnostic="Set observer.privilege to sudo_interactive or passwordless to enable auditd from web.",
-        )
-        record_web_audit_event("observer_bootstrap_failed", public_observer_log_payload(result))
-        return result
-    if not shutil.which("auditctl"):
-        result = update_observer_bootstrap_state(
-            "auditctl_not_found",
-            False,
-            method="auditd",
-            error="auditctl is not installed.",
-            diagnostic="Install auditd/auditctl or disable observer.",
-        )
-        record_web_audit_event("observer_bootstrap_failed", public_observer_log_payload(result))
-        return result
-    if not shutil.which("ausearch"):
-        result = update_observer_bootstrap_state(
-            "ausearch_not_found",
-            False,
-            method="auditd",
-            error="ausearch is not installed.",
-            diagnostic="Install auditd/ausearch or disable observer.",
-        )
-        record_web_audit_event("observer_bootstrap_failed", public_observer_log_payload(result))
-        return result
-
-    if os.geteuid() != 0 and not sudo_cached():
-        if not password:
-            result = update_observer_bootstrap_state(
-                "sudo_required",
-                False,
-                method="sudo",
-                error="sudo password is required.",
-                diagnostic="Web has no TTY, so sudo credentials must be validated from the browser once per sudo timeout window.",
-            )
-            record_web_audit_event("observer_bootstrap_failed", public_observer_log_payload(result))
-            return result
-        check = sudo_check(password)
-        if not check.get("ok"):
-            result = update_observer_bootstrap_state(
-                str(check.get("status") or "sudo_denied"),
-                False,
-                method=str(check.get("method") or "sudo"),
-                error=str(check.get("error") or check.get("status") or "sudo validation failed"),
-                diagnostic="sudo credential validation failed; auditd observer was not enabled for web jobs.",
-            )
-            record_web_audit_event("observer_bootstrap_failed", public_observer_log_payload(result))
-            return result
-
-    command, method = auditctl_preflight_command()
-    try:
-        process = subprocess.run(command, text=True, capture_output=True, timeout=10, check=False)
-    except subprocess.TimeoutExpired:
-        result = update_observer_bootstrap_state(
-            "auditctl_timeout",
-            False,
-            method=method,
-            error="auditctl validation timed out.",
-            diagnostic="auditctl -s did not return within 10 seconds.",
-        )
-        record_web_audit_event("observer_bootstrap_failed", public_observer_log_payload(result))
-        return result
-    except FileNotFoundError:
-        result = update_observer_bootstrap_state(
-            "auditctl_not_found",
-            False,
-            method=method,
-            error="auditctl is not installed.",
-            diagnostic="Install auditd/auditctl or disable observer.",
-        )
-        record_web_audit_event("observer_bootstrap_failed", public_observer_log_payload(result))
-        return result
-
-    if process.returncode == 0:
-        result = update_observer_bootstrap_state(
-            "enabled",
-            True,
-            method=method,
-            diagnostic="auditctl preflight succeeded; subsequent web jobs can start auditd observer while sudo credentials remain valid.",
-        )
-        record_web_audit_event("observer_bootstrap_enabled", public_observer_log_payload(result))
-        return result
-
-    stderr = (process.stderr or process.stdout or "auditctl validation failed").strip()[:400]
-    status = "auditctl_failed"
-    diagnostic = "auditctl -s failed; auditd may be unavailable or the kernel audit interface may be restricted."
-    if "operation not permitted" in stderr.lower():
-        status = "auditctl_permission_denied"
-        diagnostic = "auditctl was rejected by the kernel audit interface; this commonly happens in containers, WSL, or hosts without CAP_AUDIT_CONTROL/auditd support."
-    result = update_observer_bootstrap_state(status, False, method=method, error=stderr, diagnostic=diagnostic)
-    record_web_audit_event("observer_bootstrap_failed", public_observer_log_payload(result))
-    return result
-
-
-def public_observer_log_payload(result):
-    return {
-        "status": result.get("status", ""),
-        "method": result.get("method", ""),
-        "error": result.get("error", ""),
-        "diagnostic": result.get("diagnostic", ""),
-        "observer": result.get("observer", {}),
-    }
+    return OBSERVER_SERVICE.enable(password)
 
 
 def validate_policy_content(relative_path, content):
@@ -1251,7 +1019,10 @@ def write_policy_file(relative_path, content, password):
     return policy_service().write_file(relative_path, content, password)
 
 
-SKILL_SERVICE = SkillService(SKILLS_ROOT)
+SKILL_SERVICE = SkillService(
+    SKILLS_ROOT,
+    manifest_validator=DOMAIN_CONTRACT.validate_skill_manifest,
+)
 
 
 def safe_skills_path(relative_path):
@@ -1324,6 +1095,9 @@ _EXECUTION_SERVICE = None
 
 def execution_service():
     global _EXECUTION_SERVICE
+    config = read_config()
+    execution = config.get("execution") if isinstance(config.get("execution"), dict) else {}
+    max_output_bytes = safe_int(execution.get("max_output_bytes", 1048576) or 1048576, 1048576)
     if _EXECUTION_SERVICE is None:
         _EXECUTION_SERVICE = ExecutionService(
             root=ROOT,
@@ -1337,7 +1111,12 @@ def execution_service():
             process_registry_lock=JOB_PROCESSES_LOCK,
             cancel_grace=CANCEL_GRACE_SEC,
             default_job_timeout=JOB_TIMEOUT_SEC,
+            max_output_bytes=max_output_bytes,
         )
+    else:
+        # Each execution snapshots this value before spawning, so a config update
+        # applies to later Jobs without mutating an in-flight process limit.
+        _EXECUTION_SERVICE.max_output_bytes = max_output_bytes
     return _EXECUTION_SERVICE
 
 
@@ -1759,8 +1538,38 @@ def notify_service_ready():
         client.sendall(b"READY=1\nSTATUS=Web console is ready")
 
 
+class BoundedThreadingHTTPServer(ThreadingHTTPServer):
+    """Threading HTTP server with a fixed admission cap."""
+
+    daemon_threads = True
+
+    def __init__(self, server_address, request_handler_class):
+        self._worker_slots = threading.BoundedSemaphore(MAX_HTTP_WORKERS)
+        super().__init__(server_address, request_handler_class)
+
+    def process_request(self, request, client_address):
+        if not self._worker_slots.acquire(blocking=False):
+            self.shutdown_request(request)
+            return
+        try:
+            super().process_request(request, client_address)
+        except BaseException:
+            self._worker_slots.release()
+            raise
+
+    def process_request_thread(self, request, client_address):
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self._worker_slots.release()
+
+
 class Handler(SimpleHTTPRequestHandler):
     server_version = "LinuxAgentWeb/1.0"
+
+    def setup(self):
+        super().setup()
+        self.connection.settimeout(HTTP_SOCKET_TIMEOUT_SEC)
 
     def begin_request(self):
         self._metrics_recorded = False
@@ -1943,7 +1752,17 @@ class Handler(SimpleHTTPRequestHandler):
             json_response(self, HTTPStatus.OK, web_agent_session_state())
             return
         if path == "/api/skills/tree":
-            json_response(self, HTTPStatus.OK, list_skill_files())
+            try:
+                result = list_skill_files()
+            except ValueError as exc:
+                json_domain_error(
+                    self,
+                    "invalid_skill_manifest",
+                    str(exc),
+                    default=HTTPStatus.CONFLICT,
+                )
+                return
+            json_response(self, HTTPStatus.OK, result)
             return
         if path.startswith("/api/jobs/"):
             job_id = path.rsplit("/", 1)[-1]
@@ -2064,7 +1883,10 @@ class Handler(SimpleHTTPRequestHandler):
             json_response(self, HTTPStatus.OK, result)
             return
         if path == "/api/config/update":
-            result = update_config_value(str(body.get("key") or ""), body.get("value"))
+            if isinstance(body.get("changes"), dict):
+                result = update_config_values(body["changes"])
+            else:
+                result = update_config_value(str(body.get("key") or ""), body.get("value"))
             json_response(self, HTTPStatus.OK, result)
             return
         if path == "/api/config/models":
@@ -2309,7 +2131,7 @@ def main():
         },
     )
     try:
-        server = ThreadingHTTPServer((HOST, PORT), Handler)
+        server = BoundedThreadingHTTPServer((HOST, PORT), Handler)
     except OSError as exc:
         print(f"[错误] Web 控制台无法监听 http://{HOST}:{PORT}/: {exc.strerror or exc}", file=sys.stderr, flush=True)
         if exc.errno == errno.EADDRINUSE:

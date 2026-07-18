@@ -1,11 +1,16 @@
+/** @typedef {import("./types.js").AuditEvent} AuditEvent */
+
+/** @param {AuditEvent & Record<string, any>} event @returns {string} */
 export function auditEventName(event) {
   return event?.stage || event?.event || event?.type || event?.name || event?.status || event?.kind || event?.payload?.event || "event";
 }
 
+/** @param {AuditEvent & Record<string, any>} event @returns {string} */
 export function auditEventTime(event) {
   return event?.timestamp || event?.time || event?.started_at || event?.created_at || "";
 }
 
+/** @param {unknown} value @returns {string} */
 export function compactAuditTime(value) {
   if (!value) return "--";
   return String(value).replace("T", " ").replace("Z", "");
@@ -35,6 +40,7 @@ function resultSummary(detail = {}) {
   return parts.join("，");
 }
 
+/** @param {string} stage @returns {string} */
 export function auditStageLabel(stage) {
   if (stage === "session_started") return "会话开始";
   if (stage === "session_finished") return "会话结束";
@@ -73,6 +79,12 @@ export function auditStageLabel(stage) {
   return stage || "事件";
 }
 
+/**
+ * Build the presentation model for one audit event.
+ * @param {AuditEvent & Record<string, any>} event
+ * @param {(value: unknown) => string} [pretty]
+ * @returns {{stage: string, title: string, status: string, summary: string, details: string[], badges: string[]}}
+ */
 export function auditEventDisplay(event, pretty = (value) => JSON.stringify(value)) {
   const stage = auditEventName(event);
   const payload = payloadOf(event);
@@ -163,18 +175,31 @@ export function auditEventDisplay(event, pretty = (value) => JSON.stringify(valu
   };
 }
 
+/**
+ * Produce a compact human-readable event summary.
+ * @param {AuditEvent & Record<string, any>} event
+ * @param {(value: unknown) => string} [pretty]
+ * @returns {string}
+ */
 export function auditEventSummary(event, pretty = (value) => JSON.stringify(value)) {
   const display = auditEventDisplay(event, pretty);
   if (display.summary) return display.summary;
   const payload = event?.payload || event || {};
   if (payload.message) return payload.message;
-  if (payload.status) return payload.status;
+  if (payload.status) return String(payload.status);
   if (payload.mode && payload.input) return `${payload.mode}: ${payload.input}`;
-  if (payload.command) return payload.command;
-  if (payload.ref) return payload.ref;
+  if (payload.command) return String(payload.command);
+  if (payload.ref) return String(payload.ref);
   return compactText(pretty(payload));
 }
 
+/**
+ * Test whether an event belongs to a UI filter category.
+ * @param {AuditEvent & Record<string, any>} event
+ * @param {string} category
+ * @param {(value: unknown) => string} [pretty]
+ * @returns {boolean}
+ */
 export function auditEventMatchesCategory(event, category, pretty = (value) => JSON.stringify(value)) {
   const text = `${auditEventName(event)} ${pretty(event)}`.toLowerCase();
   if (category === "observer") return text.includes("observer") || text.includes("auditd");

@@ -9,6 +9,8 @@ SCHEMA="${ROOT_DIR}/schema/domain.json"
 source "${ROOT_DIR}/lib/common.sh"
 # shellcheck source=../lib/config.sh
 source "${ROOT_DIR}/lib/config.sh"
+# shellcheck source=../lib/provider_resilience.sh
+source "${ROOT_DIR}/lib/provider_resilience.sh"
 # shellcheck source=../lib/ai.sh
 source "${ROOT_DIR}/lib/ai.sh"
 # shellcheck source=../lib/protocol.sh
@@ -23,6 +25,21 @@ linux_agent_config_validate_web_metrics '{"web":{"metrics_enabled":true}}'
 linux_agent_config_validate_web_metrics '{"web":{"metrics_enabled":false}}'
 if linux_agent_config_validate_web_metrics '{"web":{"metrics_enabled":"false"}}'; then
     printf 'web.metrics_enabled string unexpectedly passed strict validation\n' >&2
+    exit 1
+fi
+linux_agent_config_validate_provider_resilience '{}'
+linux_agent_config_validate_provider_resilience '{"provider_resilience":{"enabled":true,"max_attempts":3,"backoff_initial_ms":1,"backoff_max_ms":2,"circuit_failure_threshold":2,"circuit_open_sec":30,"failover":[]}}'
+linux_agent_config_validate_provider_resilience '{"provider_resilience":{"failover":[{"provider":"openai_compatible","api_key_env":"LINUX_AGENT_FAILOVER_API_KEY"}]}}'
+if linux_agent_config_validate_provider_resilience '{"provider_resilience":{"max_attempts":0}}'; then
+    printf 'provider_resilience accepted zero attempts\n' >&2
+    exit 1
+fi
+if linux_agent_config_validate_provider_resilience '{"provider_resilience":{"failover":[{"provider":"openai","api_key":"secret"}]}}'; then
+    printf 'provider_resilience accepted an inline failover secret\n' >&2
+    exit 1
+fi
+if linux_agent_config_validate_provider_resilience '{"provider_resilience":{"failover":[{"provider":"openai","api_key_env":"PATH"}]}}'; then
+    printf 'provider_resilience accepted a non-API-key environment variable\n' >&2
     exit 1
 fi
 
@@ -49,6 +66,10 @@ jq -e '
         "persisted_session_invalid",
         "ai_config_missing",
         "ai_request_failed",
+        "ai_http_error",
+        "ai_auth_failed",
+        "ai_circuit_open",
+        "ai_failover_exhausted",
         "ai_empty_response",
         "ai_invalid_json"
     ] | all(. as $code | ($schema.error_codes[$code].http | type) == "number"))
@@ -324,5 +345,12 @@ cp "${project}/config/config.example.json" "${project}/config/config.json"
 
 tools_json="$(cd "${project}" && LINUX_AGENT_API_MODE=1 bash bin/agent api tools list '{}')"
 jq -e 'has("ok") and (.ok | type == "boolean")' <<<"${tools_json}" >/dev/null
+
+# 7) Frontend provider normalization must match schema/domain.json.
+if command -v node >/dev/null 2>&1; then
+    node "${ROOT_DIR}/tests/web_provider_normalize.mjs"
+else
+    printf 'contract: node not installed; frontend provider-id contract skipped\n'
+fi
 
 printf 'contract.sh OK\n'

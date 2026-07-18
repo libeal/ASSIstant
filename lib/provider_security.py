@@ -23,7 +23,13 @@ def validate_http_url(raw_url):
         _ = parsed.port
     except ValueError:
         return "", "invalid_url"
-    if parsed.scheme not in {"http", "https"} or not parsed.netloc or not hostname:
+    if (
+        parsed.scheme not in {"http", "https"}
+        or not parsed.netloc
+        or not hostname
+        or parsed.username is not None
+        or parsed.password is not None
+    ):
         return "", "invalid_url"
     return value, ""
 
@@ -128,7 +134,54 @@ def provider_url_error_message(status):
         "https_required": "Provider URL must use HTTPS in this runtime.",
         "provider_dns_unavailable": "Provider hostname could not be resolved safely.",
         "blocked_internal_address": "Provider URL resolves to a blocked internal/metadata address.",
+        "provider_host_not_allowed": "Provider URL host is not in the trusted host set for credentialed requests.",
+        "provider_url_override_blocked": "Request body cannot override api_url to an untrusted host when an API key is sent.",
     }.get(status, "Provider URL is not allowed.")
+
+
+
+
+def provider_url_host(raw_url):
+    """Return the lower-case hostname from a provider URL, or empty string."""
+
+    value = str(raw_url or "").strip()
+    if not value:
+        return ""
+    try:
+        parsed = urlparse(value)
+    except ValueError:
+        return ""
+    return (parsed.hostname or "").lower()
+
+
+def trusted_provider_hosts(security, *urls):
+    """Hosts allowed to receive Provider credentials.
+
+    ``providers_security.allowed_hosts`` is always trusted.  Configured and
+    registry URLs expand the set so operators can use stock Providers without
+    an explicit allowlist, while still blocking arbitrary body.api_url overrides
+    that would exfiltrate API keys to an attacker-controlled HTTPS host.
+    """
+
+    hosts = set()
+    for host in security.get("allowed_hosts") or []:
+        normalized = str(host or "").strip().lower()
+        if normalized:
+            hosts.add(normalized)
+    for raw in urls:
+        host = provider_url_host(raw)
+        if host:
+            hosts.add(host)
+    return hosts
+
+
+def host_is_trusted(host, trusted_hosts):
+    """Return whether host is present in the trusted set."""
+
+    normalized = str(host or "").strip().lower().strip("[]")
+    if not normalized:
+        return False
+    return normalized in {str(item).strip().lower().strip("[]") for item in trusted_hosts}
 
 
 def validate_command(url, policy_json):

@@ -46,6 +46,28 @@
     "terminated",
     "revision_requested"
   ],
+  "risk_level": [
+    "low",
+    "medium",
+    "high",
+    "critical"
+  ],
+  "executor_type": [
+    "skill_script",
+    "shell",
+    "remote_script",
+    "mcp_tool"
+  ],
+  "approval_type": [
+    "work",
+    "terminal"
+  ],
+  "approval_action": [
+    "approve",
+    "reject",
+    "skip",
+    "terminate"
+  ],
   "work_status": [
     "answered",
     "executed",
@@ -100,7 +122,9 @@
     "session_persistence_failed",
     "job_exception",
     "invalid_output",
-    "invalid_agent_output"
+    "invalid_agent_output",
+    "invalid_skill_manifest",
+    "output_limit_exceeded"
   ],
   "status_presentation": {
     "low": [
@@ -172,6 +196,7 @@
       "required": [
         "response_type",
         "summary",
+        "continue_decision",
         "steps"
       ],
       "response_type": "work_plan"
@@ -323,6 +348,14 @@
       "retryable": true,
       "http": 502
     },
+    "invalid_skill_manifest": {
+      "retryable": false,
+      "http": 409
+    },
+    "output_limit_exceeded": {
+      "retryable": false,
+      "http": 413
+    },
     "timed_out": {
       "retryable": true,
       "http": 504
@@ -383,6 +416,18 @@
       "retryable": true,
       "http": 502
     },
+    "provider_dns_unavailable": {
+      "retryable": true,
+      "http": 200
+    },
+    "provider_host_not_allowed": {
+      "retryable": false,
+      "http": 200
+    },
+    "provider_url_override_blocked": {
+      "retryable": false,
+      "http": 200
+    },
     "unsupported_provider": {
       "retryable": false,
       "http": 200
@@ -426,6 +471,10 @@
     "observer_disabled": {
       "retryable": false,
       "http": 409
+    },
+    "observer_helper_failed": {
+      "retryable": true,
+      "http": 503
     },
     "auditctl_not_found": {
       "retryable": false,
@@ -474,6 +523,26 @@
     "ai_request_failed": {
       "retryable": true,
       "http": 502
+    },
+    "ai_http_error": {
+      "retryable": true,
+      "http": 502
+    },
+    "ai_auth_failed": {
+      "retryable": false,
+      "http": 401
+    },
+    "ai_circuit_open": {
+      "retryable": true,
+      "http": 503
+    },
+    "ai_failover_exhausted": {
+      "retryable": true,
+      "http": 502
+    },
+    "ai_response_too_large": {
+      "retryable": false,
+      "http": 413
     },
     "ai_empty_response": {
       "retryable": true,

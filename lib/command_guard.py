@@ -19,6 +19,8 @@ from dataclasses import dataclass
 from pathlib import PurePosixPath
 from typing import Iterable
 
+from subprocess_env import build_subprocess_env
+
 
 SEPARATORS = {";", "&&", "||", "&"}
 PIPE_OPERATORS = {"|", "|&"}
@@ -1215,6 +1217,7 @@ def bash_syntax_check(text: str) -> str | None:
             text=True,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.PIPE,
+            env=build_subprocess_env(include_api_key=False),
             timeout=3,
             check=False,
         )

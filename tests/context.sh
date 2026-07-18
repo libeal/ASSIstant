@@ -40,6 +40,7 @@ linux_agent_record_conversation_turn "work" "第一轮请求" "第一轮完成" 
 linux_agent_record_conversation_turn "work" "第二轮请求" "第二轮完成" "executed" "request"
 linux_agent_record_conversation_turn "work" "第三轮请求" "第三轮完成" "executed" "request"
 [[ "$(stat -c '%a' "${history_file}")" == "600" ]]
+jq -e 'length == 2' "${history_file}" >/dev/null
 linux_agent_history_window | jq -e 'length == 2
     and .[0].request.content == "第二轮请求"
     and .[1].request.content == "第三轮请求"
@@ -57,6 +58,18 @@ linux_agent_history_window | jq -e 'length == 1
     and .[0].request.content == "旧用户请求"
     and .[0].response.content == "旧助手响应"
     and .[0].status == "executed"' >/dev/null
+
+oversized_history_file="${tmp_root}/oversized-history.json"
+printf '["history-too-large"]\n' >"${oversized_history_file}"
+LINUX_AGENT_CONVERSATION_HISTORY_FILE="${oversized_history_file}"
+saved_history_max="${LINUX_AGENT_HISTORY_MAX_BYTES}"
+LINUX_AGENT_HISTORY_MAX_BYTES=8
+if linux_agent_load_conversation_history 2>"${tmp_root}/oversized-history.err"; then
+    printf 'oversized conversation history was accepted\n' >&2
+    exit 1
+fi
+grep -q '字节上限' "${tmp_root}/oversized-history.err"
+LINUX_AGENT_HISTORY_MAX_BYTES="${saved_history_max}"
 
 loop_history_file="${tmp_root}/loop-history.json"
 # Consumed by functions sourced from lib/context.sh.

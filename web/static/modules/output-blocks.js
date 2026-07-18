@@ -1,5 +1,7 @@
 import { renderMarkdown } from "./markdown.js";
 
+/** @typedef {import("./types.js").OutputBlock} OutputBlock */
+
 function escapeHtml(value) {
   return String(value ?? "")
     .replace(/&/g, "&amp;")
@@ -54,12 +56,14 @@ function isEmptyValue(value) {
   return false;
 }
 
+/** @param {any} value @returns {OutputBlock[]} */
 export function outputBlocksFrom(value) {
   if (Array.isArray(value?.output_blocks)) return value.output_blocks;
   if (Array.isArray(value)) return value;
   return [];
 }
 
+/** @param {any} blocks @returns {OutputBlock[]} */
 export function userOutputBlocks(blocks) {
   return outputBlocksFrom(blocks).filter((block) => {
     const kind = String(block?.kind || "");
@@ -67,12 +71,20 @@ export function userOutputBlocks(blocks) {
   });
 }
 
+/** @param {any} blocks @returns {OutputBlock[]} */
 export function displayOutputBlocks(blocks) {
   const source = outputBlocksFrom(blocks);
   const userBlocks = userOutputBlocks(source);
   return userBlocks.length ? userBlocks : source;
 }
 
+/**
+ * Find the JSON payload of the first matching output block.
+ * @param {any} blocks
+ * @param {string} kind
+ * @param {string} [title]
+ * @returns {Record<string, any>}
+ */
 export function findBlockJson(blocks, kind, title = "") {
   const match = outputBlocksFrom(blocks).find((block) => {
     if (kind && block.kind !== kind) return false;
@@ -82,6 +94,7 @@ export function findBlockJson(blocks, kind, title = "") {
   return match?.json || {};
 }
 
+/** @param {any} blocks @returns {string} */
 export function outputBlocksText(blocks) {
   return displayOutputBlocks(blocks)
     .map((block) => {
@@ -93,13 +106,15 @@ export function outputBlocksText(blocks) {
     .join("\n\n");
 }
 
+/** @param {any} blocks @returns {string} */
 export function outputBlocksSummary(blocks) {
   for (const block of displayOutputBlocks(blocks)) {
     if (typeof block.text === "string" && block.text.trim()) return compactText(block.text);
-    if (block.json?.summary) return compactText(block.json.summary);
-    if (block.json?.message) return compactText(block.json.message);
-    if (block.json?.action) return compactText(block.json.action);
-    if (block.json?.tool) return compactText(block.json.tool);
+    const json = /** @type {Record<string, any>|undefined} */ (block.json);
+    if (json?.summary) return compactText(json.summary);
+    if (json?.message) return compactText(json.message);
+    if (json?.action) return compactText(json.action);
+    if (json?.tool) return compactText(json.tool);
     if (block.json !== undefined) {
       const text = jsonDisplayText(block.json);
       if (text) return compactText(text);
@@ -108,6 +123,7 @@ export function outputBlocksSummary(blocks) {
   return "";
 }
 
+/** @param {unknown} text @returns {string} */
 export function tableFromText(text) {
   const lines = String(text || "").split("\n").filter((line) => line.trim());
   if (lines.length < 2) return "";
@@ -122,6 +138,7 @@ export function tableFromText(text) {
   return `<div class="data-table-wrap"><table class="data-table">${body}</table></div>`;
 }
 
+/** @param {any} blocks @returns {string} */
 export function renderOutputBlocksHtml(blocks) {
   const sections = displayOutputBlocks(blocks).map((block) => {
     const title = block.title || block.kind || "输出";

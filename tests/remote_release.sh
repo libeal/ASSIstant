@@ -3,6 +3,8 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# shellcheck source=tests/cosign_compat.sh
+source "${ROOT_DIR}/tests/cosign_compat.sh"
 tmp_root="$(mktemp -d)"
 
 cleanup() {
@@ -51,7 +53,7 @@ jq -e '
 ' "${first}/release-manifest.json" >/dev/null
 
 registered_assets="$(jq -r '[.assets[].name, .skills[].asset.name] | sort | .[]' "${first}/release-manifest.json")"
-actual_assets="$(find "${first}" -maxdepth 1 -type f ! -name release-manifest.json -printf '%f\n' | sort)"
+actual_assets="$(find "${first}" -maxdepth 1 -type f ! -name release-manifest.json -printf '%f\n' | LC_ALL=C sort)"
 if [[ "${registered_assets}" != "${actual_assets}" ]]; then
     printf 'release contains unregistered or missing assets\n' >&2
     diff -u <(printf '%s\n' "${registered_assets}") <(printf '%s\n' "${actual_assets}") || true
@@ -89,6 +91,10 @@ if grep -Eq '^skills/[^/]+/' <<<"${core_listing}"; then
     exit 1
 fi
 grep -qx 'skills/INDEX.md' <<<"${core_listing}"
+grep -qx 'packaging/linux-agent-observer-helper.service' <<<"${core_listing}"
+grep -qx 'packaging/linux-agent-observer-helper.socket' <<<"${core_listing}"
+grep -qx 'packaging/dropins/10-provider-egress.conf.example' <<<"${core_listing}"
+grep -qx 'lib/observer_helper.py' <<<"${core_listing}"
 
 while IFS= read -r skill_name; do
     asset="$(jq -r --arg skill "${skill_name}" '.skills[$skill].asset.name' "${first}/release-manifest.json")"
@@ -117,12 +123,56 @@ grep -q 'agent/tmp/web/auth-token' "${ROOT_DIR}/.github/workflows/remote-release
 grep -q 'id-token: write' "${ROOT_DIR}/.github/workflows/remote-release.yml"
 grep -q 'prepare-release-signature.sh' "${ROOT_DIR}/.github/workflows/remote-release.yml"
 grep -q 'cosign sign-blob' "${ROOT_DIR}/scripts/prepare-release-signature.sh"
+grep -q 'refs/tags/${RELEASE_TAG}' "${ROOT_DIR}/.github/workflows/remote-release.yml"
+grep -q 'github.event.repository.default_branch' "${ROOT_DIR}/.github/workflows/remote-release.yml"
+! grep -q 'ref: \${{ github.ref }}' "${ROOT_DIR}/.github/workflows/remote-release.yml"
 grep -q 'attest-build-provenance@' "${ROOT_DIR}/.github/workflows/remote-release.yml"
+python3 - "${ROOT_DIR}/.github/workflows/remote-release.yml" <<'PY'
+import sys
+from pathlib import Path
+
+workflow = Path(sys.argv[1]).read_text(encoding="utf-8")
+quality = workflow.index("  quality:\n")
+release = workflow.index("  build-and-release:\n")
+assert quality < release
+quality_job = workflow[quality:release]
+quality_install = quality_job[quality_job.index("      - name: Install quality tooling\n"):quality_job.index("      - name: Install cosign for compatibility regressions\n")]
+coverage_step_index = quality_job.index("      - name: Report optional Python coverage\n")
+required_regression = quality_job[quality_job.index("      - name: Run regression suite\n"):coverage_step_index]
+coverage_step = quality_job[coverage_step_index:]
+assert "coverage" not in quality_install
+assert "python3 -m coverage" not in required_regression
+assert coverage_step.index("        continue-on-error: true\n") < coverage_step.index("python3 -m coverage run")
+assert "-p 'test_web_*.py'" in coverage_step
+privileged_job = workflow[release:]
+assert "    needs: quality\n" in privileged_job
+assert "apt-get" not in privileged_job
+assert "pip install" not in privileged_job
+assert "contents: write" in privileged_job
+assert "id-token: write" in privileged_job
+assert privileged_job.index("Require the selected tag ref") < privileged_job.index("Prepare release manifest signature")
+PY
+if GITHUB_ACTIONS=true GITHUB_REF=refs/heads/main \
+    bash "${ROOT_DIR}/scripts/prepare-release-signature.sh" v0.0.0-test "${first}" \
+    >"${tmp_root}/wrong-ref.stdout" 2>"${tmp_root}/wrong-ref.stderr"; then
+    printf 'release signer unexpectedly accepted a branch OIDC identity\n' >&2
+    exit 1
+fi
+grep -q 'must run from refs/tags/v0.0.0-test' "${tmp_root}/wrong-ref.stderr"
+grep -q 'assets.installer.sha256' "${ROOT_DIR}/README.md"
+grep -q '^name: ci$' "${ROOT_DIR}/.github/workflows/ci.yml"
+grep -q 'pull_request:' "${ROOT_DIR}/.github/workflows/ci.yml"
+grep -q 'branches: \[main, master\]' "${ROOT_DIR}/.github/workflows/ci.yml"
 grep -q 'curl -fsSL.*max-time.*max-filesize' "${ROOT_DIR}/remote/bootstrap.sh"
 grep -q 'curl -fsSL.*proto.*max-time.*max-filesize' "${ROOT_DIR}/scripts/install.sh"
 if grep -E '^[[:space:]]*uses:[[:space:]]+[^@[:space:]]+@' "${ROOT_DIR}/.github/workflows/remote-release.yml" |
     grep -Ev '@[0-9a-f]{40}([[:space:]]|$)' >/dev/null; then
     printf 'workflow contains an action that is not pinned to a 40-character commit SHA\n' >&2
+    exit 1
+fi
+if grep -E '^[[:space:]]*uses:[[:space:]]+[^@[:space:]]+@' "${ROOT_DIR}/.github/workflows/ci.yml" |
+    grep -Ev '@[0-9a-f]{40}([[:space:]]|$)' >/dev/null; then
+    printf 'CI workflow contains an action that is not pinned to a 40-character commit SHA\n' >&2
     exit 1
 fi
 
@@ -132,11 +182,10 @@ if command -v cosign >/dev/null 2>&1; then
     (
         cd "${cosign_dir}"
         COSIGN_PASSWORD=remote-release-test cosign generate-key-pair >/dev/null
-        COSIGN_PASSWORD=remote-release-test cosign sign-blob --yes --tlog-upload=false --key cosign.key \
-            --bundle manifest.sigstore.json "${first}/release-manifest.json" >/dev/null
-        cosign verify-blob --offline --insecure-ignore-tlog \
-            --key cosign.pub --bundle manifest.sigstore.json \
-            "${first}/release-manifest.json" >/dev/null
+        COSIGN_PASSWORD=remote-release-test linux_agent_test_cosign_sign_blob \
+            cosign.key manifest.sigstore.json "${first}/release-manifest.json" >/dev/null
+        linux_agent_test_cosign_verify_blob \
+            cosign.pub manifest.sigstore.json "${first}/release-manifest.json" >/dev/null
     )
 else
     printf 'remote_release: cosign not installed; signature roundtrip skipped\n'

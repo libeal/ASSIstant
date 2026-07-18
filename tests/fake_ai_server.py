@@ -2,9 +2,25 @@
 
 import json
 import sys
+import threading
 import time
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+
+COUNTERS = {}
+COUNTER_LOCK = threading.Lock()
+
+
+def increment_counter(name):
+    with COUNTER_LOCK:
+        COUNTERS[name] = COUNTERS.get(name, 0) + 1
+        return COUNTERS[name]
+
+
+def counters_snapshot():
+    with COUNTER_LOCK:
+        return dict(COUNTERS)
 
 
 def step(step_id, title, executor_type, reason, expected_effect, risk_level="low", **extra):
@@ -290,6 +306,9 @@ class Handler(BaseHTTPRequestHandler):
         if self.path == "/health":
             self.send_json({"ok": True})
             return
+        if self.path == "/counters":
+            self.send_json({"counters": counters_snapshot()})
+            return
         if self.path in ("/v1/models", "/models"):
             self.send_json(
                 {
@@ -308,6 +327,10 @@ class Handler(BaseHTTPRequestHandler):
             if self.headers.get("api-subscription-key") != "TEST_CONFIG_API_KEY_123456":
                 self.send_json({"error": {"message": "api-subscription-key header is required"}}, status=HTTPStatus.UNAUTHORIZED)
                 return
+        if self.path.startswith("/require-failover-key/"):
+            if self.headers.get("Authorization") != "Bearer TEST_FAILOVER_API_KEY_123456":
+                self.send_json({"error": {"message": "failover bearer key is required"}}, status=HTTPStatus.UNAUTHORIZED)
+                return
         length = int(self.headers.get("Content-Length", "0") or "0")
         raw = self.rfile.read(length)
         try:
@@ -316,7 +339,24 @@ class Handler(BaseHTTPRequestHandler):
             self.send_error(HTTPStatus.BAD_REQUEST)
             return
 
-        content = response_for(payload.get("messages", []))
+        if self.path.startswith("/flaky-retry/"):
+            if increment_counter("flaky_retry") <= 2:
+                self.send_json({"error": {"message": "transient fixture failure"}}, status=HTTPStatus.SERVICE_UNAVAILABLE)
+                return
+        elif self.path.startswith("/always-503-circuit/"):
+            increment_counter("always_503_circuit")
+            self.send_json({"error": {"message": "circuit fixture failure"}}, status=HTTPStatus.SERVICE_UNAVAILABLE)
+            return
+        elif self.path.startswith("/always-503/"):
+            increment_counter("always_503")
+            self.send_json({"error": {"message": "failover fixture failure"}}, status=HTTPStatus.SERVICE_UNAVAILABLE)
+            return
+
+        messages = payload.get("messages", [])
+        content = response_for(messages)
+        _purpose, _request_context, current_request = extract_request(messages)
+        if "超大AI响应" in current_request:
+            content = "x" * (1024 * 1024 + 4096)
         if not isinstance(content, str):
             content = json.dumps(content, ensure_ascii=False, separators=(",", ":"))
         self.send_json({"choices": [{"message": {"content": content}}]})
@@ -327,7 +367,10 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
-        self.wfile.write(body)
+        try:
+            self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
 
 
 def main():

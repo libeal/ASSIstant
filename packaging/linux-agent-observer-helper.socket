@@ -1,0 +1,15 @@
+[Unit]
+Description=Linux Agent privileged observer helper socket
+PartOf=linux-agent-web.service
+
+[Socket]
+ListenStream=/run/linux-agent/observer.sock
+Service=linux-agent-observer-helper.service
+SocketUser=root
+SocketGroup=linux-agent
+SocketMode=0660
+DirectoryMode=0755
+RemoveOnStop=yes
+
+[Install]
+WantedBy=sockets.target

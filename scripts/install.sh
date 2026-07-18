@@ -15,9 +15,15 @@ REQUIRE_SIGNATURE=0
 NO_SYSTEMD=0
 KEEP=2
 PURGE_DATA=0
+EGRESS_MODE="preserve"
+declare -a PROVIDER_CIDRS=()
 WORK_DIR=""
 PREPARED_RELEASE_DIR=""
 SYSTEMD_UNIT_PATH="${LINUX_AGENT_SYSTEMD_UNIT_PATH:-/etc/systemd/system/linux-agent-web.service}"
+SYSTEMD_UNIT_DIR="${SYSTEMD_UNIT_PATH%/*}"
+SYSTEMD_HELPER_SERVICE_PATH="${LINUX_AGENT_SYSTEMD_HELPER_SERVICE_PATH:-${SYSTEMD_UNIT_DIR}/linux-agent-observer-helper.service}"
+SYSTEMD_HELPER_SOCKET_PATH="${LINUX_AGENT_SYSTEMD_HELPER_SOCKET_PATH:-${SYSTEMD_UNIT_DIR}/linux-agent-observer-helper.socket}"
+SYSTEMD_EGRESS_DROPIN_PATH="${LINUX_AGENT_SYSTEMD_EGRESS_DROPIN_PATH:-${SYSTEMD_UNIT_DIR}/linux-agent-web.service.d/10-provider-egress.conf}"
 TRANSACTION_MODE=""
 TRANSACTION_OLD_VERSION=""
 TRANSACTION_TARGET_VERSION=""
@@ -26,8 +32,13 @@ TRANSACTION_COMMITTED=0
 CONFIG_STATE_CAPTURED=0
 SYSTEMD_STATE_CAPTURED=0
 SYSTEMD_UNIT_EXISTED=0
+SYSTEMD_HELPER_SERVICE_EXISTED=0
+SYSTEMD_HELPER_SOCKET_EXISTED=0
+SYSTEMD_EGRESS_DROPIN_EXISTED=0
 SYSTEMD_WAS_ENABLED=0
 SYSTEMD_WAS_ACTIVE=0
+SYSTEMD_HELPER_SOCKET_WAS_ENABLED=0
+SYSTEMD_HELPER_SOCKET_WAS_ACTIVE=0
 
 fail() {
     printf '[install:error] %s\n' "$*" >&2
@@ -59,6 +70,9 @@ usage() {
   --require-signature      强制使用 cosign 验证 release manifest
   --keep <数量>            升级成功后保留的版本总数，默认 2
   --no-systemd             不创建用户、不安装或操作 systemd unit
+  --provider-cidr <CIDR>   systemd 仅放行该 Provider 网段；可重复指定
+  --allow-unrestricted-provider-egress
+                           明确不启用 systemd Provider 出站过滤
   --purge-data             uninstall 时同时删除持久数据
 
 签名验证可通过 LINUX_AGENT_SIGNATURE_PUBKEY、LINUX_AGENT_SIGNATURE_IDENTITY
@@ -126,6 +140,18 @@ while [[ $# -gt 0 ]]; do
             NO_SYSTEMD=1
             shift
             ;;
+        --provider-cidr)
+            [[ $# -ge 2 ]] || fail '--provider-cidr 缺少参数'
+            [[ "${EGRESS_MODE}" != "unrestricted" ]] || fail '--provider-cidr 不能与 --allow-unrestricted-provider-egress 同时使用'
+            EGRESS_MODE="enforce"
+            PROVIDER_CIDRS+=("$2")
+            shift 2
+            ;;
+        --allow-unrestricted-provider-egress)
+            [[ "${#PROVIDER_CIDRS[@]}" -eq 0 ]] || fail '--allow-unrestricted-provider-egress 不能与 --provider-cidr 同时使用'
+            EGRESS_MODE="unrestricted"
+            shift
+            ;;
         --purge-data)
             PURGE_DATA=1
             shift
@@ -174,6 +200,50 @@ for command_name in bash curl python3 jq sha256sum stat mktemp readlink cp mv ln
     command -v "${command_name}" >/dev/null 2>&1 || fail "缺少依赖命令: ${command_name}"
 done
 
+if [[ "${NO_SYSTEMD}" -eq 1 && "${EGRESS_MODE}" != "preserve" ]]; then
+    fail 'Provider 出站过滤选项仅适用于 systemd 模式'
+fi
+if [[ "${#PROVIDER_CIDRS[@]}" -gt 64 ]]; then
+    fail '--provider-cidr 最多允许 64 项'
+fi
+if [[ "${EGRESS_MODE}" == "enforce" ]]; then
+    normalized_cidrs="$(
+        python3 - "${PROVIDER_CIDRS[@]}" <<'PY'
+import ipaddress
+import sys
+
+seen = set()
+for raw in sys.argv[1:]:
+    try:
+        network = ipaddress.ip_network(raw, strict=False)
+    except ValueError as exc:
+        raise SystemExit(f"invalid Provider CIDR {raw!r}: {exc}")
+    if network.prefixlen == 0:
+        raise SystemExit(f"refusing unrestricted Provider CIDR: {raw}")
+    value = str(network)
+    if value not in seen:
+        seen.add(value)
+        print(value)
+PY
+    )" || fail '--provider-cidr 格式非法'
+    mapfile -t PROVIDER_CIDRS <<<"${normalized_cidrs}"
+    [[ "${#PROVIDER_CIDRS[@]}" -gt 0 && -n "${PROVIDER_CIDRS[0]}" ]] || fail '至少需要一个有效的 --provider-cidr'
+fi
+
+if [[ "${NO_SYSTEMD}" -eq 0 ]]; then
+    case "${COMMAND}" in
+        install)
+            [[ "${EGRESS_MODE}" != "preserve" ]] ||
+                fail 'systemd 首次安装必须提供 --provider-cidr，或显式使用 --allow-unrestricted-provider-egress'
+            ;;
+        upgrade | rollback)
+            if [[ "${EGRESS_MODE}" == "preserve" && ! -f "${SYSTEMD_EGRESS_DROPIN_PATH}" ]]; then
+                fail '现有安装没有受管 Provider 出站策略；请提供 --provider-cidr，或显式使用 --allow-unrestricted-provider-egress'
+            fi
+            ;;
+    esac
+fi
+
 ensure_prefix() {
     if [[ -L "${PREFIX}" || (-e "${PREFIX}" && ! -d "${PREFIX}") ]]; then
         fail "安装前缀必须是普通目录且不能是符号链接: ${PREFIX}"
@@ -208,8 +278,13 @@ begin_transaction() {
     CONFIG_STATE_CAPTURED=0
     SYSTEMD_STATE_CAPTURED=0
     SYSTEMD_UNIT_EXISTED=0
+    SYSTEMD_HELPER_SERVICE_EXISTED=0
+    SYSTEMD_HELPER_SOCKET_EXISTED=0
+    SYSTEMD_EGRESS_DROPIN_EXISTED=0
     SYSTEMD_WAS_ENABLED=0
     SYSTEMD_WAS_ACTIVE=0
+    SYSTEMD_HELPER_SOCKET_WAS_ENABLED=0
+    SYSTEMD_HELPER_SOCKET_WAS_ACTIVE=0
     TRANSACTION_BACKUP_DIR="$(mktemp -d "${PREFIX}/.install-rollback.XXXXXX")"
     chmod 0700 "${TRANSACTION_BACKUP_DIR}"
     mkdir -p "${TRANSACTION_BACKUP_DIR}/config"
@@ -228,21 +303,39 @@ begin_transaction() {
 }
 
 capture_systemd_state() {
+    local path backup_name existed_var egress_dir
     [[ "${NO_SYSTEMD}" -eq 0 ]] || return 0
     command -v systemctl >/dev/null 2>&1 || fail '缺少 systemctl'
+    egress_dir="$(dirname -- "${SYSTEMD_EGRESS_DROPIN_PATH}")"
+    if [[ -L "${egress_dir}" || (-e "${egress_dir}" && ! -d "${egress_dir}") ]]; then
+        fail "systemd Provider 出站策略目录类型非法: ${egress_dir}"
+    fi
 
-    if [[ -L "${SYSTEMD_UNIT_PATH}" || (-e "${SYSTEMD_UNIT_PATH}" && ! -f "${SYSTEMD_UNIT_PATH}") ]]; then
-        fail "现有 systemd unit 类型非法: ${SYSTEMD_UNIT_PATH}"
-    fi
-    if [[ -f "${SYSTEMD_UNIT_PATH}" ]]; then
-        cp -p -- "${SYSTEMD_UNIT_PATH}" "${TRANSACTION_BACKUP_DIR}/linux-agent-web.service"
-        SYSTEMD_UNIT_EXISTED=1
-    fi
+    while IFS=$'\t' read -r path backup_name existed_var; do
+        if [[ -L "${path}" || (-e "${path}" && ! -f "${path}") ]]; then
+            fail "现有 systemd unit 类型非法: ${path}"
+        fi
+        if [[ -f "${path}" ]]; then
+            cp -p -- "${path}" "${TRANSACTION_BACKUP_DIR}/${backup_name}"
+            printf -v "${existed_var}" '%s' 1
+        fi
+    done <<EOF
+${SYSTEMD_UNIT_PATH}	linux-agent-web.service	SYSTEMD_UNIT_EXISTED
+${SYSTEMD_HELPER_SERVICE_PATH}	linux-agent-observer-helper.service	SYSTEMD_HELPER_SERVICE_EXISTED
+${SYSTEMD_HELPER_SOCKET_PATH}	linux-agent-observer-helper.socket	SYSTEMD_HELPER_SOCKET_EXISTED
+${SYSTEMD_EGRESS_DROPIN_PATH}	10-provider-egress.conf	SYSTEMD_EGRESS_DROPIN_EXISTED
+EOF
     if systemctl is-enabled --quiet linux-agent-web.service >/dev/null 2>&1; then
         SYSTEMD_WAS_ENABLED=1
     fi
     if systemctl is-active --quiet linux-agent-web.service >/dev/null 2>&1; then
         SYSTEMD_WAS_ACTIVE=1
+    fi
+    if systemctl is-enabled --quiet linux-agent-observer-helper.socket >/dev/null 2>&1; then
+        SYSTEMD_HELPER_SOCKET_WAS_ENABLED=1
+    fi
+    if systemctl is-active --quiet linux-agent-observer-helper.socket >/dev/null 2>&1; then
+        SYSTEMD_HELPER_SOCKET_WAS_ACTIVE=1
     fi
     SYSTEMD_STATE_CAPTURED=1
 }
@@ -270,7 +363,34 @@ restore_systemd_state() {
     else
         rm -f -- "${SYSTEMD_UNIT_PATH}"
     fi
+    if [[ "${SYSTEMD_HELPER_SERVICE_EXISTED}" -eq 1 ]]; then
+        cp -p -- "${TRANSACTION_BACKUP_DIR}/linux-agent-observer-helper.service" "${SYSTEMD_HELPER_SERVICE_PATH}"
+    else
+        rm -f -- "${SYSTEMD_HELPER_SERVICE_PATH}"
+    fi
+    if [[ "${SYSTEMD_HELPER_SOCKET_EXISTED}" -eq 1 ]]; then
+        cp -p -- "${TRANSACTION_BACKUP_DIR}/linux-agent-observer-helper.socket" "${SYSTEMD_HELPER_SOCKET_PATH}"
+    else
+        rm -f -- "${SYSTEMD_HELPER_SOCKET_PATH}"
+    fi
+    if [[ "${SYSTEMD_EGRESS_DROPIN_EXISTED}" -eq 1 ]]; then
+        mkdir -p -- "$(dirname -- "${SYSTEMD_EGRESS_DROPIN_PATH}")"
+        cp -p -- "${TRANSACTION_BACKUP_DIR}/10-provider-egress.conf" "${SYSTEMD_EGRESS_DROPIN_PATH}"
+    else
+        rm -f -- "${SYSTEMD_EGRESS_DROPIN_PATH}"
+        rmdir -- "$(dirname -- "${SYSTEMD_EGRESS_DROPIN_PATH}")" 2>/dev/null || true
+    fi
     systemctl daemon-reload >/dev/null 2>&1 || warn '回滚后 systemd daemon-reload 失败'
+    if [[ "${SYSTEMD_HELPER_SOCKET_WAS_ENABLED}" -eq 1 ]]; then
+        systemctl enable linux-agent-observer-helper.socket >/dev/null 2>&1 || warn '无法恢复 observer helper socket enabled 状态'
+    else
+        systemctl disable linux-agent-observer-helper.socket >/dev/null 2>&1 || true
+    fi
+    if [[ "${SYSTEMD_HELPER_SOCKET_WAS_ACTIVE}" -eq 1 ]]; then
+        systemctl start linux-agent-observer-helper.socket >/dev/null 2>&1 || warn '无法恢复 observer helper socket active 状态'
+    else
+        systemctl stop linux-agent-observer-helper.socket >/dev/null 2>&1 || true
+    fi
     if [[ "${SYSTEMD_WAS_ENABLED}" -eq 1 ]]; then
         systemctl enable linux-agent-web.service >/dev/null 2>&1 || warn '无法恢复 systemd enabled 状态'
     else
@@ -293,6 +413,7 @@ rollback_transaction() {
     if [[ "${NO_SYSTEMD}" -eq 0 && "${SYSTEMD_STATE_CAPTURED}" -eq 1 &&
         "${current_target}" == "releases/${TRANSACTION_TARGET_VERSION}" ]]; then
         systemctl stop linux-agent-web.service >/dev/null 2>&1 || true
+        systemctl stop linux-agent-observer-helper.socket >/dev/null 2>&1 || true
     fi
 
     if [[ "${current_target}" == "releases/${TRANSACTION_TARGET_VERSION}" ]]; then
@@ -435,6 +556,21 @@ validate_manifest() {
         and (.assets.installer | valid_asset)
         and ([.assets[] | valid_asset] | all)
         and (.assets.installer.name == "linux-agent-install.sh")
+        and ((.skills | type) == "object" and (.skills | length) > 0)
+        and ([.skills | to_entries[] | . as $skill | select(
+            ($skill.key | test("^[a-z0-9][a-z0-9-]*$") | not)
+            or (($skill.value | type) != "object")
+            or ($skill.value.asset | valid_asset | not)
+            or (($skill.value.refs | type) != "array" or ($skill.value.refs | length) == 0)
+            or ([$skill.value.refs[] | select(
+                ((.ref | type) != "string")
+                or (.ref | startswith($skill.key + "/") | not)
+                or ((.description | type) != "string" or (.description | length) == 0)
+                or (.risk | IN("low", "medium", "high", "critical") | not)
+            )] | length > 0)
+        )] | length == 0)
+        and ([.assets[].name, .skills[].asset.name] as $names
+            | ($names | length) == ($names | unique | length))
     ' "${manifest}" >/dev/null ||
         fail 'release manifest 契约无效；旧发布物可能不包含 installer 资产'
 }
@@ -505,6 +641,21 @@ verify_manifest_signature() {
     fi
 }
 
+verify_running_installer_asset() {
+    local manifest="$1"
+    local source_path resolved_path expected_sha expected_size actual_sha actual_size
+    source_path="${BASH_SOURCE[0]}"
+    [[ -n "${source_path}" && -f "${source_path}" && ! -L "${source_path}" ]] ||
+        fail '安装器必须先保存为普通文件并完成外部验证，不能从管道或符号链接运行'
+    resolved_path="$(readlink -f -- "${source_path}")"
+    expected_sha="$(jq -er '.assets.installer.sha256' "${manifest}")" || fail 'manifest 缺少 installer SHA256'
+    expected_size="$(jq -er '.assets.installer.size_bytes' "${manifest}")" || fail 'manifest 缺少 installer 大小'
+    actual_size="$(stat -c '%s' -- "${resolved_path}")"
+    actual_sha="$(sha256sum -- "${resolved_path}" | awk '{print $1}')"
+    [[ "${actual_size}" -eq "${expected_size}" ]] || fail '当前安装器与签名 manifest 登记的大小不一致'
+    [[ "${actual_sha}" == "${expected_sha}" ]] || fail '当前安装器与签名 manifest 登记的 SHA256 不一致'
+}
+
 obtain_asset() {
     local manifest="$1"
     local selector="$2"
@@ -539,15 +690,21 @@ import sys
 import tarfile
 from pathlib import Path, PurePosixPath
 
+MAX_MEMBERS = 10000
+MAX_FILE_BYTES = 64 * 1024 * 1024
+MAX_TOTAL_BYTES = 256 * 1024 * 1024
+MIN_FREE_RESERVE_BYTES = 64 * 1024 * 1024
+
 archive_path = Path(sys.argv[1])
 root = Path(sys.argv[2]).resolve()
 root.mkdir(parents=True, exist_ok=True)
 
 with tarfile.open(archive_path, "r:gz") as archive:
     members = archive.getmembers()
-    if not members:
-        raise SystemExit("archive is empty")
+    if not members or len(members) > MAX_MEMBERS:
+        raise SystemExit("archive member count is invalid")
     seen = set()
+    total_size = 0
     for member in members:
         path = PurePosixPath(member.name)
         if path.is_absolute() or not path.parts or any(part in ("", ".", "..") for part in path.parts):
@@ -555,12 +712,26 @@ with tarfile.open(archive_path, "r:gz") as archive:
         if not (member.isdir() or member.isfile()):
             raise SystemExit(f"unsupported archive member: {member.name}")
         normalized = path.as_posix().rstrip("/")
-        if normalized in seen and member.isfile():
-            raise SystemExit(f"duplicate archive file: {member.name}")
+        if normalized in seen:
+            raise SystemExit(f"duplicate archive member: {member.name}")
         seen.add(normalized)
+        if member.isfile():
+            if member.size < 0 or member.size > MAX_FILE_BYTES:
+                raise SystemExit(f"archive member is too large: {member.name}")
+            total_size += member.size
+            if total_size > MAX_TOTAL_BYTES:
+                raise SystemExit("archive expands beyond the allowed size")
         target = root.joinpath(*path.parts)
         if os.path.commonpath((root, target.resolve(strict=False))) != str(root):
             raise SystemExit(f"archive path escapes destination: {member.name}")
+
+    free_bytes = shutil.disk_usage(root).free
+    if total_size > max(0, free_bytes - MIN_FREE_RESERVE_BYTES):
+        raise SystemExit("archive expansion would exhaust destination storage")
+
+    for member in members:
+        path = PurePosixPath(member.name)
+        target = root.joinpath(*path.parts)
         if member.isdir():
             target.mkdir(parents=True, exist_ok=True)
             continue
@@ -571,14 +742,22 @@ with tarfile.open(archive_path, "r:gz") as archive:
         if source is None:
             raise SystemExit(f"cannot read archive member: {member.name}")
         with source, target.open("xb") as output:
-            shutil.copyfileobj(source, output)
+            remaining = member.size
+            while remaining:
+                chunk = source.read(min(1024 * 1024, remaining))
+                if not chunk:
+                    raise SystemExit(f"truncated archive member: {member.name}")
+                output.write(chunk)
+                remaining -= len(chunk)
+            output.flush()
+            os.fsync(output.fileno())
         os.chmod(target, member.mode & 0o755)
 PY
 }
 
 prepare_release() {
     local release_dir="${PREFIX}/releases/${VERSION}"
-    local manifest base_url core_archive web_archive
+    local manifest base_url core_archive web_archive skill_name skill_archive selector
     [[ ! -e "${release_dir}" && ! -L "${release_dir}" ]] || fail "版本已经安装: ${VERSION}"
     mkdir -p -- "${PREFIX}/releases"
     WORK_DIR="$(mktemp -d "${PREFIX}/.install-staging.XXXXXX")"
@@ -595,17 +774,40 @@ prepare_release() {
     [[ "$(stat -c '%s' "${manifest}")" -le 1048576 ]] || fail 'release manifest 超过 1MiB'
     validate_manifest "${manifest}"
     verify_manifest_signature "${manifest}" "${base_url}"
+    verify_running_installer_asset "${manifest}"
 
     core_archive="$(obtain_asset "${manifest}" '.assets.core' "${base_url}")"
     web_archive="$(obtain_asset "${manifest}" '.assets.web' "${base_url}")"
     mkdir -p "${WORK_DIR}/release"
     extract_archive_safely "${core_archive}" "${WORK_DIR}/release" || fail 'core archive 安全解包失败'
     extract_archive_safely "${web_archive}" "${WORK_DIR}/release" || fail 'web archive 安全解包失败'
+    while IFS= read -r skill_name; do
+        [[ "${skill_name}" =~ ^[a-z0-9][a-z0-9-]*$ ]] ||
+            fail "Skill 名称非法: ${skill_name}"
+        selector=".skills[\"${skill_name}\"].asset"
+        skill_archive="$(obtain_asset "${manifest}" "${selector}" "${base_url}")"
+        extract_archive_safely "${skill_archive}" "${WORK_DIR}/release" ||
+            fail "Skill archive 安全解包失败: ${skill_name}"
+    done < <(jq -r '.skills | keys[]' "${manifest}")
     [[ -x "${WORK_DIR}/release/bin/agent" && -x "${WORK_DIR}/release/bin/agent-web" ]] ||
         fail '发布物缺少可执行入口'
     [[ -f "${WORK_DIR}/release/config/config.example.json" &&
-        -f "${WORK_DIR}/release/packaging/linux-agent-web.service" ]] ||
+        -f "${WORK_DIR}/release/packaging/linux-agent-web.service" &&
+        -f "${WORK_DIR}/release/packaging/linux-agent-observer-helper.service" &&
+        -f "${WORK_DIR}/release/packaging/linux-agent-observer-helper.socket" ]] ||
         fail '发布物缺少配置或 systemd unit'
+
+    # Validate the bundled registry against the bundled configuration. The
+    # operator's persistent config may be invalid or point at an external
+    # skills_dir; neither should change the release-integrity verdict.
+    cp -- "${WORK_DIR}/release/config/config.example.json" "${WORK_DIR}/release/config/config.json"
+    chmod 0600 "${WORK_DIR}/release/config/config.json"
+    if ! bash "${WORK_DIR}/release/bin/agent" api skills validate '{}' |
+        jq -e '.ok == true' >/dev/null; then
+        fail '安装包内的 Skill registry 校验失败'
+    fi
+    rm -f -- "${WORK_DIR}/release/config/config.json"
+    rm -rf -- "${WORK_DIR}/release/logs" "${WORK_DIR}/release/tmp"
 
     mkdir -p "${PREFIX}/data/config" "${PREFIX}/data/logs" "${PREFIX}/data/tmp"
     cp -- "${WORK_DIR}/release/config/config.example.json" "${PREFIX}/data/config/config.example.json"
@@ -641,27 +843,104 @@ ensure_service_identity() {
     chown -R root:root "${PREFIX}/releases"
 }
 
+install_provider_egress_policy() {
+    local dropin_dir rendered target_tmp cidr
+    [[ "${NO_SYSTEMD}" -eq 0 ]] || return 0
+    case "${EGRESS_MODE}" in
+        preserve)
+            return 0
+            ;;
+        unrestricted)
+            rm -f -- "${SYSTEMD_EGRESS_DROPIN_PATH}"
+            rmdir -- "$(dirname -- "${SYSTEMD_EGRESS_DROPIN_PATH}")" 2>/dev/null || true
+            warn '已明确选择不限制 AI Provider 网络出口'
+            return 0
+            ;;
+        enforce) ;;
+        *) fail "未知 Provider 出站策略模式: ${EGRESS_MODE}" ;;
+    esac
+
+    dropin_dir="$(dirname -- "${SYSTEMD_EGRESS_DROPIN_PATH}")"
+    if [[ -L "${dropin_dir}" || (-e "${dropin_dir}" && ! -d "${dropin_dir}") ]]; then
+        fail "systemd Provider 出站策略目录类型非法: ${dropin_dir}"
+    fi
+    if [[ -L "${SYSTEMD_EGRESS_DROPIN_PATH}" ||
+        (-e "${SYSTEMD_EGRESS_DROPIN_PATH}" && ! -f "${SYSTEMD_EGRESS_DROPIN_PATH}") ]]; then
+        fail "systemd Provider 出站策略文件类型非法: ${SYSTEMD_EGRESS_DROPIN_PATH}"
+    fi
+    mkdir -p -- "${dropin_dir}"
+    rendered="${WORK_DIR:-${TRANSACTION_BACKUP_DIR}}/.linux-agent-provider-egress.$$"
+    {
+        printf '%s\n' '# Managed by linux-agent-install.sh. Re-run the installer to change this policy.'
+        printf '%s\n' '[Service]' 'IPAddressDeny=any' 'IPAddressAllow=localhost'
+        for cidr in "${PROVIDER_CIDRS[@]}"; do
+            printf 'IPAddressAllow=%s\n' "${cidr}"
+        done
+    } >"${rendered}"
+    chmod 0644 "${rendered}"
+    target_tmp="$(mktemp "${dropin_dir}/.10-provider-egress.conf.XXXXXX")"
+    if ! cp -- "${rendered}" "${target_tmp}"; then
+        rm -f -- "${target_tmp}"
+        fail '无法暂存 systemd Provider 出站策略'
+    fi
+    chmod 0644 "${target_tmp}"
+    mv -f -- "${target_tmp}" "${SYSTEMD_EGRESS_DROPIN_PATH}"
+}
+
 install_systemd_unit() {
     local source="${PREFIX}/current/packaging/linux-agent-web.service"
+    local helper_source="${PREFIX}/current/packaging/linux-agent-observer-helper.service"
+    local socket_source="${PREFIX}/current/packaging/linux-agent-observer-helper.socket"
     local render_root="${WORK_DIR:-${TRANSACTION_BACKUP_DIR:-${PREFIX}}}"
     local rendered="${render_root}/.linux-agent-web.service.$$"
+    local helper_rendered="${render_root}/.linux-agent-observer-helper.service.$$"
+    local socket_rendered="${render_root}/.linux-agent-observer-helper.socket.$$"
     [[ "${NO_SYSTEMD}" -eq 0 ]] || return 0
     command -v systemctl >/dev/null 2>&1 || fail '缺少 systemctl'
-    [[ -f "${source}" ]] || fail '当前版本缺少 systemd unit'
-    python3 - "${source}" "${rendered}" "/opt/linux-agent" "${PREFIX}" \
+    [[ -f "${source}" && -f "${helper_source}" && -f "${socket_source}" ]] ||
+        fail '当前版本缺少 systemd unit'
+    python3 - "${source}" "${rendered}" "${helper_source}" "${helper_rendered}" \
+        "${socket_source}" "${socket_rendered}" "/opt/linux-agent" "${PREFIX}" \
         "linux-agent" "${SERVICE_USER}" "${SERVICE_GROUP}" <<'PY'
 import sys
 from pathlib import Path
 
-source, output, old_prefix, prefix, old_user, user, group = sys.argv[1:]
-text = Path(source).read_text(encoding="utf-8")
-text = text.replace(old_prefix, prefix)
-text = text.replace(f"User={old_user}", f"User={user}")
-text = text.replace(f"Group={old_user}", f"Group={group}")
-Path(output).write_text(text, encoding="utf-8")
+(
+    source,
+    output,
+    helper_source,
+    helper_output,
+    socket_source,
+    socket_output,
+    old_prefix,
+    prefix,
+    old_user,
+    user,
+    group,
+) = sys.argv[1:]
+
+web = Path(source).read_text(encoding="utf-8")
+web = web.replace(old_prefix, prefix)
+web = web.replace(f"User={old_user}", f"User={user}")
+web = web.replace(f"Group={old_user}", f"Group={group}")
+Path(output).write_text(web, encoding="utf-8")
+
+helper = Path(helper_source).read_text(encoding="utf-8").replace(old_prefix, prefix)
+Path(helper_output).write_text(helper, encoding="utf-8")
+
+socket = Path(socket_source).read_text(encoding="utf-8")
+socket = socket.replace(f"SocketGroup={old_user}", f"SocketGroup={group}")
+Path(socket_output).write_text(socket, encoding="utf-8")
 PY
+    mkdir -p -- \
+        "$(dirname -- "${SYSTEMD_UNIT_PATH}")" \
+        "$(dirname -- "${SYSTEMD_HELPER_SERVICE_PATH}")" \
+        "$(dirname -- "${SYSTEMD_HELPER_SOCKET_PATH}")"
     cp -- "${rendered}" "${SYSTEMD_UNIT_PATH}"
-    chmod 0644 "${SYSTEMD_UNIT_PATH}"
+    cp -- "${helper_rendered}" "${SYSTEMD_HELPER_SERVICE_PATH}"
+    cp -- "${socket_rendered}" "${SYSTEMD_HELPER_SOCKET_PATH}"
+    chmod 0644 "${SYSTEMD_UNIT_PATH}" "${SYSTEMD_HELPER_SERVICE_PATH}" "${SYSTEMD_HELPER_SOCKET_PATH}"
+    install_provider_egress_policy
     systemctl daemon-reload
 }
 
@@ -697,7 +976,7 @@ wait_for_health() {
 
 restart_and_check() {
     [[ "${NO_SYSTEMD}" -eq 0 ]] || return 0
-    systemctl restart linux-agent-web.service || return 1
+    systemctl restart linux-agent-observer-helper.socket linux-agent-web.service || return 1
     wait_for_health >/dev/null || return 1
 }
 
@@ -754,7 +1033,7 @@ do_install() {
     atomic_switch "${VERSION}"
     if [[ "${NO_SYSTEMD}" -eq 0 ]]; then
         install_systemd_unit
-        systemctl enable --now linux-agent-web.service
+        systemctl enable --now linux-agent-observer-helper.socket linux-agent-web.service
         if ! wait_for_health >/dev/null; then
             fail '安装后健康检查失败'
         fi
@@ -811,7 +1090,7 @@ do_health() {
 }
 
 do_status() {
-    local current="" service_status="not-managed" releases='[]'
+    local current="" service_status="not-managed" egress_policy="not-managed" releases='[]'
     ensure_prefix
     current="$(current_version 2>/dev/null || true)"
     if [[ -d "${PREFIX}/releases" ]]; then
@@ -821,18 +1100,26 @@ do_status() {
     if [[ "${NO_SYSTEMD}" -eq 0 ]] && command -v systemctl >/dev/null 2>&1; then
         service_status="$(systemctl is-active linux-agent-web.service 2>/dev/null || true)"
         [[ -n "${service_status}" ]] || service_status="inactive"
+        if [[ -f "${SYSTEMD_EGRESS_DROPIN_PATH}" && ! -L "${SYSTEMD_EGRESS_DROPIN_PATH}" ]]; then
+            egress_policy="enforced"
+        else
+            egress_policy="unrestricted"
+        fi
     fi
     jq -n --arg prefix "${PREFIX}" --arg current "${current}" \
-        --arg service_status "${service_status}" --argjson releases "${releases}" \
-        '{ok:true,status:"installed_status",prefix:$prefix,current_version:$current,releases:$releases,service_status:$service_status}'
+        --arg service_status "${service_status}" --arg egress_policy "${egress_policy}" --argjson releases "${releases}" \
+        '{ok:true,status:"installed_status",prefix:$prefix,current_version:$current,releases:$releases,service_status:$service_status,provider_egress_policy:$egress_policy}'
 }
 
 do_uninstall() {
     ensure_prefix
     if [[ "${NO_SYSTEMD}" -eq 0 ]]; then
         command -v systemctl >/dev/null 2>&1 || fail '缺少 systemctl'
-        systemctl disable --now linux-agent-web.service >/dev/null 2>&1 || true
-        rm -f -- "${SYSTEMD_UNIT_PATH}"
+        systemctl disable --now linux-agent-web.service linux-agent-observer-helper.socket >/dev/null 2>&1 || true
+        systemctl stop linux-agent-observer-helper.service >/dev/null 2>&1 || true
+        rm -f -- "${SYSTEMD_UNIT_PATH}" "${SYSTEMD_HELPER_SERVICE_PATH}" "${SYSTEMD_HELPER_SOCKET_PATH}" \
+            "${SYSTEMD_EGRESS_DROPIN_PATH}"
+        rmdir -- "$(dirname -- "${SYSTEMD_EGRESS_DROPIN_PATH}")" 2>/dev/null || true
         systemctl daemon-reload
     fi
     rm -f -- "${PREFIX}/current"

@@ -7,6 +7,8 @@ import tempfile
 import uuid
 from pathlib import Path
 
+from subprocess_env import build_subprocess_env
+
 
 def _reject_json_constant(value):
     raise ValueError(f"non-finite JSON number is not allowed: {value}")
@@ -60,8 +62,10 @@ class PolicyService:
         agent_api,
         audit,
         config_public_state,
+        config_updater=None,
         effective_uid=os.geteuid,
         process_runner=subprocess.run,
+        env_builder=build_subprocess_env,
     ):
         dependencies = {
             "config_reader": config_reader,
@@ -70,10 +74,13 @@ class PolicyService:
             "audit": audit,
             "config_public_state": config_public_state,
             "process_runner": process_runner,
+            "env_builder": env_builder,
         }
         for name, dependency in dependencies.items():
             if not callable(dependency):
                 raise TypeError(f"{name} must be callable")
+        if config_updater is not None and not callable(config_updater):
+            raise TypeError("config_updater must be callable")
         if not callable(effective_uid) and not isinstance(effective_uid, int):
             raise TypeError("effective_uid must be an integer or callable")
 
@@ -82,11 +89,13 @@ class PolicyService:
         self.temp_root = self.root / "tmp" / "web" / "policy-edits"
         self._config_reader = config_reader
         self._config_writer = config_writer
+        self._config_updater = config_updater
         self._agent_api = agent_api
         self._audit = audit
         self._config_public_state = config_public_state
         self._effective_uid = effective_uid
         self._process_runner = process_runner
+        self._env_builder = env_builder
 
     def _begin_audited_mutation(self, stage, payload):
         audit_payload = dict(payload)
@@ -214,6 +223,7 @@ class PolicyService:
                 input=f"{password}\n",
                 text=True,
                 capture_output=True,
+                env=self._env_builder(include_api_key=False),
                 timeout=10,
                 check=False,
             )
@@ -321,6 +331,7 @@ class PolicyService:
                 input=f"{password}\n",
                 text=True,
                 capture_output=True,
+                env=self._env_builder(include_api_key=False),
                 timeout=10,
                 check=False,
             )
@@ -411,15 +422,23 @@ class PolicyService:
             "command_guard_update",
             {"enabled": enabled, "method": method},
         )
-        current = self._config_reader()
-        config = dict(current) if isinstance(current, dict) else {}
-        existing_guard = config.get("command_guard")
-        command_guard = dict(existing_guard) if isinstance(existing_guard, dict) else {}
-        command_guard["enabled"] = enabled
-        config["command_guard"] = command_guard
+        command_guard = {"enabled": enabled}
+
+        def mutate_config(config):
+            existing_guard = config.get("command_guard")
+            updated_guard = dict(existing_guard) if isinstance(existing_guard, dict) else {}
+            updated_guard["enabled"] = enabled
+            config["command_guard"] = updated_guard
+
         try:
-            self._config_writer(config)
-        except OSError as exc:
+            if self._config_updater is not None:
+                self._config_updater(mutate_config)
+            else:
+                current = self._config_reader()
+                config = dict(current) if isinstance(current, dict) else {}
+                mutate_config(config)
+                self._config_writer(config)
+        except (OSError, ValueError) as exc:
             return {
                 "ok": False,
                 "status": "config_write_failed",

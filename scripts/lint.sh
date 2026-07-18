@@ -2,8 +2,8 @@
 #
 # 统一静态检查基线：本地与 CI 共用。
 # 必备检查（缺依赖即失败）：bash -n、python3 -m py_compile、node --check。
-# 可选工具（未安装则跳过并提示）：shellcheck、shfmt、pyflakes/ruff、tsc。
-# tsc 一旦存在，checkJs 诊断会作为失败处理。
+# 可选工具（未安装则跳过并提示）：shellcheck、shfmt、pyflakes/ruff。
+# tsc 在本地默认可选；CI/显式门禁模式缺失时直接失败。
 
 set -uo pipefail
 
@@ -94,19 +94,18 @@ else
     warn "ruff/pyflakes 未安装"
 fi
 
-# —— 可选依赖：TypeScript checkJs（本机有 tsc 时作为质量门禁）——
+# —— TypeScript checkJs（CI/显式门禁模式为必备依赖）——
 if command -v tsc >/dev/null 2>&1; then
-    note "tsc --noEmit --checkJs"
-    mapfile -d '' -t CHECK_JS_FILES < <(find web/static -type f -name '*.js' -print0 | sort -z)
-    if [[ "${#CHECK_JS_FILES[@]}" -gt 0 ]]; then
-        # Exported APIs are covered by JSDoc checks; internal callbacks remain
-        # ordinary JavaScript while structural, DOM and nullability errors fail.
-        tsc --noEmit --allowJs --checkJs --noImplicitAny false --target ES2020 \
-            --module NodeNext --moduleResolution NodeNext --pretty false \
-            "${CHECK_JS_FILES[@]}" || fail "tsc checkJs reported issues"
-    fi
+    note "tsc --project jsconfig.json"
+    # tests/web_jsdoc.mjs requires explicit @param/@returns on every exported
+    # function; checkJs enforces their structural use across the frontend.
+    tsc --project jsconfig.json --pretty false || fail "tsc checkJs reported issues"
 else
-    warn "tsc 未安装，跳过可选 JSDoc/checkJs 检查"
+    if [[ "${CI:-}" == "true" || "${LINUX_AGENT_REQUIRE_TSC:-0}" == "1" ]]; then
+        fail "tsc 未安装，无法执行必备的 JSDoc/checkJs 类型门禁"
+    else
+        warn "tsc 未安装，跳过本地 JSDoc/checkJs 检查（CI 不允许跳过）"
+    fi
 fi
 
 if [[ "${status}" -eq 0 ]]; then

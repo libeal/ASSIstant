@@ -1,4 +1,7 @@
-/** @param {Record<string, any>} app @returns {Record<string, Function>} */
+/** @typedef {import("./types.js").AppContext} AppContext */
+/** @typedef {import("./types.js").PolicyView} PolicyView */
+
+/** @param {AppContext} app @returns {PolicyView} */
 export function createPolicyView(app) {
   const state = app.state;
   const api = app.request;

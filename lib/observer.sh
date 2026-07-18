@@ -3,6 +3,7 @@
 set -euo pipefail
 
 LINUX_AGENT_OBSERVER_SESSION_CONTEXT=""
+LINUX_AGENT_OBSERVER_HELPER_CAPABILITY=""
 
 linux_agent_observer_config_enabled() {
     local enabled="auto"
@@ -24,6 +25,49 @@ linux_agent_observer_privilege_mode() {
         sudo_interactive | passwordless | none) printf '%s\n' "${mode}" ;;
         *) printf 'sudo_interactive\n' ;;
     esac
+}
+
+linux_agent_observer_helper_socket() {
+    printf '%s\n' "${LINUX_AGENT_OBSERVER_HELPER_SOCKET:-/run/linux-agent/observer.sock}"
+}
+
+linux_agent_observer_helper_available() {
+    local socket_path helper_path
+    socket_path="$(linux_agent_observer_helper_socket)"
+    helper_path="${LINUX_AGENT_ROOT}/lib/observer_helper.py"
+    [[ "${socket_path}" == /* && -S "${socket_path}" && -f "${helper_path}" ]] &&
+        command -v python3 >/dev/null 2>&1
+}
+
+linux_agent_observer_helper_request() {
+    local operation="$1"
+    shift
+    local -a capability_args=()
+    local socket_path
+    socket_path="$(linux_agent_observer_helper_socket)"
+    linux_agent_observer_helper_available || return 127
+    if [[ "${operation}" != "status" ]]; then
+        [[ "${LINUX_AGENT_OBSERVER_HELPER_CAPABILITY:-}" =~ ^[0-9a-f]{64}$ ]] || return 126
+        capability_args=(--capability "${LINUX_AGENT_OBSERVER_HELPER_CAPABILITY}")
+    fi
+    python3 "${LINUX_AGENT_ROOT}/lib/observer_helper.py" request \
+        --socket "${socket_path}" "${operation}" "$@" "${capability_args[@]}"
+}
+
+linux_agent_observer_new_helper_capability() {
+    python3 -c 'import secrets; print(secrets.token_hex(32))'
+}
+
+linux_agent_observer_release_helper_key() {
+    local key="$1"
+    [[ -n "${key}" && -n "${LINUX_AGENT_OBSERVER_HELPER_CAPABILITY:-}" ]] || return 0
+    linux_agent_observer_helper_available || return 0
+    linux_agent_observer_helper_request release_key --key "${key}" >/dev/null 2>&1 || true
+}
+
+linux_agent_observer_close_helper_session() {
+    linux_agent_observer_release_helper_key "${1:-}"
+    LINUX_AGENT_OBSERVER_HELPER_CAPABILITY=""
 }
 
 linux_agent_observer_max_events() {
@@ -199,6 +243,17 @@ linux_agent_observer_log_event() {
 }
 
 linux_agent_observer_auditctl() {
+    if linux_agent_observer_helper_available; then
+        case "$*" in
+            -s) linux_agent_observer_helper_request status ;;
+            -l) linux_agent_observer_helper_request list_rules ;;
+            *)
+                printf 'observer helper rejected an unstructured auditctl request\n' >&2
+                return 126
+                ;;
+        esac
+        return
+    fi
     if [[ "$(id -u)" -eq 0 ]]; then
         auditctl "$@"
     else
@@ -207,11 +262,28 @@ linux_agent_observer_auditctl() {
 }
 
 linux_agent_observer_ausearch() {
+    if linux_agent_observer_helper_available; then
+        if [[ "$#" -eq 2 && "$1" == "-k" ]]; then
+            linux_agent_observer_helper_request search_key --key "$2"
+            return
+        fi
+        printf 'observer helper rejected an unstructured ausearch request\n' >&2
+        return 126
+    fi
     if [[ "$(id -u)" -eq 0 ]]; then
         ausearch "$@"
     else
         sudo -n ausearch "$@"
     fi
+}
+
+linux_agent_observer_list_rules() {
+    local audit_key="$1"
+    if linux_agent_observer_helper_available; then
+        linux_agent_observer_helper_request list_rules --key "${audit_key}"
+        return
+    fi
+    linux_agent_observer_auditctl -l
 }
 
 linux_agent_observer_preflight() {
@@ -223,6 +295,24 @@ linux_agent_observer_preflight() {
         jq -cn '{status:"disabled", backend:"auditd", available:false, reason_code:"observer_disabled", reason:"observer disabled by config", diagnostic:"observer.enabled is disabled in config"}'
         return 0
     fi
+    if [[ "${privilege}" == "none" ]]; then
+        jq -cn '{status:"unavailable", backend:"auditd", available:false, privilege:"none", sudo_available:null, sudo_authenticated:false, reason_code:"observer_privilege_disabled", reason:"observer privileged access disabled", diagnostic:"observer.privilege is set to none; neither the privileged helper nor sudo will be used."}'
+        return 0
+    fi
+    if linux_agent_observer_helper_available; then
+        set +e
+        reason="$(linux_agent_observer_auditctl -s 2>&1 >/dev/null)"
+        auditctl_exit_code=$?
+        set -e
+        if [[ "${auditctl_exit_code}" -eq 0 ]]; then
+            jq -cn '{status:"available", backend:"auditd", available:true, privilege:"helper", sudo_available:null, sudo_authenticated:null, auditctl_exit_code:0}'
+        else
+            jq -cn --arg reason "${reason}" --argjson auditctl_exit_code "${auditctl_exit_code}" \
+                '{status:"unavailable", backend:"auditd", available:false, privilege:"helper", sudo_available:null, sudo_authenticated:null, auditctl_exit_code:$auditctl_exit_code, reason_code:"observer_helper_failed", reason:$reason, diagnostic:"The privileged observer helper socket exists but its auditd preflight failed; execution will not fall back to sudo."}'
+        fi
+        return 0
+    fi
+
     if ! command -v auditctl >/dev/null 2>&1; then
         jq -cn '{status:"unavailable", backend:"auditd", available:false, reason_code:"auditctl_not_found", reason:"auditctl not found", diagnostic:"Install auditd/auditctl or disable observer."}'
         return 0
@@ -252,10 +342,6 @@ linux_agent_observer_preflight() {
         return 0
     fi
 
-    if [[ "${privilege}" == "none" ]]; then
-        jq -cn '{status:"unavailable", backend:"auditd", available:false, privilege:"none", sudo_available:null, sudo_authenticated:false, reason_code:"sudo_disabled", reason:"observer sudo privilege disabled", diagnostic:"observer.privilege is set to none."}'
-        return 0
-    fi
     if ! command -v sudo >/dev/null 2>&1; then
         jq -cn '{status:"unavailable", backend:"auditd", available:false, privilege:"none", sudo_available:false, sudo_authenticated:false, reason_code:"sudo_not_found", reason:"sudo not found for non-root auditd access", diagnostic:"Install sudo, run as root, or disable observer."}'
         return 0
@@ -398,7 +484,7 @@ linux_agent_observer_runtime_verify() {
     installed_syscalls="$(jq -c '.installed_syscalls' <<<"${context_json}")"
 
     set +e
-    listing="$(linux_agent_observer_auditctl -l 2>&1)"
+    listing="$(linux_agent_observer_list_rules "${audit_key}" 2>&1)"
     auditctl_exit_code=$?
     set -e
     if [[ "${auditctl_exit_code}" -ne 0 ]]; then
@@ -498,6 +584,11 @@ linux_agent_observer_install_syscall_rule() {
     local audit_uid="$1"
     local key="$2"
     local syscall="$3"
+    if linux_agent_observer_helper_available; then
+        linux_agent_observer_helper_request add_rule \
+            --audit-uid "${audit_uid}" --key "${key}" --syscall "${syscall}" >/dev/null 2>&1
+        return
+    fi
     linux_agent_observer_auditctl -a always,exit -F arch=b64 -S "${syscall}" -F "auid=${audit_uid}" -k "${key}" >/dev/null 2>&1
 }
 
@@ -505,6 +596,11 @@ linux_agent_observer_remove_syscall_rule() {
     local audit_uid="$1"
     local key="$2"
     local syscall="$3"
+    if linux_agent_observer_helper_available; then
+        linux_agent_observer_helper_request remove_rule \
+            --audit-uid "${audit_uid}" --key "${key}" --syscall "${syscall}" >/dev/null 2>&1
+        return
+    fi
     linux_agent_observer_auditctl -d always,exit -F arch=b64 -S "${syscall}" -F "auid=${audit_uid}" -k "${key}" >/dev/null 2>&1
 }
 
@@ -515,6 +611,7 @@ linux_agent_observer_session_start() {
     local require_all=false selected_count installed_count rolled_back='[]' rollback_failed='[]'
     [[ -n "${subject_json}" ]] || subject_json='{}'
     linux_agent_observer_clear_failed_context
+    LINUX_AGENT_OBSERVER_HELPER_CAPABILITY=""
 
     boundary_summary="$(linux_agent_audit_boundary_runtime_summary)"
     preflight="$(linux_agent_observer_preflight)"
@@ -549,6 +646,11 @@ linux_agent_observer_session_start() {
     uid="$(id -u)"
     audit_uid="$(linux_agent_observer_audit_uid)"
     key="$(linux_agent_observer_key "${scope}")"
+    if linux_agent_observer_helper_available; then
+        LINUX_AGENT_OBSERVER_HELPER_CAPABILITY="$(linux_agent_observer_new_helper_capability)"
+    else
+        LINUX_AGENT_OBSERVER_HELPER_CAPABILITY=""
+    fi
     start_time="$(linux_agent_now_iso)"
 
     local syscall
@@ -786,6 +888,7 @@ linux_agent_observer_session_finish() {
     local status end_time audit_key audit_uid installed cleanup_notes cleanup_remaining notes raw parsed query_status syscall
     context_json="$(linux_agent_observer_current_context)"
     if [[ -z "${context_json}" ]]; then
+        linux_agent_observer_close_helper_session ""
         linux_agent_observer_clear_failed_context
         return 0
     fi
@@ -815,6 +918,7 @@ linux_agent_observer_session_finish() {
             --argjson cleanup_remaining "${cleanup_remaining}" \
             '. + {end_time:$end_time, final_status:$final_status, cleanup_notes:$cleanup_notes, installed_syscalls:$cleanup_remaining}' <<<"${context_json}")"
         linux_agent_observer_log_event "observer_session_finished" "${done_context}"
+        linux_agent_observer_close_helper_session "${audit_key}"
         linux_agent_observer_clear_failed_context
         LINUX_AGENT_OBSERVER_SESSION_CONTEXT=""
         return 0
@@ -847,6 +951,7 @@ linux_agent_observer_session_finish() {
             '{status:"failed", backend:"auditd", lifecycle:"session", audit_key:$audit_key, start_time:$start_time, end_time:$end_time, final_status:$final_status, exec_count:0, file_event_count:0, processes:[], file_events:[], notes:$notes}')"
         linux_agent_observer_log_event "observer_failed" "${failed}"
         linux_agent_observer_log_event "observer_session_finished" "${failed}"
+        linux_agent_observer_close_helper_session "${audit_key}"
         linux_agent_observer_clear_failed_context
         LINUX_AGENT_OBSERVER_SESSION_CONTEXT=""
         return 0
@@ -862,8 +967,37 @@ linux_agent_observer_session_finish() {
         --argjson notes "${notes}" \
         '. + {lifecycle:"session", start_time:$start_time, end_time:$end_time, final_status:$final_status, notes:$notes}' <<<"${parsed}")"
     linux_agent_observer_log_event "observer_session_finished" "${parsed}"
+    linux_agent_observer_close_helper_session "${audit_key}"
     linux_agent_observer_clear_failed_context
     LINUX_AGENT_OBSERVER_SESSION_CONTEXT=""
+}
+
+# A daemonized descendant can keep a FIFO writer open after the direct command
+# exits. Plain `wait` would then block forever, so limiter shutdown is bounded
+# and any forced stop is treated as an output-integrity failure.
+linux_agent_wait_output_limiter() {
+    local limiter_pid="$1"
+    local poll_count=0
+    local status=0
+
+    [[ "${limiter_pid}" =~ ^[0-9]+$ ]] || return 125
+    while ((poll_count < 100)); do
+        if ! kill -0 "${limiter_pid}" >/dev/null 2>&1; then
+            wait "${limiter_pid}" 2>/dev/null
+            return $?
+        fi
+        sleep 0.05
+        ((poll_count += 1))
+    done
+
+    kill -TERM "${limiter_pid}" >/dev/null 2>&1 || true
+    sleep 0.1
+    kill -KILL "${limiter_pid}" >/dev/null 2>&1 || true
+    wait "${limiter_pid}" 2>/dev/null || status=$?
+    if ((status == 0)); then
+        status=125
+    fi
+    return "${status}"
 }
 
 linux_agent_run_observed_process() {
@@ -881,9 +1015,12 @@ linux_agent_run_observed_process() {
     timeout_sec="$(linux_agent_execution_timeout_sec)"
     timed_out=false
     observer_status="recorded"
-    if ! command -v timeout >/dev/null 2>&1; then
+    if ! command -v timeout >/dev/null 2>&1 ||
+        ! command -v setsid >/dev/null 2>&1 ||
+        ! command -v mkfifo >/dev/null 2>&1 ||
+        ! command -v python3 >/dev/null 2>&1; then
         end_time="$(linux_agent_now_iso)"
-        printf 'execution timeout guard is unavailable; refusing unbounded execution\n' >"${stderr_file}"
+        printf 'execution lifecycle guard is unavailable; refusing unbounded execution\n' >"${stderr_file}"
         observer_marker="$(jq -cn \
             --arg scope "${scope}" \
             --argjson subject "${subject_json}" \
@@ -895,7 +1032,7 @@ linux_agent_run_observed_process() {
         jq -cn --argjson observer "${observer_marker}" '{exit_code:127, root_pid:null, timed_out:false, observer:$observer}'
         return 0
     fi
-    execution_command=(timeout -s TERM -k 5s "${timeout_sec}s" "$@")
+    execution_command=(setsid --wait timeout -s TERM -k 5s "${timeout_sec}s" "$@")
     audit_payload="$(jq -cn \
         --arg scope "${scope}" \
         --argjson subject "${subject_json}" \
@@ -919,13 +1056,87 @@ linux_agent_run_observed_process() {
             '{exit_code:($blocked_result.exit_code // 125), root_pid:null, timed_out:false, observer:{status:"audit_blocked", backend:"auditd", lifecycle:"execution"}, blocked_result:$blocked_result}'
         return 0
     fi
+    local max_output_bytes output_capped output_integrity_unknown
+    local stdout_truncated_bytes stderr_truncated_bytes
+    local stdout_pipe stderr_pipe stdout_marker stderr_marker stdout_limiter_pid stderr_limiter_pid
+    local stdout_limiter_status stderr_limiter_status
+    max_output_bytes="$(linux_agent_execution_max_output_bytes 2>/dev/null || printf '1048576')"
+    [[ "${max_output_bytes}" =~ ^[0-9]+$ ]] || max_output_bytes=1048576
+    output_capped=false
+    output_integrity_unknown=false
+    stdout_truncated_bytes=0
+    stderr_truncated_bytes=0
+    stdout_pipe="${stdout_file}.pipe.$$"
+    stderr_pipe="${stderr_file}.pipe.$$"
+    stdout_marker="${stdout_file}.overflow.$$"
+    stderr_marker="${stderr_file}.overflow.$$"
+    rm -f -- "${stdout_pipe}" "${stderr_pipe}" "${stdout_marker}" "${stderr_marker}"
+    mkfifo -m 600 "${stdout_pipe}" "${stderr_pipe}"
     set +e
-    "${execution_command[@]}" >"${stdout_file}" 2>"${stderr_file}" &
+    # The producer opens its FIFO writers first and blocks until both limiter
+    # readers are attached. This makes its PID available to the limiters.
+    "${execution_command[@]}" >"${stdout_pipe}" 2>"${stderr_pipe}" &
     pid=$!
+    python3 "${LINUX_AGENT_ROOT}/lib/output_limiter.py" \
+        --output "${stdout_file}" --marker "${stdout_marker}" \
+        --max-bytes "${max_output_bytes}" --producer-pid "${pid}" <"${stdout_pipe}" &
+    stdout_limiter_pid=$!
+    python3 "${LINUX_AGENT_ROOT}/lib/output_limiter.py" \
+        --output "${stderr_file}" --marker "${stderr_marker}" \
+        --max-bytes "${max_output_bytes}" --producer-pid "${pid}" <"${stderr_pipe}" &
+    stderr_limiter_pid=$!
+    while kill -0 "${pid}" 2>/dev/null; do
+        if [[ -f "${stdout_marker}" || -f "${stderr_marker}" ]]; then
+            output_capped=true
+            kill -TERM -- "-${pid}" 2>/dev/null || true
+            for _ in {1..20}; do
+                kill -0 "${pid}" 2>/dev/null || break
+                sleep 0.05
+            done
+            kill -KILL -- "-${pid}" 2>/dev/null || true
+            break
+        fi
+        sleep 0.02
+    done
     wait "${pid}"
     exit_code=$?
+    linux_agent_wait_output_limiter "${stdout_limiter_pid}"
+    stdout_limiter_status=$?
+    linux_agent_wait_output_limiter "${stderr_limiter_pid}"
+    stderr_limiter_status=$?
+    rm -f -- "${stdout_pipe}" "${stderr_pipe}"
     set -e
-    if [[ "${exit_code}" -eq 124 ]]; then
+    local stdout_marker_json stderr_marker_json
+    stdout_marker_json="$(cat "${stdout_marker}" 2>/dev/null || true)"
+    stderr_marker_json="$(cat "${stderr_marker}" 2>/dev/null || true)"
+    if [[ "${stdout_limiter_status}" -ne 0 || "${stderr_limiter_status}" -ne 0 ]]; then
+        output_integrity_unknown=true
+        printf 'execution output limiter failed; output integrity is unknown\n' >"${stderr_file}"
+        exit_code=125
+        observer_status="guard_unavailable"
+    fi
+    if jq -e '.truncated == true' <<<"${stdout_marker_json}" >/dev/null 2>&1; then
+        stdout_truncated_bytes="$(jq -r '.truncated_bytes // 1' <<<"${stdout_marker_json}" 2>/dev/null || printf '1')"
+        output_capped=true
+    fi
+    if jq -e '.truncated == true' <<<"${stderr_marker_json}" >/dev/null 2>&1; then
+        stderr_truncated_bytes="$(jq -r '.truncated_bytes // 1' <<<"${stderr_marker_json}" 2>/dev/null || printf '1')"
+        output_capped=true
+    fi
+    if jq -e '.producer_detached == true' <<<"${stdout_marker_json}" >/dev/null 2>&1 ||
+        jq -e '.producer_detached == true' <<<"${stderr_marker_json}" >/dev/null 2>&1; then
+        output_integrity_unknown=true
+        printf 'execution descendant retained an output stream; output integrity is unknown\n' >"${stderr_file}"
+    fi
+    rm -f -- "${stdout_marker}" "${stderr_marker}"
+    if [[ "${output_integrity_unknown}" == "true" ]]; then
+        output_capped=false
+        observer_status="guard_unavailable"
+        exit_code=125
+    elif [[ "${output_capped}" == "true" ]]; then
+        observer_status="output_capped"
+        exit_code=125
+    elif [[ "${exit_code}" -eq 124 ]]; then
         timed_out=true
         observer_status="timed_out"
     fi
@@ -940,13 +1151,21 @@ linux_agent_run_observed_process() {
         --argjson exit_code "${exit_code}" \
         --argjson timed_out "${timed_out}" \
         --argjson timeout_sec "${timeout_sec}" \
+        --argjson output_capped "${output_capped}" \
+        --argjson output_integrity_unknown "${output_integrity_unknown}" \
+        --argjson stdout_truncated_bytes "${stdout_truncated_bytes}" \
+        --argjson stderr_truncated_bytes "${stderr_truncated_bytes}" \
         --argjson session_observer "${LINUX_AGENT_OBSERVER_SESSION_CONTEXT:-null}" \
-        '{status:$status, backend:"auditd", lifecycle:"execution", scope:$scope, subject:$subject, start_time:$start_time, end_time:$end_time, root_pid:$root_pid, exit_code:$exit_code, timed_out:$timed_out, timeout_sec:$timeout_sec, session_audit_key:($session_observer.audit_key // null), session_status:($session_observer.status // null)}')"
+        '{status:$status, backend:"auditd", lifecycle:"execution", scope:$scope, subject:$subject, start_time:$start_time, end_time:$end_time, root_pid:$root_pid, exit_code:$exit_code, timed_out:$timed_out, timeout_sec:$timeout_sec, output_capped:$output_capped, output_integrity_unknown:$output_integrity_unknown, stdout_truncated_bytes:$stdout_truncated_bytes, stderr_truncated_bytes:$stderr_truncated_bytes, session_audit_key:($session_observer.audit_key // null), session_status:($session_observer.status // null)}')"
     linux_agent_observer_log_event "execution_finished" "${observer_marker}"
     jq -cn \
         --argjson exit_code "${exit_code}" \
         --argjson root_pid "${pid}" \
         --argjson timed_out "${timed_out}" \
         --argjson observer "${observer_marker}" \
-        '{exit_code:$exit_code, root_pid:$root_pid, timed_out:$timed_out, observer:$observer}'
+        --argjson output_capped "${output_capped}" \
+        --argjson output_integrity_unknown "${output_integrity_unknown}" \
+        --argjson stdout_truncated_bytes "${stdout_truncated_bytes}" \
+        --argjson stderr_truncated_bytes "${stderr_truncated_bytes}" \
+        '{exit_code:$exit_code, root_pid:$root_pid, timed_out:$timed_out, output_capped:$output_capped, output_integrity_unknown:$output_integrity_unknown, stdout_truncated_bytes:$stdout_truncated_bytes, stderr_truncated_bytes:$stderr_truncated_bytes, observer:$observer}'
 }

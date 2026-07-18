@@ -27,9 +27,20 @@ class ProviderSecurityHelpers:
     validate_url: object
     inspect_url: object
     error_message: object
+    url_host: object
+    trusted_hosts: object
+    host_is_trusted: object
 
     def __post_init__(self):
-        for name in ("policy_from_config", "validate_url", "inspect_url", "error_message"):
+        for name in (
+            "policy_from_config",
+            "validate_url",
+            "inspect_url",
+            "error_message",
+            "url_host",
+            "trusted_hosts",
+            "host_is_trusted",
+        ):
             if not callable(getattr(self, name)):
                 raise TypeError(f"security helper {name} must be callable")
 
@@ -412,10 +423,38 @@ class ProviderService:
                 str(models.get("reason") or "This provider does not expose a configured model list endpoint."),
             )
 
-        api_url = str(body.get("api_url") or config.get("api_url") or provider.get("api_url") or "")
+        configured_api_url = str(config.get("api_url") or provider.get("api_url") or "")
+        body_api_url = str(body.get("api_url") or "").strip()
         security = dict(self._security.policy_from_config(config))
         if self._remote_mode:
             security["require_https"] = True
+
+        # Credentialed model fetches must not send the API key to an arbitrary
+        # public HTTPS host supplied only in the request body.  Trusted hosts
+        # are allowed_hosts plus hosts from configured/registry api_url values.
+        trusted_hosts = self._security.trusted_hosts(
+            security,
+            configured_api_url,
+            provider.get("api_url"),
+            models.get("url"),
+        )
+        api_url = configured_api_url
+        if body_api_url:
+            body_host = self._security.url_host(body_api_url)
+            if body_host and self._security.host_is_trusted(body_host, trusted_hosts):
+                api_url = body_api_url
+            elif body_host:
+                # Defer the final decision until we know whether credentials
+                # will be attached; unauthenticated catalogue endpoints may
+                # still use a body URL after normal SSRF checks.
+                api_url = body_api_url
+            else:
+                return self._model_error(
+                    "invalid_url",
+                    provider_id,
+                    self._security.error_message("invalid_url"),
+                )
+
         if models.get("derive_from_api_url") or not models.get("url"):
             api_url, url_error = self._security.validate_url(api_url, security)
             if url_error:
@@ -440,6 +479,19 @@ class ProviderService:
                 provider_id,
                 "API key is required to list models.",
             )
+        if auth != "none" and api_key:
+            request_host = self._security.url_host(url)
+            if not self._security.host_is_trusted(request_host, trusted_hosts):
+                status = (
+                    "provider_url_override_blocked"
+                    if body_api_url and self._security.url_host(body_api_url) == request_host
+                    else "provider_host_not_allowed"
+                )
+                return self._model_error(
+                    status,
+                    provider_id,
+                    self._security.error_message(status),
+                )
 
         timeout = min(max(self._safe_int(config.get("request_timeout_sec", 30) or 30, 30), 1), 60)
         headers = {"Accept": "application/json"}

@@ -1,0 +1,70 @@
+name: ci
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  lint-and-test:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Install lint tooling
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y shellcheck shfmt python3-pyflakes
+          npm install --global 'typescript@5.7.3'
+          command -v shfmt
+          shfmt -version
+          command -v tsc
+          tsc --version
+          python3 -c 'import pyflakes; print(pyflakes.__version__)'
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@d58896d6a1865668819e1d91763c7751a165e159 # v3.9.2
+        with:
+          cosign-release: v3.1.1
+
+      - name: Lint
+        run: bash scripts/lint.sh
+
+      - name: Python unit tests
+        run: python3 -m unittest discover -s tests -p 'test_*.py' -v
+
+      - name: Frontend unit tests
+        run: bash tests/web_frontend.sh
+
+      - name: Shell regressions
+        run: |
+          set -euo pipefail
+          for test_file in \
+            tests/policy.sh \
+            tests/tools.sh \
+            tests/context.sh \
+            tests/workflow.sh \
+            tests/workflow_unit.sh \
+            tests/observer.sh \
+            tests/audit_integrity.sh \
+            tests/mcp.sh \
+            tests/contract.sh \
+            tests/security.sh \
+            tests/smoke.sh \
+            tests/web_api.sh \
+            tests/web_server.sh \
+            tests/interactive.sh \
+            tests/remote_release.sh \
+            tests/remote_runtime.sh \
+            tests/remote_web_security.sh \
+            tests/backup.sh \
+            tests/install.sh; do
+            echo "::group::${test_file}"
+            bash "${test_file}"
+            echo "::endgroup::"
+          done

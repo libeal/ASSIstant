@@ -630,6 +630,7 @@ linux_agent_process_script_request() {
 
     material="$(printf 'skill_script=%s\narguments=%s\n%s\n' "${ref}" "${arguments_json}" "$(linux_agent_skill_script_content "${ref}")")"
     review="$(linux_agent_policy_review_text "script:${ref}" "${material}")"
+    review="$(linux_agent_backup_policy_review "${ref}" "${arguments_json}" "${review}")"
     linux_agent_log_event "script_policy_checked" "${review}"
     if ! linux_agent_output_json_enabled; then
         printf '脚本: %s\n参数: %s\n审查: %s\n' "${ref}" "${arguments_json}" "$(jq -c '.risk_level' <<<"${review}")"

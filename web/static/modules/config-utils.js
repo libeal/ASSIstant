@@ -9,9 +9,33 @@ export function getNestedValue(source, path) {
     .reduce((cursor, key) => (cursor == null ? undefined : cursor[key]), source);
 }
 
-/** @param {unknown} value @returns {string} */
-export function normalizeProviderId(value) {
-  return String(value || "").trim().toLowerCase();
+/**
+ * Normalize a provider id the same way as schema/domain.json.
+ * Fold separators, collapse repeats, then apply optional prefix/alias rules.
+ * @param {unknown} value
+ * @param {{prefix_rules?: Array<{prefix?: string, canonical?: string}>, aliases?: Record<string, string>}|null} [rules]
+ * @returns {string}
+ */
+export function normalizeProviderId(value, rules = null) {
+  let normalized = String(value || "")
+    .trim()
+    .toLowerCase()
+    .replace(/[-\s/]+/g, "_");
+  const prefixRules = Array.isArray(rules?.prefix_rules) ? rules.prefix_rules : [];
+  for (const rule of prefixRules) {
+    const prefix = String(rule?.prefix || "");
+    if (prefix && normalized.startsWith(prefix)) {
+      return String(rule?.canonical || prefix);
+    }
+  }
+  const aliases = rules?.aliases && typeof rules.aliases === "object" ? rules.aliases : null;
+  if (aliases && Object.prototype.hasOwnProperty.call(aliases, normalized)) {
+    return String(aliases[normalized]);
+  }
+  if (aliases && normalized === "" && Object.prototype.hasOwnProperty.call(aliases, "")) {
+    return String(aliases[""]);
+  }
+  return normalized;
 }
 
 /** @param {string} key @returns {string} */
@@ -25,9 +49,14 @@ export function remoteSecretTransmissionBlocked(config) {
   return remote.enabled === true && remote.allow_api_key_transmission !== true;
 }
 
-/** @param {{type?: string}} field @param {any} value @returns {any} */
-export function normalizeConfigFieldValue(field, value) {
-  if (field.type === "provider") return normalizeProviderId(value);
+/**
+ * @param {{type?: string}} field
+ * @param {any} value
+ * @param {{prefix_rules?: Array<{prefix?: string, canonical?: string}>, aliases?: Record<string, string>}|null} [providerRules]
+ * @returns {any}
+ */
+export function normalizeConfigFieldValue(field, value, providerRules = null) {
+  if (field.type === "provider") return normalizeProviderId(value, providerRules);
   if (field.type === "boolean") return Boolean(value);
   if (field.type === "number") {
     const number = Number(value);
@@ -46,8 +75,13 @@ export function normalizeConfigFieldValue(field, value) {
   return value == null ? "" : String(value);
 }
 
-/** @param {Record<string, any>} config @param {Array<Record<string, any>>} [groups] @returns {Record<string, any>} */
-export function collectEditableConfigValues(config, groups = CONFIG_GROUPS) {
+/**
+ * @param {Record<string, any>} config
+ * @param {Array<Record<string, any>>} [groups]
+ * @param {{prefix_rules?: Array<{prefix?: string, canonical?: string}>, aliases?: Record<string, string>}|null} [providerRules]
+ * @returns {Record<string, any>}
+ */
+export function collectEditableConfigValues(config, groups = CONFIG_GROUPS, providerRules = null) {
   const values = {};
   for (const group of groups) {
     for (const field of group.fields) {
@@ -56,7 +90,7 @@ export function collectEditableConfigValues(config, groups = CONFIG_GROUPS) {
         continue;
       }
       const rawValue = field.key === "provider" ? (config.provider_id || config.provider) : getNestedValue(config, field.key);
-      values[field.key] = normalizeConfigFieldValue(field, rawValue);
+      values[field.key] = normalizeConfigFieldValue(field, rawValue, providerRules);
     }
   }
   return values;

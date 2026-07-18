@@ -1,3 +1,13 @@
+/** @typedef {import("./types.js").ApiResponse} ApiResponse */
+/** @typedef {import("./types.js").RequestOptions} RequestOptions */
+
+/**
+ * Send one authenticated JSON request to the local Agent API.
+ * @param {string} path
+ * @param {RequestOptions} [options]
+ * @param {() => string} [getToken]
+ * @returns {Promise<ApiResponse>}
+ */
 export async function requestJson(path, options = {}, getToken = () => "") {
   const init = {
     method: options.method || "GET",

@@ -22,6 +22,9 @@ from pathlib import Path
 SAFE_SESSION_ID = re.compile(r"^[A-Za-z0-9._-]+$")
 COMPLETE_JOB_JOURNAL_VERSION = 1
 AUDIT_OUTBOX_EVENT_ID = re.compile(r"^[A-Za-z0-9:._-]+$")
+MAX_HISTORY_FILE_BYTES = 8 * 1024 * 1024
+MAX_TURN_LINE_BYTES = 2 * 1024 * 1024
+MAX_TURNS_FILE_BYTES = 64 * 1024 * 1024
 
 
 class SessionDataError(ValueError):
@@ -96,6 +99,11 @@ def _read_json_array_optional(path):
     path = Path(path)
     try:
         with path.open("r", encoding="utf-8") as handle:
+            size = os.fstat(handle.fileno()).st_size
+            if size > MAX_HISTORY_FILE_BYTES:
+                raise SessionDataError(
+                    f"session history exceeds {MAX_HISTORY_FILE_BYTES} bytes: {path}"
+                )
             value = json.load(handle)
     except FileNotFoundError:
         return None
@@ -139,18 +147,27 @@ def read_turns(path):
     path = Path(path)
     turns = []
     try:
-        handle = path.open("r", encoding="utf-8")
+        handle = path.open("rb")
     except FileNotFoundError:
         return []
     except OSError as exc:
         raise SessionDataError(f"cannot read persisted turns {path}: {exc}") from exc
     with handle:
+        size = os.fstat(handle.fileno()).st_size
+        if size > MAX_TURNS_FILE_BYTES:
+            raise SessionDataError(
+                f"persisted turns exceed {MAX_TURNS_FILE_BYTES} bytes: {path}"
+            )
         for line_number, line in enumerate(handle, start=1):
             if not line.strip():
                 continue
+            if len(line) > MAX_TURN_LINE_BYTES:
+                raise SessionDataError(
+                    f"persisted turn exceeds {MAX_TURN_LINE_BYTES} bytes: {path}:{line_number}"
+                )
             try:
                 turn = json.loads(line)
-            except json.JSONDecodeError as exc:
+            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
                 raise SessionDataError(
                     f"invalid persisted turn {path}:{line_number}: {exc}"
                 ) from exc
@@ -180,6 +197,10 @@ def read_last_turn(path):
             count = min(65536, position)
             position -= count
             pending = os.pread(fd, count, position) + pending
+            if len(pending) > MAX_TURN_LINE_BYTES:
+                raise SessionDataError(
+                    f"final persisted turn exceeds {MAX_TURN_LINE_BYTES} bytes: {path}"
+                )
             parts = pending.split(b"\n")
             candidates = parts if position == 0 else parts[1:]
             for candidate in reversed(candidates):
@@ -211,11 +232,21 @@ def write_turns_atomic(path, turns):
     try:
         fd = os.open(str(tmp_path), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         try:
+            total_size = 0
             for turn in turns:
                 if not isinstance(turn, dict):
                     raise SessionDataError("persisted turns must contain JSON objects")
-                raw = json.dumps(turn, ensure_ascii=False, separators=(",", ":")) + "\n"
-                _write_all(fd, raw.encode("utf-8"))
+                raw = (json.dumps(turn, ensure_ascii=False, separators=(",", ":")) + "\n").encode("utf-8")
+                if len(raw) > MAX_TURN_LINE_BYTES:
+                    raise SessionDataError(
+                        f"persisted turn exceeds {MAX_TURN_LINE_BYTES} bytes"
+                    )
+                total_size += len(raw)
+                if total_size > MAX_TURNS_FILE_BYTES:
+                    raise SessionDataError(
+                        f"persisted turns exceed {MAX_TURNS_FILE_BYTES} bytes"
+                    )
+                _write_all(fd, raw)
             os.fsync(fd)
         finally:
             os.close(fd)
@@ -235,12 +266,18 @@ def append_turn(path, turn):
         raise SessionDataError("persisted turn must be a JSON object")
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
+    raw = (json.dumps(turn, ensure_ascii=False, separators=(",", ":")) + "\n").encode("utf-8")
+    if len(raw) > MAX_TURN_LINE_BYTES:
+        raise SessionDataError(f"persisted turn exceeds {MAX_TURN_LINE_BYTES} bytes")
     fd = os.open(str(path), os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
     try:
         fcntl.flock(fd, fcntl.LOCK_EX)
         os.fchmod(fd, 0o600)
-        raw = json.dumps(turn, ensure_ascii=False, separators=(",", ":")) + "\n"
-        _write_all(fd, raw.encode("utf-8"))
+        if os.fstat(fd).st_size + len(raw) > MAX_TURNS_FILE_BYTES:
+            raise SessionDataError(
+                f"persisted turns exceed {MAX_TURNS_FILE_BYTES} bytes"
+            )
+        _write_all(fd, raw)
         os.fsync(fd)
     finally:
         try:
@@ -598,16 +635,30 @@ class SessionStore:
         try:
             os.fchmod(fd, 0o600)
             original_size = os.fstat(fd).st_size
-            if original_size > 0 and os.pread(fd, 1, original_size - 1) != b"\n":
+            needs_separator = (
+                original_size > 0
+                and os.pread(fd, 1, original_size - 1) != b"\n"
+            )
+            if needs_separator:
                 # A valid final JSON object does not require a trailing newline.
                 # Add its separator as part of this append; rollback truncates
                 # both the separator and new turns back to before_size.
                 _write_all(fd, b"\n")
+            appended_size = 1 if needs_separator else 0
             for turn in turns:
                 if not isinstance(turn, dict):
                     raise SessionDataError("appended turn must be a JSON object")
-                raw = json.dumps(turn, ensure_ascii=False, separators=(",", ":")) + "\n"
-                _write_all(fd, raw.encode("utf-8"))
+                raw = (json.dumps(turn, ensure_ascii=False, separators=(",", ":")) + "\n").encode("utf-8")
+                if len(raw) > MAX_TURN_LINE_BYTES:
+                    raise SessionDataError(
+                        f"appended turn exceeds {MAX_TURN_LINE_BYTES} bytes"
+                    )
+                appended_size += len(raw)
+                if original_size + appended_size > MAX_TURNS_FILE_BYTES:
+                    raise SessionDataError(
+                        f"persisted turns exceed {MAX_TURNS_FILE_BYTES} bytes"
+                    )
+                _write_all(fd, raw)
             os.fsync(fd)
         finally:
             os.close(fd)
@@ -1315,6 +1366,8 @@ class SessionStore:
                         "workspace history before Job merge",
                     )
                     merged_history = [*workspace_history, *new_history]
+                    limit = self.context_turn_limit()
+                    merged_history = merged_history[-limit:] if limit else []
                     transaction_targets.append(
                         self._transaction_target(
                             context.workspace.history_file,
