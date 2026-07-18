@@ -1,0 +1,13 @@
+# Optional tools used by selected network, audit, and deep-inspection Skills.
+auditd
+bind9-dnsutils
+ethtool
+iproute2
+iputils-ping
+lsof
+net-tools
+openssl
+snmp
+sudo
+traceroute
+whois

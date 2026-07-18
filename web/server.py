@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import calendar
+import ipaddress
 import json
 import os
 import errno
@@ -16,7 +17,7 @@ import uuid
 from http import HTTPStatus
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import unquote, urlparse
+from urllib.parse import quote, unquote, urlparse
 
 
 ROOT = Path(os.environ.get("LINUX_AGENT_ROOT", Path(__file__).resolve().parents[1])).resolve()
@@ -72,6 +73,7 @@ from audit import (  # noqa: E402
     AuditWriteBlocked,
     append_audit_event as append_web_audit_event,
 )
+from authentication import BootstrapCredential  # noqa: E402
 from metrics import (  # noqa: E402
     create_default_registry,
     normalize_route,
@@ -543,6 +545,50 @@ AUTH_TOKEN_EPHEMERAL = os.environ.get("LINUX_AGENT_WEB_TOKEN_EPHEMERAL", "0") ==
 if not AUTH_TOKEN:
     AUTH_TOKEN = secrets.token_hex(32)
     AUTH_TOKEN_EPHEMERAL = True
+
+WEB_BOOTSTRAP = BootstrapCredential()
+
+
+def auto_open_enabled():
+    """Only auto-open a browser for an interactive local desktop session."""
+    if REMOTE_MODE:
+        return False
+    configured = os.environ.get("LINUX_AGENT_WEB_AUTO_OPEN", "").strip().lower()
+    if configured in {"0", "false", "no", "off"}:
+        return False
+    if configured in {"1", "true", "yes", "on"}:
+        return True
+    return sys.platform == "darwin" or bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
+
+
+def auto_open_web_console():
+    """Open the UI with a one-time fragment credential when a desktop is present."""
+    if not auto_open_enabled():
+        return False
+    bootstrap_secret = WEB_BOOTSTRAP.issue(ttl_seconds=90)
+    browser_host = HOST
+    if browser_host in {"0.0.0.0", "::", "[::]"}:
+        browser_host = "127.0.0.1"
+    else:
+        try:
+            if ipaddress.ip_address(browser_host.strip("[]")).version == 6:
+                browser_host = f"[{browser_host.strip('[]')}]"
+        except ValueError:
+            pass
+    url = f"http://{browser_host}:{PORT}/#bootstrap={quote(bootstrap_secret, safe='')}"
+
+    def open_browser():
+        try:
+            import webbrowser
+
+            webbrowser.open(url, new=2, autoraise=True)
+        except Exception:
+            # Browser launch is a convenience; the server and manual token flow
+            # must remain available when no graphical browser is installed.
+            pass
+
+    threading.Thread(target=open_browser, name="web-browser-launch", daemon=True).start()
+    return True
 
 
 def persist_ephemeral_token():
@@ -1634,6 +1680,39 @@ class Handler(SimpleHTTPRequestHandler):
         if not parsed.path.startswith("/api/"):
             json_response(self, HTTPStatus.NOT_FOUND, {"ok": False, "status": "not_found"})
             return
+        if parsed.path == "/api/auth/bootstrap":
+            try:
+                body = read_json_body(self)
+            except RequestBodyTooLarge as exc:
+                json_domain_error(
+                    self,
+                    "request_too_large",
+                    str(exc),
+                    default=HTTPStatus.REQUEST_ENTITY_TOO_LARGE,
+                )
+                return
+            except ValueError as exc:
+                json_domain_error(
+                    self,
+                    "invalid_json",
+                    str(exc),
+                    default=HTTPStatus.BAD_REQUEST,
+                )
+                return
+            token = WEB_BOOTSTRAP.consume(
+                body.get("bootstrap") if isinstance(body, dict) else "",
+                AUTH_TOKEN,
+            )
+            if not token:
+                json_domain_error(
+                    self,
+                    "unauthorized",
+                    "Missing or invalid bootstrap credential.",
+                    default=HTTPStatus.UNAUTHORIZED,
+                )
+                return
+            json_response(self, HTTPStatus.OK, {"ok": True, "status": "authenticated", "token": token})
+            return
         if not self.require_auth():
             return
         try:
@@ -2158,6 +2237,7 @@ def main():
             print("[信息] 使用 config/config.json 中配置的 web.token 认证。", file=sys.stderr, flush=True)
         print(f"[info] serving {STATIC_ROOT} on http://{HOST}:{PORT}/", flush=True)
         notify_service_ready()
+        auto_open_web_console()
 
         def handle_shutdown_signal(_signum, _frame):
             terminate_running_jobs()

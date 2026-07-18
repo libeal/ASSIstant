@@ -185,6 +185,19 @@ gh attestation verify linux-agent-core.tar.gz --repo libeal/ASSIstant
 jq '.packages, .files' sbom.spdx.json
 ```
 
+### Debian 与 Fedora 安装包
+
+项目可生成两个不携带第三方库的精简本地安装包。Debian/Ubuntu 包从 `apt` 软件源安装 `requirements/debian.txt`，Fedora/RHEL 包按 `requirements/fedora.txt` 调用 `yum install -y`：
+
+```bash
+SOURCE_DATE_EPOCH=0 bash scripts/build-install-packages.sh v1.1.2
+tar -xzf linux-agent-v1.1.2-debian.tar.gz
+cd linux-agent-v1.1.2-debian
+sudo bash install.sh
+```
+
+Fedora 使用同名的 `linux-agent-v1.1.2-fedora.tar.gz`。两个包都只包含 core、Web、Skill、安装器、对应依赖清单和校验文件；不会包含测试、日志、缓存、Git 数据、Python site-packages 或 npm 模块。追加 `--with-optional-tools` 可安装网络与 audit Skill 的可选系统工具；依赖已由镜像或配置管理准备好时可使用 `--skip-dependencies`。
+
 ### 本地运行
 
 ```bash
@@ -215,7 +228,9 @@ bash bin/agent policy validate file-vault.json
 bash bin/agent-web
 ```
 
-默认访问 `http://127.0.0.1:8765/`。静态页面不需要认证，所有 `/api/` 请求都需要 `Authorization: Bearer <token>`（认证使用常量时间比较，不再支持 `X-Agent-Token` 备用头）。如果 `web.token` 留空，启动时会用系统 CSPRNG 生成本次运行的临时 token，并写入权限 `0600` 的 `tmp/web/auth-token` 文件（不在终端回显），退出时清理；配置文件 `config/config.json` 写入时也会强制 `0600`。
+默认访问 `http://127.0.0.1:8765/`。静态页面不需要认证，业务 `/api/` 请求都需要 `Authorization: Bearer <token>`（认证使用常量时间比较，不再支持 `X-Agent-Token` 备用头）；仅启动器使用的一次性 `/api/auth/bootstrap` 凭据例外。如果 `web.token` 留空，启动时会用系统 CSPRNG 生成本次运行的临时 token，并写入权限 `0600` 的 `tmp/web/auth-token` 文件（不在终端回显），退出时清理；配置文件 `config/config.json` 写入时也会强制 `0600`。
+
+在本机桌面会话中，`agent-web` 会自动打开前端外壳：启动器把一次性 bootstrap 凭据放在 URL fragment，前端换取 token 后立即清理地址栏并连接，真实 token 不会进入 URL、HTTP 日志或静态 HTML。无图形桌面、Remote 模式或不希望自动打开浏览器时，可设置 `LINUX_AGENT_WEB_AUTO_OPEN=0`，仍可在右上角手动输入 token；显式设为 `1` 可在受控桌面环境强制打开。
 systemd 生产部署会通过 `/run/linux-agent/observer.sock` 自动使用独立 auditd helper，不向浏览器索取 sudo 密码；socket 存在但 helper 失败时不会降级回 sudo。本地手工启动且没有 helper 时，Web 才沿用一次性 sudo bootstrap。跳过或启用失败都会写入 Web 审计日志。默认 `observer.require=false` 时按降级模式继续；强合规环境设置为 `true` 后，observer 不可用或规则失效会拒绝真实执行。`observer.privilege=none` 会同时禁用 helper 与 sudo。
 
 常用命令：
@@ -764,8 +779,10 @@ bash scripts/lint.sh
 | `packaging/linux-agent-web.service` | 生产 Web systemd 单元，包含非 root 身份、只读代码、可写数据目录和资源沙箱。 |
 | `packaging/linux-agent-observer-helper.service` / `.socket` | 仅持有 audit capability 的 root helper 与 `0660` Unix socket。 |
 | `packaging/dropins/10-provider-egress.conf.example` | 默认拒绝网络出口、按 Provider CIDR 显式放行的 systemd drop-in 模板。 |
+| `packaging/install-package.sh` / `INSTALL_PACKAGE.md` | Debian/Fedora 归档内的依赖安装入口与使用说明。 |
 | `packaging/权限边界.md` | Terminal、Skill、MCP、远程脚本、文件编辑和 AI 调用的权限与密钥边界。 |
 | `remote/bootstrap.sh` | CLI/Web Remote runtime 的自包含 bootstrap；固定版本下载 manifest 和资产并在本机临时运行。 |
+| `scripts/build-install-packages.sh` | 构建精简、可复现的 Debian/Ubuntu 与 Fedora/RHEL 本地安装归档。 |
 | `scripts/build-remote-release.sh` | 构建确定性 core/Web/skill/installer 资产、SPDX 2.3 SBOM、`SHA256SUMS` 和 release manifest。 |
 | `scripts/install.sh` | systemd 安装、升级、自动回滚、健康检查、状态查询和卸载；支持本地 `--from-dist` 演练。 |
 | `scripts/prepare-release-signature.sh` | 为 release manifest 准备 Sigstore/cosign bundle。 |
@@ -843,6 +860,7 @@ bash scripts/lint.sh
 | `tests/tools.sh` | 覆盖本地工具、skill 登记、日志清理边界和 doctor。 |
 | `tests/observer.sh` | 覆盖 observer 禁用、mock auditd、事件汇总和失败降级。 |
 | `tests/audit_integrity.sh` | 覆盖审计链、篡改、权限、轮转、磁盘策略、并发写入和离线证据导出。 |
+| `tests/install_packages.sh` | 覆盖 Debian/Fedora 包的确定性、内容隔离、校验和及无 systemd 安装。 |
 | `tests/install.sh` | 无 root 覆盖发布物校验、安装、升级、回滚、持久数据、版本保留和健康检查。 |
 | `tests/workflow_unit.sh` | 覆盖 CLI/API 共享 Work 工作流边界。 |
 | `tests/contract.sh` | 覆盖 API/domain schema、状态和错误码契约。 |

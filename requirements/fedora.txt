@@ -1,0 +1,18 @@
+# linux-agent runtime and installer dependencies for Fedora/RHEL-like systems.
+# One yum package name per line; comments and blank lines are ignored.
+bash
+ca-certificates
+coreutils
+curl
+findutils
+gawk
+grep
+jq
+python3
+procps-ng
+sed
+tar
+gzip
+systemd
+shadow-utils
+

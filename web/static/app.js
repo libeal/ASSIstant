@@ -45,6 +45,7 @@ import { createSkillsView } from "./modules/view-skills.js";
 import { createAuditView } from "./modules/view-audit.js";
 import { createPolicyView } from "./modules/view-policy.js";
 import { bindApplicationEvents } from "./modules/app-bindings.js";
+import { consumeBootstrapFromLocation } from "./modules/auth.js";
 
 /** @typedef {import("./modules/types.js").ApplicationController} ApplicationController */
 
@@ -163,6 +164,12 @@ async function connect() {
   }
   localStorage.setItem("linuxAgentToken", state.token);
   const health = await api("/api/health");
+  if (!health?.ok) {
+    setStatus("connectionState", "offline", "high");
+    setText("rootPath", "未连接");
+    if (health?.status === "unauthorized") localStorage.removeItem("linuxAgentToken");
+    throw new Error(health?.error || health?.status || "连接失败");
+  }
   setLayoutRunId(health.web_server?.run_id || "");
   setStatus("connectionState", "online", "ok");
   setText("rootPath", health.root || "connected");
@@ -177,6 +184,18 @@ async function connect() {
   await app.loadAuditList();
   await app.loadPolicies();
   showToast("Connected");
+}
+
+async function exchangeBootstrap(bootstrap) {
+  const result = await requestJson(
+    "/api/auth/bootstrap",
+    { method: "POST", body: { bootstrap } },
+    () => "",
+  );
+  if (!result?.ok || !result.token) {
+    throw new Error(result?.error || "自动认证失败，请手动输入 token");
+  }
+  return String(result.token);
 }
 
 async function loadDomainSchema() {
@@ -225,6 +244,7 @@ async function safeAction(fn) {
 }
 
 function init() {
+  const bootstrap = consumeBootstrapFromLocation();
   const tokenInput = $("tokenInput");
   if (tokenInput instanceof HTMLInputElement) tokenInput.value = state.token;
   app.updateWorkActionLabel();
@@ -234,7 +254,15 @@ function init() {
   initSidebarToggle();
   bindApplicationEvents(app, { safeAction, showScreen, connect, shutdownServer, state });
   bindPanelDrag();
-  if (state.token) safeAction(connect);
+  if (bootstrap) {
+    safeAction(async () => {
+      state.token = await exchangeBootstrap(bootstrap);
+      if (tokenInput instanceof HTMLInputElement) tokenInput.value = state.token;
+      await connect();
+    });
+  } else if (state.token) {
+    safeAction(connect);
+  }
 }
 
 Object.assign(app, {

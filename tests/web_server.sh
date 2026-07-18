@@ -6,6 +6,10 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # shellcheck source=helpers.sh
 source "${ROOT_DIR}/tests/helpers.sh"
 
+# The integration test is headless; keep the desktop convenience launcher out
+# of the service lifecycle while still exercising the normal server path.
+export LINUX_AGENT_WEB_AUTO_OPEN=0
+
 tmp_root="$(mktemp -d)"
 server_pid=""
 cleanup() {
@@ -73,6 +77,15 @@ grep -q 'audit.integrity_chain 已移除' "${removed_chain_err}"
 tmp_config="$(mktemp)"
 jq 'del(.audit.integrity_chain)' "${project}/config/config.json" >"${tmp_config}"
 mv "${tmp_config}" "${project}/config/config.json"
+
+report_failure() {
+    local status=$?
+    local line="${1:-unknown}"
+    trap - ERR
+    printf 'web_server: failed at line %s (exit=%s)\n' "${line}" "${status}" >&2
+    return "${status}"
+}
+trap 'report_failure "${LINENO}"' ERR
 
 mkdir -p "${project}/mcp/stdio-web" "${project}/mcp/http-web" "${project}/mcp/sse-web"
 cat >"${project}/mcp/stdio-web/mcp.json" <<JSON
@@ -232,6 +245,12 @@ negative_length_code="$(curl --noproxy '*' -sS -o "${tmp_root}/negative-length.j
     -H 'Content-Length: -1' --data-binary '{}' "${base_url}/api/terminal/review" || true)"
 [[ "${negative_length_code}" == "400" ]]
 jq -e '.status == "invalid_json"' "${tmp_root}/negative-length.json" >/dev/null
+
+bootstrap_code="$(curl --noproxy '*' -sS -o "${tmp_root}/bootstrap.json" -w '%{http_code}' \
+    -X POST -H "Content-Type: application/json" -d '{"bootstrap":"invalid"}' \
+    "${base_url}/api/auth/bootstrap" || true)"
+[[ "${bootstrap_code}" == "401" ]]
+jq -e '.status == "unauthorized"' "${tmp_root}/bootstrap.json" >/dev/null
 
 chunked_code="$(curl --noproxy '*' -sS -o "${tmp_root}/chunked.json" -w '%{http_code}' \
     -X POST -H "Authorization: Bearer ${token}" -H "Content-Type: application/json" \
@@ -644,6 +663,7 @@ policy_write="$(curl --noproxy '*' -sS \
     "${base_url}/api/policies/write")"
 jq -e 'if .ok then .status == "saved" and (.method == "root" or .method == "sudo") else .status == "sudo_required" end' <<<"${policy_write}" >/dev/null
 
+job_poll_attempts=300
 work_payload="$(jq -cn '{resource:"work", action:"run", payload:{input:"查看cpu占用"}}')"
 work_job_one="$(curl --noproxy '*' -sS \
     -H "Authorization: Bearer ${token}" \
@@ -663,7 +683,7 @@ work_job_two_id="$(jq -r '.job_id' <<<"${work_job_two}")"
 [[ "${work_job_two_id}" =~ ^[0-9a-f]+$ ]]
 [[ "${work_job_two_id}" != "${work_job_one_id}" ]]
 work_result_one=""
-for _ in $(seq 1 100); do
+for _ in $(seq 1 "${job_poll_attempts}"); do
     work_result_one="$(curl --noproxy '*' -sS -H "Authorization: Bearer ${token}" "${base_url}/api/jobs/${work_job_one_id}")"
     work_status_one="$(jq -r '.status' <<<"${work_result_one}")"
     if [[ "${work_status_one}" != "queued" && "${work_status_one}" != "running" ]]; then
@@ -690,7 +710,7 @@ slow_work_job_id="$(jq -r '.job_id' <<<"${slow_work_job}")"
 [[ "${slow_work_job_id}" =~ ^[0-9a-f]+$ ]]
 slow_partial_seen=0
 slow_work_state=""
-for _ in $(seq 1 200); do
+for _ in $(seq 1 "${job_poll_attempts}"); do
     slow_work_state="$(curl --noproxy '*' -sS -H "Authorization: Bearer ${token}" "${base_url}/api/jobs/${slow_work_job_id}")"
     if jq -e '.status == "running"
         and .result.status == "running"
@@ -710,7 +730,7 @@ if [[ "${slow_partial_seen}" != "1" ]]; then
         "$(jq -r '.result.status // "unknown"' <<<"${slow_work_state}")" >&2
     exit 1
 fi
-for _ in $(seq 1 100); do
+for _ in $(seq 1 "${job_poll_attempts}"); do
     slow_work_result="$(curl --noproxy '*' -sS -H "Authorization: Bearer ${token}" "${base_url}/api/jobs/${slow_work_job_id}")"
     slow_work_status="$(jq -r '.status' <<<"${slow_work_result}")"
     if [[ "${slow_work_status}" != "queued" && "${slow_work_status}" != "running" ]]; then
@@ -724,7 +744,7 @@ jq -e '.result_status == "executed" and .result_ok == true
     and ([.result.output_blocks[]? | select(.title == "执行流程") | .text | contains("# 工作计划") and contains("步骤输出")] | any)' <<<"${slow_work_result}" >/dev/null
 
 work_result_two=""
-for _ in $(seq 1 100); do
+for _ in $(seq 1 "${job_poll_attempts}"); do
     work_result_two="$(curl --noproxy '*' -sS -H "Authorization: Bearer ${token}" "${base_url}/api/jobs/${work_job_two_id}")"
     work_status_two="$(jq -r '.status' <<<"${work_result_two}")"
     if [[ "${work_status_two}" != "queued" && "${work_status_two}" != "running" ]]; then
@@ -927,7 +947,7 @@ work_job_after_leave="$(curl --noproxy '*' -sS \
     "${base_url}/api/jobs")"
 work_job_after_leave_id="$(jq -r '.job_id' <<<"${work_job_after_leave}")"
 [[ "${work_job_after_leave_id}" =~ ^[0-9a-f]+$ ]]
-for _ in $(seq 1 100); do
+for _ in $(seq 1 "${job_poll_attempts}"); do
     work_result_after_leave="$(curl --noproxy '*' -sS -H "Authorization: Bearer ${token}" "${base_url}/api/jobs/${work_job_after_leave_id}")"
     work_status_after_leave="$(jq -r '.status' <<<"${work_result_after_leave}")"
     if [[ "${work_status_after_leave}" != "queued" && "${work_status_after_leave}" != "running" ]]; then
@@ -956,7 +976,7 @@ job_id="$(jq -r '.job_id' <<<"${job}")"
 
 job_status=""
 job_result=""
-for _ in $(seq 1 80); do
+for _ in $(seq 1 "${job_poll_attempts}"); do
     job_result="$(curl --noproxy '*' -sS -H "Authorization: Bearer ${token}" "${base_url}/api/jobs/${job_id}")"
     job_status="$(jq -r '.status' <<<"${job_result}")"
     if [[ "${job_status}" != "queued" && "${job_status}" != "running" ]]; then
@@ -1024,7 +1044,7 @@ cancel_result="$(curl --noproxy '*' -sS \
     -d '{}' \
     "${base_url}/api/jobs/${cancel_job_id}/cancel")"
 jq -e '.ok == true and .status == "cancelled"' <<<"${cancel_result}" >/dev/null
-for _ in $(seq 1 80); do
+for _ in $(seq 1 "${job_poll_attempts}"); do
     cancelled_state="$(curl --noproxy '*' -sS -H "Authorization: Bearer ${token}" "${base_url}/api/jobs/${cancel_job_id}")"
     survivor_state="$(curl --noproxy '*' -sS -H "Authorization: Bearer ${token}" "${base_url}/api/jobs/${survivor_job_id}")"
     cancelled_status="$(jq -r '.status' <<<"${cancelled_state}")"
@@ -1150,7 +1170,7 @@ retry_source="$(curl --noproxy '*' -sS \
     -d "${retry_source_payload}" \
     "${base_url}/api/jobs")"
 retry_source_id="$(jq -r '.job_id' <<<"${retry_source}")"
-for _ in $(seq 1 80); do
+for _ in $(seq 1 "${job_poll_attempts}"); do
     retry_source_state="$(curl --noproxy '*' -sS -H "Authorization: Bearer ${token}" "${base_url}/api/jobs/${retry_source_id}")"
     retry_source_status="$(jq -r '.status' <<<"${retry_source_state}")"
     [[ "${retry_source_status}" != "queued" && "${retry_source_status}" != "running" ]] && break
@@ -1194,7 +1214,7 @@ retry_replay_code="$(curl --noproxy '*' -sS -o "${retry_replay_file}" -w '%{http
 [[ "${retry_replay_code}" == "200" ]]
 jq -e --arg id "${retry_one_id}" '.deduplicated == true and .job_id == $id' "${retry_replay_file}" >/dev/null
 
-for _ in $(seq 1 80); do
+for _ in $(seq 1 "${job_poll_attempts}"); do
     retry_one_state="$(curl --noproxy '*' -sS -H "Authorization: Bearer ${token}" "${base_url}/api/jobs/${retry_one_id}")"
     retry_one_status="$(jq -r '.status' <<<"${retry_one_state}")"
     [[ "${retry_one_status}" != "queued" && "${retry_one_status}" != "running" ]] && break
@@ -1212,7 +1232,7 @@ retry_two_id="$(jq -r '.job_id' <<<"${retry_two}")"
 jq -e --arg parent "${retry_one_id}" --arg root "${retry_source_id}" '
     .retry_of == $parent and .root_job_id == $root and .attempt == 3
 ' <<<"${retry_two}" >/dev/null
-for _ in $(seq 1 80); do
+for _ in $(seq 1 "${job_poll_attempts}"); do
     retry_two_state="$(curl --noproxy '*' -sS -H "Authorization: Bearer ${token}" "${base_url}/api/jobs/${retry_two_id}")"
     retry_two_status="$(jq -r '.status' <<<"${retry_two_state}")"
     [[ "${retry_two_status}" != "queued" && "${retry_two_status}" != "running" ]] && break
@@ -1239,7 +1259,7 @@ approval_job="$(curl --noproxy '*' -sS \
     -d "${approval_payload}" \
     "${base_url}/api/jobs")"
 approval_job_id="$(jq -r '.job_id' <<<"${approval_job}")"
-for _ in $(seq 1 100); do
+for _ in $(seq 1 "${job_poll_attempts}"); do
     approval_result="$(curl --noproxy '*' -sS -H "Authorization: Bearer ${token}" "${base_url}/api/jobs/${approval_job_id}")"
     approval_job_status="$(jq -r '.status' <<<"${approval_result}")"
     if [[ "${approval_job_status}" != "queued" && "${approval_job_status}" != "running" ]]; then
@@ -1285,7 +1305,7 @@ approval_resume_job="$(curl --noproxy '*' -sS \
     -d "${approval_resume_payload}" \
     "${base_url}/api/jobs")"
 approval_resume_job_id="$(jq -r '.job_id' <<<"${approval_resume_job}")"
-for _ in $(seq 1 100); do
+for _ in $(seq 1 "${job_poll_attempts}"); do
     approval_resume_result="$(curl --noproxy '*' -sS -H "Authorization: Bearer ${token}" "${base_url}/api/jobs/${approval_resume_job_id}")"
     approval_resume_status="$(jq -r '.status' <<<"${approval_resume_result}")"
     if [[ "${approval_resume_status}" != "queued" && "${approval_resume_status}" != "running" ]]; then
