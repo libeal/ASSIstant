@@ -265,9 +265,12 @@ esac
 SH
 chmod 0755 "${fake_bin}/gh" "${fake_bin}/cosign"
 
+# The fake release scenarios are local fixtures; do not inherit the workflow's
+# real tag guard while exercising signature reuse and creation.
 FAKE_RELEASE_EXISTS=1 \
     FAKE_RELEASE_DIR="${fake_release}" \
     FAKE_SIGNATURE_LOG="${signature_log}" \
+    GITHUB_ACTIONS=false \
     PATH="${fake_bin}:${PATH}" \
     bash "${ROOT_DIR}/scripts/prepare-release-signature.sh" v0.0.0-test "${reuse_dist}"
 cmp "${fake_release}/release-manifest.json.sigstore.json" \
@@ -279,6 +282,7 @@ grep -qx 'verify' "${signature_log}"
 FAKE_RELEASE_EXISTS=0 \
     FAKE_RELEASE_DIR="${fake_release}" \
     FAKE_SIGNATURE_LOG="${signature_log}" \
+    GITHUB_ACTIONS=false \
     PATH="${fake_bin}:${PATH}" \
     bash "${ROOT_DIR}/scripts/prepare-release-signature.sh" v0.0.0-test "${new_dist}"
 grep -qx 'new-bundle' "${new_dist}/release-manifest.json.sigstore.json"

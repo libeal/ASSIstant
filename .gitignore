@@ -9,3 +9,5 @@ dist/
 docs/
 CLAUDE.md
 .claude
+.codex
+.agents
