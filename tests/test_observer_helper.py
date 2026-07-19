@@ -2,6 +2,7 @@
 
 import contextlib
 import io
+import json
 import os
 import socket
 import sys
@@ -321,6 +322,35 @@ class ObserverHelperProtocolTests(unittest.TestCase):
         finally:
             server.close()
 
+    def test_ping_proves_socket_transport_without_running_auditctl(self):
+        server, client = socket.socketpair()
+        try:
+            client.sendall(b'{"operation":"ping"}\n')
+            client.shutdown(socket.SHUT_WR)
+            with mock.patch.object(
+                observer_helper,
+                "_peer_credentials",
+                return_value=(os.getpid(), os.geteuid(), os.getegid()),
+            ), mock.patch.object(observer_helper, "run_command") as run_command:
+                with contextlib.redirect_stderr(io.StringIO()):
+                    observer_helper.handle_connection(server)
+            response = json.loads(client.recv(4096).decode("utf-8"))
+        finally:
+            server.close()
+            client.close()
+
+        self.assertEqual(
+            response,
+            {
+                "ok": True,
+                "status": "ready",
+                "exit_code": 0,
+                "stdout": "",
+                "stderr": "",
+            },
+        )
+        run_command.assert_not_called()
+
     def test_client_request_rejects_invalid_responses(self):
         responses = (
             (b"", "empty response"),
@@ -365,6 +395,32 @@ class ObserverHelperProtocolTests(unittest.TestCase):
         self.assertEqual(125, exit_code)
         self.assertIn("observer helper request failed: connection refused", stderr.getvalue())
         self.assertNotIn("Traceback", stderr.getvalue())
+
+    def test_request_permission_failure_explains_socket_group_repair(self):
+        stderr = io.StringIO()
+        with mock.patch.object(
+            sys,
+            "argv",
+            [
+                "observer_helper.py",
+                "request",
+                "--socket",
+                "/run/test.sock",
+                "ping",
+            ],
+        ), mock.patch.object(
+            observer_helper,
+            "client_request",
+            side_effect=PermissionError(13, "Permission denied"),
+        ), contextlib.redirect_stderr(stderr):
+            exit_code = observer_helper.main()
+
+        output = stderr.getvalue()
+        self.assertEqual(125, exit_code)
+        self.assertIn("permission denied for socket /run/test.sock", output)
+        self.assertIn("SocketGroup", output)
+        self.assertIn("linux-agent-observer-helper.socket", output)
+        self.assertNotIn("Traceback", output)
 
 
 if __name__ == "__main__":

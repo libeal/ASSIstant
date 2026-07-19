@@ -147,6 +147,30 @@ def load_domain_schema():
 DOMAIN_SCHEMA = load_domain_schema()
 DOMAIN_CONTRACT = DomainContract(DOMAIN_SCHEMA)
 
+AGENT_API_RESPONSE_PROFILES = {
+    "health": {"required_fields": {"root": str, "web": dict}},
+    "config_web": {"required_fields": {"web": dict}},
+    "doctor": {"required_fields": {"doctor": dict}},
+    "tools": {"required_fields": {"scripts": list}},
+    "skills_validate": {"required_fields": {"validation": dict}},
+    "mcp_list": {"required_fields": {"servers": list}},
+    "mcp_validate": {"required_fields": {"validation": dict}},
+    "mcp_tools": {"required_fields": {"servers": list, "tools": list}},
+    "audit_list": {"required_fields": {"sessions": list}},
+    "audit_read": {"required_fields": {"events": list}},
+    "sense": {"required_fields": {"sense": dict}},
+    "review": {"required_fields": {"review": dict, "output_blocks": list}},
+    "terminal_run": {"execution_result": True},
+    "edit_plan": {"required_fields": {"edit": dict}},
+    "edit_review": {"required_fields": {"reviews": list, "scripts": list}},
+    "skill_materialize": {"required_fields": {"skill": str, "files": list}},
+}
+
+
+def validate_agent_api_response(result, profile):
+    specification = AGENT_API_RESPONSE_PROFILES[profile]
+    return DOMAIN_CONTRACT.validate_api_result(result, **specification)
+
 
 def write_config(config):
     CONFIG_STORE.write(config)
@@ -1803,15 +1827,15 @@ class Handler(SimpleHTTPRequestHandler):
             )
             return
         routes = {
-            "/api/health": ("health", "get"),
-            "/api/config/web": ("config", "web"),
-            "/api/doctor": ("doctor", "run"),
-            "/api/tools": ("tools", "list"),
-            "/api/skills/validate": ("skills", "validate"),
-            "/api/mcp": ("mcp", "list"),
-            "/api/mcp/validate": ("mcp", "validate"),
-            "/api/mcp/tools": ("mcp", "tools"),
-            "/api/audit/list": ("audit", "list"),
+            "/api/health": ("health", "get", "health"),
+            "/api/config/web": ("config", "web", "config_web"),
+            "/api/doctor": ("doctor", "run", "doctor"),
+            "/api/tools": ("tools", "list", "tools"),
+            "/api/skills/validate": ("skills", "validate", "skills_validate"),
+            "/api/mcp": ("mcp", "list", "mcp_list"),
+            "/api/mcp/validate": ("mcp", "validate", "mcp_validate"),
+            "/api/mcp/tools": ("mcp", "tools", "mcp_tools"),
+            "/api/audit/list": ("audit", "list", "audit_list"),
         }
         if path == "/api/runtime/backup":
             send_runtime_backup(self)
@@ -1869,6 +1893,16 @@ class Handler(SimpleHTTPRequestHandler):
             timeout=120,
             request_id=self.request_id,
         )
+        try:
+            validate_agent_api_response(result, route[2])
+        except DomainValidationError as exc:
+            json_domain_error(
+                self,
+                "invalid_agent_output",
+                str(exc),
+                default=HTTPStatus.BAD_GATEWAY,
+            )
+            return
         if path == "/api/health" and isinstance(result, dict):
             result["web_server"] = {
                 "run_id": SERVER_RUN_ID,
@@ -1878,14 +1912,13 @@ class Handler(SimpleHTTPRequestHandler):
 
     def handle_api_post(self, path, body):
         sync_routes = {
-            "/api/sense": ("sense", "get"),
-            "/api/script/review": ("script", "review"),
-            "/api/terminal/review": ("terminal", "review"),
-            "/api/terminal/run": ("terminal", "run"),
-            "/api/edit/plan": ("edit", "plan"),
-            "/api/edit/review": ("edit", "review"),
-            "/api/audit/read": ("audit", "read"),
-            "/api/skills/materialize": ("skills", "materialize"),
+            "/api/sense": ("sense", "get", "sense"),
+            "/api/script/review": ("script", "review", "review"),
+            "/api/terminal/review": ("terminal", "review", "review"),
+            "/api/terminal/run": ("terminal", "run", "terminal_run"),
+            "/api/edit/plan": ("edit", "plan", "edit_plan"),
+            "/api/edit/review": ("edit", "review", "edit_review"),
+            "/api/skills/materialize": ("skills", "materialize", "skill_materialize"),
         }
         if path == "/api/policies/read":
             try:
@@ -1931,6 +1964,16 @@ class Handler(SimpleHTTPRequestHandler):
                 timeout=180,
                 request_id=self.request_id,
             )
+            try:
+                validate_agent_api_response(result, "audit_read")
+            except DomainValidationError as exc:
+                json_domain_error(
+                    self,
+                    "invalid_agent_output",
+                    str(exc),
+                    default=HTTPStatus.BAD_GATEWAY,
+                )
+                return
             if isinstance(result, dict) and isinstance(result.get("events"), list):
                 audit_session_id = str(body.get("session_id") or result.get("session_id") or "")
                 try:
@@ -1963,6 +2006,16 @@ class Handler(SimpleHTTPRequestHandler):
                 timeout=120,
                 request_id=self.request_id,
             )
+            try:
+                validate_agent_api_response(result, "audit_list")
+            except DomainValidationError as exc:
+                json_domain_error(
+                    self,
+                    "invalid_agent_output",
+                    str(exc),
+                    default=HTTPStatus.BAD_GATEWAY,
+                )
+                return
             json_response(self, HTTPStatus.OK, result)
             return
         if path == "/api/config/update":
@@ -2198,6 +2251,16 @@ class Handler(SimpleHTTPRequestHandler):
             timeout=180,
             request_id=self.request_id,
         )
+        try:
+            validate_agent_api_response(result, route[2])
+        except DomainValidationError as exc:
+            json_domain_error(
+                self,
+                "invalid_agent_output",
+                str(exc),
+                default=HTTPStatus.BAD_GATEWAY,
+            )
+            return
         json_response(self, HTTPStatus.OK, result)
 
 

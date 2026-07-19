@@ -84,6 +84,8 @@ class DomainContract:
 
     def validate_execution_result(self, result):
         self._require_fields("execution_result", result)
+        if not isinstance(result.get("ok"), bool):
+            raise DomainValidationError("execution_result ok must be a boolean")
         if result.get("schema_version") != self.schema_version:
             raise DomainValidationError("execution_result schema_version is unsupported")
         if str(result.get("protocol_version") or "") != self.protocol_version:
@@ -119,6 +121,81 @@ class DomainContract:
             raise DomainValidationError("execution_result output_blocks must be an array")
         if result.get("timeline_semantics") != "step_projection":
             raise DomainValidationError("unsupported timeline semantics")
+        return result
+
+    def validate_api_result(
+        self,
+        result,
+        *,
+        execution_result=False,
+        required_fields=None,
+    ):
+        """Validate a versioned CLI API envelope before Web returns it."""
+
+        if execution_result:
+            self.validate_execution_result(result)
+        else:
+            if not isinstance(result, dict):
+                raise DomainValidationError("api_result must be an object")
+            if not isinstance(result.get("ok"), bool):
+                raise DomainValidationError("api_result ok must be a boolean")
+            if result.get("schema_version") != self.schema_version:
+                raise DomainValidationError("api_result schema_version is unsupported")
+            if str(result.get("protocol_version") or "") != self.protocol_version:
+                raise DomainValidationError("api_result protocol_version is unsupported")
+            status = result.get("status")
+            if not isinstance(status, str) or not status:
+                raise DomainValidationError(
+                    "api_result status must be a non-empty string"
+                )
+            supported = self.compatibility_statuses.union(self.error_codes)
+            if supported and status not in supported:
+                raise DomainValidationError(
+                    f"unsupported api_result status: {status}"
+                )
+            if result["ok"] is False:
+                self._require_fields("error", result)
+                code = result.get("code")
+                if not isinstance(code, str) or not code:
+                    raise DomainValidationError(
+                        "api_result error code must be a non-empty string"
+                    )
+                if code != status:
+                    raise DomainValidationError(
+                        "api_result error status must match its code"
+                    )
+                if supported and code not in supported:
+                    raise DomainValidationError(
+                        f"unsupported api_result error code: {code}"
+                    )
+                if not isinstance(result.get("message"), str):
+                    raise DomainValidationError(
+                        "api_result error message must be a string"
+                    )
+                if not isinstance(result.get("retryable"), bool):
+                    raise DomainValidationError(
+                        "api_result error retryable must be a boolean"
+                    )
+                if not isinstance(result.get("request_id"), str):
+                    raise DomainValidationError(
+                        "api_result error request_id must be a string"
+                    )
+                if not isinstance(result.get("details"), dict):
+                    raise DomainValidationError(
+                        "api_result error details must be an object"
+                    )
+
+        if result.get("ok") is True:
+            for name, expected_type in (required_fields or {}).items():
+                value = result.get(name)
+                if not isinstance(value, expected_type):
+                    raise DomainValidationError(
+                        f"api_result {name} has an invalid type"
+                    )
+                if expected_type is str and not value.strip():
+                    raise DomainValidationError(
+                        f"api_result {name} must be a non-empty string"
+                    )
         return result
 
     def validate_job(self, job):

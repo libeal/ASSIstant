@@ -257,7 +257,7 @@ def authorize_request(
     if not isinstance(request, dict):
         raise HelperRequestError("request must be a JSON object")
     operation = str(request.get("operation") or "")
-    if operation == "status":
+    if operation in {"ping", "status"}:
         return None
     if operation not in {
         "list_rules",
@@ -590,7 +590,15 @@ def handle_connection(connection: socket.socket) -> None:
             peer_pid=peer_pid,
             peer_uid=peer_uid,
         )
-        if operation == "release_key":
+        if operation == "ping":
+            response = {
+                "ok": True,
+                "status": "ready",
+                "exit_code": 0,
+                "stdout": "",
+                "stderr": "",
+            }
+        elif operation == "release_key":
             response = {
                 "ok": True,
                 "status": "released",
@@ -746,6 +754,7 @@ def main() -> int:
     request_parser.add_argument(
         "operation",
         choices=(
+            "ping",
             "status",
             "list_rules",
             "add_rule",
@@ -772,6 +781,15 @@ def main() -> int:
         request["capability"] = args.capability
     try:
         return client_request(args.socket, request)
+    except PermissionError as exc:
+        print(
+            "observer helper request failed: "
+            f"permission denied for socket {args.socket}: {exc}. "
+            "Verify that the Web service user belongs to the configured "
+            "SocketGroup, then restart linux-agent-observer-helper.socket.",
+            file=sys.stderr,
+        )
+        return 125
     except Exception as exc:  # Keep helper transport failures out of shell tracebacks.
         print(f"observer helper request failed: {exc}", file=sys.stderr)
         return 125

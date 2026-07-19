@@ -124,7 +124,8 @@
     "invalid_output",
     "invalid_agent_output",
     "invalid_skill_manifest",
-    "output_limit_exceeded"
+    "output_limit_exceeded",
+    "skill_materialized"
   ],
   "status_presentation": {
     "low": [
@@ -134,7 +135,8 @@
       "success",
       "approved",
       "auto_approved",
-      "answered"
+      "answered",
+      "skill_materialized"
     ],
     "medium": [
       "running",

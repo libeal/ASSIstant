@@ -9,6 +9,7 @@ tmp_root="$(mktemp -d)"
 web_pid=""
 notify_pid=""
 fake_systemd_pidfile=""
+fake_systemd_helper_pidfile=""
 
 cleanup() {
     if [[ -n "${web_pid}" ]] && kill -0 "${web_pid}" >/dev/null 2>&1; then
@@ -22,6 +23,10 @@ cleanup() {
     if [[ -n "${fake_systemd_pidfile}" && -f "${fake_systemd_pidfile}" ]]; then
         fake_systemd_pid="$(<"${fake_systemd_pidfile}")"
         kill "${fake_systemd_pid}" >/dev/null 2>&1 || true
+    fi
+    if [[ -n "${fake_systemd_helper_pidfile}" && -f "${fake_systemd_helper_pidfile}" ]]; then
+        fake_systemd_helper_pid="$(<"${fake_systemd_helper_pidfile}")"
+        kill "${fake_systemd_helper_pid}" >/dev/null 2>&1 || true
     fi
     rm -rf -- "${tmp_root}"
 }
@@ -48,6 +53,9 @@ repack_core_for_test() {
             ;;
         fail-restart)
             : >"${stage}/FAIL_RESTART"
+            ;;
+        fail-helper)
+            : >"${stage}/FAIL_HELPER"
             ;;
         managed-config)
             jq --argjson port "${MANAGED_TEST_PORT:?}" \
@@ -237,19 +245,23 @@ if command -v unshare >/dev/null 2>&1 && unshare -Ur true >/dev/null 2>&1; then
     fake_systemd_dir="${tmp_root}/fake-systemd"
     fake_systemd_bin="${tmp_root}/fake-systemd-bin"
     fake_systemd_pidfile="${fake_systemd_dir}/service.pid"
+    fake_systemd_helper_pidfile="${fake_systemd_dir}/helper.pid"
     managed_dist_one="${tmp_root}/managed-dist-one"
     managed_dist_two="${tmp_root}/managed-dist-two"
     failing_dist_three="${tmp_root}/failing-dist-three"
+    failing_helper_dist_three="${tmp_root}/failing-helper-dist-three"
     mkdir -p "${managed_prefix}/systemd" "${fake_systemd_dir}" "${fake_systemd_bin}"
     cp -a "${dist_one}" "${managed_dist_one}"
     cp -a "${dist_two}" "${managed_dist_two}"
     cp -a "${dist_three}" "${failing_dist_three}"
+    cp -a "${dist_three}" "${failing_helper_dist_three}"
     MANAGED_TEST_PORT="$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1]); s.close()')"
     MANAGED_TEST_TOKEN="install-managed-token"
     export MANAGED_TEST_PORT MANAGED_TEST_TOKEN
     repack_core_for_test "${managed_dist_one}" managed-config
     repack_core_for_test "${managed_dist_two}" unit-v2
     repack_core_for_test "${failing_dist_three}" fail-restart
+    repack_core_for_test "${failing_helper_dist_three}" fail-helper
     failing_core_listing="$(tar -tzf "${failing_dist_three}/linux-agent-core.tar.gz")"
     grep -qx 'FAIL_RESTART' <<<"${failing_core_listing}"
 
@@ -262,7 +274,7 @@ shift || true
 printf '%s\n' "${command_name}" >>"${FAKE_SYSTEMD_STATE}/commands"
 
 stop_service() {
-    local pid=""
+    local pid="" helper_pid=""
     if [[ -f "${FAKE_SYSTEMD_STATE}/service.pid" ]]; then
         pid="$(<"${FAKE_SYSTEMD_STATE}/service.pid")"
         kill "${pid}" >/dev/null 2>&1 || true
@@ -272,11 +284,57 @@ stop_service() {
         done
         rm -f -- "${FAKE_SYSTEMD_STATE}/service.pid"
     fi
+    if [[ -f "${FAKE_SYSTEMD_STATE}/helper.pid" ]]; then
+        helper_pid="$(<"${FAKE_SYSTEMD_STATE}/helper.pid")"
+        kill "${helper_pid}" >/dev/null 2>&1 || true
+        wait "${helper_pid}" 2>/dev/null || true
+        rm -f -- "${FAKE_SYSTEMD_STATE}/helper.pid"
+    fi
+    rm -f -- "${LINUX_AGENT_OBSERVER_HELPER_SOCKET}"
+}
+
+start_helper() {
+    [[ ! -f "${FAKE_SYSTEMD_PREFIX}/current/FAIL_HELPER" ]] || return 0
+    python3 - "${LINUX_AGENT_OBSERVER_HELPER_SOCKET}" <<'PY' \
+        >"${FAKE_SYSTEMD_STATE}/helper.stdout" \
+        2>"${FAKE_SYSTEMD_STATE}/helper.stderr" &
+import json
+import os
+import socket
+import sys
+
+path = sys.argv[1]
+with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as server:
+    server.bind(path)
+    os.chmod(path, 0o660)
+    server.listen()
+    while True:
+        connection, _ = server.accept()
+        with connection:
+            payload = bytearray()
+            while b"\n" not in payload:
+                chunk = connection.recv(4096)
+                if not chunk:
+                    break
+                payload.extend(chunk)
+            request = json.loads(payload.decode("utf-8"))
+            operation = request.get("operation")
+            response = {
+                "ok": operation == "ping",
+                "status": "ready" if operation == "ping" else "invalid_request",
+                "exit_code": 0 if operation == "ping" else 126,
+                "stdout": "",
+                "stderr": "" if operation == "ping" else "unsupported test operation",
+            }
+            connection.sendall(json.dumps(response).encode("utf-8") + b"\n")
+PY
+    printf '%s\n' "$!" >"${FAKE_SYSTEMD_STATE}/helper.pid"
 }
 
 start_service() {
     [[ ! -f "${FAKE_SYSTEMD_PREFIX}/current/FAIL_RESTART" ]] || return 1
     stop_service
+    start_helper
     (
         unset NOTIFY_SOCKET
         exec bash "${FAKE_SYSTEMD_PREFIX}/current/bin/agent-web"
@@ -332,6 +390,8 @@ SH
             FAKE_SYSTEMD_PREFIX="${managed_prefix}" \
             FAKE_SYSTEMD_STATE="${fake_systemd_dir}" \
             LINUX_AGENT_SYSTEMD_UNIT_PATH="${managed_unit_path}" \
+            LINUX_AGENT_OBSERVER_HELPER_SOCKET="${fake_systemd_dir}/observer.sock" \
+            LINUX_AGENT_INSTALL_HEALTH_ATTEMPTS=6 \
             LINUX_AGENT_ALLOW_UNSAFE_SYSTEMD_TEST_PREFIX=1 \
             LINUX_AGENT_ALLOW_ROOT_SERVICE_USER_FOR_TESTS=1 \
             bash "${ROOT_DIR}/scripts/install.sh" "$@" \
@@ -372,6 +432,7 @@ SH
     grep -q '^IPAddressAllow=localhost$' "${managed_egress_path}"
     grep -q '^IPAddressAllow=127.0.0.1/32$' "${managed_egress_path}"
     FAKE_SYSTEMD_PREFIX="${managed_prefix}" FAKE_SYSTEMD_STATE="${fake_systemd_dir}" \
+        LINUX_AGENT_OBSERVER_HELPER_SOCKET="${fake_systemd_dir}/observer.sock" \
         "${fake_systemd_bin}/systemctl" enable --now \
         linux-agent-observer-helper.socket linux-agent-web.service
     run_managed_installer upgrade --version v0.0.1-test --from-dist "${managed_dist_two}"
@@ -391,6 +452,14 @@ SH
     jq -e '.remote.release_version == "v0.0.1-test"' "${managed_prefix}/data/config/config.json" >/dev/null
     grep -q '^Environment=LINUX_AGENT_UNIT_MARKER=v2$' "${managed_unit_path}"
     [[ "$(sha256sum "${managed_egress_path}" | awk '{print $1}')" == "${managed_egress_sha}" ]]
+    if run_managed_installer upgrade --version v0.0.2-test --from-dist "${failing_helper_dist_three}" \
+        >"${tmp_root}/managed-helper-failure.stdout" 2>"${tmp_root}/managed-helper-failure.stderr"; then
+        printf 'managed upgrade unexpectedly accepted an unreachable observer helper\n' >&2
+        exit 1
+    fi
+    grep -q 'observer helper request failed' "${tmp_root}/managed-helper-failure.stderr"
+    [[ "$(readlink "${managed_prefix}/current")" == "releases/v0.0.1-test" ]]
+    [[ ! -e "${managed_prefix}/releases/v0.0.2-test" ]]
     run_managed_installer upgrade --version v0.0.2-test --from-dist "${dist_three}"
     [[ "$(readlink "${managed_prefix}/current")" == "releases/v0.0.2-test" ]]
     ! grep -q 'LINUX_AGENT_UNIT_MARKER' "${managed_unit_path}"
@@ -399,8 +468,10 @@ SH
     grep -q '^Environment=LINUX_AGENT_UNIT_MARKER=v2$' "${managed_unit_path}"
     [[ -z "$(find "${managed_prefix}" -maxdepth 1 -name '.linux-agent-web.service.*' -print -quit)" ]]
     FAKE_SYSTEMD_PREFIX="${managed_prefix}" FAKE_SYSTEMD_STATE="${fake_systemd_dir}" \
+        LINUX_AGENT_OBSERVER_HELPER_SOCKET="${fake_systemd_dir}/observer.sock" \
         "${fake_systemd_bin}/systemctl" stop linux-agent-web.service
     fake_systemd_pidfile=""
+    fake_systemd_helper_pidfile=""
 else
     printf 'install: user namespaces unavailable; managed systemd transaction scenario skipped\n'
 fi
@@ -446,14 +517,14 @@ if ! kill -0 "${web_pid}" >/dev/null 2>&1; then
     sed -n '1,160p' "${tmp_root}/web.stderr" >&2
     exit 1
 fi
-installer_health="$(bash "${ROOT_DIR}/scripts/install.sh" health --prefix "${prefix}" --no-systemd)"
+installer_health="$(bash "${ROOT_DIR}/scripts/install.sh" health --prefix "${prefix}")"
 jq -e '.ok == true and .status == "ok"' <<<"${installer_health}" >/dev/null
 find "${prefix}/data/logs" -maxdepth 1 -type f -name 'web_*.jsonl' -print -quit | grep -q .
 wait "${notify_pid}"
 notify_pid=""
 grep -q '^READY=1' "${notify_output}"
 
-status_json="$(bash "${ROOT_DIR}/scripts/install.sh" status --prefix "${prefix}" --no-systemd)"
+status_json="$(bash "${ROOT_DIR}/scripts/install.sh" status --prefix "${prefix}")"
 jq -e '.ok == true and .current_version == "v0.0.2-test" and .service_status == "not-managed"' \
     <<<"${status_json}" >/dev/null
 

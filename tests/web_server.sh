@@ -149,6 +149,43 @@ for _ in $(seq 1 60); do
     sleep 0.2
 done
 
+# Successful-looking CLI responses that violate the domain contract must stop
+# at the Web boundary instead of reaching the browser as usable data.
+mv "${project}/bin/agent" "${project}/bin/agent.real"
+cat >"${project}/bin/agent" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [[ "${1:-}" == "api" && "${2:-}" == "doctor" && "${3:-}" == "run" ]]; then
+    printf '%s\n' '{"ok":true,"status":"not_in_domain_schema","schema_version":1,"protocol_version":"1.0.0","doctor":{}}'
+    exit 0
+fi
+if [[ "${1:-}" == "api" && "${2:-}" == "terminal" && "${3:-}" == "run" ]]; then
+    printf '%s\n' '{"ok":true,"status":"executed","schema_version":1,"protocol_version":"1.0.0"}'
+    exit 0
+fi
+exec bash "${script_dir}/agent.real" "$@"
+SH
+chmod 0755 "${project}/bin/agent"
+
+invalid_doctor_code="$(curl --noproxy '*' -sS \
+    -o "${tmp_root}/invalid-doctor-output.json" -w '%{http_code}' \
+    -H "Authorization: Bearer ${token}" "${base_url}/api/doctor")"
+[[ "${invalid_doctor_code}" == "502" ]]
+jq -e '.ok == false and .status == "invalid_agent_output" and .code == "invalid_agent_output"' \
+    "${tmp_root}/invalid-doctor-output.json" >/dev/null
+
+invalid_terminal_code="$(curl --noproxy '*' -sS \
+    -o "${tmp_root}/invalid-terminal-output.json" -w '%{http_code}' \
+    -H "Authorization: Bearer ${token}" -H 'Content-Type: application/json' \
+    -d '{"command":"printf ok","approve":true}' "${base_url}/api/terminal/run")"
+[[ "${invalid_terminal_code}" == "502" ]]
+jq -e '.ok == false and .status == "invalid_agent_output" and .code == "invalid_agent_output"' \
+    "${tmp_root}/invalid-terminal-output.json" >/dev/null
+
+mv "${project}/bin/agent.real" "${project}/bin/agent"
+
 legacy_job="$(curl --noproxy '*' -sS -H "Authorization: Bearer ${token}" "${base_url}/api/jobs/${legacy_job_id}")"
 jq -e '
     .status == "failed"

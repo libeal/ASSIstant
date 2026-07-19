@@ -324,7 +324,12 @@ load_existing_service_identity() {
     local installed_user=""
     if read_install_state; then
         if [[ "${INSTALL_STATE_NO_SYSTEMD}" -ne "${NO_SYSTEMD}" ]]; then
-            fail '当前安装的 systemd 模式与本次参数不一致'
+            if [[ ("${COMMAND}" == "health" || "${COMMAND}" == "status") &&
+                "${NO_SYSTEMD}" -eq 0 && "${INSTALL_STATE_NO_SYSTEMD}" -eq 1 ]]; then
+                NO_SYSTEMD=1
+            else
+                fail '当前安装的 systemd 模式与本次参数不一致'
+            fi
         fi
         if [[ -n "${INSTALL_STATE_SERVICE_USER}" ]]; then
             if [[ "${SERVICE_USER_EXPLICIT}" -eq 1 && "${SERVICE_USER}" != "${INSTALL_STATE_SERVICE_USER}" ]]; then
@@ -1096,7 +1101,7 @@ PY
     systemctl daemon-reload
 }
 
-health_request() {
+web_health_request() {
     local config_path="${PREFIX}/data/config/config.json"
     local token_file="${PREFIX}/data/tmp/web/auth-token"
     local port token
@@ -1114,15 +1119,61 @@ health_request() {
         "http://127.0.0.1:${port}/api/health"
 }
 
-wait_for_health() {
+observer_helper_health_request() {
+    local helper="${PREFIX}/current/lib/observer_helper.py"
+    local socket_path="${LINUX_AGENT_OBSERVER_HELPER_SOCKET:-/run/linux-agent/observer.sock}"
+    local current_user
+    [[ -f "${helper}" && ! -L "${helper}" ]] || {
+        printf 'observer helper 客户端不存在: %s\n' "${helper}" >&2
+        return 1
+    }
+    if [[ "${EUID}" -eq 0 && "${SERVICE_USER}" != "root" ]]; then
+        command -v runuser >/dev/null 2>&1 || {
+            printf '缺少 runuser，无法以 Web 服务用户 %s 检查 observer helper\n' "${SERVICE_USER}" >&2
+            return 1
+        }
+        runuser -u "${SERVICE_USER}" -- \
+            python3 "${helper}" request --socket "${socket_path}" ping
+        return
+    fi
+    current_user="$(id -un)" || return 1
+    if [[ "${current_user}" != "${SERVICE_USER}" ]]; then
+        printf 'observer helper 健康检查必须由 root 或 Web 服务用户 %s 执行（当前用户: %s）\n' \
+            "${SERVICE_USER}" "${current_user}" >&2
+        return 1
+    fi
+    python3 "${helper}" request --socket "${socket_path}" ping
+}
+
+health_request() {
     local output
-    for _ in $(seq 1 60); do
-        if output="$(health_request 2>/dev/null)" && jq -e '.ok == true and .status == "ok"' >/dev/null <<<"${output}"; then
+    output="$(web_health_request)" || return 1
+    if [[ "${NO_SYSTEMD}" -eq 1 ]]; then
+        printf '%s\n' "${output}"
+        return 0
+    fi
+    observer_helper_health_request || return 1
+    jq -c '. + {observer_helper:{ok:true,status:"ready"}}' <<<"${output}"
+}
+
+wait_for_health() {
+    local output error_file attempts="${LINUX_AGENT_INSTALL_HEALTH_ATTEMPTS:-60}"
+    [[ "${attempts}" =~ ^[0-9]+$ && "${attempts}" -ge 1 && "${attempts}" -le 600 ]] || attempts=60
+    error_file="$(mktemp)"
+    for _ in $(seq 1 "${attempts}"); do
+        if output="$(health_request 2>"${error_file}")" &&
+            jq -e '.ok == true and .status == "ok"' >/dev/null <<<"${output}"; then
+            rm -f -- "${error_file}"
             printf '%s\n' "${output}"
             return 0
         fi
         sleep 0.5
     done
+    if [[ -s "${error_file}" ]]; then
+        printf '最后一次健康检查错误：\n' >&2
+        sed -n '1,20p' "${error_file}" >&2
+    fi
+    rm -f -- "${error_file}"
     return 1
 }
 
@@ -1321,12 +1372,18 @@ do_rollback() {
 
 do_health() {
     ensure_prefix
+    load_existing_service_identity
+    validate_service_identity
     health_request || fail '健康检查失败'
 }
 
 do_status() {
     local current="" service_status="not-managed" egress_policy="not-managed" releases='[]'
+    local helper_socket_status="not-managed" helper_service_status="not-managed"
+    local helper_reachable="null" helper_error="" helper_error_file=""
     ensure_prefix
+    load_existing_service_identity
+    validate_service_identity
     current="$(current_version 2>/dev/null || true)"
     if [[ -d "${PREFIX}/releases" ]]; then
         releases="$(find "${PREFIX}/releases" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' |
@@ -1335,6 +1392,18 @@ do_status() {
     if [[ "${NO_SYSTEMD}" -eq 0 ]] && command -v systemctl >/dev/null 2>&1; then
         service_status="$(systemctl is-active linux-agent-web.service 2>/dev/null || true)"
         [[ -n "${service_status}" ]] || service_status="inactive"
+        helper_socket_status="$(systemctl is-active linux-agent-observer-helper.socket 2>/dev/null || true)"
+        [[ -n "${helper_socket_status}" ]] || helper_socket_status="inactive"
+        helper_error_file="$(mktemp)"
+        if observer_helper_health_request 2>"${helper_error_file}"; then
+            helper_reachable="true"
+        else
+            helper_reachable="false"
+            helper_error="$(sed -n '1,5p' "${helper_error_file}")"
+        fi
+        rm -f -- "${helper_error_file}"
+        helper_service_status="$(systemctl is-active linux-agent-observer-helper.service 2>/dev/null || true)"
+        [[ -n "${helper_service_status}" ]] || helper_service_status="inactive"
         if [[ -f "${SYSTEMD_EGRESS_DROPIN_PATH}" && ! -L "${SYSTEMD_EGRESS_DROPIN_PATH}" ]]; then
             egress_policy="enforced"
         else
@@ -1342,8 +1411,12 @@ do_status() {
         fi
     fi
     jq -n --arg prefix "${PREFIX}" --arg current "${current}" \
-        --arg service_status "${service_status}" --arg egress_policy "${egress_policy}" --argjson releases "${releases}" \
-        '{ok:true,status:"installed_status",prefix:$prefix,current_version:$current,releases:$releases,service_status:$service_status,provider_egress_policy:$egress_policy}'
+        --arg service_status "${service_status}" --arg egress_policy "${egress_policy}" \
+        --arg helper_socket_status "${helper_socket_status}" \
+        --arg helper_service_status "${helper_service_status}" \
+        --arg helper_error "${helper_error}" --argjson helper_reachable "${helper_reachable}" \
+        --argjson releases "${releases}" \
+        '{ok:true,status:"installed_status",prefix:$prefix,current_version:$current,releases:$releases,service_status:$service_status,provider_egress_policy:$egress_policy,observer_helper:{socket_status:$helper_socket_status,service_status:$helper_service_status,reachable:$helper_reachable,error:$helper_error}}'
 }
 
 stop_and_disable_unit() {

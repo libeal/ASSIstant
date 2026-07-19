@@ -43,6 +43,76 @@ class DomainContractTest(unittest.TestCase):
         self.assertEqual(self.contract.protocol_version, result["protocol_version"])
         self.assertEqual("step_projection", result["timeline_semantics"])
 
+    def test_api_result_validates_version_status_and_route_fields(self):
+        result = {
+            "ok": True,
+            "status": "checked",
+            "schema_version": self.contract.schema_version,
+            "protocol_version": self.contract.protocol_version,
+            "doctor": {},
+        }
+        self.assertIs(
+            result,
+            self.contract.validate_api_result(
+                result,
+                required_fields={"doctor": dict},
+            ),
+        )
+        for field, value in (
+            ("status", "invented"),
+            ("protocol_version", "9.9.9"),
+            ("doctor", []),
+        ):
+            with self.subTest(field=field), self.assertRaises(
+                DomainValidationError
+            ):
+                self.contract.validate_api_result(
+                    {**result, field: value},
+                    required_fields={"doctor": dict},
+                )
+
+    def test_api_result_accepts_known_errors_and_materialized_skill(self):
+        error = {
+            "ok": False,
+            "status": "validation_failed",
+            "code": "validation_failed",
+            "message": "invalid input",
+            "retryable": False,
+            "request_id": "request-one",
+            "details": {},
+            "schema_version": self.contract.schema_version,
+            "protocol_version": self.contract.protocol_version,
+        }
+        self.assertIs(error, self.contract.validate_api_result(error))
+
+        materialized = {
+            "ok": True,
+            "status": "skill_materialized",
+            "skill": "ops-basic",
+            "files": [],
+            "schema_version": self.contract.schema_version,
+            "protocol_version": self.contract.protocol_version,
+        }
+        self.assertIs(
+            materialized,
+            self.contract.validate_api_result(
+                materialized,
+                required_fields={"skill": str, "files": list},
+            ),
+        )
+
+    def test_api_result_uses_full_execution_contract_when_requested(self):
+        result = self.result()
+        self.assertIs(
+            result,
+            self.contract.validate_api_result(result, execution_result=True),
+        )
+        with self.assertRaisesRegex(DomainValidationError, "output_blocks"):
+            self.contract.validate_api_result(
+                {key: value for key, value in result.items() if key != "output_blocks"},
+                execution_result=True,
+            )
+
     def test_duplicate_projection_and_unknown_status_are_rejected(self):
         duplicate = self.result()["timeline"] * 2
         with self.assertRaises(DomainValidationError):
