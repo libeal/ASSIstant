@@ -493,7 +493,10 @@ class ProviderService:
                 )
 
         timeout = min(max(self._safe_int(config.get("request_timeout_sec", 30) or 30, 30), 1), 60)
-        headers = {"Accept": "application/json"}
+        headers = {
+            "Accept": "application/json",
+            "User-Agent": "LinuxAgentWeb/1.0",
+        }
         headers.update(provider_auth_headers(auth, api_key))
         payload, error = self._fetcher(url, headers, timeout, api_key, resolved_addresses)
         if error:

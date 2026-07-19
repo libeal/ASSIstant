@@ -133,6 +133,7 @@ async function shutdownServer() {
   if (!window.confirm("结束 agent-web 进程并关闭当前界面？")) return;
   const result = await api("/api/server/shutdown", { method: "POST", body: {} });
   showShutdownScreen(result);
+  window.close();
 }
 
 function showShutdownScreen(result) {

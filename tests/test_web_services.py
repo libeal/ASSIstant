@@ -241,6 +241,7 @@ class ProviderServiceTests(unittest.TestCase):
         self.assertEqual(self.inspected[0][0], "https://api.example/v1/models")
         self.assertEqual(self.fetches[0][4], ("203.0.113.10",))
         self.assertEqual(self.fetches[0][2], 60)
+        self.assertEqual(self.fetches[0][1]["User-Agent"], "LinuxAgentWeb/1.0")
 
     def test_pinned_https_handler_uses_context_without_legacy_hostname_argument(self):
         handler = provider_module._PinnedHTTPSHandler(["203.0.113.10"])
