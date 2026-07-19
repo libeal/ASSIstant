@@ -101,6 +101,10 @@ elif mode == "partial":
     time.sleep(0.3)
     print("flow-two", file=sys.stderr, flush=True)
     print(json.dumps({"ok": True, "status": "executed"}), flush=True)
+elif mode == "completed_then_wait":
+    print(json.dumps({"ok": True, "status": "executed"}), flush=True)
+    Path(payload["ready_file"]).write_text("ready", encoding="utf-8")
+    time.sleep(60)
 else:
     print(json.dumps({
         "ok": True,
@@ -280,6 +284,31 @@ class ExecutionServiceTest(unittest.TestCase):
         self.assertNotIn("ignoreterm", self.registry)
         with self.assertRaises(ProcessLookupError):
             os.kill(pid, 0)
+
+    def test_late_cancel_preserves_a_completed_business_result(self):
+        ready_file = self.root / "completed-then-wait.ready"
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(
+                self.service.run_job,
+                "work",
+                "run",
+                {"fixture": "completed_then_wait", "ready_file": str(ready_file)},
+                self.job_context("completed-then-wait"),
+                10,
+            )
+            self.wait_for(ready_file.exists)
+            termination = self.service.terminate("completed-then-wait")
+            result = future.result(timeout=3)
+
+        self.assertTrue(termination["ok"])
+        self.assertTrue(result["ok"])
+        self.assertEqual("executed", result["status"])
+        self.assertFalse(result["cancelled"])
+        self.assertTrue(result["cancel_requested_after_completion"])
+        runtime = next(
+            block for block in result["output_blocks"] if block["title"] == "Agent runtime"
+        )
+        self.assertTrue(runtime["json"]["cancel_requested_after_completion"])
 
     def test_partial_stderr_callback_receives_running_output(self):
         with ThreadPoolExecutor(max_workers=1) as executor:

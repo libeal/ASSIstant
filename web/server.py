@@ -1281,7 +1281,11 @@ def run_job(job_id, job, resource, action, payload, job_context):
         return None
 
     finalizing_record = update_job(job_id, begin_finalization)
-    if isinstance(finalizing_record, dict) and finalizing_record.get("cancel_requested_at"):
+    if (
+        isinstance(finalizing_record, dict)
+        and finalizing_record.get("cancel_requested_at")
+        and result.get("status") not in {"answered", "executed"}
+    ):
         result = DOMAIN_CONTRACT.enrich_execution_result(cancelled_job_result(finalizing_record))
 
     terminal_status = terminal_job_status(result)

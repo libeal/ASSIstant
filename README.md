@@ -138,6 +138,8 @@ test "$(stat -c '%s' linux-agent-install.sh)" -eq "${expected_size}"
 test "$(sha256sum linux-agent-install.sh | awk '{print $1}')" = "${expected_sha}"
 sudo bash linux-agent-install.sh install --version "${version}" --require-signature \
   --provider-cidr 203.0.113.0/24 --provider-cidr 2001:db8:1234::/48
+# 安装健康检查会临时启动后自动停止；配置完成后再显式长期启动
+sudo systemctl enable --now linux-agent-observer-helper.socket linux-agent-web.service
 sudo bash linux-agent-install.sh upgrade --version vX.Y.NEW --require-signature
 sudo bash linux-agent-install.sh rollback
 sudo bash linux-agent-install.sh health
@@ -166,7 +168,7 @@ scrape_configs:
       - targets: ["127.0.0.1:8765"]
 ```
 
-`upgrade` 切换后会重启 observer helper socket 与 Web 服务，并轮询认证后的 `/api/health`，失败时自动恢复旧版本。生产安装同时部署 root auditd helper 的 service/socket；主 Web 进程仍以专用非 root 用户运行，helper 只接受固定 JSON 协议和 syscall allowlist，不接受命令文本。默认保留最近两个版本，可用 `--keep` 调整；`uninstall` 默认保留 `data/`，只有 `uninstall --purge-data` 会删除持久数据。systemd 模式的自定义 `--prefix` 应位于 `/opt`、`/srv` 等系统服务目录，安装器会拒绝被 `ProtectHome` 或 `PrivateTmp` 隐藏的 `/home`、`/root`、`/run/user`、`/tmp` 和 `/var/tmp`。容器和测试环境可使用 `--no-systemd --prefix <目录>`，本地发布演练可增加 `--from-dist <目录>`。
+首次 `install` 会写入代码、配置模板和 systemd unit，先停止可能残留的旧实例，再临时启动新版本完成认证健康检查；检查结束后自动停止 Web、observer socket 和 helper。安装器不修改原有开机启用状态，全新安装默认未启用。管理员完成 Provider/API key 配置后，再显式执行上面的 `systemctl enable --now`。`upgrade` 切换后会重启已经部署的 observer helper socket 与 Web 服务，并轮询认证后的 `/api/health`，失败时自动恢复旧版本。生产安装同时部署 root auditd helper 的 service/socket；主 Web 进程仍以专用非 root 用户运行，helper 只接受固定 JSON 协议和 syscall allowlist，不接受命令文本。默认保留最近两个版本，可用 `--keep` 调整；`uninstall` 默认保留 `data/`，只有 `uninstall --purge-data` 会删除持久数据。systemd 模式的自定义 `--prefix` 应位于 `/opt`、`/srv` 等系统服务目录，安装器会拒绝被 `ProtectHome` 或 `PrivateTmp` 隐藏的 `/home`、`/root`、`/run/user`、`/tmp` 和 `/var/tmp`。容器和测试环境可使用 `--no-systemd --prefix <目录>`，本地发布演练可增加 `--from-dist <目录>`。
 
 首次 systemd 安装必须明确网络出口策略。重复传入 `--provider-cidr` 后，安装器会事务化生成 `IPAddressDeny=any`、放行 localhost 和所列 IPv4/IPv6 CIDR 的 drop-in；升级和回滚默认保留该策略，失败回滚也会恢复旧文件。CIDR 应覆盖主 Provider、所有 failover Provider，以及未使用本机 DNS stub 时的 DNS 服务地址；地址变化后重新运行 upgrade 并传入新列表。确实无法固定出口网段时必须显式使用 `--allow-unrestricted-provider-egress`，安装器会给出警告，不能以“未配置”静默获得无限制出口。
 
@@ -187,16 +189,17 @@ jq '.packages, .files' sbom.spdx.json
 
 ### Debian 与 Fedora 安装包
 
-项目可生成两个不携带第三方库的精简本地安装包。Debian/Ubuntu 包从 `apt` 软件源安装 `requirements/debian.txt`，Fedora/RHEL 包按 `requirements/fedora.txt` 调用 `yum install -y`：
+项目可生成两个不携带第三方库的精简安装包，Release workflow 会同时发布它们并提供 GitHub build provenance。Debian/Ubuntu 包从 `apt` 软件源安装 `requirements/debian.txt`，Fedora/RHEL 包按 `requirements/fedora.txt` 调用 `yum install -y`：
 
 ```bash
-SOURCE_DATE_EPOCH=0 bash scripts/build-install-packages.sh v1.1.2
-tar -xzf linux-agent-v1.1.2-debian.tar.gz
-cd linux-agent-v1.1.2-debian
-sudo bash install.sh
+SOURCE_DATE_EPOCH=0 bash scripts/build-install-packages.sh vX.Y.Z dist/packages
+sha256sum -c dist/packages/linux-agent-vX.Y.Z-debian.tar.gz.sha256
+tar -xzf dist/packages/linux-agent-vX.Y.Z-debian.tar.gz
+cd linux-agent-vX.Y.Z-debian
+sudo bash install.sh --provider-cidr 203.0.113.0/24
 ```
 
-Fedora 使用同名的 `linux-agent-v1.1.2-fedora.tar.gz`。两个包都只包含 core、Web、Skill、安装器、对应依赖清单和校验文件；不会包含测试、日志、缓存、Git 数据、Python site-packages 或 npm 模块。追加 `--with-optional-tools` 可安装网络与 audit Skill 的可选系统工具；依赖已由镜像或配置管理准备好时可使用 `--skip-dependencies`。
+Fedora 使用同名的 `linux-agent-vX.Y.Z-fedora.tar.gz`。两个包都只包含 core、Web、Skill、安装器、对应依赖清单和校验文件；不会包含测试、日志、缓存、Git 数据、Python site-packages 或 npm 模块。首次 systemd 安装必须显式提供 `--provider-cidr`，确实无法固定出口时才使用 `--allow-unrestricted-provider-egress`。安装健康检查会先停止遗留实例，再临时启动新版本，检查后自动停止且不修改原有开机启用状态；全新安装默认未启用。配置完成后执行 `sudo systemctl enable --now linux-agent-observer-helper.socket linux-agent-web.service`。追加 `--with-optional-tools` 可安装网络与 audit Skill 的可选系统工具；依赖已由镜像或配置管理准备好时可使用 `--skip-dependencies`。归档不是原生 `.deb`/`.rpm`，升级、回滚和卸载使用包内 `release/linux-agent-install.sh`。
 
 ### 本地运行
 

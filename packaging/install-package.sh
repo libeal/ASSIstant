@@ -14,7 +14,7 @@ fail() {
 usage() {
     cat <<'EOF'
 用法:
-  sudo bash install.sh [选项] [安装器选项]
+  sudo bash install.sh --provider-cidr <CIDR> [选项]
 
 包选项:
   --skip-dependencies      跳过 yum/apt-get 依赖安装（用于已准备好的系统）
@@ -32,7 +32,8 @@ EOF
 [[ -d "${RELEASE_DIR}" && ! -L "${RELEASE_DIR}" ]] || fail '安装包缺少 release 目录'
 [[ -f "${RELEASE_DIR}/release-manifest.json" && ! -L "${RELEASE_DIR}/release-manifest.json" ]] ||
     fail '安装包缺少 release-manifest.json'
-[[ -x "${RELEASE_DIR}/linux-agent-install.sh" ]] || fail '安装包缺少可执行 linux-agent-install.sh'
+[[ -f "${RELEASE_DIR}/linux-agent-install.sh" && ! -L "${RELEASE_DIR}/linux-agent-install.sh" &&
+    -x "${RELEASE_DIR}/linux-agent-install.sh" ]] || fail '安装包缺少可执行 linux-agent-install.sh'
 
 skip_dependencies=0
 optional_tools=0
@@ -64,11 +65,11 @@ while [[ $# -gt 0 ]]; do
 done
 
 package_checksum_file="${PACKAGE_ROOT}/PACKAGE-SHA256SUMS"
-if [[ -f "${package_checksum_file}" ]]; then
-    command -v sha256sum >/dev/null 2>&1 || fail '缺少 sha256sum，无法校验安装包内容'
-    (cd "${PACKAGE_ROOT}" && sha256sum -c --strict "${package_checksum_file}") ||
-        fail '安装包内容校验失败，请重新解压可信归档'
-fi
+[[ -f "${package_checksum_file}" && ! -L "${package_checksum_file}" ]] ||
+    fail '安装包缺少 PACKAGE-SHA256SUMS，拒绝执行未完整校验的内容'
+command -v sha256sum >/dev/null 2>&1 || fail '缺少 sha256sum，无法校验安装包内容'
+(cd "${PACKAGE_ROOT}" && sha256sum -c --strict "${package_checksum_file}") ||
+    fail '安装包内容校验失败，请重新解压可信归档'
 
 read_requirements() {
     local requirements_file="$1"
@@ -117,6 +118,18 @@ install_packages() {
             ;;
     esac
 }
+
+has_no_systemd=0
+has_egress_policy=0
+for installer_arg in "${installer_args[@]}"; do
+    case "${installer_arg}" in
+        --no-systemd) has_no_systemd=1 ;;
+        --provider-cidr | --allow-unrestricted-provider-egress) has_egress_policy=1 ;;
+    esac
+done
+if [[ "${has_no_systemd}" -eq 0 && "${has_egress_policy}" -eq 0 ]]; then
+    fail 'systemd 首次安装必须提供 --provider-cidr，或显式使用 --allow-unrestricted-provider-egress'
+fi
 
 if [[ "${skip_dependencies}" -eq 0 ]]; then
     declare -a required_packages=()

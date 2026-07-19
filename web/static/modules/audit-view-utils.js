@@ -12,9 +12,8 @@ export function filteredAuditSessions(sessions, { query = "", status = "all" } =
   });
 }
 
-/** @param {AuditEvent[]} events @param {{category?: string, limit?: number}} [filters] @returns {AuditEvent[]} */
-export function filteredAuditEvents(events, { category = "all", limit = 200 } = {}) {
-  const max = Math.max(0, Number(limit) || 0);
+/** @param {AuditEvent[]} events @param {{category?: string}} [filters] @returns {AuditEvent[]} */
+export function filteredAuditEvents(events, { category = "all" } = {}) {
   let list = Array.isArray(events) ? events : [];
   if (category && category !== "all") {
     list = list.filter((event) => {
@@ -22,7 +21,26 @@ export function filteredAuditEvents(events, { category = "all", limit = 200 } = 
       return stage.includes(String(category).toLowerCase());
     });
   }
-  return max > 0 ? list.slice(0, max) : list;
+  return list;
+}
+
+/**
+ * Select the next render batch without changing the complete event collection.
+ * @param {AuditEvent[]} events
+ * @param {number} start
+ * @param {number} batchSize
+ * @returns {{events: AuditEvent[], nextIndex: number, done: boolean}}
+ */
+export function nextAuditRenderBatch(events, start, batchSize) {
+  const list = Array.isArray(events) ? events : [];
+  const first = Math.max(0, Math.min(list.length, Number.isFinite(start) ? Math.floor(start) : 0));
+  const size = Math.max(1, Number.isFinite(batchSize) ? Math.floor(batchSize) : 1);
+  const nextIndex = Math.min(list.length, first + size);
+  return {
+    events: list.slice(first, nextIndex),
+    nextIndex,
+    done: nextIndex >= list.length,
+  };
 }
 
 /** @param {AuditEvent} event @returns {string} */

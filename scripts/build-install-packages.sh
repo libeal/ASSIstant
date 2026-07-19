@@ -3,24 +3,25 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-VERSION="${1:-v1.1.2}"
-OUTPUT_DIR="${2:-${ROOT_DIR}}"
+VERSION="${1:-}"
+OUTPUT_DIR="${2:-${ROOT_DIR}/dist/packages}"
 SOURCE_EPOCH="${SOURCE_DATE_EPOCH:-0}"
 
 [[ "${VERSION}" =~ ^v[0-9A-Za-z][0-9A-Za-z._-]*$ ]] || {
-    printf 'usage: %s [v-version] [output-dir]\n' "$0" >&2
+    printf 'usage: %s <v-version> [output-dir]\n' "$0" >&2
     exit 2
 }
-for command_name in bash jq tar gzip sha256sum stat find sort cp mktemp readlink; do
+for command_name in bash jq tar gzip sha256sum stat find sort cp mkdir chmod mv rm mktemp readlink; do
     command -v "${command_name}" >/dev/null 2>&1 || {
         printf 'missing build command: %s\n' "${command_name}" >&2
         exit 1
     }
 done
-[[ -d "${OUTPUT_DIR}" && ! -L "${OUTPUT_DIR}" ]] || {
-    printf 'output directory must be an existing ordinary directory: %s\n' "${OUTPUT_DIR}" >&2
+if [[ -L "${OUTPUT_DIR}" || (-e "${OUTPUT_DIR}" && ! -d "${OUTPUT_DIR}") ]]; then
+    printf 'output directory must be an ordinary directory: %s\n' "${OUTPUT_DIR}" >&2
     exit 1
-}
+fi
+mkdir -p -- "${OUTPUT_DIR}"
 OUTPUT_DIR="$(readlink -f -- "${OUTPUT_DIR}")"
 
 tmp_root="$(mktemp -d)"
@@ -122,9 +123,11 @@ for distro in debian fedora; do
     tar --sort=name --mtime="@${SOURCE_EPOCH}" --owner=0 --group=0 --numeric-owner \
         --format=gnu -C "${tmp_root}" -cf - "${package_name}" | gzip -n >"${archive_tmp}"
     mv -f -- "${archive_tmp}" "${output_path}"
+    checksum_tmp="${tmp_root}/${package_name}.tar.gz.sha256"
     (
         cd "${OUTPUT_DIR}"
-        sha256sum -- "${package_name}.tar.gz" >"${package_name}.tar.gz.sha256"
+        sha256sum -- "${package_name}.tar.gz" >"${checksum_tmp}"
     )
+    mv -f -- "${checksum_tmp}" "${OUTPUT_DIR}/${package_name}.tar.gz.sha256"
     printf 'built: %s (%s bytes)\n' "${output_path}" "$(stat -c '%s' "${output_path}")"
 done

@@ -65,7 +65,8 @@ jobs:
             tests/remote_runtime.sh \
             tests/remote_web_security.sh \
             tests/backup.sh \
-            tests/install.sh; do
+            tests/install.sh \
+            tests/install_packages.sh; do
             echo "::group::${test_file}"
             bash "${test_file}"
             echo "::endgroup::"

@@ -1,6 +1,8 @@
 /** @typedef {import("./types.js").AppContext} AppContext */
 /** @typedef {import("./types.js").AuditView} AuditView */
 
+import { nextAuditRenderBatch } from "./audit-view-utils.js";
+
 /**
  * @param {AppContext} app
  * @param {{restoreTimelineFromAudit: Function, showScreen: Function}} hooks
@@ -74,6 +76,7 @@ export function createAuditView(app, hooks) {
   const contextTurnCapacityPure = app.contextTurnCapacityPure;
   const contextMetaByTurnPure = app.contextMetaByTurnPure;
   let sessionTurnCounter = app.sessionTurnCounterRef;
+  let auditRenderGeneration = 0;
 
   async function loadAuditList() {
     if (state.auditPaused) {
@@ -102,6 +105,7 @@ export function createAuditView(app, hooks) {
   function renderAuditSessionList() {
     const container = $("auditList");
     if (!container) return;
+    auditRenderGeneration += 1;
     container.innerHTML = "";
     const sessions = filteredAuditSessions();
     if (!sessions.length) {
@@ -189,39 +193,53 @@ export function createAuditView(app, hooks) {
   function renderAuditEventTimeline() {
     const container = $("auditList");
     if (!container) return;
+    const generation = ++auditRenderGeneration;
     const events = filteredAuditEvents();
+    const batchSize = auditEventBatchSize();
     container.innerHTML = "";
     if (!events.length) {
       container.appendChild(emptyEvent(state.currentAuditSession ? "当前筛选下没有事件" : "尚未选择 session"));
       return;
     }
-    for (const event of events) {
-      const item = document.createElement("div");
-      item.className = "event";
-      const display = auditProtocol.auditEventDisplay(event, pretty);
-      item.innerHTML = `
-        <time>${escapeHtml(auditProtocol.compactAuditTime(auditProtocol.auditEventTime(event)))}</time>
-        <div class="body">
-          <strong>${escapeHtml(display.title)}</strong>
-          <span>${escapeHtml(display.summary || "事件已记录。")}</span>
-          <div class="event-meta">
-            <span class="mini-pill">${escapeHtml(display.stage)}</span>
-            ${display.status ? `<span class="mini-pill risk ${app.statusKind(display.status)}">${escapeHtml(display.status)}</span>` : ""}
-            ${display.badges.map((badge) => `<span class="mini-pill">${escapeHtml(badge)}</span>`).join("")}
+
+    function appendBatch(start) {
+      if (generation !== auditRenderGeneration) return;
+      const batch = nextAuditRenderBatch(events, start, batchSize);
+      const fragment = document.createDocumentFragment();
+      for (const event of batch.events) {
+        const item = document.createElement("div");
+        item.className = "event";
+        const display = auditProtocol.auditEventDisplay(event, pretty);
+        item.innerHTML = `
+          <time>${escapeHtml(auditProtocol.compactAuditTime(auditProtocol.auditEventTime(event)))}</time>
+          <div class="body">
+            <strong>${escapeHtml(display.title)}</strong>
+            <span>${escapeHtml(display.summary || "事件已记录。")}</span>
+            <div class="event-meta">
+              <span class="mini-pill">${escapeHtml(display.stage)}</span>
+              ${display.status ? `<span class="mini-pill risk ${app.statusKind(display.status)}">${escapeHtml(display.status)}</span>` : ""}
+              ${display.badges.map((badge) => `<span class="mini-pill">${escapeHtml(badge)}</span>`).join("")}
+            </div>
+            ${display.details.length ? `<div class="event-lines">${display.details.map((line) => `<div class="event-line">${escapeHtml(line)}</div>`).join("")}</div>` : ""}
           </div>
-          ${display.details.length ? `<div class="event-lines">${display.details.map((line) => `<div class="event-line">${escapeHtml(line)}</div>`).join("")}</div>` : ""}
-        </div>
-      `;
-      container.appendChild(item);
+        `;
+        fragment.appendChild(item);
+      }
+      container.appendChild(fragment);
+      if (!batch.done) window.requestAnimationFrame(() => appendBatch(batch.nextIndex));
     }
+
+    appendBatch(0);
+  }
+
+  function auditEventBatchSize() {
+    return Math.max(1, Math.min(200, Number($("auditLimitInput")?.value || 40)));
   }
 
   function filteredAuditEvents() {
     const category = String($("auditEventFilter")?.value || "");
-    const limit = Math.max(1, Math.min(200, Number($("auditLimitInput")?.value || 40)));
     return (state.auditEvents || [])
-      .filter((event) => !category || auditProtocol.auditEventMatchesCategory(event, category, pretty))
-      .slice(0, limit);
+      .filter((event) => !category || auditProtocol.auditEventMatchesCategory(event, category, pretty));
   }
 
   function auditSummaryText(event) {
@@ -246,12 +264,11 @@ export function createAuditView(app, hooks) {
       "",
       "事件时间线:",
     ];
-    events.slice(0, 80).forEach((event, index) => {
+    events.forEach((event, index) => {
       const display = auditProtocol.auditEventDisplay(event, pretty);
       lines.push(`${index + 1}. ${auditProtocol.compactAuditTime(auditProtocol.auditEventTime(event))} ${display.title} - ${display.summary || "已记录"}`);
-      display.details.slice(0, 4).forEach((detail) => lines.push(`   ${detail}`));
+      display.details.forEach((detail) => lines.push(`   ${detail}`));
     });
-    if (events.length > 80) lines.push(`... 还有 ${events.length - 80} 个事件未在预览中展开。`);
     return lines.join("\n");
   }
 
@@ -286,7 +303,7 @@ export function createAuditView(app, hooks) {
       container.innerHTML = '<tr><td colspan="3">当前 session 没有 observer 事件。</td></tr>';
       return;
     }
-    for (const event of observerEvents.slice(0, 12)) {
+    for (const event of observerEvents) {
       const payload = /** @type {Record<string, any>} */ (event.payload || event.data || event);
       const display = auditProtocol.auditEventDisplay(event, pretty);
       const status = payload.status || payload.lifecycle || auditProtocol.auditEventName(event);

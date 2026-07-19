@@ -10,6 +10,11 @@ cleanup() {
 }
 trap cleanup EXIT
 
+if bash "${ROOT_DIR}/scripts/build-install-packages.sh" >/dev/null 2>&1; then
+    printf 'build-install-packages unexpectedly accepted a missing version\n' >&2
+    exit 1
+fi
+
 mkdir -p "${tmp_root}/first" "${tmp_root}/second"
 SOURCE_DATE_EPOCH=0 bash "${ROOT_DIR}/scripts/build-install-packages.sh" \
     v0.0.0-test "${tmp_root}/first" >/dev/null
@@ -29,6 +34,13 @@ for distro in debian fedora; do
     package_root="${extract_dir}/linux-agent-v0.0.0-test-${distro}"
     mkdir -p "${extract_dir}"
     tar -xzf "${tmp_root}/first/${archive}" -C "${extract_dir}"
+    if bash "${package_root}/install.sh" --skip-dependencies \
+        --prefix "${tmp_root}/missing-egress-prefix-${distro}" >/dev/null \
+        2>"${tmp_root}/missing-egress.stderr"; then
+        printf 'package unexpectedly accepted an implicit systemd egress policy\n' >&2
+        exit 1
+    fi
+    grep -q '首次安装必须提供 --provider-cidr' "${tmp_root}/missing-egress.stderr"
     (
         cd "${package_root}"
         sha256sum -c --strict PACKAGE-SHA256SUMS >/dev/null
@@ -65,6 +77,37 @@ for distro in debian fedora; do
     bash "${package_root}/install.sh" --skip-dependencies --no-systemd --prefix "${prefix}" >/dev/null
     bash "${prefix}/current/bin/agent" api health |
         jq -e '.ok == true and .version == "v0.0.0-test"' >/dev/null
+
+    jq -e '.schema_version == 1 and .installed == true and .no_systemd == true' \
+        "${prefix}/.install-state.json" >/dev/null
+    missing_checksum_root="${tmp_root}/missing-checksum-${distro}"
+    cp -a "${package_root}" "${missing_checksum_root}"
+    rm -f -- "${missing_checksum_root}/PACKAGE-SHA256SUMS"
+    if bash "${missing_checksum_root}/install.sh" --skip-dependencies --no-systemd \
+        --prefix "${tmp_root}/missing-checksum-prefix-${distro}" >/dev/null \
+        2>"${tmp_root}/missing-checksum.stderr"; then
+        printf 'package unexpectedly accepted a missing PACKAGE-SHA256SUMS\n' >&2
+        exit 1
+    fi
+    grep -q '缺少 PACKAGE-SHA256SUMS' "${tmp_root}/missing-checksum.stderr"
 done
+
+unmanaged_prefix="${tmp_root}/unmanaged"
+mkdir -p "${unmanaged_prefix}/data"
+printf 'must-survive\n' >"${unmanaged_prefix}/data/marker"
+if bash "${ROOT_DIR}/scripts/install.sh" uninstall --prefix "${unmanaged_prefix}" --no-systemd --purge-data \
+    >/dev/null 2>"${tmp_root}/unmanaged-uninstall.stderr"; then
+    printf 'unmanaged prefix was unexpectedly accepted for uninstall\n' >&2
+    exit 1
+fi
+grep -q '不是受管安装' "${tmp_root}/unmanaged-uninstall.stderr"
+grep -qx 'must-survive' "${unmanaged_prefix}/data/marker"
+
+bash "${ROOT_DIR}/scripts/install.sh" uninstall --prefix "${tmp_root}/prefix-debian" --no-systemd
+[[ ! -e "${tmp_root}/prefix-debian/current" ]]
+[[ -f "${tmp_root}/prefix-debian/data/config/config.json" ]]
+jq -e '.installed == false' "${tmp_root}/prefix-debian/.install-state.json" >/dev/null
+bash "${ROOT_DIR}/scripts/install.sh" uninstall --prefix "${tmp_root}/prefix-debian" --no-systemd --purge-data
+[[ ! -e "${tmp_root}/prefix-debian" ]]
 
 printf 'install_packages: ok\n'

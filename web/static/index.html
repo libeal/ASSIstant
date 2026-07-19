@@ -442,14 +442,14 @@
                     <label class="small">session 筛选<input class="field" id="auditSessionFilter" placeholder="按 session_id / 状态 / 日期过滤"></label>
                     <label class="small">状态筛选<select class="select" id="auditStatusFilter"><option value="">全部状态</option><option value="executed">executed</option><option value="failed">failed</option><option value="blocked">blocked</option><option value="approval_required">approval_required</option><option value="rejected">rejected</option><option value="terminated">terminated</option></select></label>
                     <label class="small">事件筛选<select class="select" id="auditEventFilter"><option value="">全部事件</option><option value="observer">observer 状态</option><option value="policy">策略审查</option><option value="execution">执行输出</option><option value="decision">用户决策</option></select></label>
-                    <label class="small">显示数量<input class="field" id="auditLimitInput" type="number" min="1" max="200" value="40"></label>
+                    <label class="small">会话数 / 事件批量<input class="field" id="auditLimitInput" type="number" min="1" max="200" value="40"></label>
                   </div>
                   <div class="small">中文注释：列表来自 <span class="mono">/api/audit/list</span>，点击某个 session 后再通过 <span class="mono">/api/audit/read</span> 读取完整报告和事件。</div>
                   <div class="toolbar action-gap"><button class="btn" id="auditRefreshBtn" type="button">刷新会话</button><button class="btn secondary" id="auditRestoreTimelineBtn" type="button" disabled>恢复到工作台</button><button class="btn secondary" id="auditPauseBtn" type="button">暂停</button><button class="btn secondary" id="auditFindFailureBtn" type="button">定位失败</button></div>
                 </div>
 
                 <div class="panel">
-                  <div class="panel-header"><div><h3>会话审计时间线</h3><p>上方筛选控制 session 列表；读取后这里会切换为该 session 的事件时间线。</p></div></div>
+                  <div class="panel-header"><div><h3>会话审计时间线</h3><p>上方筛选控制 session 列表；读取后事件会分批渲染，直至完整显示该 session 的时间线。</p></div></div>
                   <div class="timeline" id="auditList">
                     <div class="event"><time>--</time><div class="body"><strong>等待连接</strong><span>连接 token 后加载真实审计会话。</span></div></div>
                   </div>

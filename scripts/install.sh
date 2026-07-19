@@ -11,6 +11,9 @@ PREFIX="/opt/linux-agent"
 FROM_DIST=""
 SERVICE_USER="linux-agent"
 SERVICE_GROUP="linux-agent"
+SERVICE_USER_EXPLICIT=0
+SERVICE_USER_CREATED=0
+SERVICE_USER_CREATED_THIS_RUN=0
 REQUIRE_SIGNATURE=0
 NO_SYSTEMD=0
 KEEP=2
@@ -39,6 +42,11 @@ SYSTEMD_WAS_ENABLED=0
 SYSTEMD_WAS_ACTIVE=0
 SYSTEMD_HELPER_SOCKET_WAS_ENABLED=0
 SYSTEMD_HELPER_SOCKET_WAS_ACTIVE=0
+INSTALL_STATE_CAPTURED=0
+INSTALL_STATE_EXISTED=0
+INSTALL_STATE_SERVICE_USER=""
+INSTALL_STATE_SERVICE_USER_CREATED=0
+INSTALL_STATE_NO_SYSTEMD=0
 
 fail() {
     printf '[install:error] %s\n' "$*" >&2
@@ -125,6 +133,7 @@ while [[ $# -gt 0 ]]; do
         --service-user)
             [[ $# -ge 2 ]] || fail '--service-user 缺少参数'
             SERVICE_USER="$2"
+            SERVICE_USER_EXPLICIT=1
             shift 2
             ;;
         --keep)
@@ -245,10 +254,15 @@ if [[ "${NO_SYSTEMD}" -eq 0 ]]; then
 fi
 
 ensure_prefix() {
+    local mode="${1:-create}"
     if [[ -L "${PREFIX}" || (-e "${PREFIX}" && ! -d "${PREFIX}") ]]; then
         fail "安装前缀必须是普通目录且不能是符号链接: ${PREFIX}"
     fi
-    mkdir -p -- "${PREFIX}"
+    if [[ "${mode}" == "create" ]]; then
+        mkdir -p -- "${PREFIX}"
+    else
+        [[ -d "${PREFIX}" ]] || fail "安装前缀不存在: ${PREFIX}"
+    fi
     PREFIX="$(readlink -f -- "${PREFIX}")"
     [[ "${PREFIX}" != "/" ]] || fail '拒绝使用根目录作为安装前缀'
     if [[ "${NO_SYSTEMD}" -eq 0 ]]; then
@@ -265,11 +279,109 @@ ensure_prefix() {
     fi
 }
 
+install_state_path() {
+    printf '%s/.install-state.json\n' "${PREFIX}"
+}
+
+read_install_state() {
+    local state_path
+    state_path="$(install_state_path)"
+    [[ -e "${state_path}" ]] || return 1
+    [[ -f "${state_path}" && ! -L "${state_path}" ]] ||
+        fail "安装状态文件类型非法: ${state_path}"
+    jq -e --arg prefix "${PREFIX}" '
+        type == "object"
+        and .schema_version == 1
+        and .prefix == $prefix
+        and (.installed | type == "boolean")
+        and (.no_systemd | type == "boolean")
+        and (.service_user | type == "string")
+        and (.service_user_created | type == "boolean")
+        and (.service_user == "" or (.service_user | test("^[a-z_][a-z0-9_-]*[$]?$")))
+    ' "${state_path}" >/dev/null || fail '安装状态文件契约无效'
+    INSTALL_STATE_SERVICE_USER="$(jq -er '.service_user' "${state_path}")"
+    INSTALL_STATE_SERVICE_USER_CREATED="$(jq -er 'if .service_user_created then 1 else 0 end' "${state_path}")"
+    INSTALL_STATE_NO_SYSTEMD="$(jq -er 'if .no_systemd then 1 else 0 end' "${state_path}")"
+    return 0
+}
+
+validate_service_identity() {
+    local uid
+    [[ "${SERVICE_USER}" =~ ^[a-z_][a-z0-9_-]*[$]?$ ]] || fail '--service-user 格式非法'
+    [[ "${NO_SYSTEMD}" -eq 0 ]] || return 0
+    if [[ "${SERVICE_USER}" == "root" && "${LINUX_AGENT_ALLOW_ROOT_SERVICE_USER_FOR_TESTS:-0}" != "1" ]]; then
+        fail 'systemd 服务必须使用非 root 用户'
+    fi
+    if id "${SERVICE_USER}" >/dev/null 2>&1; then
+        uid="$(id -u "${SERVICE_USER}")"
+        if [[ "${uid}" == "0" && "${LINUX_AGENT_ALLOW_ROOT_SERVICE_USER_FOR_TESTS:-0}" != "1" ]]; then
+            fail 'systemd 服务用户不能映射到 UID 0'
+        fi
+    fi
+}
+
+load_existing_service_identity() {
+    local installed_user=""
+    if read_install_state; then
+        if [[ "${INSTALL_STATE_NO_SYSTEMD}" -ne "${NO_SYSTEMD}" ]]; then
+            fail '当前安装的 systemd 模式与本次参数不一致'
+        fi
+        if [[ -n "${INSTALL_STATE_SERVICE_USER}" ]]; then
+            if [[ "${SERVICE_USER_EXPLICIT}" -eq 1 && "${SERVICE_USER}" != "${INSTALL_STATE_SERVICE_USER}" ]]; then
+                fail "服务用户必须保持为已安装用户: ${INSTALL_STATE_SERVICE_USER}"
+            fi
+            SERVICE_USER="${INSTALL_STATE_SERVICE_USER}"
+            SERVICE_USER_CREATED="${INSTALL_STATE_SERVICE_USER_CREATED}"
+        fi
+        return 0
+    fi
+    [[ "${NO_SYSTEMD}" -eq 0 ]] || return 0
+    if [[ -f "${SYSTEMD_UNIT_PATH}" && ! -L "${SYSTEMD_UNIT_PATH}" ]]; then
+        installed_user="$(sed -n 's/^User=//p' "${SYSTEMD_UNIT_PATH}" | head -n 1)"
+        if [[ -n "${installed_user}" ]]; then
+            if [[ "${SERVICE_USER_EXPLICIT}" -eq 1 && "${SERVICE_USER}" != "${installed_user}" ]]; then
+                fail "服务用户必须保持为已安装用户: ${installed_user}"
+            fi
+            SERVICE_USER="${installed_user}"
+        fi
+    fi
+    return 0
+}
+
+write_install_state() {
+    local installed="$1"
+    local state_path state_tmp service_user=""
+    state_path="$(install_state_path)"
+    state_tmp="$(mktemp "${PREFIX}/.install-state.XXXXXX")"
+    if [[ "${NO_SYSTEMD}" -eq 0 ]]; then
+        service_user="${SERVICE_USER}"
+    fi
+    jq -S -n \
+        --arg prefix "${PREFIX}" \
+        --arg service_user "${service_user}" \
+        --argjson installed "${installed}" \
+        --argjson no_systemd "$([[ "${NO_SYSTEMD}" -eq 1 ]] && printf true || printf false)" \
+        --argjson service_user_created "$([[ "${NO_SYSTEMD}" -eq 0 && "${SERVICE_USER_CREATED}" -eq 1 ]] && printf true || printf false)" \
+        '{schema_version:1,prefix:$prefix,installed:$installed,no_systemd:$no_systemd,service_user:$service_user,service_user_created:$service_user_created}' \
+        >"${state_tmp}" || {
+        rm -f -- "${state_tmp}"
+        fail '无法写入安装状态文件'
+    }
+    chmod 0600 "${state_tmp}"
+    if [[ "${NO_SYSTEMD}" -eq 0 ]]; then
+        chown root:root "${state_tmp}" || {
+            rm -f -- "${state_tmp}"
+            fail '无法设置安装状态文件所有权'
+        }
+    fi
+    mv -f -- "${state_tmp}" "${state_path}"
+}
+
 begin_transaction() {
     local mode="$1"
     local old_version="$2"
     local target_version="$3"
-    local name source backup
+    local name source backup state_path
 
     TRANSACTION_MODE="${mode}"
     TRANSACTION_OLD_VERSION="${old_version}"
@@ -285,6 +397,9 @@ begin_transaction() {
     SYSTEMD_WAS_ACTIVE=0
     SYSTEMD_HELPER_SOCKET_WAS_ENABLED=0
     SYSTEMD_HELPER_SOCKET_WAS_ACTIVE=0
+    INSTALL_STATE_CAPTURED=0
+    INSTALL_STATE_EXISTED=0
+    SERVICE_USER_CREATED_THIS_RUN=0
     TRANSACTION_BACKUP_DIR="$(mktemp -d "${PREFIX}/.install-rollback.XXXXXX")"
     chmod 0700 "${TRANSACTION_BACKUP_DIR}"
     mkdir -p "${TRANSACTION_BACKUP_DIR}/config"
@@ -300,6 +415,15 @@ begin_transaction() {
         fi
     done
     CONFIG_STATE_CAPTURED=1
+    state_path="$(install_state_path)"
+    if [[ -L "${state_path}" || (-e "${state_path}" && ! -f "${state_path}") ]]; then
+        fail "安装状态文件类型非法: ${state_path}"
+    fi
+    if [[ -f "${state_path}" ]]; then
+        cp -p -- "${state_path}" "${TRANSACTION_BACKUP_DIR}/install-state.json"
+        INSTALL_STATE_EXISTED=1
+    fi
+    INSTALL_STATE_CAPTURED=1
 }
 
 capture_systemd_state() {
@@ -356,6 +480,17 @@ restore_persistent_config() {
     done
 }
 
+restore_install_state() {
+    local state_path
+    state_path="$(install_state_path)"
+    [[ "${INSTALL_STATE_CAPTURED}" -eq 1 ]] || return 0
+    if [[ "${INSTALL_STATE_EXISTED}" -eq 1 ]]; then
+        cp -p -- "${TRANSACTION_BACKUP_DIR}/install-state.json" "${state_path}"
+    else
+        rm -f -- "${state_path}"
+    fi
+}
+
 restore_systemd_state() {
     [[ "${NO_SYSTEMD}" -eq 0 && "${SYSTEMD_STATE_CAPTURED}" -eq 1 ]] || return 0
     if [[ "${SYSTEMD_UNIT_EXISTED}" -eq 1 ]]; then
@@ -397,7 +532,7 @@ restore_systemd_state() {
         systemctl disable linux-agent-web.service >/dev/null 2>&1 || true
     fi
     if [[ "${SYSTEMD_WAS_ACTIVE}" -eq 1 ]]; then
-        systemctl restart linux-agent-web.service >/dev/null 2>&1 || warn '无法恢复升级前的服务进程'
+        systemctl restart linux-agent-web.service >/dev/null 2>&1 || warn '无法恢复操作前的 Web 服务进程'
     else
         systemctl stop linux-agent-web.service >/dev/null 2>&1 || true
     fi
@@ -433,7 +568,17 @@ rollback_transaction() {
     fi
 
     restore_persistent_config || warn '无法完整恢复持久配置'
+    restore_install_state || warn '无法完整恢复安装状态'
     restore_systemd_state || warn '无法完整恢复 systemd unit 状态'
+
+    if [[ "${TRANSACTION_MODE}" == "install" && "${SERVICE_USER_CREATED_THIS_RUN}" -eq 1 &&
+        "${NO_SYSTEMD}" -eq 0 && "${SERVICE_USER}" != "root" ]]; then
+        if command -v userdel >/dev/null 2>&1 && id "${SERVICE_USER}" >/dev/null 2>&1; then
+            userdel "${SERVICE_USER}" >/dev/null 2>&1 ||
+                warn "安装失败后无法删除本次创建的服务用户: ${SERVICE_USER}"
+        fi
+    fi
+    SERVICE_USER_CREATED_THIS_RUN=0
 
     if [[ "${TRANSACTION_MODE}" == "install" || "${TRANSACTION_MODE}" == "upgrade" ]]; then
         current_target="$(readlink -- "${PREFIX}/current" 2>/dev/null || true)"
@@ -831,12 +976,19 @@ prepare_release() {
 }
 
 ensure_service_identity() {
+    local uid
     [[ "${NO_SYSTEMD}" -eq 0 ]] || return 0
     command -v chown >/dev/null 2>&1 || fail '缺少 chown，无法设置服务数据所有权'
+    validate_service_identity
     if ! id "${SERVICE_USER}" >/dev/null 2>&1; then
         command -v useradd >/dev/null 2>&1 || fail '缺少 useradd，无法创建 systemd 服务用户'
         useradd --system --home-dir "${PREFIX}" --shell /usr/sbin/nologin "${SERVICE_USER}"
+        SERVICE_USER_CREATED=1
+        SERVICE_USER_CREATED_THIS_RUN=1
     fi
+    uid="$(id -u "${SERVICE_USER}")"
+    [[ "${uid}" != "0" || "${LINUX_AGENT_ALLOW_ROOT_SERVICE_USER_FOR_TESTS:-0}" == "1" ]] ||
+        fail 'systemd 服务用户不能映射到 UID 0'
     SERVICE_GROUP="$(id -gn "${SERVICE_USER}")"
     [[ -n "${SERVICE_GROUP}" ]] || fail "无法确定服务用户主组: ${SERVICE_USER}"
     chown -R "${SERVICE_USER}:${SERVICE_GROUP}" "${PREFIX}/data"
@@ -980,6 +1132,70 @@ restart_and_check() {
     wait_for_health >/dev/null || return 1
 }
 
+run_install_health_check() {
+    local health_started_at health_ok=0 startup_ok=0 cleanup_ok=1 unit
+    local -a units=(
+        linux-agent-web.service
+        linux-agent-observer-helper.service
+        linux-agent-observer-helper.socket
+    )
+
+    health_started_at="$(date --iso-8601=seconds)"
+
+    # systemctl start does not replace an already-running process. Stop any
+    # pre-existing instance so the health request always reaches this release.
+    for unit in "${units[@]}"; do
+        systemctl stop "${unit}" || cleanup_ok=0
+    done
+    if [[ "${cleanup_ok}" -ne 1 ]]; then
+        warn '无法停止安装前已存在的服务进程'
+        report_install_health_failure "${health_started_at}"
+    elif
+        systemctl start linux-agent-observer-helper.socket linux-agent-web.service
+    then
+        startup_ok=1
+        if wait_for_health >/dev/null; then
+            health_ok=1
+        else
+            warn '新安装版本未在超时时间内通过认证健康检查'
+            report_install_health_failure "${health_started_at}"
+        fi
+    else
+        warn '无法启动新安装版本的临时健康检查服务'
+        report_install_health_failure "${health_started_at}"
+    fi
+    for unit in "${units[@]}"; do
+        systemctl stop "${unit}" || cleanup_ok=0
+    done
+    for unit in "${units[@]}"; do
+        if systemctl is-active --quiet "${unit}"; then
+            cleanup_ok=0
+        fi
+    done
+    [[ "${cleanup_ok}" -eq 1 ]] || return 2
+    [[ "${startup_ok}" -eq 1 ]] || return 3
+    [[ "${health_ok}" -eq 1 ]]
+}
+
+report_install_health_failure() {
+    local health_started_at="$1"
+    local -a units=(
+        linux-agent-web.service
+        linux-agent-observer-helper.service
+        linux-agent-observer-helper.socket
+    )
+
+    warn '以下为安装健康检查失败时的 systemd 状态：'
+    systemctl status --no-pager --full "${units[@]}" >&2 || true
+    if command -v journalctl >/dev/null 2>&1; then
+        warn '以下为本次安装健康检查期间的 journal：'
+        journalctl --no-pager --since "${health_started_at}" -n 80 \
+            -u linux-agent-web.service \
+            -u linux-agent-observer-helper.service \
+            -u linux-agent-observer-helper.socket >&2 || true
+    fi
+}
+
 prune_releases() {
     local current keep_others version line
     local -a candidates=()
@@ -1019,10 +1235,15 @@ rollback_target() {
 }
 
 do_install() {
-    local release_dir
+    local release_dir install_health_status=0
     ensure_prefix
+    load_existing_service_identity
+    validate_service_identity
     if [[ -e "${PREFIX}/current" || -L "${PREFIX}/current" ]]; then
         fail '检测到已有安装，请使用 upgrade'
+    fi
+    if read_install_state && [[ "$(jq -r '.installed' "$(install_state_path)")" == "true" ]]; then
+        fail '安装状态表明当前前缀仍在使用，请先执行 upgrade 或 uninstall'
     fi
     begin_transaction install "" "${VERSION}"
     prepare_release
@@ -1033,18 +1254,28 @@ do_install() {
     atomic_switch "${VERSION}"
     if [[ "${NO_SYSTEMD}" -eq 0 ]]; then
         install_systemd_unit
-        systemctl enable --now linux-agent-observer-helper.socket linux-agent-web.service
-        if ! wait_for_health >/dev/null; then
-            fail '安装后健康检查失败'
-        fi
+        run_install_health_check || install_health_status=$?
+        case "${install_health_status}" in
+            0) ;;
+            1) fail '安装后健康检查失败；临时服务已停止' ;;
+            2) fail '安装后无法停止临时健康检查服务' ;;
+            3) fail '安装后无法启动临时健康检查服务；临时单元已停止' ;;
+            *) fail '安装后临时健康检查失败' ;;
+        esac
     fi
+    write_install_state true
     commit_transaction
     info "已安装 ${VERSION}: ${release_dir}"
+    if [[ "${NO_SYSTEMD}" -eq 0 ]]; then
+        info '安装后健康检查已通过，临时服务已停止；安装器未修改原有开机启用状态，需要长期运行时请显式执行 systemctl enable --now linux-agent-observer-helper.socket linux-agent-web.service'
+    fi
 }
 
 do_upgrade() {
     local old_version release_dir
     ensure_prefix
+    load_existing_service_identity
+    validate_service_identity
     old_version="$(current_version)" || fail '未检测到现有安装，请先执行 install'
     [[ "${old_version}" != "${VERSION}" ]] || fail '目标版本已经是当前版本'
     begin_transaction upgrade "${old_version}" "${VERSION}"
@@ -1060,6 +1291,7 @@ do_upgrade() {
         fail '升级失败，已恢复旧版本'
     fi
     append_history "${old_version}"
+    write_install_state true
     commit_transaction
     prune_releases
     info "已从 ${old_version} 升级到 ${VERSION}: ${release_dir}"
@@ -1068,6 +1300,8 @@ do_upgrade() {
 do_rollback() {
     local old_version target
     ensure_prefix
+    load_existing_service_identity
+    validate_service_identity
     old_version="$(current_version)" || fail '未检测到现有安装'
     target="$(rollback_target)" || fail '没有可回滚的历史版本'
     begin_transaction rollback "${old_version}" "${target}"
@@ -1080,6 +1314,7 @@ do_rollback() {
         fail '回滚目标健康检查失败，已恢复原版本'
     fi
     append_history "${old_version}"
+    write_install_state true
     commit_transaction
     info "已从 ${old_version} 回滚到 ${target}"
 }
@@ -1111,12 +1346,51 @@ do_status() {
         '{ok:true,status:"installed_status",prefix:$prefix,current_version:$current,releases:$releases,service_status:$service_status,provider_egress_policy:$egress_policy}'
 }
 
+stop_and_disable_unit() {
+    local unit="$1"
+    if systemctl is-active --quiet "${unit}"; then
+        systemctl stop "${unit}" || fail "无法停止 systemd 单元: ${unit}"
+    fi
+    if systemctl is-active --quiet "${unit}"; then
+        fail "systemd 单元仍在运行: ${unit}"
+    fi
+    if systemctl is-enabled --quiet "${unit}"; then
+        systemctl disable "${unit}" || fail "无法禁用 systemd 单元: ${unit}"
+    fi
+}
+
+validate_uninstall_target() {
+    local state_path state_installed
+    ensure_prefix existing
+    state_path="$(install_state_path)"
+    if [[ -L "${state_path}" || (-e "${state_path}" && ! -f "${state_path}") ]]; then
+        fail "安装状态文件类型非法: ${state_path}"
+    fi
+    if [[ -f "${state_path}" ]]; then
+        read_install_state
+        if [[ -n "${INSTALL_STATE_SERVICE_USER}" ]]; then
+            SERVICE_USER="${INSTALL_STATE_SERVICE_USER}"
+            SERVICE_USER_CREATED="${INSTALL_STATE_SERVICE_USER_CREATED}"
+        fi
+        [[ "${INSTALL_STATE_NO_SYSTEMD}" -eq "${NO_SYSTEMD}" ]] ||
+            fail '当前安装的 systemd 模式与本次参数不一致'
+        state_installed="$(jq -r '.installed' "${state_path}")"
+        if [[ "${state_installed}" == "true" ]]; then
+            current_version >/dev/null || fail '安装状态存在但 current 不是受管版本'
+        fi
+        return 0
+    fi
+    current_version >/dev/null || fail '目标前缀不是受管安装，拒绝卸载'
+    [[ -x "${PREFIX}/current/bin/agent" ]] || fail '目标前缀缺少受管 Agent 入口，拒绝卸载'
+}
+
 do_uninstall() {
-    ensure_prefix
+    validate_uninstall_target
     if [[ "${NO_SYSTEMD}" -eq 0 ]]; then
         command -v systemctl >/dev/null 2>&1 || fail '缺少 systemctl'
-        systemctl disable --now linux-agent-web.service linux-agent-observer-helper.socket >/dev/null 2>&1 || true
-        systemctl stop linux-agent-observer-helper.service >/dev/null 2>&1 || true
+        stop_and_disable_unit linux-agent-web.service
+        stop_and_disable_unit linux-agent-observer-helper.socket
+        stop_and_disable_unit linux-agent-observer-helper.service
         rm -f -- "${SYSTEMD_UNIT_PATH}" "${SYSTEMD_HELPER_SERVICE_PATH}" "${SYSTEMD_HELPER_SOCKET_PATH}" \
             "${SYSTEMD_EGRESS_DROPIN_PATH}"
         rmdir -- "$(dirname -- "${SYSTEMD_EGRESS_DROPIN_PATH}")" 2>/dev/null || true
@@ -1126,6 +1400,14 @@ do_uninstall() {
     rm -rf -- "${PREFIX}/releases"
     if [[ "${PURGE_DATA}" -eq 1 ]]; then
         rm -rf -- "${PREFIX}/data"
+        rm -f -- "$(install_state_path)"
+        if [[ "${SERVICE_USER_CREATED}" -eq 1 && "${SERVICE_USER}" != "root" &&
+            -n "${SERVICE_USER}" ]] && id "${SERVICE_USER}" >/dev/null 2>&1; then
+            command -v userdel >/dev/null 2>&1 || fail '缺少 userdel，无法删除安装器创建的服务用户'
+            userdel "${SERVICE_USER}" || fail "无法删除安装器创建的服务用户: ${SERVICE_USER}"
+        fi
+    else
+        write_install_state false
     fi
     if [[ -z "$(find "${PREFIX}" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null)" ]]; then
         rmdir -- "${PREFIX}"

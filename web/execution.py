@@ -807,15 +807,21 @@ class ExecutionService:
                     ],
                 }
 
-        cancelled = bool(
+        result_was_cancelled = result.get("status") == "cancelled"
+        process_was_terminated = bool(
+            not outcome.timed_out
+            and not outcome.output_limit_exceeded
+            and outcome.returncode is not None
+            and outcome.returncode < 0
+        )
+        completed_before_cancel = bool(
             outcome.cancelled
-            or (
-                not outcome.timed_out
-                and not outcome.output_limit_exceeded
-                and outcome.returncode is not None
-                and outcome.returncode < 0
-            )
-            or result.get("status") == "cancelled"
+            and result.get("ok") is True
+            and result.get("status") in {"answered", "executed"}
+        )
+        cancelled = bool(
+            result_was_cancelled
+            or (not completed_before_cancel and (outcome.cancelled or process_was_terminated))
         )
         if outcome.timed_out:
             result["ok"] = False
@@ -836,6 +842,8 @@ class ExecutionService:
         )
         result["timed_out"] = bool(outcome.timed_out)
         result["cancelled"] = cancelled
+        if completed_before_cancel:
+            result["cancel_requested_after_completion"] = True
 
         blocks = result.setdefault("output_blocks", [])
         if not isinstance(blocks, list):
@@ -856,6 +864,7 @@ class ExecutionService:
                     "exit_code": outcome.returncode,
                     "timed_out": bool(outcome.timed_out),
                     "cancelled": cancelled,
+                    "cancel_requested_after_completion": completed_before_cancel,
                     "output_limit_exceeded": bool(outcome.output_limit_exceeded),
                     "stdout_truncated_bytes": outcome.stdout_truncated_bytes,
                     "stderr_truncated_bytes": outcome.stderr_truncated_bytes,

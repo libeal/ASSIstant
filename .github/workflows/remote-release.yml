@@ -92,7 +92,8 @@ jobs:
             tests/remote_runtime.sh \
             tests/remote_web_security.sh \
             tests/backup.sh \
-            tests/install.sh; do
+            tests/install.sh \
+            tests/install_packages.sh; do
             echo "::group::${test_file}"
             bash "${test_file}"
             echo "::endgroup::"
@@ -167,6 +168,11 @@ jobs:
           SOURCE_DATE_EPOCH: "0"
         run: bash scripts/build-remote-release.sh "${RELEASE_TAG}" dist/remote
 
+      - name: Build deterministic Debian and Fedora install packages
+        env:
+          SOURCE_DATE_EPOCH: "0"
+        run: bash scripts/build-install-packages.sh "${RELEASE_TAG}" dist/remote
+
       - name: Prepare release manifest signature
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -209,6 +215,14 @@ jobs:
             --certificate-identity-regexp '^https://github.com/libeal/ASSIstant/\.github/workflows/remote-release\.yml@refs/tags/v.*$' \
             "${manifest}"
           gh attestation verify "${core}" --repo "${GITHUB_REPOSITORY}"
+          for distro in debian fedora; do
+            package="linux-agent-${RELEASE_TAG}-${distro}.tar.gz"
+            checksum="${RUNNER_TEMP}/${package}.sha256"
+            curl -fsSL --proto '=https' --tlsv1.2 "${release_url}/${package}" -o "${RUNNER_TEMP}/${package}"
+            curl -fsSL --proto '=https' --tlsv1.2 "${release_url}/${package}.sha256" -o "${checksum}"
+            (cd "${RUNNER_TEMP}" && sha256sum -c "${package}.sha256")
+            gh attestation verify "${RUNNER_TEMP}/${package}" --repo "${GITHUB_REPOSITORY}"
+          done
 
       - name: Smoke test published CLI entrypoint
         run: |

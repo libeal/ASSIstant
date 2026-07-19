@@ -310,7 +310,13 @@ case "${command_name}" in
             stop_service
         fi
         ;;
-    restart | start) start_service ;;
+    restart) start_service ;;
+    start)
+        if [[ ! -f "${FAKE_SYSTEMD_STATE}/service.pid" ]] ||
+            ! kill -0 "$(<"${FAKE_SYSTEMD_STATE}/service.pid")" >/dev/null 2>&1; then
+            start_service
+        fi
+        ;;
     stop) stop_service ;;
     *)
         printf 'unsupported fake systemctl command: %s\n' "${command_name}" >&2
@@ -327,6 +333,7 @@ SH
             FAKE_SYSTEMD_STATE="${fake_systemd_dir}" \
             LINUX_AGENT_SYSTEMD_UNIT_PATH="${managed_unit_path}" \
             LINUX_AGENT_ALLOW_UNSAFE_SYSTEMD_TEST_PREFIX=1 \
+            LINUX_AGENT_ALLOW_ROOT_SERVICE_USER_FOR_TESTS=1 \
             bash "${ROOT_DIR}/scripts/install.sh" "$@" \
             --prefix "${managed_prefix}" --service-user root
     }
@@ -337,6 +344,9 @@ SH
         exit 1
     fi
     grep -q '首次安装必须提供 --provider-cidr' "${tmp_root}/missing-egress.stderr"
+    sleep 300 &
+    printf '%s\n' "$!" >"${fake_systemd_dir}/service.pid"
+    : >"${fake_systemd_dir}/enabled"
     if ! run_managed_installer install --version v0.0.0-test --from-dist "${managed_dist_one}" \
         --provider-cidr 127.0.0.1; then
         printf 'managed install failed; fake systemd commands:\n' >&2
@@ -345,10 +355,25 @@ SH
         sed -n '1,200p' "${fake_systemd_dir}/web.stderr" >&2 2>/dev/null || true
         exit 1
     fi
+    [[ -f "${fake_systemd_dir}/enabled" ]]
+    [[ ! -f "${fake_systemd_dir}/service.pid" ]]
+    grep -q '^start$' "${fake_systemd_dir}/commands"
+    grep -q '^stop$' "${fake_systemd_dir}/commands"
+    if grep -q '^disable$' "${fake_systemd_dir}/commands"; then
+        printf 'managed install unexpectedly changed the existing enabled state\n' >&2
+        exit 1
+    fi
+    if grep -q '^enable$' "${fake_systemd_dir}/commands"; then
+        printf 'managed install unexpectedly enabled systemd units\n' >&2
+        exit 1
+    fi
     managed_egress_path="${managed_prefix}/systemd/linux-agent-web.service.d/10-provider-egress.conf"
     grep -q '^IPAddressDeny=any$' "${managed_egress_path}"
     grep -q '^IPAddressAllow=localhost$' "${managed_egress_path}"
     grep -q '^IPAddressAllow=127.0.0.1/32$' "${managed_egress_path}"
+    FAKE_SYSTEMD_PREFIX="${managed_prefix}" FAKE_SYSTEMD_STATE="${fake_systemd_dir}" \
+        "${fake_systemd_bin}/systemctl" enable --now \
+        linux-agent-observer-helper.socket linux-agent-web.service
     run_managed_installer upgrade --version v0.0.1-test --from-dist "${managed_dist_two}"
     grep -q '^Environment=LINUX_AGENT_UNIT_MARKER=v2$' "${managed_unit_path}"
     grep -q "^ExecStart=/usr/bin/python3 ${managed_prefix}/current/lib/observer_helper.py serve$" \
