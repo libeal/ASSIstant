@@ -24,6 +24,7 @@ from provider_security import (  # noqa: E402
     trusted_provider_hosts,
 )
 import policy as policy_module  # noqa: E402
+import provider as provider_module  # noqa: E402
 from policy import PolicyService  # noqa: E402
 from skills import SkillService  # noqa: E402
 
@@ -241,6 +242,19 @@ class ProviderServiceTests(unittest.TestCase):
         self.assertEqual(self.fetches[0][4], ("203.0.113.10",))
         self.assertEqual(self.fetches[0][2], 60)
 
+    def test_pinned_https_handler_uses_context_without_legacy_hostname_argument(self):
+        handler = provider_module._PinnedHTTPSHandler(["203.0.113.10"])
+        response = mock.sentinel.response
+
+        with mock.patch.object(handler, "do_open", return_value=response) as do_open:
+            result = handler.https_open(mock.sentinel.request)
+
+        self.assertIs(result, response)
+        connection_type, request = do_open.call_args.args
+        self.assertIs(request, mock.sentinel.request)
+        self.assertEqual(do_open.call_args.kwargs, {"context": handler._context})
+        connection = connection_type("api.example", context=handler._context)
+        self.assertEqual(connection.resolved_addresses, ("203.0.113.10",))
 
     def test_credentialed_body_api_url_override_is_blocked(self):
         """Body api_url to an untrusted public host must not receive the API key."""
