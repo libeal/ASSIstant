@@ -271,6 +271,11 @@ ensure_prefix() {
                 if [[ "${LINUX_AGENT_ALLOW_UNSAFE_SYSTEMD_TEST_PREFIX:-0}" == "1" &&
                     "${SYSTEMD_UNIT_PATH}" == "${PREFIX}/"* ]]; then
                     warn "仅测试：允许 systemd 沙箱不可见的安装前缀 ${PREFIX}"
+                elif [[ ("${COMMAND}" == "health" || "${COMMAND}" == "status") &&
+                    -f "${PREFIX}/.install-state.json" &&
+                    ! -L "${PREFIX}/.install-state.json" &&
+                    "$(jq -r '.no_systemd // false' "${PREFIX}/.install-state.json" 2>/dev/null || printf false)" == "true" ]]; then
+                    :
                 else
                     fail 'systemd 模式的 --prefix 不能位于 /home、/root、/run/user、/tmp 或 /var/tmp；请使用 /opt、/srv 等系统服务目录，或显式使用 --no-systemd'
                 fi

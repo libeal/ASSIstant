@@ -323,21 +323,18 @@ class ObserverHelperProtocolTests(unittest.TestCase):
             server.close()
 
     def test_ping_proves_socket_transport_without_running_auditctl(self):
-        server, client = socket.socketpair()
-        try:
-            client.sendall(b'{"operation":"ping"}\n')
-            client.shutdown(socket.SHUT_WR)
-            with mock.patch.object(
-                observer_helper,
-                "_peer_credentials",
-                return_value=(os.getpid(), os.geteuid(), os.getegid()),
-            ), mock.patch.object(observer_helper, "run_command") as run_command:
-                with contextlib.redirect_stderr(io.StringIO()):
-                    observer_helper.handle_connection(server)
-            response = json.loads(client.recv(4096).decode("utf-8"))
-        finally:
-            server.close()
-            client.close()
+        connection = mock.MagicMock()
+        connection.recv.return_value = b'{"operation":"ping"}\n'
+        with mock.patch.object(
+            observer_helper,
+            "_peer_credentials",
+            return_value=(os.getpid(), os.geteuid(), os.getegid()),
+        ), mock.patch.object(observer_helper, "run_command") as run_command:
+            with contextlib.redirect_stderr(io.StringIO()):
+                observer_helper.handle_connection(connection)
+        response = json.loads(
+            connection.sendall.call_args.args[0].decode("utf-8")
+        )
 
         self.assertEqual(
             response,
