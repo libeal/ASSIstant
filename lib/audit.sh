@@ -7,6 +7,7 @@ LINUX_AGENT_AUDIT_LOG="${LINUX_AGENT_AUDIT_LOG:-}"
 LINUX_AGENT_SESSION_ACTIVE=0
 LINUX_AGENT_SESSION_FINISHED=0
 LINUX_AGENT_LAST_BUSINESS_STATUS=""
+declare -a LINUX_AGENT_AUDIT_CHAIN_ARGS=()
 
 linux_agent_audit_boundaries_path() {
     printf '%s/policies/audit-boundaries.json\n' "${LINUX_AGENT_ROOT}"
@@ -24,10 +25,13 @@ linux_agent_audit_chain_writer() {
     printf '%s\n' "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/audit_chain.py"
 }
 
-# Cached CLI options for lib/audit_chain.py, derived from config .audit.*.
+# Cached CLI option array for lib/audit_chain.py, derived from config .audit.*.
 # Changing .audit.* at runtime requires clearing LINUX_AGENT_AUDIT_CHAIN_ARGS.
 linux_agent_audit_chain_args() {
-    if [[ -z "${LINUX_AGENT_AUDIT_CHAIN_ARGS:-}" ]]; then
+    if ! declare -p LINUX_AGENT_AUDIT_CHAIN_ARGS >/dev/null 2>&1; then
+        declare -ga LINUX_AGENT_AUDIT_CHAIN_ARGS=()
+    fi
+    if ((${#LINUX_AGENT_AUDIT_CHAIN_ARGS[@]} == 0)); then
         # The hash chain (seq/prev_hash/hash) is a mandatory integrity invariant,
         # not a toggle: verify rejects unchained events as tampered, so writing
         # them would be self-contradictory. Only fsync and disk policy are tunable.
@@ -39,12 +43,15 @@ linux_agent_audit_chain_args() {
             on_full="$(linux_agent_config_get_default '.audit.on_full' 'degrade')"
         fi
         [[ "${on_full}" == "block" || "${on_full}" == "degrade" ]] || on_full="degrade"
-        local args=""
-        [[ "${fsync}" == "true" ]] || args+=" --no-fsync"
-        args+=" --max-bytes ${max_bytes} --min-free-bytes ${min_free} --on-full ${on_full}"
-        LINUX_AGENT_AUDIT_CHAIN_ARGS="${args# }"
+        [[ "${fsync}" == "true" ]] || LINUX_AGENT_AUDIT_CHAIN_ARGS+=(--no-fsync)
+        LINUX_AGENT_AUDIT_CHAIN_ARGS+=(
+            --max-bytes "${max_bytes}"
+            --min-free-bytes "${min_free}"
+            --on-full "${on_full}"
+        )
     fi
-    printf '%s\n' "${LINUX_AGENT_AUDIT_CHAIN_ARGS}"
+    local IFS=" "
+    printf '%s\n' "${LINUX_AGENT_AUDIT_CHAIN_ARGS[*]}"
 }
 
 # Keep one Python chain writer per Bash process/session. The protocol is
@@ -77,11 +84,13 @@ linux_agent_audit_writer_stop() {
 }
 
 linux_agent_audit_writer_start() {
-    local writer chain_args writer_key
+    local writer chain_key writer_key
+    local -a chain_args=()
     writer="$(linux_agent_audit_chain_writer)"
     linux_agent_audit_chain_args >/dev/null
-    chain_args="${LINUX_AGENT_AUDIT_CHAIN_ARGS}"
-    writer_key="${writer}|${LINUX_AGENT_AUDIT_LOG}|${chain_args}"
+    chain_args=("${LINUX_AGENT_AUDIT_CHAIN_ARGS[@]}")
+    printf -v chain_key '%q ' "${chain_args[@]}"
+    writer_key="${writer}|${LINUX_AGENT_AUDIT_LOG}|${chain_key}"
     if [[ "${LINUX_AGENT_AUDIT_WRITER_KEY:-}" == "${writer_key}" &&
         "${LINUX_AGENT_AUDIT_WRITER_OWNER_PID:-}" == "${BASHPID}" &&
         -n "${LINUX_AGENT_AUDIT_WRITER_PID:-}" ]] &&
@@ -90,10 +99,8 @@ linux_agent_audit_writer_start() {
     fi
 
     linux_agent_audit_writer_stop
-    # chain_args is a controlled option string.
-    # shellcheck disable=SC2086
     coproc LINUX_AGENT_AUDIT_WRITER_PROCESS {
-        python3 "${writer}" serve "${LINUX_AGENT_AUDIT_LOG}" ${chain_args}
+        python3 "${writer}" serve "${LINUX_AGENT_AUDIT_LOG}" "${chain_args[@]}"
     }
     LINUX_AGENT_AUDIT_WRITER_INPUT_FD="${LINUX_AGENT_AUDIT_WRITER_PROCESS[1]}"
     LINUX_AGENT_AUDIT_WRITER_OUTPUT_FD="${LINUX_AGENT_AUDIT_WRITER_PROCESS[0]}"
@@ -109,13 +116,13 @@ linux_agent_audit_writer_start() {
 # `append` interleaves safely with the owner's persistent writer.
 linux_agent_audit_append_oneshot() {
     local event="$1"
-    local writer chain_args
+    local writer
+    local -a chain_args=()
     writer="$(linux_agent_audit_chain_writer)"
     linux_agent_audit_chain_args >/dev/null
-    chain_args="${LINUX_AGENT_AUDIT_CHAIN_ARGS}"
-    # chain_args is a controlled option string.
-    # shellcheck disable=SC2086
-    printf '%s\n' "${event}" | python3 "${writer}" append "${LINUX_AGENT_AUDIT_LOG}" ${chain_args}
+    chain_args=("${LINUX_AGENT_AUDIT_CHAIN_ARGS[@]}")
+    printf '%s\n' "${event}" |
+        python3 "${writer}" append "${LINUX_AGENT_AUDIT_LOG}" "${chain_args[@]}"
 }
 
 linux_agent_audit_write_event() {

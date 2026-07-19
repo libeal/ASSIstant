@@ -958,15 +958,18 @@ def _cli_serve(argv):
         print(f"audit_chain: invalid option: {exc}", file=sys.stderr)
         return 2
 
-    for raw in sys.stdin:
-        try:
-            event = _event_from_json(raw)
-        except (json.JSONDecodeError, RecursionError, ValueError) as exc:
-            code, message = 2, f"audit_chain: invalid event JSON: {exc}"
-        else:
-            code, message = _append_once(path, event, options)
-        message = " ".join(message.splitlines())
-        print(f"{code}\t{message}", flush=True)
+    try:
+        for raw in sys.stdin:
+            try:
+                event = _event_from_json(raw)
+            except (json.JSONDecodeError, RecursionError, ValueError) as exc:
+                code, message = 2, f"audit_chain: invalid event JSON: {exc}"
+            else:
+                code, message = _append_once(path, event, options)
+            message = " ".join(message.splitlines())
+            print(f"{code}\t{message}", flush=True)
+    except KeyboardInterrupt:
+        return 130
     return 0
 
 

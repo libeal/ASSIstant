@@ -46,6 +46,46 @@ linux_agent_init_env "${project}"
 linux_agent_load_config
 unset LINUX_AGENT_AUDIT_CHAIN_ARGS
 
+# Audit writer options must remain separate argv entries even when the caller's
+# IFS disables implicit space splitting. Exercise both persistent and one-shot
+# writer paths because each invokes audit_chain.py independently.
+ifs_persistent_log="${tmp_root}/ifs-persistent.jsonl"
+ifs_oneshot_log="${tmp_root}/ifs-oneshot.jsonl"
+(
+    IFS=
+    event='{"timestamp":"t","session_id":"ifs","stage":"persistent","payload":{}}'
+    LINUX_AGENT_AUDIT_LOG="${ifs_persistent_log}" linux_agent_audit_write_event "${event}"
+    linux_agent_audit_writer_stop
+
+    event='{"timestamp":"t","session_id":"ifs","stage":"oneshot","payload":{}}'
+    LINUX_AGENT_AUDIT_LOG="${ifs_oneshot_log}" linux_agent_audit_append_oneshot "${event}"
+)
+jq -e '.stage == "persistent" and .session_id == "ifs"' "${ifs_persistent_log}" >/dev/null
+jq -e '.stage == "oneshot" and .session_id == "ifs"' "${ifs_oneshot_log}" >/dev/null
+
+# The persistent writer shares SIGINT with the CLI and must exit without a traceback.
+PYTHONPATH="${ROOT_DIR}/lib" python3 - "${tmp_root}/interrupt.jsonl" <<'PY'
+import sys
+
+import audit_chain
+
+
+class InterruptingInput:
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        raise KeyboardInterrupt
+
+
+real_stdin = sys.stdin
+try:
+    sys.stdin = InterruptingInput()
+    assert audit_chain._cli_serve([sys.argv[1]]) == 130
+finally:
+    sys.stdin = real_stdin
+PY
+
 # --- Part A: a real session is strictly chained, 0600, and verifies clean ---
 linux_agent_start_session "audit integrity test"
 session_id="${LINUX_AGENT_SESSION_ID}"
