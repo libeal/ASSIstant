@@ -96,6 +96,11 @@ grep -qx 'packaging/linux-agent-observer-helper.socket' <<<"${core_listing}"
 grep -qx 'packaging/dropins/10-provider-egress.conf.example' <<<"${core_listing}"
 grep -qx 'lib/observer_helper.py' <<<"${core_listing}"
 
+web_listing="$(tar -tzf "${first}/linux-agent-web.tar.gz")"
+grep -qx 'web/package.json' <<<"${web_listing}"
+tar -xOzf "${first}/linux-agent-web.tar.gz" web/package.json |
+    jq -e '.private == true and .type == "module"' >/dev/null
+
 while IFS= read -r skill_name; do
     asset="$(jq -r --arg skill "${skill_name}" '.skills[$skill].asset.name' "${first}/release-manifest.json")"
     [[ -f "${first}/${asset}" ]]
