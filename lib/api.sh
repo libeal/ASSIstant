@@ -56,6 +56,30 @@ linux_agent_api_error() {
         }'
 }
 
+linux_agent_api_execution_error() {
+    local status="$1"
+    local code="$2"
+    local message="$3"
+    local source="${4:-}"
+    [[ -n "${source}" ]] || source='{}'
+    jq -cn \
+        --arg status "${status}" \
+        --arg code "${code}" \
+        --arg message "${message}" \
+        --argjson source "${source}" '
+        $source + {
+            ok:false,
+            status:$status,
+            error:$message,
+            code:$code,
+            error_code:$code,
+            message:$message,
+            timeline:[],
+            approval_card:null,
+            output_blocks:[]
+        }'
+}
+
 linux_agent_api_web_config_json() {
     jq -cn \
         --argjson enabled "$(linux_agent_config_bool_default '.web.enabled' 'true')" \
@@ -325,10 +349,10 @@ linux_agent_api_work_prepare_response() {
 
 linux_agent_api_work_run() {
     local payload="$1"
-    local user_input prepared response_json execution_plan_json context_json response_type execution_json final_status answer used_agent_loop execution_state_json execution_selection
+    local user_input prepared response_json execution_plan_json context_json response_type execution_json final_status answer used_agent_loop execution_state_json execution_selection error_code error_source
     user_input="$(jq -r '.input // .request // empty' <<<"${payload}")"
     if [[ -z "${user_input}" ]]; then
-        linux_agent_api_error "missing_input" "input is required."
+        linux_agent_api_execution_error "invalid" "missing_input" "input is required."
         return 0
     fi
 
@@ -339,16 +363,27 @@ linux_agent_api_work_run() {
     if jq -e '(.response? // .plan?) | type == "object"' <<<"${payload}" >/dev/null; then
         response_json="$(jq -c '.response // .plan' <<<"${payload}")"
         if linux_agent_ai_response_is_error "${response_json}"; then
-            jq -cn \
-                --arg status "$(jq -r '.status' <<<"${response_json}")" \
-                --arg error "$(linux_agent_ai_error_text "${response_json}")" \
-                --argjson response "${response_json}" \
-                '{ok:false, status:$status, error:$error, response:$response}'
+            error_code="$(jq -r '.status // "ai_request_failed"' <<<"${response_json}")"
+            if [[ "${error_code}" == "ai_invalid_response" ]]; then
+                final_status="ai_invalid_response"
+            else
+                final_status="ai_failed"
+            fi
+            error_source="$(jq -cn --argjson response "${response_json}" '{response:$response}')"
+            linux_agent_api_execution_error \
+                "${final_status}" \
+                "${error_code}" \
+                "$(linux_agent_ai_error_text "${response_json}")" \
+                "${error_source}"
             return 0
         fi
         if ! linux_agent_validate_work_response "${response_json}"; then
-            jq -cn --argjson response "${response_json}" \
-                '{ok:false, status:"ai_invalid_response", error:"response/plan 不符合 work schema。", response:$response}'
+            error_source="$(jq -cn --argjson response "${response_json}" '{response:$response}')"
+            linux_agent_api_execution_error \
+                "ai_invalid_response" \
+                "ai_invalid_response" \
+                "response/plan 不符合 work schema。" \
+                "${error_source}"
             return 0
         fi
         if jq -e '(.context? | type == "object")' <<<"${payload}" >/dev/null; then
@@ -364,9 +399,18 @@ linux_agent_api_work_run() {
     else
         linux_agent_capture_prepared_work_request prepared "${user_input}" "work"
         if [[ "$(jq -r '.ok // false' <<<"${prepared}")" != "true" ]]; then
-            final_status="$(jq -r '.status // "ai_failed"' <<<"${prepared}")"
+            error_code="$(jq -r '.code // .error_code // .status // "ai_request_failed"' <<<"${prepared}")"
+            case "$(jq -r '.status // empty' <<<"${prepared}")" in
+                blocked) final_status="blocked" ;;
+                ai_invalid_response) final_status="ai_invalid_response" ;;
+                *) final_status="ai_failed" ;;
+            esac
             linux_agent_log_event "finished" "$(jq -cn --arg status "${final_status}" '{status:$status}')"
-            printf '%s\n' "${prepared}"
+            linux_agent_api_execution_error \
+                "${final_status}" \
+                "${error_code}" \
+                "$(jq -r '.error // .message // "AI request failed."' <<<"${prepared}")" \
+                "${prepared}"
             return 0
         fi
         response_json="$(jq -c '.response' <<<"${prepared}")"
@@ -756,7 +800,10 @@ linux_agent_api_dispatch_raw() {
             ;;
         work:run)
             if ! linux_agent_remote_api_key_transmission_allowed; then
-                linux_agent_api_error "secret_transmission_disabled" "Remote runtime 未允许向 AI Provider 传输 API key。"
+                linux_agent_api_execution_error \
+                    "blocked" \
+                    "secret_transmission_disabled" \
+                    "Remote runtime 未允许向 AI Provider 传输 API key。"
             else
                 linux_agent_api_work_run "${payload}"
             fi
@@ -807,14 +854,19 @@ linux_agent_api_normalize_envelope() {
                 schema_version:($schema.schema_version // 1),
                 protocol_version:($schema.protocol_version // "1.0.0")
             }
+            | (
+                has("timeline")
+                and has("approval_card")
+                and has("output_blocks")
+              ) as $is_execution_result
             | if has("timeline") then
                 . + {timeline_semantics:(.timeline_semantics // "step_projection")}
               else . end
             | if .ok == false then
-                (.code // .status // "internal_error") as $code
+                (.code // .error_code // .status // "internal_error") as $code
                 | (.message // .error // $code | tostring) as $message
                 | . + {
-                    status:$code,
+                    status:(if $is_execution_result then (.status // "failed") else $code end),
                     error:$message,
                     code:$code,
                     message:$message,

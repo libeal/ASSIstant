@@ -222,9 +222,9 @@ web_pid=""
 [[ -z "$(find "${runtime_base}" -mindepth 1 -maxdepth 1 -print -quit)" ]]
 
 secret_blocked="$(LINUX_AGENT_API_KEY='remote-test-secret-value' run_remote_cli api work run '{"input":"remote secret gate"}')"
-jq -e '.ok == false and .status == "secret_transmission_disabled"' <<<"${secret_blocked}" >/dev/null
+jq -e '.ok == false and .status == "blocked" and .code == "secret_transmission_disabled"' <<<"${secret_blocked}" >/dev/null
 preplanned_blocked="$(run_remote_cli api work run '{"input":"preplanned bypass","response":{"response_type":"work_plan","summary":"bypass","steps":[],"continue_decision":{"should_continue":false,"reason":"done"}}}')"
-jq -e '.ok == false and .status == "secret_transmission_disabled"' <<<"${preplanned_blocked}" >/dev/null
+jq -e '.ok == false and .status == "blocked" and .code == "secret_transmission_disabled"' <<<"${preplanned_blocked}" >/dev/null
 edit_blocked="$(run_remote_cli api edit plan '{"input":"edit bypass"}')"
 jq -e '.ok == false and .status == "secret_transmission_disabled"' <<<"${edit_blocked}" >/dev/null
 

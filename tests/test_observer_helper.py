@@ -321,6 +321,51 @@ class ObserverHelperProtocolTests(unittest.TestCase):
         finally:
             server.close()
 
+    def test_client_request_rejects_invalid_responses(self):
+        responses = (
+            (b"", "empty response"),
+            (b"not-json", "invalid UTF-8 JSON"),
+            (b"[]", "must be a JSON object"),
+            (b'{"exit_code":true}', "exit_code is invalid"),
+        )
+        for payload, expected in responses:
+            with self.subTest(payload=payload):
+                connection = mock.MagicMock()
+                connection.__enter__.return_value = connection
+                connection.recv.side_effect = [payload, b""]
+                with mock.patch.object(
+                    observer_helper.socket,
+                    "socket",
+                    return_value=connection,
+                ), self.assertRaisesRegex(
+                    observer_helper.HelperRequestError,
+                    expected,
+                ):
+                    observer_helper.client_request("/run/test.sock", {"operation": "status"})
+
+    def test_request_transport_failure_returns_controlled_diagnostic(self):
+        stderr = io.StringIO()
+        with mock.patch.object(
+            sys,
+            "argv",
+            [
+                "observer_helper.py",
+                "request",
+                "--socket",
+                "/run/test.sock",
+                "status",
+            ],
+        ), mock.patch.object(
+            observer_helper,
+            "client_request",
+            side_effect=ConnectionRefusedError("connection refused"),
+        ), contextlib.redirect_stderr(stderr):
+            exit_code = observer_helper.main()
+
+        self.assertEqual(125, exit_code)
+        self.assertIn("observer helper request failed: connection refused", stderr.getvalue())
+        self.assertNotIn("Traceback", stderr.getvalue())
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -60,6 +60,19 @@ class DomainContractTest(unittest.TestCase):
         ):
             self.result(status="observer_required_unavailable")
 
+    def test_ai_failure_keeps_error_code_out_of_lifecycle_status(self):
+        result = self.result(
+            ok=False,
+            status="ai_failed",
+            code="ai_request_failed",
+            error_code="ai_request_failed",
+            error="provider unavailable",
+            timeline=[],
+        )
+        self.assertEqual("ai_failed", result["status"])
+        self.assertEqual("ai_request_failed", result["code"])
+        self.assertEqual("ai_request_failed", result["error_code"])
+
     def test_error_contract_keeps_compatibility_aliases(self):
         error = self.contract.normalize_error(
             {"ok": False, "status": "too_many_jobs", "error": "busy"},

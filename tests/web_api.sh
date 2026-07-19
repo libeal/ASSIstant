@@ -187,7 +187,13 @@ tmp_config="$(mktemp)"
 jq 'del(.api_key) | del(.api_key_file)' "${project_missing}/config/config.json" >"${tmp_config}"
 mv "${tmp_config}" "${project_missing}/config/config.json"
 missing_ai="$(cd "${project_missing}" && bash bin/agent api work run '{"input":"查看cpu占用"}' 2>/dev/null)"
-jq -e '.ok == false and .status == "ai_config_missing"' <<<"${missing_ai}" >/dev/null
+jq -e '.ok == false
+    and .status == "ai_failed"
+    and .code == "ai_config_missing"
+    and .error_code == "ai_config_missing"
+    and (.timeline | type) == "array"
+    and .approval_card == null
+    and (.output_blocks | type) == "array"' <<<"${missing_ai}" >/dev/null
 
 script_review="$(bash "${ROOT_DIR}/bin/agent" api script review '{"ref":"ops-basic/resource-inspect","arguments":{"top_n":1}}')"
 jq -e '.ok == true and .status == "approved" and .review.engine == "ast+rules" and .review.risk_level == "low" and (.output_blocks | length) > 0' <<<"${script_review}" >/dev/null

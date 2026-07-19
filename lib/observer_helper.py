@@ -713,11 +713,28 @@ def client_request(socket_path: str, request: dict[str, object]) -> int:
             response_bytes.extend(chunk)
             if len(response_bytes) > 2 * MAX_STREAM_BYTES + MAX_REQUEST_BYTES:
                 raise RuntimeError("helper response exceeds the client limit")
-    response = json.loads(response_bytes.decode("utf-8"))
-    sys.stdout.write(str(response.get("stdout") or ""))
-    sys.stderr.write(str(response.get("stderr") or ""))
+    if not response_bytes:
+        raise HelperRequestError("helper returned an empty response")
+    try:
+        response = json.loads(response_bytes.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise HelperRequestError("helper returned invalid UTF-8 JSON") from exc
+    if not isinstance(response, dict):
+        raise HelperRequestError("helper response must be a JSON object")
+    stdout = response.get("stdout") or ""
+    stderr = response.get("stderr") or ""
+    if not isinstance(stdout, str) or not isinstance(stderr, str):
+        raise HelperRequestError("helper response streams must be strings")
+    sys.stdout.write(stdout)
+    sys.stderr.write(stderr)
     exit_code = response.get("exit_code", 125)
-    return int(exit_code) if isinstance(exit_code, int) and 0 <= exit_code <= 255 else 125
+    if (
+        isinstance(exit_code, bool)
+        or not isinstance(exit_code, int)
+        or not 0 <= exit_code <= 255
+    ):
+        raise HelperRequestError("helper response exit_code is invalid")
+    return exit_code
 
 
 def main() -> int:
@@ -753,7 +770,11 @@ def main() -> int:
         request["syscall"] = args.syscall
     if args.capability is not None:
         request["capability"] = args.capability
-    return client_request(args.socket, request)
+    try:
+        return client_request(args.socket, request)
+    except Exception as exc:  # Keep helper transport failures out of shell tracebacks.
+        print(f"observer helper request failed: {exc}", file=sys.stderr)
+        return 125
 
 
 if __name__ == "__main__":

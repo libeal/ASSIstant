@@ -244,8 +244,8 @@ jq -e '
 ' <<<"${normalized_error}" >/dev/null
 
 # Explicit structured error fields from an execution result survive both the
-# protocol adapter and the final API normalization. Lifecycle status remains a
-# result enum until the error-envelope compatibility alias is applied.
+# protocol adapter and the final API normalization. Lifecycle status and error
+# code remain separate at the execution_result boundary.
 observer_protocol="$(linux_agent_protocol_envelope_for_single_execution \
     'Observer gate' \
     '{"ok":false,"status":"blocked","error_code":"observer_required_unavailable","exit_code":126,"output":{"raw":"observer unavailable"}}')"
@@ -261,12 +261,31 @@ observer_normalized="$(LINUX_AGENT_REQUEST_ID="observer-contract" \
 jq -e --slurpfile schema "${SCHEMA}" '
     .code as $code
     | .ok == false
-    and .status == "observer_required_unavailable"
+    and .status == "blocked"
     and .code == "observer_required_unavailable"
     and .error_code == "observer_required_unavailable"
     and .request_id == "observer-contract"
     and ($schema[0].error_codes | has($code))
 ' <<<"${observer_normalized}" >/dev/null
+
+ai_failure="$(linux_agent_api_execution_error \
+    "ai_failed" \
+    "ai_request_failed" \
+    "provider unavailable" \
+    '{"response":{"ok":false,"response_type":"error","status":"ai_request_failed"}}')"
+ai_failure_normalized="$(LINUX_AGENT_REQUEST_ID="ai-contract" \
+    linux_agent_api_normalize_envelope <<<"${ai_failure}")"
+jq -e '
+    .ok == false
+    and .status == "ai_failed"
+    and .code == "ai_request_failed"
+    and .error_code == "ai_request_failed"
+    and .request_id == "ai-contract"
+    and .response.status == "ai_request_failed"
+    and (.timeline | type) == "array"
+    and .approval_card == null
+    and (.output_blocks | type) == "array"
+' <<<"${ai_failure_normalized}" >/dev/null
 
 # Dispatch must execute in the current shell so session-wide audit state is
 # still available to the teardown performed by bin/agent.
