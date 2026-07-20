@@ -143,8 +143,11 @@ sudo systemctl enable --now linux-agent-observer-helper.socket linux-agent-web.s
 sudo bash linux-agent-install.sh upgrade --version vX.Y.NEW --require-signature
 sudo bash linux-agent-install.sh rollback
 sudo bash linux-agent-install.sh health
+sudo bash linux-agent-install.sh repair-observer
 sudo bash linux-agent-install.sh status
 ```
+
+如果 Web 控制台报告 `observer_helper_failed` 且错误是 observer socket 权限不足，运行 `repair-observer` 会重新应用当前服务用户对应的 `SocketGroup`，重建 socket inode，并以 Web 服务用户执行 helper 健康检查；它不会切换版本或修改持久配置。
 
 ### Prometheus 指标
 

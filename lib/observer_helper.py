@@ -785,8 +785,9 @@ def main() -> int:
         print(
             "observer helper request failed: "
             f"permission denied for socket {args.socket}: {exc}. "
-            "Verify that the Web service user belongs to the configured "
-            "SocketGroup, then restart linux-agent-observer-helper.socket.",
+            "Run the current linux-agent-install.sh repair-observer command, "
+            "or verify that the Web service user belongs to the configured "
+            "SocketGroup and recreate linux-agent-observer-helper.socket.",
             file=sys.stderr,
         )
         return 125

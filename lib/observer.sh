@@ -876,6 +876,7 @@ linux_agent_observer_log_file_vault_observations() {
             scope:$scope,
             mode:(if $scope == "terminal" then "terminal" elif $scope == "session" then "unknown" else "work" end),
             observed_paths:($events | map(.name) | unique),
+            observed_path_count:([$events[] | .name] | unique | length),
             event_count:($events | length),
             action:(if any($events[]; event_is_modify) then "modify" else "access" end),
             warning:"auditd 观察到文件保险箱路径发生文件事件。"

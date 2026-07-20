@@ -68,6 +68,7 @@ usage() {
   linux-agent-install.sh upgrade --version vX.Y.Z [选项]
   linux-agent-install.sh rollback [选项]
   linux-agent-install.sh health [--prefix <目录>]
+  linux-agent-install.sh repair-observer [--prefix <目录>]
   linux-agent-install.sh status [选项]
   linux-agent-install.sh uninstall [--purge-data] [选项]
 
@@ -174,7 +175,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 case "${COMMAND}" in
-    install | upgrade | rollback | health | status | uninstall) ;;
+    install | upgrade | rollback | health | repair-observer | status | uninstall) ;;
     -h | --help | "")
         usage
         [[ -n "${COMMAND}" ]] && exit 0
@@ -1382,6 +1383,36 @@ do_health() {
     health_request || fail '健康检查失败'
 }
 
+do_repair_observer() {
+    local socket_path="${LINUX_AGENT_OBSERVER_HELPER_SOCKET:-/run/linux-agent/observer.sock}"
+    ensure_prefix existing
+    load_existing_service_identity
+    validate_service_identity
+    [[ "${NO_SYSTEMD}" -eq 0 ]] || fail 'repair-observer 需要 systemd 模式的受管安装'
+    current_version >/dev/null || fail '未检测到当前受管版本，请先执行 install'
+
+    # Re-render the units first so SocketGroup follows the actual Web service
+    # primary group, then recreate the socket inode instead of trusting a
+    # stale socket that survived a manual daemon-reload or an older release.
+    WORK_DIR="$(mktemp -d "${PREFIX}/.install-staging.repair-observer.XXXXXX")"
+    chmod 0700 "${WORK_DIR}"
+    install_systemd_unit
+    systemctl stop linux-agent-web.service
+    systemctl stop linux-agent-observer-helper.service
+    systemctl stop linux-agent-observer-helper.socket
+    [[ "${socket_path}" == /* && "${socket_path}" != *$'\n'* ]] ||
+        fail 'observer helper socket 路径非法'
+    if [[ -L "${socket_path}" || (-e "${socket_path}" && ! -S "${socket_path}") ]]; then
+        fail "拒绝删除非普通 Unix socket: ${socket_path}"
+    fi
+    if [[ -S "${socket_path}" ]]; then
+        rm -f -- "${socket_path}"
+    fi
+    systemctl start linux-agent-observer-helper.socket linux-agent-web.service
+    wait_for_health >/dev/null || fail 'observer socket 修复后健康检查失败'
+    info 'observer helper socket 已重建，Web 用户权限健康检查通过'
+}
+
 do_status() {
     local current="" service_status="not-managed" egress_policy="not-managed" releases='[]'
     local helper_socket_status="not-managed" helper_service_status="not-managed"
@@ -1502,6 +1533,7 @@ case "${COMMAND}" in
     upgrade) do_upgrade ;;
     rollback) do_rollback ;;
     health) do_health ;;
+    repair-observer) do_repair_observer ;;
     status) do_status ;;
     uninstall) do_uninstall ;;
 esac

@@ -34,4 +34,12 @@ sudo bash install.sh --provider-cidr 203.0.113.0/24
 sudo systemctl enable --now linux-agent-observer-helper.socket linux-agent-web.service
 ```
 
+如果 Web 控制台报告 `observer_helper_failed` 且错误是 observer socket 权限不足，先用当前版本安装器重建 unit 和 socket：
+
+```bash
+sudo bash linux-agent-install.sh repair-observer
+```
+
+该操作会重新应用服务用户对应的 `SocketGroup`，停止并重建 `linux-agent-observer-helper.socket`，再以 Web 服务用户执行认证健康检查；不会切换版本或修改持久配置。
+
 启动前应先编辑 `/opt/linux-agent/data/config/config.json` 设置 Provider 和 API key。测试或无 systemd 环境可传 `--skip-dependencies --no-systemd --prefix <目录>`。卸载默认保留 `data/`；确认不再需要配置和审计数据时使用 `uninstall --purge-data`，该选项也会删除安装器创建的服务用户。

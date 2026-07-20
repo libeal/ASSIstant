@@ -415,6 +415,7 @@ class ObserverHelperProtocolTests(unittest.TestCase):
         output = stderr.getvalue()
         self.assertEqual(125, exit_code)
         self.assertIn("permission denied for socket /run/test.sock", output)
+        self.assertIn("repair-observer", output)
         self.assertIn("SocketGroup", output)
         self.assertIn("linux-agent-observer-helper.socket", output)
         self.assertNotIn("Traceback", output)

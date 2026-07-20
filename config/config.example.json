@@ -72,7 +72,7 @@
     "enabled": true,
     "host": "127.0.0.1",
     "port": 8765,
-    "token": "0123",
+    "token": "",
     "job_retention_hours": 24,
     "max_active_jobs": 4,
     "job_timeout_sec": 900,
