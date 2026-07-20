@@ -148,11 +148,23 @@ linux_agent_api_tools_list() {
 
 linux_agent_api_audit_list() {
     local payload="$1"
-    local limit include_runtime query entries item path session_id size mtime count summary haystack
+    local limit normalized_limit max_limit=200 include_runtime query entries item path session_id size mtime count summary haystack
     local segment_path segment_size segment_mtime
     local -a segment_files=()
     limit="$(jq -r '.limit // 50' <<<"${payload}")"
-    [[ "${limit}" =~ ^[0-9]+$ && "${limit}" -gt 0 ]] || limit=50
+    [[ "${limit}" =~ ^[0-9]+$ ]] || limit=50
+    # The Web UI caps this at 200, but the API is also callable directly. Keep
+    # an oversized decimal string from reaching arithmetic or unbounded scans.
+    normalized_limit="$(sed 's/^0*//' <<<"${limit}")"
+    if [[ -z "${normalized_limit}" || "${normalized_limit}" == "0" ]]; then
+        normalized_limit=50
+    fi
+    if ((${#normalized_limit} > ${#max_limit})) ||
+        ((${#normalized_limit} == ${#max_limit} && "${normalized_limit}" > "${max_limit}")); then
+        limit="${max_limit}"
+    else
+        limit="${normalized_limit}"
+    fi
     include_runtime="$(jq -r '.include_runtime // false' <<<"${payload}")"
     query="$(jq -r '.query // .filter // .session_id // empty' <<<"${payload}")"
     entries='[]'
@@ -275,7 +287,8 @@ linux_agent_api_audit_list() {
             '$prior + [$summary]')"
     done < <(find "${LINUX_AGENT_LOG_DIR}" -maxdepth 1 -type f -name '*.jsonl' -printf '%T@\t%p\0' 2>/dev/null | sort -z -nr)
 
-    jq -cn --argjson entries "${entries}" '{ok:true, status:"listed", sessions:$entries}'
+    jq -cn --argjson limit "${limit}" --argjson entries "${entries}" \
+        '{ok:true, status:"listed", limit:$limit, sessions:$entries}'
 }
 
 linux_agent_api_audit_read() {

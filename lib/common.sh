@@ -123,7 +123,18 @@ linux_agent_audit_mode() {
 
     case "${mode}" in
         safe_summary | redacted_verbose)
-            if declare -F linux_agent_audit_boundary_payload_mode >/dev/null 2>&1; then
+            if declare -F linux_agent_audit_boundary_entry_allowed >/dev/null 2>&1; then
+                if linux_agent_audit_boundary_entry_allowed \
+                    "${mode}" '.allowed_to_observe.audit_payload_modes'; then
+                    printf '%s\n' "${mode}"
+                    return 0
+                fi
+                if declare -F linux_agent_audit_boundary_payload_mode >/dev/null 2>&1; then
+                    mode="$(linux_agent_audit_boundary_payload_mode "${mode}")"
+                else
+                    mode="safe_summary"
+                fi
+            elif declare -F linux_agent_audit_boundary_payload_mode >/dev/null 2>&1; then
                 mode="$(linux_agent_audit_boundary_payload_mode "${mode}")"
             fi
             printf '%s\n' "${mode}"
@@ -243,6 +254,54 @@ linux_agent_sanitize_json() {
         ' <<<"${input}"
     else
         linux_agent_sanitize_text "${input}" "${limit}"
+    fi
+}
+
+# Audit verbose mode needs the complete redacted value, while the general
+# sanitizer intentionally caps strings for model prompts and summaries. Keep
+# this separate so changing the audit view does not weaken those other limits.
+linux_agent_redact_json_full() {
+    local input="$1"
+    local redaction
+    redaction="$(linux_agent_redaction_rules_config)"
+
+    if printf '%s' "${input}" | jq -e . >/dev/null 2>&1; then
+        jq -c --argjson redaction "${redaction}" '
+            def sensitive_key:
+                test($redaction.sensitive_key_pattern // "(?i)(api[_-]?key|token|password|passwd|secret|authorization|cookie|credential|private[_-]?key)");
+            def redact_string:
+                reduce ($redaction.rules // [])[] as $rule
+                    (.;
+                     if (($rule.pattern // "") != "") then
+                        gsub($rule.pattern; ($rule.replacement // "[REDACTED]"))
+                     else . end);
+            def redact:
+                if type == "object" then
+                    with_entries(
+                        if (.key | sensitive_key) then
+                            .value = "[REDACTED]"
+                        else
+                            .value |= redact
+                        end
+                    )
+                elif type == "array" then
+                    map(redact)
+                elif type == "string" then
+                    redact_string
+                else
+                    .
+                end;
+            redact
+        ' <<<"${input}"
+    else
+        printf '%s' "${input}" |
+            jq -R -r -s --argjson redaction "${redaction}" '
+                reduce ($redaction.rules // [])[] as $rule
+                    (.;
+                     if (($rule.pattern // "") != "") then
+                        gsub($rule.pattern; ($rule.replacement // "[REDACTED]"))
+                     else . end)
+            '
     fi
 }
 

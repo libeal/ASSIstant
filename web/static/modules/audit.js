@@ -120,11 +120,11 @@ export function auditEventDisplay(event, pretty = (value) => JSON.stringify(valu
     summary = payload.summary_preview || `生成 ${payload.step_count ?? 0} 个步骤`;
     details.push(`步骤数：${payload.step_count ?? 0}`);
   } else if (stage === "step_policy_checked") {
-    const review = payload.review || {};
+    const review = payload.review || payload.detail || {};
     summary = stepName(payload);
     badges.push(review.risk_level || "risk");
     details.push(`审查结果：${review.approved === false ? "阻断" : review.approval_required ? "需要审批" : "通过"}`);
-    details.push(`发现项：${review.finding_count ?? 0}`);
+    details.push(`发现项：${review.finding_count ?? (Array.isArray(review.findings) ? review.findings.length : 0)}`);
   } else if (String(stage).startsWith("step_")) {
     const detail = payload.detail || {};
     summary = stepName(payload);

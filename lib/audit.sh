@@ -649,6 +649,10 @@ linux_agent_audit_boundary_should_log_stage() {
 linux_agent_audit_boundary_payload_mode() {
     local fallback="${1:-safe_summary}"
     local mode
+    if linux_agent_audit_boundary_entry_allowed "${fallback}" '.allowed_to_observe.audit_payload_modes'; then
+        printf '%s\n' "${fallback}"
+        return 0
+    fi
     mode="$(linux_agent_audit_boundary_config | jq -r '.observing.audit_payload_mode // empty' 2>/dev/null || true)"
     if [[ -n "${mode}" ]] && linux_agent_audit_boundary_entry_allowed "${mode}" '.allowed_to_observe.audit_payload_modes'; then
         printf '%s\n' "${mode}"
@@ -990,14 +994,15 @@ linux_agent_audit_payload() {
     local payload="$2"
     local sanitized
 
-    sanitized="$(linux_agent_sanitize_json "${payload}")"
     if [[ "$(linux_agent_audit_mode)" == "redacted_verbose" ]]; then
+        sanitized="$(linux_agent_redact_json_full "${payload}")"
         if printf '%s' "${sanitized}" | jq -e . >/dev/null 2>&1; then
             printf '%s\n' "${sanitized}"
         else
             jq -cn --arg raw "${sanitized}" '{raw_preview:$raw}'
         fi
     else
+        sanitized="$(linux_agent_sanitize_json "${payload}")"
         linux_agent_audit_safe_summary "${stage}" "${sanitized}"
     fi
 }

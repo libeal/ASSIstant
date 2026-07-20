@@ -35,7 +35,7 @@
       "remote_script": false
     }
   },
-  "audit_mode": "safe_summary",
+  "audit_mode": "redacted_verbose",
   "audit_text_limit": 1000,
   "audit": {
     "fsync": true,

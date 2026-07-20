@@ -156,8 +156,16 @@ AGENT_API_RESPONSE_PROFILES = {
     "mcp_list": {"required_fields": {"servers": list}},
     "mcp_validate": {"required_fields": {"validation": dict}},
     "mcp_tools": {"required_fields": {"servers": list, "tools": list}},
-    "audit_list": {"required_fields": {"sessions": list}},
-    "audit_read": {"required_fields": {"events": list}},
+    "audit_list": {"required_fields": {"sessions": list, "limit": int}},
+    "audit_read": {
+        "required_fields": {
+            "session_id": str,
+            "report": str,
+            "integrity": dict,
+            "integrity_ok": bool,
+            "events": list,
+        }
+    },
     "sense": {"required_fields": {"sense": dict}},
     "review": {"required_fields": {"review": dict, "output_blocks": list}},
     "terminal_run": {"execution_result": True},

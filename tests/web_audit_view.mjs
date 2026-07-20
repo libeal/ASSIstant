@@ -127,6 +127,15 @@ assert.match(auditList.children.at(-1).innerHTML, /new_54/);
 
 const report = view.renderAuditReadableReport({ session_id: "large", events: largeTimeline });
 assert.match(report, /422\. -- event_421 - event_421/);
-assert.doesNotMatch(report, /未在预览中展开/);
+assert.match(report, /完整 JSONL 事件:/);
+assert.match(report, /"stage":"event_421"/);
+const brokenReport = view.renderAuditReadableReport({
+  session_id: "broken",
+  events: [],
+  integrity_ok: false,
+  integrity: { ok: false, breaks: [{ line: 2, reason: "hash_mismatch" }] },
+});
+assert.match(brokenReport, /完整性: 失败/);
+assert.match(brokenReport, /2:hash_mismatch/);
 
 console.log("web_audit_view: ok");

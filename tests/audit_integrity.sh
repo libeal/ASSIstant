@@ -209,11 +209,14 @@ printf '%s' '{"timestamp":"t3","session_id":"session_rotated_api","stage":"sessi
 api_list="$(linux_agent_api_audit_list "$(jq -cn --arg query "${api_session}" '{limit:1,query:$query}')")"
 jq -e --arg session_id "${api_session}" '
     .ok == true
+    and .limit == 1
     and (.sessions | length) == 1
     and .sessions[0].session_id == $session_id
     and .sessions[0].event_count == 3
     and .sessions[0].status == "tested"
 ' <<<"${api_list}" >/dev/null
+api_limit="$(linux_agent_api_audit_list '{"limit":999999999999999999999999999999999999}')"
+jq -e '.ok == true and .limit == 200' <<<"${api_limit}" >/dev/null
 api_read="$(linux_agent_api_audit_read "$(jq -cn --arg session_id "${api_session}" '{session_id:$session_id}')")"
 jq -e '
     .ok == true
@@ -223,6 +226,21 @@ jq -e '
 ' <<<"${api_read}" >/dev/null
 show_report="$(linux_agent_show_audit "${api_session}")"
 grep -q 'session_rotated_api' <<<"${show_report}"
+
+# A configured verbose mode must survive the audit-boundary allowlist and keep
+# the complete redacted payload available to the API/UI.
+LINUX_AGENT_CONFIG_JSON="$(jq '.audit_mode="redacted_verbose"' <<<"${LINUX_AGENT_CONFIG_JSON}")"
+unset LINUX_AGENT_AUDIT_CHAIN_ARGS
+linux_agent_start_session "verbose audit test"
+verbose_session_id="${LINUX_AGENT_SESSION_ID}"
+long_payload="$(printf '%1200s' '' | tr ' ' 'x')"
+linux_agent_log_event "received" "$(jq -cn --arg input "${long_payload}" '{mode:"work", input:$input, password:"verbose-secret"}')"
+linux_agent_finish_session "tested"
+verbose_log="${LINUX_AGENT_LOG_DIR}/${verbose_session_id}.jsonl"
+jq -e --arg input "${long_payload}" '
+    select(.stage == "received")
+    | .payload.input == $input and .payload.password == "[REDACTED]"
+' "${verbose_log}" >/dev/null
 grep -q '会话结束' <<<"${show_report}"
 
 # --- Part D: disk-space degrade drops payload but preserves a valid chain ---

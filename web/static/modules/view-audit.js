@@ -250,12 +250,20 @@ export function createAuditView(app, hooks) {
     const events = Array.isArray(data.events) ? data.events : [];
     const restored = data.web_timeline || {};
     const selectedSession = (state.auditSessions || []).find((session) => session.session_id === data.session_id) || {};
+    const integrity = data.integrity && typeof data.integrity === "object" ? data.integrity : {};
+    const integrityKnown = typeof data.integrity_ok === "boolean" || typeof integrity.ok === "boolean";
+    const integrityOk = data.integrity_ok === true && integrity.ok !== false;
+    const integrityBreaks = Array.isArray(integrity.breaks) ? integrity.breaks : [];
     const lines = [
       `Session: ${data.session_id || state.currentAuditSession || "--"}`,
       `来源: ${selectedSession.entrypoint_label || (selectedSession.entrypoint === "web" ? "Web" : "CLI") || "--"}`,
       `模式: ${auditModeLabel(selectedSession.modes || [], selectedSession.mode_label) || "--"}`,
       `状态: ${selectedSession.status || restored.status || data.status || "--"}`,
       `事件数: ${events.length}`,
+      `完整性: ${integrityKnown ? (integrityOk ? "通过" : "失败") : "未校验"}`,
+      ...(integrityKnown && !integrityOk
+        ? [`完整性断点: ${integrityBreaks.length ? integrityBreaks.map((item) => `${item.line || "?"}:${item.reason || "unknown"}`).join(", ") : "未提供"}`]
+        : []),
       `可回放轮次: ${Array.isArray(restored.turns) ? restored.turns.length : 0}`,
       `可回放步骤: ${Array.isArray(restored.timeline) ? restored.timeline.length : 0}`,
       ...(data.timeline_unavailable_reason
@@ -269,6 +277,13 @@ export function createAuditView(app, hooks) {
       lines.push(`${index + 1}. ${auditProtocol.compactAuditTime(auditProtocol.auditEventTime(event))} ${display.title} - ${display.summary || "已记录"}`);
       display.details.forEach((detail) => lines.push(`   ${detail}`));
     });
+    // Keep the human timeline above, but also expose every stored event. The
+    // API has already applied redaction and returned hash-chain validation; rebuilding
+    // only summaries here made payloads disappear from the audit console.
+    if (events.length) {
+      lines.push("", "完整 JSONL 事件:");
+      events.forEach((event) => lines.push(JSON.stringify(event)));
+    }
     return lines.join("\n");
   }
 

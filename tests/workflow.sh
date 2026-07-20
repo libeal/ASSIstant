@@ -141,9 +141,9 @@ done
 jq -e '
     select(
         .stage == "step_policy_checked"
-        and .payload.review.approved == true
-        and .payload.review.risk_level == "low"
-        and .payload.review.finding_count == 0
+        and (.payload.review // .payload.detail).approved == true
+        and (.payload.review // .payload.detail).risk_level == "low"
+        and (((.payload.review // .payload.detail).finding_count // (((.payload.review // .payload.detail).findings // []) | length)) == 0)
     )
 ' "${resource_audit_log}" >/dev/null
 
