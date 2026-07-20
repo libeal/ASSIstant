@@ -1,5 +1,4 @@
 # Optional tools used by selected network, audit, and deep-inspection Skills.
-audit
 bind-utils
 ethtool
 iproute

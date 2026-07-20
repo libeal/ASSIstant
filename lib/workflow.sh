@@ -51,6 +51,7 @@ linux_agent_prepare_work_request() {
         "${context_json}")"
     response_json="$(linux_agent_normalize_model_response "${response_json}")"
     linux_agent_store_thinking_summary "${response_json}" "initial"
+    response_json="$(linux_agent_response_without_thinking "${response_json}")"
 
     if linux_agent_ai_response_is_error "${response_json}"; then
         linux_agent_audit_require_event "ai_failed" "${response_json}" || {

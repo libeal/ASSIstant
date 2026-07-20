@@ -58,8 +58,10 @@ for distro in debian fedora; do
         debian) [[ ! -e "${package_root}/requirements/fedora.txt" ]] ;;
         fedora)
             [[ ! -e "${package_root}/requirements/debian.txt" ]]
+            grep -qx 'audit' "${package_root}/requirements/fedora.txt"
+            grep -qx 'policycoreutils' "${package_root}/requirements/fedora.txt"
             grep -qx 'procps-ng' "${package_root}/requirements/fedora.txt"
-            grep -q 'yum install -y' "${package_root}/INSTALL.md"
+            grep -qx 'util-linux' "${package_root}/requirements/fedora.txt"
             ;;
     esac
 
@@ -80,6 +82,10 @@ for distro in debian fedora; do
 
     jq -e '.schema_version == 1 and .installed == true and .no_systemd == true' \
         "${prefix}/.install-state.json" >/dev/null
+    jq -e --arg user "$(id -un)" '.service_user == $user' \
+        "${prefix}/.install-state.json" >/dev/null
+    [[ "$(stat -c '%u:%g' "${prefix}")" == "$(id -u):$(id -g)" ]]
+    [[ "$(stat -c '%u:%g' "${prefix}/data")" == "$(id -u):$(id -g)" ]]
     missing_checksum_root="${tmp_root}/missing-checksum-${distro}"
     cp -a "${package_root}" "${missing_checksum_root}"
     rm -f -- "${missing_checksum_root}/PACKAGE-SHA256SUMS"
@@ -91,6 +97,49 @@ for distro in debian fedora; do
     fi
     grep -q '缺少 PACKAGE-SHA256SUMS' "${tmp_root}/missing-checksum.stderr"
 done
+
+fake_kylin_bin="${tmp_root}/fake-kylin-bin"
+fake_kylin_os_release="${tmp_root}/kylin-os-release"
+fake_kylin_os_release_target="${tmp_root}/kylin-os-release.real"
+fake_dnf_log="${tmp_root}/dnf.log"
+mkdir -p "${fake_kylin_bin}"
+cat >"${fake_kylin_bin}/dnf" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\n' "$*" >>"${FAKE_DNF_LOG}"
+SH
+cat >"${fake_kylin_bin}/sudo" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+exec "$@"
+SH
+chmod 0755 "${fake_kylin_bin}/dnf" "${fake_kylin_bin}/sudo"
+cat >"${fake_kylin_os_release_target}" <<'EOF'
+NAME="Kylin Linux Advanced Server"
+ID=kylin
+ID_LIKE="rhel fedora"
+VERSION_ID=V11
+EOF
+ln -s "$(basename -- "${fake_kylin_os_release_target}")" "${fake_kylin_os_release}"
+
+fedora_package_root="${tmp_root}/extract-fedora/linux-agent-v0.0.0-test-fedora"
+PATH="${fake_kylin_bin}:${PATH}" \
+    FAKE_DNF_LOG="${fake_dnf_log}" \
+    LINUX_AGENT_OS_RELEASE_PATH="${fake_kylin_os_release}" \
+    bash "${fedora_package_root}/install.sh" --no-systemd \
+    --prefix "${tmp_root}/kylin-dnf-prefix" >/dev/null
+grep -q '^install -y .*audit.*policycoreutils' "${fake_dnf_log}"
+
+debian_package_root="${tmp_root}/extract-debian/linux-agent-v0.0.0-test-debian"
+if PATH="${fake_kylin_bin}:${PATH}" \
+    LINUX_AGENT_OS_RELEASE_PATH="${fake_kylin_os_release}" \
+    bash "${debian_package_root}/install.sh" --no-systemd \
+    --prefix "${tmp_root}/wrong-package-prefix" \
+    >"${tmp_root}/wrong-package.stdout" 2>"${tmp_root}/wrong-package.stderr"; then
+    printf 'Debian package unexpectedly accepted a Kylin RPM host\n' >&2
+    exit 1
+fi
+grep -q '安装包与主机不匹配' "${tmp_root}/wrong-package.stderr"
 
 unmanaged_prefix="${tmp_root}/unmanaged"
 mkdir -p "${unmanaged_prefix}/data"

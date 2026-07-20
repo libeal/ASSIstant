@@ -992,7 +992,14 @@ linux_agent_audit_safe_summary() {
 linux_agent_audit_payload() {
     local stage="$1"
     local payload="$2"
-    local sanitized
+    local sanitized filtered
+
+    # Thinking summaries belong only in the explicitly enabled, owner-only
+    # thinking trace. Keep them out of both compact and verbose audit streams,
+    # including when they are nested in resume state or execution results.
+    if filtered="$(jq -c 'del(.. | .thinking_summary?)' <<<"${payload}" 2>/dev/null)"; then
+        payload="${filtered}"
+    fi
 
     if [[ "$(linux_agent_audit_mode)" == "redacted_verbose" ]]; then
         sanitized="$(linux_agent_redact_json_full "${payload}")"

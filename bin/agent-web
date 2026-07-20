@@ -32,6 +32,7 @@ generate_token() {
 
 require_command jq
 require_command python3
+linux_agent_require_python_runtime
 linux_agent_init_env "${ROOT_DIR}"
 linux_agent_load_config
 
@@ -56,6 +57,9 @@ cancel_grace="$(config_get '.web.cancel_grace_sec' '2')"
 [[ -n "${host}" ]] || host="127.0.0.1"
 if [[ "${LINUX_AGENT_REMOTE_MODE:-0}" == "1" ]]; then
     host="127.0.0.1"
+    if [[ -n "${LINUX_AGENT_REMOTE_WEB_PORT:-}" ]]; then
+        port="${LINUX_AGENT_REMOTE_WEB_PORT}"
+    fi
 fi
 if [[ ! "${port}" =~ ^[0-9]+$ || "${port}" -le 0 || "${port}" -gt 65535 ]]; then
     printf '[错误] web.port 必须是 1-65535 的整数。\n' >&2

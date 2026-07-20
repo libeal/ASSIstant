@@ -24,6 +24,7 @@ trap cleanup EXIT
 
 release_dir="${tmp_root}/release"
 runtime_base="${tmp_root}/runtime"
+web_port="$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1]); s.close()')"
 mkdir -p "${runtime_base}"
 SOURCE_DATE_EPOCH=0 bash "${ROOT_DIR}/scripts/build-remote-release.sh" v0.0.0-test "${release_dir}" >/dev/null
 
@@ -116,22 +117,37 @@ fi
 
 web_stdout="${tmp_root}/remote-web.stdout"
 web_stderr="${tmp_root}/remote-web.stderr"
+
+remote_web_token() {
+    local config_file="" token="" token_file=""
+    config_file="$(find "${runtime_base}" -maxdepth 5 -type f \
+        -path '*/linux-agent-remote.*/agent/config/config.json' -print -quit 2>/dev/null || true)"
+    if [[ -n "${config_file}" ]]; then
+        token="$(jq -r '.web.token // empty' "${config_file}" 2>/dev/null || true)"
+        if [[ -n "${token}" ]]; then
+            printf '%s\n' "${token}"
+            return 0
+        fi
+    fi
+    token_file="$(find "${runtime_base}" -maxdepth 5 -type f \
+        -path '*/linux-agent-remote.*/agent/tmp/web/auth-token' -print -quit 2>/dev/null || true)"
+    if [[ -n "${token_file}" ]]; then
+        printf '%s\n' "$(<"${token_file}")"
+    fi
+}
+
 curl -fsSL "file://${release_dir}/linux-agent-web.sh" |
     XDG_RUNTIME_DIR="${runtime_base}" \
+        LINUX_AGENT_REMOTE_WEB_PORT="${web_port}" \
         LINUX_AGENT_ALLOW_INSECURE_TEST_URL=1 \
         LINUX_AGENT_RELEASE_BASE_URL="file://${release_dir}" \
         bash >"${web_stdout}" 2>"${web_stderr}" &
 web_pid="$!"
 web_token=""
 for _ in $(seq 1 100); do
-    token_file="$(find "${runtime_base}" -maxdepth 5 -type f \
-        -path '*/linux-agent-remote.*/agent/tmp/web/auth-token' -print -quit 2>/dev/null || true)"
-    web_token=""
-    if [[ -n "${token_file}" ]]; then
-        web_token="$(<"${token_file}")"
-    fi
+    web_token="$(remote_web_token)"
     if [[ -n "${web_token}" ]] && curl -fsS -H "Authorization: Bearer ${web_token}" \
-        http://127.0.0.1:8765/api/health |
+        "http://127.0.0.1:${web_port}/api/health" |
         jq -e '.ok == true and .remote.enabled == true and .remote.release_version == "v0.0.0-test"' >/dev/null; then
         break
     fi
@@ -146,28 +162,28 @@ if grep -Fq -- "${web_token}" "${web_stdout}" "${web_stderr}"; then
     printf 'remote Web token was echoed to stdout/stderr\n' >&2
     exit 1
 fi
-tools_json="$(curl -fsS -H "Authorization: Bearer ${web_token}" http://127.0.0.1:8765/api/tools)"
+tools_json="$(curl -fsS -H "Authorization: Bearer ${web_token}" "http://127.0.0.1:${web_port}/api/tools")"
 jq -e '[.scripts[].materialization] | all(. == "available")' <<<"${tools_json}" >/dev/null
 materialize_one="${tmp_root}/materialize-one.json"
 materialize_two="${tmp_root}/materialize-two.json"
 curl -fsS -X POST -H "Authorization: Bearer ${web_token}" -H 'Content-Type: application/json' \
-    -d '{"skill":"os-deep-inspect"}' http://127.0.0.1:8765/api/skills/materialize >"${materialize_one}" &
+    -d '{"skill":"os-deep-inspect"}' "http://127.0.0.1:${web_port}/api/skills/materialize" >"${materialize_one}" &
 materialize_pid_one="$!"
 curl -fsS -X POST -H "Authorization: Bearer ${web_token}" -H 'Content-Type: application/json' \
-    -d '{"skill":"os-deep-inspect"}' http://127.0.0.1:8765/api/skills/materialize >"${materialize_two}" &
+    -d '{"skill":"os-deep-inspect"}' "http://127.0.0.1:${web_port}/api/skills/materialize" >"${materialize_two}" &
 materialize_pid_two="$!"
 wait "${materialize_pid_one}"
 wait "${materialize_pid_two}"
 jq -e '.ok == true and .status == "skill_materialized"' "${materialize_one}" >/dev/null
 jq -e '.ok == true and .status == "skill_materialized"' "${materialize_two}" >/dev/null
-tools_after_materialize="$(curl -fsS -H "Authorization: Bearer ${web_token}" http://127.0.0.1:8765/api/tools)"
+tools_after_materialize="$(curl -fsS -H "Authorization: Bearer ${web_token}" "http://127.0.0.1:${web_port}/api/tools")"
 jq -e '
     ([.scripts[] | select(.skill == "os-deep-inspect") | .materialization] | all(. == "ready"))
     and ([.scripts[] | select(.skill != "os-deep-inspect") | .materialization] | all(. == "available"))
 ' <<<"${tools_after_materialize}" >/dev/null
 web_backup="${tmp_root}/remote-web-backup.tar.gz"
 curl -fsS -H "Authorization: Bearer ${web_token}" -o "${web_backup}" \
-    http://127.0.0.1:8765/api/runtime/backup
+    "http://127.0.0.1:${web_port}/api/runtime/backup"
 tar -tzf "${web_backup}" >/dev/null
 web_backup_extract="${tmp_root}/remote-web-backup"
 mkdir -p "${web_backup_extract}"
@@ -179,7 +195,7 @@ fi
 grep -R -Eq -- '"stage":"remote_bootstrap_verified"' "${web_backup_extract}/logs"
 grep -R -Eq -- '"stage":"skill_materialized"' "${web_backup_extract}/logs"
 curl -fsS -X POST -H "Authorization: Bearer ${web_token}" -H 'Content-Type: application/json' \
-    -d '{}' http://127.0.0.1:8765/api/server/shutdown >/dev/null
+    -d '{}' "http://127.0.0.1:${web_port}/api/server/shutdown" >/dev/null
 wait "${web_pid}"
 web_pid=""
 [[ -z "$(find "${runtime_base}" -mindepth 1 -maxdepth 1 -print -quit)" ]]
@@ -189,20 +205,16 @@ signal_stdout="${tmp_root}/remote-web-signal.stdout"
 signal_stderr="${tmp_root}/remote-web-signal.stderr"
 curl -fsSL "file://${release_dir}/linux-agent-web.sh" |
     XDG_RUNTIME_DIR="${runtime_base}" \
+        LINUX_AGENT_REMOTE_WEB_PORT="${web_port}" \
         LINUX_AGENT_ALLOW_INSECURE_TEST_URL=1 \
         LINUX_AGENT_RELEASE_BASE_URL="file://${release_dir}" \
         bash >"${signal_stdout}" 2>"${signal_stderr}" &
 web_pid="$!"
 signal_token=""
 for _ in $(seq 1 100); do
-    token_file="$(find "${runtime_base}" -maxdepth 5 -type f \
-        -path '*/linux-agent-remote.*/agent/tmp/web/auth-token' -print -quit 2>/dev/null || true)"
-    signal_token=""
-    if [[ -n "${token_file}" ]]; then
-        signal_token="$(<"${token_file}")"
-    fi
+    signal_token="$(remote_web_token)"
     if [[ -n "${signal_token}" ]] && curl -fsS -H "Authorization: Bearer ${signal_token}" \
-        http://127.0.0.1:8765/api/health >/dev/null; then
+        "http://127.0.0.1:${web_port}/api/health" >/dev/null; then
         break
     fi
     sleep 0.1

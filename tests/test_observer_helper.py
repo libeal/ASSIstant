@@ -322,6 +322,22 @@ class ObserverHelperProtocolTests(unittest.TestCase):
         finally:
             server.close()
 
+    def test_peer_credential_failure_returns_structured_error(self):
+        connection = mock.MagicMock()
+        with mock.patch.object(
+            observer_helper,
+            "_peer_credentials",
+            side_effect=OSError("peer credentials unavailable"),
+        ), contextlib.redirect_stderr(io.StringIO()):
+            observer_helper.handle_connection(connection)
+
+        response = json.loads(
+            connection.sendall.call_args.args[0].decode("utf-8")
+        )
+        self.assertEqual(response["status"], "helper_failed")
+        self.assertEqual(response["exit_code"], 125)
+        self.assertIn("peer credentials unavailable", response["stderr"])
+
     def test_ping_proves_socket_transport_without_running_auditctl(self):
         connection = mock.MagicMock()
         connection.recv.return_value = b'{"operation":"ping"}\n'
@@ -371,27 +387,35 @@ class ObserverHelperProtocolTests(unittest.TestCase):
                     observer_helper.client_request("/run/test.sock", {"operation": "status"})
 
     def test_request_transport_failure_returns_controlled_diagnostic(self):
-        stderr = io.StringIO()
-        with mock.patch.object(
-            sys,
-            "argv",
-            [
-                "observer_helper.py",
-                "request",
-                "--socket",
-                "/run/test.sock",
-                "status",
-            ],
-        ), mock.patch.object(
-            observer_helper,
-            "client_request",
-            side_effect=ConnectionRefusedError("connection refused"),
-        ), contextlib.redirect_stderr(stderr):
-            exit_code = observer_helper.main()
+        failures = (
+            ConnectionRefusedError("connection refused"),
+            ConnectionResetError("connection reset by peer"),
+        )
+        for failure in failures:
+            with self.subTest(failure=failure):
+                stderr = io.StringIO()
+                with mock.patch.object(
+                    sys,
+                    "argv",
+                    [
+                        "observer_helper.py",
+                        "request",
+                        "--socket",
+                        "/run/test.sock",
+                        "status",
+                    ],
+                ), mock.patch.object(
+                    observer_helper,
+                    "client_request",
+                    side_effect=failure,
+                ), contextlib.redirect_stderr(stderr):
+                    exit_code = observer_helper.main()
 
-        self.assertEqual(125, exit_code)
-        self.assertIn("observer helper request failed: connection refused", stderr.getvalue())
-        self.assertNotIn("Traceback", stderr.getvalue())
+                self.assertEqual(125, exit_code)
+                self.assertIn(
+                    f"observer helper request failed: {failure}", stderr.getvalue()
+                )
+                self.assertNotIn("Traceback", stderr.getvalue())
 
     def test_request_permission_failure_explains_socket_group_repair(self):
         stderr = io.StringIO()

@@ -9,6 +9,7 @@ ROOT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 # 以便 Web 和未来 remote bootstrap 复用同一套执行链路。
 # shellcheck source=../lib/common.sh
 source "${ROOT_DIR}/lib/common.sh"
+linux_agent_require_python_runtime
 # shellcheck source=../lib/config.sh
 source "${ROOT_DIR}/lib/config.sh"
 # shellcheck source=../lib/audit.sh

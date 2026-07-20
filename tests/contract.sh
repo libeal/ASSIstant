@@ -18,6 +18,7 @@ source "${ROOT_DIR}/lib/protocol.sh"
 # shellcheck source=../lib/api.sh
 source "${ROOT_DIR}/lib/api.sh"
 
+jq -e '.web.token == "0123"' "${ROOT_DIR}/config/config.example.json" >/dev/null
 linux_agent_init_env "${ROOT_DIR}"
 
 linux_agent_config_validate_web_metrics '{}'

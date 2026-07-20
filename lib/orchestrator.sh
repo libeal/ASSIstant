@@ -63,7 +63,7 @@ linux_agent_add_agent_loop_context() {
 
 linux_agent_response_without_thinking() {
     local response_json="$1"
-    jq -c 'del(.thinking_summary)' <<<"${response_json}"
+    jq -c 'del(.. | .thinking_summary?)' <<<"${response_json}"
 }
 
 linux_agent_thinking_trace_root() {
@@ -223,6 +223,7 @@ linux_agent_request_agent_reflection() {
     response_json="$(linux_agent_call_ai_with_context "${user_input}" "${reflection_context}" "work_reflect" "${observation_json}")"
     response_json="$(linux_agent_normalize_model_response "${response_json}")"
     linux_agent_store_thinking_summary "${response_json}" "${iteration}"
+    response_json="$(linux_agent_response_without_thinking "${response_json}")"
 
     if linux_agent_ai_response_is_error "${response_json}"; then
         linux_agent_print_warn "$(linux_agent_ai_error_text "${response_json}")"

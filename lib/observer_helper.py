@@ -62,7 +62,7 @@ ALLOWED_SYSCALLS = frozenset(
     }
 )
 TOOL_PATHS = {
-    "auditctl": ("/sbin/auditctl", "/usr/sbin/auditctl"),
+    "auditctl": ("/sbin/auditctl", "/usr/sbin/auditctl", "/usr/bin/auditctl"),
     "ausearch": ("/sbin/ausearch", "/usr/sbin/ausearch", "/usr/bin/ausearch"),
 }
 _CAPABILITY_LOCK = threading.Lock()
@@ -578,11 +578,12 @@ def _receive_request(connection: socket.socket) -> object:
 
 
 def handle_connection(connection: socket.socket) -> None:
-    peer_pid, peer_uid, peer_gid = _peer_credentials(connection)
+    peer_pid = peer_uid = peer_gid = -1
     operation = ""
     request = None
     authorization = None
     try:
+        peer_pid, peer_uid, peer_gid = _peer_credentials(connection)
         request = _receive_request(connection)
         operation = str(request.get("operation") or "") if isinstance(request, dict) else ""
         authorization = authorize_request(

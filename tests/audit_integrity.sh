@@ -235,11 +235,18 @@ linux_agent_start_session "verbose audit test"
 verbose_session_id="${LINUX_AGENT_SESSION_ID}"
 long_payload="$(printf '%1200s' '' | tr ' ' 'x')"
 linux_agent_log_event "received" "$(jq -cn --arg input "${long_payload}" '{mode:"work", input:$input, password:"verbose-secret"}')"
+linux_agent_log_event "executed" '{"status":"executed","resume_state":{"thinking_summary":"private-thinking","next_step_index":1}}'
 linux_agent_finish_session "tested"
 verbose_log="${LINUX_AGENT_LOG_DIR}/${verbose_session_id}.jsonl"
 jq -e --arg input "${long_payload}" '
     select(.stage == "received")
     | .payload.input == $input and .payload.password == "[REDACTED]"
+' "${verbose_log}" >/dev/null
+! grep -q 'private-thinking' "${verbose_log}"
+jq -e '
+    select(.stage == "executed")
+    | .payload.resume_state.next_step_index == 1
+        and (.payload.resume_state | has("thinking_summary") | not)
 ' "${verbose_log}" >/dev/null
 grep -q '会话结束' <<<"${show_report}"
 

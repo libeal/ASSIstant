@@ -13,7 +13,7 @@ LINUX_AGENT_TMP_DIR=""
 # Other sourced modules consume the initialized path globals.
 # shellcheck disable=SC2034
 linux_agent_init_env() {
-    local root_dir="$1"
+    local root_dir="$1" runtime_dir runtime_meta runtime_label current_user selinux_status
     local resolved_log_dir resolved_root releases_dir install_prefix expected_log_dir
     LINUX_AGENT_ROOT="${root_dir}"
     LINUX_AGENT_LOG_DIR="${root_dir}/logs"
@@ -23,13 +23,29 @@ linux_agent_init_env() {
     LINUX_AGENT_TMP_ROOT="${root_dir}/tmp"
     LINUX_AGENT_TMP_DIR="${LINUX_AGENT_TMP_ROOT}"
 
-    mkdir -p \
+    if ! mkdir -p \
         "${LINUX_AGENT_LOG_DIR}" \
         "${LINUX_AGENT_SKILLS_DIR}" \
         "${LINUX_AGENT_MCP_DIR}" \
         "${LINUX_AGENT_TMP_ROOT}" \
-        "${root_dir}/config"
-
+        "${root_dir}/config"; then
+        linux_agent_print_error "无法创建运行目录；检查 ${root_dir} 及 config/logs/tmp 的所有权和权限。"
+        return 1
+    fi
+    current_user="$(id -un 2>/dev/null || printf unknown)"
+    for runtime_dir in "${root_dir}/config" "${LINUX_AGENT_LOG_DIR}" "${LINUX_AGENT_TMP_ROOT}"; do
+        if [[ ! -d "${runtime_dir}" || ! -w "${runtime_dir}" || ! -x "${runtime_dir}" ]]; then
+            runtime_meta="$(stat -c '%U:%G %a' "${runtime_dir}" 2>/dev/null || printf unknown)"
+            selinux_status="$(getenforce 2>/dev/null || true)"
+            if [[ -n "${selinux_status}" && "${selinux_status}" != "Disabled" ]]; then
+                runtime_label="$(ls -Zd "${runtime_dir}" 2>/dev/null | awk '{print $1}' || true)"
+                [[ -n "${runtime_label}" ]] && runtime_meta+=" SELinux=${runtime_label}(${selinux_status})"
+            fi
+            linux_agent_print_error \
+                "运行目录不可写: ${runtime_dir}（当前用户 ${current_user}，目录 ${runtime_meta}）。源码/无 systemd 运行应归属当前用户；受管安装应归属 Web 服务用户。"
+            return 1
+        fi
+    done
     # Production installs intentionally expose releases/<version>/logs as a
     # root-owned symlink to the persistent data directory. Resolve that trusted
     # directory once so audit_chain.py can retain O_NOFOLLOW on log/lock files.
@@ -103,6 +119,17 @@ linux_agent_require_command() {
     local name="$1"
     if ! command -v "${name}" >/dev/null 2>&1; then
         linux_agent_print_error "缺少依赖命令: ${name}"
+        return 1
+    fi
+}
+
+linux_agent_require_python_runtime() {
+    local current_version
+
+    linux_agent_require_command python3 || return 1
+    if ! python3 -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 10) else 1)'; then
+        current_version="$(python3 -V 2>&1 || printf unknown)"
+        linux_agent_print_error "Python 版本过低: ${current_version}；需要 Python 3.10+"
         return 1
     fi
 }

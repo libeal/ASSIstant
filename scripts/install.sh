@@ -47,6 +47,10 @@ INSTALL_STATE_EXISTED=0
 INSTALL_STATE_SERVICE_USER=""
 INSTALL_STATE_SERVICE_USER_CREATED=0
 INSTALL_STATE_NO_SYSTEMD=0
+OBSERVER_STATE_CAPTURED=0
+OBSERVER_STATE_EXISTED=0
+OBSERVER_STATE_PATH=""
+OBSERVER_STATE_BACKUP_PATH=""
 
 fail() {
     printf '[install:error] %s\n' "$*" >&2
@@ -59,6 +63,22 @@ warn() {
 
 info() {
     printf '[install] %s\n' "$*" >&2
+}
+
+validate_runtime_compatibility() {
+    local curl_help
+    if ((BASH_VERSINFO[0] < 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] < 3))); then
+        fail "Bash 版本过低: ${BASH_VERSION}；需要 Bash 4.3+"
+    fi
+    python3 -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 10) else 1)' ||
+        fail "Python 版本过低: $(python3 -V 2>&1)；需要 Python 3.10+"
+    stat -c '%a' / >/dev/null 2>&1 || fail '当前 stat 不支持 GNU -c 选项'
+    find / -maxdepth 0 -printf '' >/dev/null 2>&1 || fail '当前 find 不支持 GNU -printf 选项'
+    tar --help 2>&1 | grep -q -- '--sort' || fail '当前 tar 不支持 GNU --sort 选项'
+    date --iso-8601=seconds >/dev/null 2>&1 || fail '当前 date 不支持 GNU --iso-8601 选项'
+    curl_help="$(curl --help all 2>/dev/null || curl --help 2>/dev/null || true)"
+    grep -q -- '--proto ' <<<"${curl_help}" || fail '当前 curl 不支持 --proto 安全选项'
+    grep -q -- '--max-filesize ' <<<"${curl_help}" || fail '当前 curl 不支持 --max-filesize 选项'
 }
 
 usage() {
@@ -206,9 +226,11 @@ if [[ "${NO_SYSTEMD}" -eq 0 && "${COMMAND}" != "health" && "${COMMAND}" != "stat
     [[ "${EUID}" -eq 0 ]] || fail '操作 systemd 需要 root；测试或容器环境请使用 --no-systemd'
 fi
 
-for command_name in bash curl python3 jq sha256sum stat mktemp readlink cp mv ln mkdir chmod find sort awk; do
+for command_name in bash curl python3 jq sha256sum stat mktemp readlink cp mv ln mkdir chmod \
+    find sort awk tar gzip sed grep date id chown dirname basename seq; do
     command -v "${command_name}" >/dev/null 2>&1 || fail "缺少依赖命令: ${command_name}"
 done
+validate_runtime_compatibility
 
 if [[ "${NO_SYSTEMD}" -eq 1 && "${EGRESS_MODE}" != "preserve" ]]; then
     fail 'Provider 出站过滤选项仅适用于 systemd 模式'
@@ -322,7 +344,13 @@ read_install_state() {
 validate_service_identity() {
     local uid
     [[ "${SERVICE_USER}" =~ ^[a-z_][a-z0-9_-]*[$]?$ ]] || fail '--service-user 格式非法'
-    [[ "${NO_SYSTEMD}" -eq 0 ]] || return 0
+    if [[ "${NO_SYSTEMD}" -eq 1 ]]; then
+        if [[ "${SERVICE_USER_EXPLICIT}" -eq 0 && -z "${INSTALL_STATE_SERVICE_USER}" ]]; then
+            return 0
+        fi
+        id "${SERVICE_USER}" >/dev/null 2>&1 || fail "无 systemd 运行用户不存在: ${SERVICE_USER}"
+        return 0
+    fi
     if [[ "${SERVICE_USER}" == "root" && "${LINUX_AGENT_ALLOW_ROOT_SERVICE_USER_FOR_TESTS:-0}" != "1" ]]; then
         fail 'systemd 服务必须使用非 root 用户'
     fi
@@ -369,12 +397,9 @@ load_existing_service_identity() {
 
 write_install_state() {
     local installed="$1"
-    local state_path state_tmp service_user=""
+    local state_path state_tmp service_user="${SERVICE_USER}"
     state_path="$(install_state_path)"
     state_tmp="$(mktemp "${PREFIX}/.install-state.XXXXXX")"
-    if [[ "${NO_SYSTEMD}" -eq 0 ]]; then
-        service_user="${SERVICE_USER}"
-    fi
     jq -S -n \
         --arg prefix "${PREFIX}" \
         --arg service_user "${service_user}" \
@@ -418,6 +443,10 @@ begin_transaction() {
     SYSTEMD_HELPER_SOCKET_WAS_ACTIVE=0
     INSTALL_STATE_CAPTURED=0
     INSTALL_STATE_EXISTED=0
+    OBSERVER_STATE_CAPTURED=0
+    OBSERVER_STATE_EXISTED=0
+    OBSERVER_STATE_PATH=""
+    OBSERVER_STATE_BACKUP_PATH=""
     SERVICE_USER_CREATED_THIS_RUN=0
     TRANSACTION_BACKUP_DIR="$(mktemp -d "${PREFIX}/.install-rollback.XXXXXX")"
     chmod 0700 "${TRANSACTION_BACKUP_DIR}"
@@ -588,6 +617,7 @@ rollback_transaction() {
 
     restore_persistent_config || warn '无法完整恢复持久配置'
     restore_install_state || warn '无法完整恢复安装状态'
+    restore_observer_helper_state || warn '无法恢复 observer helper capability 状态'
     restore_systemd_state || warn '无法完整恢复 systemd unit 状态'
 
     if [[ "${TRANSACTION_MODE}" == "install" && "${SERVICE_USER_CREATED_THIS_RUN}" -eq 1 &&
@@ -996,7 +1026,21 @@ prepare_release() {
 
 ensure_service_identity() {
     local uid
-    [[ "${NO_SYSTEMD}" -eq 0 ]] || return 0
+    if [[ "${NO_SYSTEMD}" -eq 1 ]]; then
+        if [[ -z "${INSTALL_STATE_SERVICE_USER}" && "${SERVICE_USER_EXPLICIT}" -eq 0 ]]; then
+            if [[ "${EUID}" -eq 0 && "${SUDO_USER:-}" != "root" &&
+                "${SUDO_USER:-}" =~ ^[a-z_][a-z0-9_-]*[$]?$ ]] &&
+                id "${SUDO_USER}" >/dev/null 2>&1; then
+                SERVICE_USER="${SUDO_USER}"
+            else
+                SERVICE_USER="$(id -un)" || fail '无法确定无 systemd 运行用户'
+            fi
+        fi
+        validate_service_identity
+        SERVICE_GROUP="$(id -gn "${SERVICE_USER}")" || fail "无法确定运行用户主组: ${SERVICE_USER}"
+        [[ -n "${SERVICE_GROUP}" ]] || fail "无法确定运行用户主组: ${SERVICE_USER}"
+        return 0
+    fi
     command -v chown >/dev/null 2>&1 || fail '缺少 chown，无法设置服务数据所有权'
     validate_service_identity
     if ! id "${SERVICE_USER}" >/dev/null 2>&1; then
@@ -1012,6 +1056,44 @@ ensure_service_identity() {
     [[ -n "${SERVICE_GROUP}" ]] || fail "无法确定服务用户主组: ${SERVICE_USER}"
     chown -R "${SERVICE_USER}:${SERVICE_GROUP}" "${PREFIX}/data"
     chown -R root:root "${PREFIX}/releases"
+}
+
+finalize_no_systemd_ownership() {
+    local expected_uid expected_gid path
+    [[ "${NO_SYSTEMD}" -eq 1 && "${EUID}" -eq 0 ]] || return 0
+    if [[ -n "${WORK_DIR}" && -d "${WORK_DIR}" ]]; then
+        case "${WORK_DIR}" in
+            "${PREFIX}"/.install-staging.*) rm -rf -- "${WORK_DIR}" ;;
+            *) fail "拒绝清理非预期 staging 目录: ${WORK_DIR}" ;;
+        esac
+        WORK_DIR=""
+    fi
+    command -v chown >/dev/null 2>&1 || fail '缺少 chown，无法设置无 systemd 安装所有权'
+    validate_service_identity
+    SERVICE_GROUP="$(id -gn "${SERVICE_USER}")" || fail "无法确定运行用户主组: ${SERVICE_USER}"
+    chown "${SERVICE_USER}:${SERVICE_GROUP}" "${PREFIX}" ||
+        fail "无法将无 systemd 安装归属到运行用户: ${SERVICE_USER}"
+    chown -R "${SERVICE_USER}:${SERVICE_GROUP}" "${PREFIX}/data" ||
+        fail "无法将无 systemd 安装归属到运行用户: ${SERVICE_USER}"
+    if [[ -d "${PREFIX}/releases" && ! -L "${PREFIX}/releases" ]]; then
+        chown -R "${SERVICE_USER}:${SERVICE_GROUP}" "${PREFIX}/releases" ||
+            fail "无法将无 systemd 发布目录归属到运行用户: ${SERVICE_USER}"
+    fi
+    chown "${SERVICE_USER}:${SERVICE_GROUP}" "$(install_state_path)" ||
+        fail "无法设置无 systemd 安装状态所有权: $(install_state_path)"
+    if [[ -L "${PREFIX}/current" ]]; then
+        chown -h "${SERVICE_USER}:${SERVICE_GROUP}" "${PREFIX}/current" ||
+            fail '无法设置无 systemd current 链接所有权'
+    fi
+    expected_uid="$(id -u "${SERVICE_USER}")"
+    expected_gid="$(id -g "${SERVICE_USER}")"
+    for path in "${PREFIX}" "${PREFIX}/data" "${PREFIX}/data/config" \
+        "${PREFIX}/data/logs" "${PREFIX}/data/tmp" "$(install_state_path)"; do
+        [[ -e "${path}" && ! -L "${path}" ]] || fail "无 systemd 运行路径缺失或类型非法: ${path}"
+        [[ "$(stat -c '%u' "${path}")" == "${expected_uid}" &&
+        "$(stat -c '%g' "${path}")" == "${expected_gid}" ]] ||
+            fail "无 systemd 运行路径所有权不匹配 ${SERVICE_USER}:${SERVICE_GROUP}: ${path}"
+    done
 }
 
 install_provider_egress_policy() {
@@ -1056,6 +1138,77 @@ install_provider_egress_policy() {
     fi
     chmod 0644 "${target_tmp}"
     mv -f -- "${target_tmp}" "${SYSTEMD_EGRESS_DROPIN_PATH}"
+}
+
+restore_selinux_paths() {
+    local status path
+    local -a existing_paths=()
+    command -v getenforce >/dev/null 2>&1 || return 0
+    status="$(getenforce 2>/dev/null || true)"
+    [[ "${status}" != "Disabled" && -n "${status}" ]] || return 0
+    for path in "$@"; do
+        [[ -e "${path}" || -L "${path}" ]] && existing_paths+=("${path}")
+    done
+    [[ "${#existing_paths[@]}" -gt 0 ]] || return 0
+    if ! command -v restorecon >/dev/null 2>&1; then
+        if [[ "${status}" == "Enforcing" ]]; then
+            fail 'SELinux Enforcing 已启用但缺少 restorecon；请安装 policycoreutils'
+        fi
+        warn 'SELinux 已启用但缺少 restorecon，跳过安全上下文恢复'
+        return 0
+    fi
+    restorecon -RF "${existing_paths[@]}" ||
+        fail "SELinux 安全上下文恢复失败: ${existing_paths[*]}"
+}
+
+verify_service_runtime_access() {
+    local config_path="${PREFIX}/data/config/config.json"
+    local -a command=(python3 - "${config_path}" "${PREFIX}/data/config"
+        "${PREFIX}/data/logs" "${PREFIX}/data/tmp")
+    [[ "${NO_SYSTEMD}" -eq 0 ]] || return 0
+    if [[ "${EUID}" -eq 0 && "${SERVICE_USER}" != "root" ]]; then
+        command -v runuser >/dev/null 2>&1 ||
+            fail '缺少 runuser，无法验证 Web 服务用户的数据目录权限'
+        command=(runuser -u "${SERVICE_USER}" -- "${command[@]}")
+    fi
+    "${command[@]}" <<'PY' ||
+import os
+import sys
+from pathlib import Path
+
+config = Path(sys.argv[1])
+directories = [Path(value) for value in sys.argv[2:]]
+if not config.is_file() or not os.access(config, os.R_OK):
+    raise SystemExit(f"config is not readable: {config}")
+for directory in directories:
+    if not directory.is_dir() or not os.access(directory, os.R_OK | os.W_OK | os.X_OK):
+        raise SystemExit(f"runtime directory is not accessible: {directory}")
+    probe = directory / f".linux-agent-permission-probe-{os.getpid()}"
+    descriptor = os.open(probe, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        os.write(descriptor, b"permission-probe\n")
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+    probe.unlink()
+PY
+        fail "Web 服务用户 ${SERVICE_USER} 无法读取配置或写入 data/{config,logs,tmp}"
+}
+
+verify_systemd_unit_files() {
+    local output_file
+    [[ "${NO_SYSTEMD}" -eq 0 ]] || return 0
+    command -v systemd-analyze >/dev/null 2>&1 ||
+        fail '缺少 systemd-analyze，无法验证 systemd unit 兼容性'
+    output_file="$(mktemp)"
+    if ! LC_ALL=C systemd-analyze verify \
+        "${SYSTEMD_UNIT_PATH}" "${SYSTEMD_HELPER_SERVICE_PATH}" \
+        "${SYSTEMD_HELPER_SOCKET_PATH}" >"${output_file}" 2>&1; then
+        sed -n '1,80p' "${output_file}" >&2
+        rm -f -- "${output_file}"
+        fail '当前 systemd 不支持安装包中的 unit 配置'
+    fi
+    rm -f -- "${output_file}"
 }
 
 install_systemd_unit() {
@@ -1112,6 +1265,11 @@ PY
     cp -- "${socket_rendered}" "${SYSTEMD_HELPER_SOCKET_PATH}"
     chmod 0644 "${SYSTEMD_UNIT_PATH}" "${SYSTEMD_HELPER_SERVICE_PATH}" "${SYSTEMD_HELPER_SOCKET_PATH}"
     install_provider_egress_policy
+    restore_selinux_paths "${PREFIX}" "${SYSTEMD_UNIT_PATH}" \
+        "${SYSTEMD_HELPER_SERVICE_PATH}" "${SYSTEMD_HELPER_SOCKET_PATH}" \
+        "${SYSTEMD_EGRESS_DROPIN_PATH}"
+    verify_service_runtime_access
+    verify_systemd_unit_files
     systemctl daemon-reload
 }
 
@@ -1133,8 +1291,9 @@ web_health_request() {
         "http://127.0.0.1:${port}/api/health"
 }
 
-observer_helper_health_request() {
-    local helper="${1:-${PREFIX}/current/lib/observer_helper.py}"
+observer_helper_request() {
+    local operation="$1"
+    local helper="${2:-${PREFIX}/current/lib/observer_helper.py}"
     local socket_path="${LINUX_AGENT_OBSERVER_HELPER_SOCKET:-/run/linux-agent/observer.sock}"
     local current_user
     [[ -f "${helper}" && ! -L "${helper}" ]] || {
@@ -1147,7 +1306,7 @@ observer_helper_health_request() {
             return 1
         }
         runuser -u "${SERVICE_USER}" -- \
-            python3 "${helper}" request --socket "${socket_path}" ping
+            python3 "${helper}" request --socket "${socket_path}" "${operation}"
         return
     fi
     current_user="$(id -un)" || return 1
@@ -1156,7 +1315,15 @@ observer_helper_health_request() {
             "${SERVICE_USER}" "${current_user}" >&2
         return 1
     fi
-    python3 "${helper}" request --socket "${socket_path}" ping
+    python3 "${helper}" request --socket "${socket_path}" "${operation}"
+}
+
+observer_helper_health_request() {
+    observer_helper_request ping "${1:-${PREFIX}/current/lib/observer_helper.py}"
+}
+
+observer_helper_audit_preflight_request() {
+    observer_helper_request status "${1:-${PREFIX}/current/lib/observer_helper.py}"
 }
 
 health_request() {
@@ -1329,6 +1496,7 @@ do_install() {
         esac
     fi
     write_install_state true
+    finalize_no_systemd_ownership
     commit_transaction
     info "已安装 ${VERSION}: ${release_dir}"
     if [[ "${NO_SYSTEMD}" -eq 0 ]]; then
@@ -1357,6 +1525,7 @@ do_upgrade() {
     fi
     append_history "${old_version}"
     write_install_state true
+    finalize_no_systemd_ownership
     commit_transaction
     prune_releases
     info "已从 ${old_version} 升级到 ${VERSION}: ${release_dir}"
@@ -1380,6 +1549,7 @@ do_rollback() {
     fi
     append_history "${old_version}"
     write_install_state true
+    finalize_no_systemd_ownership
     commit_transaction
     info "已从 ${old_version} 回滚到 ${target}"
 }
@@ -1442,6 +1612,91 @@ write_source_observer_socket_dropin() {
     fi
 }
 
+install_source_observer_helper_runtime() {
+    local source_prefix="$1" install_root="$2" digest runtime_dir staging_dir=""
+    local resolved_root owner mode path helper_sha env_sha runtime_helper_sha runtime_env_sha
+    local helper_source="${source_prefix}/lib/observer_helper.py"
+    local env_source="${source_prefix}/lib/subprocess_env.py"
+    [[ -f "${helper_source}" && ! -L "${helper_source}" &&
+        -f "${env_source}" && ! -L "${env_source}" ]] || return 1
+    helper_sha="$(sha256sum "${helper_source}" | awk '{print $1}')" || return 1
+    env_sha="$(sha256sum "${env_source}" | awk '{print $1}')" || return 1
+    digest="$(printf '%s\n%s\n' "${helper_sha}" "${env_sha}" | sha256sum | awk '{print $1}')" ||
+        return 1
+    [[ "${digest}" =~ ^[0-9a-f]{64}$ ]] || return 1
+    if [[ -L "${install_root}" || (-e "${install_root}" && ! -d "${install_root}") ]]; then
+        return 1
+    fi
+    mkdir -p -- "${install_root}" || return 1
+    chown root:root "${install_root}" || return 1
+    chmod 0755 "${install_root}" || return 1
+    resolved_root="$(readlink -f -- "${install_root}")" || return 1
+    [[ "${resolved_root}" == "${install_root}" ]] || return 1
+    owner="$(stat -c '%u:%g' "${install_root}")" || return 1
+    mode="$(stat -c '%a' "${install_root}")" || return 1
+    [[ "${owner}" == "0:0" ]] || return 1
+    (((8#${mode} & 0022) == 0)) || return 1
+    runtime_dir="${install_root}/${digest}"
+    if [[ -d "${runtime_dir}" && ! -L "${runtime_dir}" ]]; then
+        [[ -f "${runtime_dir}/observer_helper.py" && ! -L "${runtime_dir}/observer_helper.py" &&
+            -f "${runtime_dir}/subprocess_env.py" && ! -L "${runtime_dir}/subprocess_env.py" ]] || return 1
+        runtime_helper_sha="$(sha256sum "${runtime_dir}/observer_helper.py" | awk '{print $1}')" || return 1
+        runtime_env_sha="$(sha256sum "${runtime_dir}/subprocess_env.py" | awk '{print $1}')" || return 1
+        [[ "${runtime_helper_sha}" == "${helper_sha}" && "${runtime_env_sha}" == "${env_sha}" ]] ||
+            return 1
+        for path in "${runtime_dir}" "${runtime_dir}/observer_helper.py" \
+            "${runtime_dir}/subprocess_env.py"; do
+            [[ "$(stat -c '%u:%g' "${path}")" == "0:0" ]] || return 1
+            mode="$(stat -c '%a' "${path}")" || return 1
+            (((8#${mode} & 0022) == 0)) || return 1
+        done
+        printf '%s\n' "${runtime_dir}"
+        return 0
+    fi
+    [[ ! -e "${runtime_dir}" ]] || return 1
+    staging_dir="$(mktemp -d "${install_root}/.staging.XXXXXX")" || return 1
+    if ! cp -- "${helper_source}" "${staging_dir}/observer_helper.py" ||
+        ! cp -- "${env_source}" "${staging_dir}/subprocess_env.py" ||
+        ! chmod 0755 "${staging_dir}" "${staging_dir}/observer_helper.py" ||
+        ! chmod 0644 "${staging_dir}/subprocess_env.py" ||
+        ! chown -R root:root "${staging_dir}"; then
+        rm -rf -- "${staging_dir}"
+        return 1
+    fi
+    runtime_helper_sha="$(sha256sum "${staging_dir}/observer_helper.py" | awk '{print $1}')" || {
+        rm -rf -- "${staging_dir}"
+        return 1
+    }
+    runtime_env_sha="$(sha256sum "${staging_dir}/subprocess_env.py" | awk '{print $1}')" || {
+        rm -rf -- "${staging_dir}"
+        return 1
+    }
+    if [[ "${runtime_helper_sha}" != "${helper_sha}" || "${runtime_env_sha}" != "${env_sha}" ]] ||
+        ! mv -- "${staging_dir}" "${runtime_dir}"; then
+        rm -rf -- "${staging_dir}"
+        return 1
+    fi
+    printf '%s\n' "${runtime_dir}"
+}
+
+write_source_observer_service_dropin() {
+    local dropin_dir="$1" dropin_path="$2" runtime_dir="$3" work_dir="$4" target_tmp=""
+    [[ "${runtime_dir}" =~ ^/[a-zA-Z0-9_./-]+$ ]] || return 1
+    mkdir -p -- "${dropin_dir}" || return 1
+    printf '%s\n%s\n%s\n%s\n' \
+        '# Managed by linux-agent-install.sh repair-observer for a source checkout.' \
+        '[Service]' 'ExecStart=' \
+        "ExecStart=/usr/bin/python3 ${runtime_dir}/observer_helper.py serve" \
+        >"${work_dir}/source-helper-service.conf" || return 1
+    target_tmp="$(mktemp "${dropin_dir}/.10-source-runtime.conf.XXXXXX")" || return 1
+    if ! cp -- "${work_dir}/source-helper-service.conf" "${target_tmp}" ||
+        ! chmod 0644 "${target_tmp}" ||
+        ! mv -f -- "${target_tmp}" "${dropin_path}"; then
+        rm -f -- "${target_tmp}"
+        return 1
+    fi
+}
+
 restore_source_observer_activity() {
     local socket_was_active="$1" helper_was_active="$2" failed=0
     if [[ "${socket_was_active}" -eq 1 ]]; then
@@ -1452,30 +1707,92 @@ restore_source_observer_activity() {
             systemctl stop linux-agent-observer-helper.service || failed=1
         fi
     else
-        systemctl stop linux-agent-observer-helper.service || failed=1
         systemctl stop linux-agent-observer-helper.socket || failed=1
+        if [[ "${helper_was_active}" -eq 1 ]]; then
+            systemctl start linux-agent-observer-helper.service || failed=1
+        else
+            systemctl stop linux-agent-observer-helper.service || failed=1
+        fi
     fi
     return "${failed}"
 }
 
 rollback_source_observer_repair() {
-    local dropin_dir="$1" dropin_path="$2" backup_path="$3"
-    local dropin_existed="$4" socket_was_active="$5" helper_was_active="$6" failed=0
-    if [[ "${dropin_existed}" -eq 1 ]]; then
-        cp -p -- "${backup_path}" "${dropin_path}" || failed=1
+    local socket_dropin_dir="$1" socket_dropin_path="$2" socket_backup_path="$3"
+    local socket_dropin_existed="$4" service_dropin_dir="$5" service_dropin_path="$6"
+    local service_backup_path="$7" service_dropin_existed="$8"
+    local socket_was_active="$9" helper_was_active="${10}" failed=0
+    if [[ "${socket_dropin_existed}" -eq 1 ]]; then
+        cp -p -- "${socket_backup_path}" "${socket_dropin_path}" || failed=1
     else
-        rm -f -- "${dropin_path}" || failed=1
-        rmdir -- "${dropin_dir}" 2>/dev/null || true
+        rm -f -- "${socket_dropin_path}" || failed=1
+        rmdir -- "${socket_dropin_dir}" 2>/dev/null || true
     fi
+    if [[ "${service_dropin_existed}" -eq 1 ]]; then
+        cp -p -- "${service_backup_path}" "${service_dropin_path}" || failed=1
+    else
+        rm -f -- "${service_dropin_path}" || failed=1
+        rmdir -- "${service_dropin_dir}" 2>/dev/null || true
+    fi
+    restore_observer_helper_state || failed=1
     systemctl daemon-reload || failed=1
     restore_source_observer_activity "${socket_was_active}" "${helper_was_active}" || failed=1
     return "${failed}"
 }
 
+capture_observer_helper_state() {
+    local backup_dir="$1"
+    local state_path="${LINUX_AGENT_OBSERVER_HELPER_STATE:-/run/linux-agent/observer-capabilities.json}"
+    if [[ "${state_path}" != "/run/linux-agent/observer-capabilities.json" ]]; then
+        if [[ "${LINUX_AGENT_ALLOW_UNSAFE_SYSTEMD_TEST_PREFIX:-0}" != "1" ||
+            "${state_path}" != "${PREFIX}/"* ]]; then
+            return 1
+        fi
+    fi
+    if [[ -L "${state_path}" || (-e "${state_path}" && ! -f "${state_path}") ]]; then
+        return 1
+    fi
+    local backup_path="${backup_dir}/observer-capabilities.json"
+    if [[ -f "${state_path}" ]]; then
+        cp -p -- "${state_path}" "${backup_path}" || return 1
+        OBSERVER_STATE_EXISTED=1
+    else
+        OBSERVER_STATE_EXISTED=0
+    fi
+    OBSERVER_STATE_PATH="${state_path}"
+    OBSERVER_STATE_BACKUP_PATH="${backup_path}"
+    OBSERVER_STATE_CAPTURED=1
+}
+
+reset_observer_helper_state() {
+    [[ "${OBSERVER_STATE_CAPTURED}" -eq 1 && -n "${OBSERVER_STATE_PATH}" ]] || return 1
+    local state_path="${OBSERVER_STATE_PATH}"
+    rm -f -- "${state_path}"
+}
+
+restore_observer_helper_state() {
+    local state_tmp
+    [[ "${OBSERVER_STATE_CAPTURED}" -eq 1 && -n "${OBSERVER_STATE_PATH}" ]] || return 0
+    if [[ "${OBSERVER_STATE_EXISTED}" -eq 1 ]]; then
+        [[ -f "${OBSERVER_STATE_BACKUP_PATH}" && ! -L "${OBSERVER_STATE_BACKUP_PATH}" ]] || return 1
+        mkdir -p -- "$(dirname -- "${OBSERVER_STATE_PATH}")" || return 1
+        state_tmp="${OBSERVER_STATE_PATH}.repair.$$"
+        cp -p -- "${OBSERVER_STATE_BACKUP_PATH}" "${state_tmp}" || return 1
+        mv -f -- "${state_tmp}" "${OBSERVER_STATE_PATH}" || {
+            rm -f -- "${state_tmp}"
+            return 1
+        }
+    else
+        rm -f -- "${OBSERVER_STATE_PATH}" || return 1
+    fi
+    OBSERVER_STATE_CAPTURED=0
+}
+
 do_repair_observer() {
     local socket_path="${LINUX_AGENT_OBSERVER_HELPER_SOCKET:-/run/linux-agent/observer.sock}"
     local installed_user="" managed_version="" socket_dropin_dir socket_dropin_path
-    local source_dropin_existed=0 source_helper_was_active=0
+    local service_dropin_dir="" service_dropin_path="" source_runtime_root="" source_runtime_dir=""
+    local source_dropin_existed=0 source_service_dropin_existed=0 source_helper_was_active=0
     local web_was_active=0 socket_was_active=0
     ensure_prefix existing
     [[ "${NO_SYSTEMD}" -eq 0 ]] || fail 'repair-observer 需要 systemd observer helper'
@@ -1491,6 +1808,7 @@ do_repair_observer() {
         validate_service_identity
         id "${SERVICE_USER}" >/dev/null 2>&1 || fail "Web 服务用户不存在: ${SERVICE_USER}"
         SERVICE_GROUP="$(id -gn "${SERVICE_USER}")" || fail "无法确定 Web 服务用户主组: ${SERVICE_USER}"
+        ensure_service_identity
 
         # Re-render the units first so SocketGroup follows the actual Web
         # service primary group, then recreate the socket inode instead of
@@ -1514,6 +1832,9 @@ do_repair_observer() {
             linux-agent-observer-helper.socket; then
             fail '无法停止 observer repair 所需的 systemd unit'
         fi
+        capture_observer_helper_state "${TRANSACTION_BACKUP_DIR}" ||
+            fail 'observer helper state 路径或文件类型非法'
+        reset_observer_helper_state || fail '无法重置 observer helper capability 状态'
         if [[ -L "${socket_path}" || (-e "${socket_path}" && ! -S "${socket_path}") ]]; then
             fail "拒绝删除非普通 Unix socket: ${socket_path}"
         fi
@@ -1523,6 +1844,8 @@ do_repair_observer() {
         systemctl start linux-agent-observer-helper.socket linux-agent-web.service ||
             fail 'observer socket 修复后无法启动临时健康检查服务'
         wait_for_health >/dev/null || fail 'observer socket 修复后健康检查失败'
+        observer_helper_audit_preflight_request >/dev/null ||
+            fail 'observer helper 可连接，但 auditd/auditctl 预检失败'
         restore_observer_repair_activity "${web_was_active}" "${socket_was_active}" ||
             fail 'observer socket 修复后无法恢复原服务运行状态'
         commit_transaction
@@ -1532,6 +1855,8 @@ do_repair_observer() {
 
     [[ -x "${PREFIX}/bin/agent-web" &&
         -f "${PREFIX}/lib/observer_helper.py" &&
+        -f "${PREFIX}/lib/subprocess_env.py" &&
+        -f "${PREFIX}/packaging/linux-agent-observer-helper.service" &&
         -f "${PREFIX}/packaging/linux-agent-observer-helper.socket" ]] ||
         fail '目标既不是受管安装，也不是有效的 Linux Agent 源码目录'
     if [[ "${SERVICE_USER_EXPLICIT}" -eq 0 ]]; then
@@ -1556,22 +1881,51 @@ do_repair_observer() {
         fail "systemd unit 目录不存在或类型非法: ${SYSTEMD_UNIT_DIR}"
     [[ "${SYSTEMD_HELPER_SOCKET_PATH}" == "${SYSTEMD_UNIT_DIR}/linux-agent-observer-helper.socket" ]] ||
         fail 'observer helper socket unit 必须位于 Web unit 的同一 systemd 目录'
+    [[ "${SYSTEMD_HELPER_SERVICE_PATH}" == "${SYSTEMD_UNIT_DIR}/linux-agent-observer-helper.service" ]] ||
+        fail 'observer helper service unit 必须位于 Web unit 的同一 systemd 目录'
     systemctl cat linux-agent-observer-helper.socket >/dev/null 2>&1 ||
         fail '未安装 linux-agent-observer-helper.socket；源码快速运行本身不会安装 systemd helper'
+    systemctl cat linux-agent-observer-helper.service >/dev/null 2>&1 ||
+        fail '未安装 linux-agent-observer-helper.service；源码快速运行本身不会安装 systemd helper'
+
+    source_runtime_root="${LINUX_AGENT_SOURCE_HELPER_INSTALL_ROOT:-/usr/local/libexec/linux-agent-observer-helper}"
+    if [[ "${source_runtime_root}" != "/usr/local/libexec/linux-agent-observer-helper" ]]; then
+        if [[ "${LINUX_AGENT_ALLOW_UNSAFE_SYSTEMD_TEST_PREFIX:-0}" != "1" ||
+            "${source_runtime_root}" != "${PREFIX}/"* ]]; then
+            fail '源码 observer helper runtime 只能安装到 /usr/local/libexec/linux-agent-observer-helper'
+        fi
+    fi
+    [[ "${source_runtime_root}" == /* && "${source_runtime_root}" != *$'\n'* ]] ||
+        fail '源码 observer helper runtime 路径非法'
+    case "/${source_runtime_root#/}/" in
+        */../* | */./*) fail '源码 observer helper runtime 路径不能包含 . 或 ..' ;;
+    esac
 
     WORK_DIR="$(mktemp -d "${PREFIX}/.install-staging.repair-observer.XXXXXX")"
     chmod 0700 "${WORK_DIR}"
     socket_dropin_dir="${SYSTEMD_HELPER_SOCKET_PATH}.d"
     socket_dropin_path="${socket_dropin_dir}/10-socket-group.conf"
+    service_dropin_dir="${SYSTEMD_HELPER_SERVICE_PATH}.d"
+    service_dropin_path="${service_dropin_dir}/10-source-runtime.conf"
     if [[ -L "${socket_dropin_dir}" || (-e "${socket_dropin_dir}" && ! -d "${socket_dropin_dir}") ]]; then
         fail "observer socket drop-in 目录类型非法: ${socket_dropin_dir}"
     fi
     if [[ -L "${socket_dropin_path}" || (-e "${socket_dropin_path}" && ! -f "${socket_dropin_path}") ]]; then
         fail "observer socket drop-in 文件类型非法: ${socket_dropin_path}"
     fi
+    if [[ -L "${service_dropin_dir}" || (-e "${service_dropin_dir}" && ! -d "${service_dropin_dir}") ]]; then
+        fail "observer helper service drop-in 目录类型非法: ${service_dropin_dir}"
+    fi
+    if [[ -L "${service_dropin_path}" || (-e "${service_dropin_path}" && ! -f "${service_dropin_path}") ]]; then
+        fail "observer helper service drop-in 文件类型非法: ${service_dropin_path}"
+    fi
     if [[ -f "${socket_dropin_path}" ]]; then
         cp -p -- "${socket_dropin_path}" "${WORK_DIR}/original-socket-group.conf"
         source_dropin_existed=1
+    fi
+    if [[ -f "${service_dropin_path}" ]]; then
+        cp -p -- "${service_dropin_path}" "${WORK_DIR}/original-source-runtime.conf"
+        source_service_dropin_existed=1
     fi
     if systemctl is-active --quiet linux-agent-observer-helper.socket >/dev/null 2>&1; then
         socket_was_active=1
@@ -1583,18 +1937,46 @@ do_repair_observer() {
         "${socket_dropin_dir}" "${socket_dropin_path}" "${SERVICE_GROUP}" "${WORK_DIR}"; then
         fail '无法写入 observer socket 的源码部署 drop-in'
     fi
+    source_runtime_dir="$(install_source_observer_helper_runtime "${PREFIX}" "${source_runtime_root}")" ||
+        fail '无法安装源码 observer helper runtime'
+    if ! write_source_observer_service_dropin \
+        "${service_dropin_dir}" "${service_dropin_path}" "${source_runtime_dir}" "${WORK_DIR}"; then
+        rollback_source_observer_repair \
+            "${socket_dropin_dir}" "${socket_dropin_path}" \
+            "${WORK_DIR}/original-socket-group.conf" "${source_dropin_existed}" \
+            "${service_dropin_dir}" "${service_dropin_path}" \
+            "${WORK_DIR}/original-source-runtime.conf" "${source_service_dropin_existed}" \
+            "${socket_was_active}" "${source_helper_was_active}" || true
+        fail '无法写入 observer helper service 的源码 runtime drop-in'
+    fi
+    restore_selinux_paths "${source_runtime_root}" "${socket_dropin_path}" \
+        "${service_dropin_path}" "$(dirname -- "${socket_path}")"
+    verify_systemd_unit_files
     if ! systemctl daemon-reload ||
         ! systemctl stop linux-agent-observer-helper.service linux-agent-observer-helper.socket; then
         rollback_source_observer_repair \
             "${socket_dropin_dir}" "${socket_dropin_path}" \
             "${WORK_DIR}/original-socket-group.conf" "${source_dropin_existed}" \
+            "${service_dropin_dir}" "${service_dropin_path}" \
+            "${WORK_DIR}/original-source-runtime.conf" "${source_service_dropin_existed}" \
             "${socket_was_active}" "${source_helper_was_active}" || true
         fail '无法重新加载或停止 observer helper socket'
+    fi
+    if ! capture_observer_helper_state "${WORK_DIR}" || ! reset_observer_helper_state; then
+        rollback_source_observer_repair \
+            "${socket_dropin_dir}" "${socket_dropin_path}" \
+            "${WORK_DIR}/original-socket-group.conf" "${source_dropin_existed}" \
+            "${service_dropin_dir}" "${service_dropin_path}" \
+            "${WORK_DIR}/original-source-runtime.conf" "${source_service_dropin_existed}" \
+            "${socket_was_active}" "${source_helper_was_active}" || true
+        fail 'observer helper state 路径、类型或重置操作失败'
     fi
     if [[ -L "${socket_path}" || (-e "${socket_path}" && ! -S "${socket_path}") ]]; then
         rollback_source_observer_repair \
             "${socket_dropin_dir}" "${socket_dropin_path}" \
             "${WORK_DIR}/original-socket-group.conf" "${source_dropin_existed}" \
+            "${service_dropin_dir}" "${service_dropin_path}" \
+            "${WORK_DIR}/original-source-runtime.conf" "${source_service_dropin_existed}" \
             "${socket_was_active}" "${source_helper_was_active}" || true
         fail "拒绝删除非普通 Unix socket: ${socket_path}"
     fi
@@ -1602,21 +1984,28 @@ do_repair_observer() {
         rollback_source_observer_repair \
             "${socket_dropin_dir}" "${socket_dropin_path}" \
             "${WORK_DIR}/original-socket-group.conf" "${source_dropin_existed}" \
+            "${service_dropin_dir}" "${service_dropin_path}" \
+            "${WORK_DIR}/original-source-runtime.conf" "${source_service_dropin_existed}" \
             "${socket_was_active}" "${source_helper_was_active}" || true
         fail "无法删除旧 observer helper socket: ${socket_path}"
     fi
     if ! systemctl start linux-agent-observer-helper.socket ||
-        ! observer_helper_health_request "${PREFIX}/lib/observer_helper.py" >/dev/null; then
+        ! observer_helper_health_request "${PREFIX}/lib/observer_helper.py" >/dev/null ||
+        ! observer_helper_audit_preflight_request "${PREFIX}/lib/observer_helper.py" >/dev/null; then
         rollback_source_observer_repair \
             "${socket_dropin_dir}" "${socket_dropin_path}" \
             "${WORK_DIR}/original-socket-group.conf" "${source_dropin_existed}" \
+            "${service_dropin_dir}" "${service_dropin_path}" \
+            "${WORK_DIR}/original-source-runtime.conf" "${source_service_dropin_existed}" \
             "${socket_was_active}" "${source_helper_was_active}" || true
-        fail 'observer socket 修复后仍无法由源码 Web 用户访问'
+        fail 'observer socket 修复后仍无法由源码 Web 用户访问；请检查 observer helper service journal'
     fi
     if ! restore_source_observer_activity "${socket_was_active}" "${source_helper_was_active}"; then
         rollback_source_observer_repair \
             "${socket_dropin_dir}" "${socket_dropin_path}" \
             "${WORK_DIR}/original-socket-group.conf" "${source_dropin_existed}" \
+            "${service_dropin_dir}" "${service_dropin_path}" \
+            "${WORK_DIR}/original-source-runtime.conf" "${source_service_dropin_existed}" \
             "${socket_was_active}" "${source_helper_was_active}" || true
         fail 'observer socket 修复后无法恢复原 helper 运行状态'
     fi
@@ -1726,7 +2115,11 @@ do_uninstall() {
             userdel "${SERVICE_USER}" || fail "无法删除安装器创建的服务用户: ${SERVICE_USER}"
         fi
     else
+        if [[ "${NO_SYSTEMD}" -eq 1 ]]; then
+            ensure_service_identity
+        fi
         write_install_state false
+        finalize_no_systemd_ownership
     fi
     if [[ -z "$(find "${PREFIX}" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null)" ]]; then
         rmdir -- "${PREFIX}"

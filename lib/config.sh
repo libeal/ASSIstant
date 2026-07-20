@@ -20,7 +20,10 @@ linux_agent_load_config() {
         return 1
     fi
 
-    config_json="$(cat "${LINUX_AGENT_CONFIG_FILE}")"
+    if ! config_json="$(cat "${LINUX_AGENT_CONFIG_FILE}")"; then
+        linux_agent_print_error "无法读取 config/config.json；请检查当前用户与文件所有权。"
+        return 1
+    fi
     if ! jq -e 'type == "object"' >/dev/null 2>&1 <<<"${config_json}"; then
         linux_agent_print_error "config/config.json 必须是合法的 JSON 对象。"
         return 1

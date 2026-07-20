@@ -28,6 +28,20 @@ copy_project() {
     configure_fake_ai "${target}"
 }
 
+permission_project="${tmp_root}/runtime-permission"
+permission_stdout="${tmp_root}/runtime-permission.stdout"
+permission_stderr="${tmp_root}/runtime-permission.stderr"
+copy_project "${permission_project}"
+mkdir -p "${permission_project}/tmp"
+chmod 0500 "${permission_project}/tmp"
+set +e
+(cd "${permission_project}" && bash bin/agent doctor >"${permission_stdout}" 2>"${permission_stderr}")
+permission_status=$?
+set -e
+chmod 0700 "${permission_project}/tmp"
+[[ "${permission_status}" -ne 0 ]]
+grep -q '运行目录不可写' "${permission_stderr}"
+
 assert_single_run_session() {
     local name="$1"
     shift
@@ -53,9 +67,16 @@ assert_ai_file_manifest() {
     grep -q '"relative_path":"skills/INDEX.md"' "${log_file}"
     grep -q '"relative_path":"skills/ops-basic/SKILL.md"' "${log_file}"
     ! grep -q '"relative_path":"skills/network-ops-tools/SKILL.md"' "${log_file}"
-    grep -q '"disclosed_skill_count":1' "${log_file}"
-    grep -q '"disclosed_skills":\["ops-basic"\]' "${log_file}"
-    [[ "$(grep -o '查看cpu占用,内存环境' "${log_file}" | wc -l | tr -d ' ')" -eq 1 ]]
+    jq -e '
+        select(.stage == "request_context_built")
+        | .payload.skills
+        | .disclosed_count == 1
+            and ([.disclosed[].name] == ["ops-basic"])
+    ' "${log_file}" >/dev/null
+    jq -se --arg request '查看cpu占用,内存环境' '
+        [.[] | select((.payload | tostring) | contains($request)) | .stage]
+        | sort == (["received", "request_context_built"] | sort)
+    ' "${log_file}" >/dev/null
     grep -q '"sha256":"' "${log_file}"
     ai_files_line="$(jq -r '.stage' "${log_file}" | awk '$0=="ai_files_manifest" {print NR; exit}')"
     session_finished_line="$(jq -r '.stage' "${log_file}" | awk '$0=="session_finished" {print NR; exit}')"

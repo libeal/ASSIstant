@@ -98,6 +98,16 @@ grep -q '^DirectoryMode=0755$' "${prefix}/current/packaging/linux-agent-observer
 grep -q '^IPAddressDeny=any$' "${prefix}/current/packaging/dropins/10-provider-egress.conf.example"
 [[ "$(readlink "${prefix}/releases/v0.0.0-test/config")" == "../../data/config" ]]
 [[ "$(stat -c '%a' "${prefix}/data/config/config.json")" == "600" ]]
+expected_runtime_user="$(id -un)"
+expected_runtime_uid="$(id -u)"
+expected_runtime_gid="$(id -g)"
+jq -e --arg user "${expected_runtime_user}" '.service_user == $user' \
+    "${prefix}/.install-state.json" >/dev/null
+for owned_path in "${prefix}" "${prefix}/data" "${prefix}/data/config" \
+    "${prefix}/data/logs" "${prefix}/data/tmp" "${prefix}/.install-state.json"; do
+    [[ "$(stat -c '%u' "${owned_path}")" == "${expected_runtime_uid}" ]]
+    [[ "$(stat -c '%g' "${owned_path}")" == "${expected_runtime_gid}" ]]
+done
 jq -e '.remote.enabled == true and .remote.release_version == "v0.0.0-test"' \
     "${prefix}/data/config/config.json" >/dev/null
 health_json="$(bash "${prefix}/current/bin/agent" api health)"
@@ -247,6 +257,7 @@ if command -v unshare >/dev/null 2>&1 && unshare -Ur true >/dev/null 2>&1; then
     fake_systemd_pidfile="${fake_systemd_dir}/service.pid"
     fake_systemd_helper_pidfile="${fake_systemd_dir}/helper.pid"
     managed_observer_socket="${managed_prefix}/systemd/observer.sock"
+    managed_observer_state="${managed_prefix}/systemd/observer-capabilities.json"
     managed_dist_one="${tmp_root}/managed-dist-one"
     managed_dist_two="${tmp_root}/managed-dist-two"
     failing_dist_three="${tmp_root}/failing-dist-three"
@@ -325,12 +336,13 @@ with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as server:
                 payload.extend(chunk)
             request = json.loads(payload.decode("utf-8"))
             operation = request.get("operation")
+            operation_ok = operation in ("ping", "status")
             response = {
-                "ok": operation == "ping",
-                "status": "ready" if operation == "ping" else "invalid_request",
-                "exit_code": 0 if operation == "ping" else 126,
-                "stdout": "",
-                "stderr": "" if operation == "ping" else "unsupported test operation",
+                "ok": operation_ok,
+                "status": "ready" if operation_ok else "invalid_request",
+                "exit_code": 0 if operation_ok else 126,
+                "stdout": "enabled 1\n" if operation == "status" else "",
+                "stderr": "" if operation_ok else "unsupported test operation",
             }
             connection.sendall(json.dumps(response).encode("utf-8") + b"\n")
 PY
@@ -407,7 +419,27 @@ case "${command_name}" in
         ;;
 esac
 SH
-    chmod 0755 "${fake_systemd_bin}/systemctl"
+    cat >"${fake_systemd_bin}/systemd-analyze" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+[[ "${1:-}" == "verify" ]]
+printf 'verify\n' >>"${FAKE_SYSTEMD_STATE}/commands"
+if [[ "${FAKE_SYSTEMD_ANALYZE_FAIL:-0}" == "1" ]]; then
+    printf 'Unknown lvalue ProtectSystem\n' >&2
+    exit 1
+fi
+SH
+    cat >"${fake_systemd_bin}/getenforce" <<'SH'
+#!/usr/bin/env bash
+printf '%s\n' "${FAKE_SELINUX_STATUS:-Disabled}"
+SH
+    cat >"${fake_systemd_bin}/restorecon" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+printf 'restorecon %s\n' "$*" >>"${FAKE_SYSTEMD_STATE}/commands"
+SH
+    chmod 0755 "${fake_systemd_bin}/systemctl" "${fake_systemd_bin}/systemd-analyze" \
+        "${fake_systemd_bin}/getenforce" "${fake_systemd_bin}/restorecon"
 
     run_managed_installer() {
         unshare -Ur env \
@@ -416,6 +448,7 @@ SH
             FAKE_SYSTEMD_STATE="${fake_systemd_dir}" \
             LINUX_AGENT_SYSTEMD_UNIT_PATH="${managed_unit_path}" \
             LINUX_AGENT_OBSERVER_HELPER_SOCKET="${managed_observer_socket}" \
+            LINUX_AGENT_OBSERVER_HELPER_STATE="${managed_observer_state}" \
             LINUX_AGENT_INSTALL_HEALTH_ATTEMPTS=6 \
             LINUX_AGENT_ALLOW_UNSAFE_SYSTEMD_TEST_PREFIX=1 \
             LINUX_AGENT_ALLOW_ROOT_SERVICE_USER_FOR_TESTS=1 \
@@ -464,8 +497,19 @@ SH
     grep -q '^Environment=LINUX_AGENT_UNIT_MARKER=v2$' "${managed_unit_path}"
     grep -q "^ExecStart=/usr/bin/python3 ${managed_prefix}/current/lib/observer_helper.py serve$" \
         "${managed_prefix}/systemd/linux-agent-observer-helper.service"
+    grep -q '^Restart=on-failure$' \
+        "${managed_prefix}/systemd/linux-agent-observer-helper.service"
     grep -q '^SocketGroup=root$' "${managed_prefix}/systemd/linux-agent-observer-helper.socket"
     grep -q '^DirectoryMode=0755$' "${managed_prefix}/systemd/linux-agent-observer-helper.socket"
+    grep -q '^verify$' "${fake_systemd_dir}/commands"
+    if FAKE_SYSTEMD_ANALYZE_FAIL=1 run_managed_installer repair-observer \
+        >"${tmp_root}/systemd-verify.stdout" 2>"${tmp_root}/systemd-verify.stderr"; then
+        printf 'managed repair unexpectedly accepted incompatible systemd units\n' >&2
+        exit 1
+    fi
+    grep -q '当前 systemd 不支持' "${tmp_root}/systemd-verify.stderr"
+    FAKE_SELINUX_STATUS=Enforcing run_managed_installer repair-observer
+    grep -q '^restorecon ' "${fake_systemd_dir}/commands"
     sed -i 's/^SocketGroup=root$/SocketGroup=stale-group/' \
         "${managed_prefix}/systemd/linux-agent-observer-helper.socket"
     run_managed_installer repair-observer
@@ -491,6 +535,8 @@ SH
     [[ -S "${managed_observer_socket}" ]]
     sed -i 's/^SocketGroup=root$/SocketGroup=rollback-group/' \
         "${managed_prefix}/systemd/linux-agent-observer-helper.socket"
+    printf 'managed-state-marker\n' >"${managed_observer_state}"
+    chmod 0600 "${managed_observer_state}"
     : >"${managed_prefix}/current/FAIL_HELPER"
     if run_managed_installer repair-observer \
         >"${tmp_root}/managed-repair-failure.stdout" \
@@ -501,6 +547,7 @@ SH
     rm -f -- "${managed_prefix}/current/FAIL_HELPER"
     grep -q '^SocketGroup=rollback-group$' \
         "${managed_prefix}/systemd/linux-agent-observer-helper.socket"
+    grep -qx 'managed-state-marker' "${managed_observer_state}"
     [[ -f "${fake_systemd_dir}/service.pid" ]]
     FAKE_SYSTEMD_PREFIX="${managed_prefix}" FAKE_SYSTEMD_STATE="${fake_systemd_dir}" \
         LINUX_AGENT_OBSERVER_HELPER_SOCKET="${managed_observer_socket}" \
@@ -548,16 +595,23 @@ SH
 
     source_prefix="${tmp_root}/source-prefix"
     source_unit_path="${source_prefix}/systemd/linux-agent-web.service"
+    source_helper_service_path="${source_prefix}/systemd/linux-agent-observer-helper.service"
     source_helper_socket_path="${source_prefix}/systemd/linux-agent-observer-helper.socket"
     source_observer_socket="${source_prefix}/systemd/source-observer.sock"
+    source_observer_state="${source_prefix}/systemd/observer-capabilities.json"
+    source_runtime_root="${source_prefix}/systemd/libexec"
     mkdir -p "${source_prefix}/bin" "${source_prefix}/lib" \
         "${source_prefix}/packaging" "${source_prefix}/systemd"
     cp "${ROOT_DIR}/bin/agent-web" "${source_prefix}/bin/agent-web"
     cp "${ROOT_DIR}/lib/observer_helper.py" "${source_prefix}/lib/observer_helper.py"
     cp "${ROOT_DIR}/lib/subprocess_env.py" "${source_prefix}/lib/subprocess_env.py"
+    cp "${ROOT_DIR}/packaging/linux-agent-observer-helper.service" \
+        "${source_prefix}/packaging/linux-agent-observer-helper.service"
     cp "${ROOT_DIR}/packaging/linux-agent-observer-helper.socket" \
         "${source_prefix}/packaging/linux-agent-observer-helper.socket"
     printf '%s\n%s\n' '[Service]' 'User=root' >"${source_unit_path}"
+    cp "${ROOT_DIR}/packaging/linux-agent-observer-helper.service" \
+        "${source_helper_service_path}"
     cp "${ROOT_DIR}/packaging/linux-agent-observer-helper.socket" "${source_helper_socket_path}"
 
     run_source_observer_repair() {
@@ -566,8 +620,11 @@ SH
             FAKE_SYSTEMD_PREFIX="${source_prefix}" \
             FAKE_SYSTEMD_STATE="${fake_systemd_dir}" \
             LINUX_AGENT_SYSTEMD_UNIT_PATH="${source_unit_path}" \
+            LINUX_AGENT_SYSTEMD_HELPER_SERVICE_PATH="${source_helper_service_path}" \
             LINUX_AGENT_SYSTEMD_HELPER_SOCKET_PATH="${source_helper_socket_path}" \
             LINUX_AGENT_OBSERVER_HELPER_SOCKET="${source_observer_socket}" \
+            LINUX_AGENT_OBSERVER_HELPER_STATE="${source_observer_state}" \
+            LINUX_AGENT_SOURCE_HELPER_INSTALL_ROOT="${source_runtime_root}" \
             LINUX_AGENT_ALLOW_UNSAFE_SYSTEMD_TEST_PREFIX=1 \
             LINUX_AGENT_ALLOW_ROOT_SERVICE_USER_FOR_TESTS=1 \
             "$@" bash "${ROOT_DIR}/scripts/install.sh" repair-observer \
@@ -591,9 +648,18 @@ SH
     run_source_observer_repair
     grep -q '^SocketGroup=root$' \
         "${source_helper_socket_path}.d/10-socket-group.conf"
+    source_runtime_helper="$(sed -n \
+        's#^ExecStart=/usr/bin/python3 \(.*\) serve$#\1#p' \
+        "${source_helper_service_path}.d/10-source-runtime.conf")"
+    [[ "${source_runtime_helper}" == "${source_runtime_root}/"*/observer_helper.py ]]
+    [[ -x "${source_runtime_helper}" ]]
+    [[ -f "$(dirname -- "${source_runtime_helper}")/subprocess_env.py" ]]
+    [[ "$(stat -c '%u:%g' "${source_runtime_helper}")" == "$(id -u):$(id -g)" ]]
     [[ ! -f "${fake_systemd_dir}/helper.pid" ]]
     [[ ! -S "${source_observer_socket}" ]]
 
+    printf 'source-state-marker\n' >"${source_observer_state}"
+    chmod 0600 "${source_observer_state}"
     if run_source_observer_repair FAKE_HELPER_FAIL=1 \
         >"${tmp_root}/source-observer-failure.stdout" \
         2>"${tmp_root}/source-observer-failure.stderr"; then
@@ -602,6 +668,7 @@ SH
     fi
     grep -q '^SocketGroup=root$' \
         "${source_helper_socket_path}.d/10-socket-group.conf"
+    grep -qx 'source-state-marker' "${source_observer_state}"
     [[ ! -f "${fake_systemd_dir}/helper.pid" ]]
     [[ ! -S "${source_observer_socket}" ]]
 

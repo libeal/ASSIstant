@@ -11,13 +11,21 @@ fail() {
     exit 1
 }
 
+info() {
+    printf '[package-install] %s\n' "$*" >&2
+}
+
+if ((BASH_VERSINFO[0] < 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] < 3))); then
+    fail "Bash 版本过低: ${BASH_VERSION}；需要 Bash 4.3+"
+fi
+
 usage() {
     cat <<'EOF'
 用法:
   sudo bash install.sh --provider-cidr <CIDR> [选项]
 
 包选项:
-  --skip-dependencies      跳过 yum/apt-get 依赖安装（用于已准备好的系统）
+  --skip-dependencies      跳过 dnf/yum/apt-get 依赖安装（用于已准备好的系统）
   --with-optional-tools    同时安装该发行版的可选 Skill 工具
   -h, --help               显示帮助
 
@@ -110,13 +118,60 @@ install_packages() {
             "${runner[@]}" apt-get update
             "${runner[@]}" apt-get install -y --no-install-recommends "${packages[@]}"
             ;;
-        yum)
-            "${runner[@]}" yum install -y "${packages[@]}"
+        dnf | yum)
+            "${runner[@]}" "${package_manager}" install -y "${packages[@]}"
             ;;
         *)
             fail "不支持的包管理器: ${package_manager}"
             ;;
     esac
+}
+
+read_os_release_field() {
+    local field="$1" line value=""
+    # Fedora/RPM systems commonly expose /etc/os-release as a symlink to
+    # /usr/lib/os-release. -f follows the link while still rejecting devices.
+    [[ -f "${OS_RELEASE_PATH}" ]] || return 1
+    line="$(sed -n "s/^${field}=//p" "${OS_RELEASE_PATH}" | head -n 1)"
+    [[ -n "${line}" ]] || return 1
+    value="${line}"
+    if [[ "${value}" == \"*\" && "${value}" == *\" ]]; then
+        value="${value:1:${#value}-2}"
+    elif [[ "${value}" == \'*\' && "${value}" == *\' ]]; then
+        value="${value:1:${#value}-2}"
+    fi
+    [[ "${value}" =~ ^[A-Za-z0-9._[:space:]-]+$ ]] || return 1
+    printf '%s\n' "${value}"
+}
+
+detect_host_family() {
+    local os_id os_like identity
+    os_id="$(read_os_release_field ID 2>/dev/null || true)"
+    os_like="$(read_os_release_field ID_LIKE 2>/dev/null || true)"
+    identity="$(printf '%s %s' "${os_id}" "${os_like}" | tr '[:upper:]' '[:lower:]')"
+    [[ -n "${identity//[[:space:]]/}" ]] || return 1
+    if [[ "${identity}" == *kylin* ]]; then
+        printf 'rpm\n'
+    elif [[ " ${identity} " == *" debian "* || " ${identity} " == *" ubuntu "* ]]; then
+        printf 'debian\n'
+    elif [[ " ${identity} " == *" fedora "* || " ${identity} " == *" rhel "* ||
+        " ${identity} " == *" centos "* || " ${identity} " == *" rocky "* ||
+        " ${identity} " == *" almalinux "* || " ${identity} " == *" openeuler "* ||
+        " ${identity} " == *" anolis "* ]]; then
+        printf 'rpm\n'
+    else
+        printf 'unknown\n'
+    fi
+}
+
+select_rpm_manager() {
+    if command -v dnf >/dev/null 2>&1; then
+        printf 'dnf\n'
+    elif command -v yum >/dev/null 2>&1; then
+        printf 'yum\n'
+    else
+        return 1
+    fi
 }
 
 has_no_systemd=0
@@ -131,18 +186,28 @@ if [[ "${has_no_systemd}" -eq 0 && "${has_egress_policy}" -eq 0 ]]; then
     fail 'systemd 首次安装必须提供 --provider-cidr，或显式使用 --allow-unrestricted-provider-egress'
 fi
 
+OS_RELEASE_PATH="${LINUX_AGENT_OS_RELEASE_PATH:-/etc/os-release}"
+if [[ -f "${REQUIREMENTS_DIR}/debian.txt" ]]; then
+    requirement_prefix=debian
+elif [[ -f "${REQUIREMENTS_DIR}/fedora.txt" ]]; then
+    requirement_prefix=fedora
+else
+    fail '安装包缺少发行版依赖清单'
+fi
+
 if [[ "${skip_dependencies}" -eq 0 ]]; then
     declare -a required_packages=()
     declare -a optional_packages=()
-    if [[ -f "${REQUIREMENTS_DIR}/debian.txt" ]]; then
-        package_manager=apt-get
-        requirement_prefix=debian
-    elif [[ -f "${REQUIREMENTS_DIR}/fedora.txt" ]]; then
-        package_manager=yum
-        requirement_prefix=fedora
-    else
-        fail '安装包缺少发行版依赖清单'
-    fi
+    host_family="$(detect_host_family)" ||
+        fail "无法从 ${OS_RELEASE_PATH} 识别主机发行版"
+    case "${requirement_prefix}:${host_family}" in
+        debian:debian) package_manager=apt-get ;;
+        fedora:rpm) package_manager="$(select_rpm_manager)" || fail '当前 RPM 系统缺少 dnf/yum' ;;
+        *)
+            fail "安装包与主机不匹配: package=${requirement_prefix}, host=${host_family}；请使用正确发行版安装包"
+            ;;
+    esac
+    info "已识别 package=${requirement_prefix}, host=${host_family}, manager=${package_manager}"
     read_requirements "${REQUIREMENTS_DIR}/${requirement_prefix}.txt" required_packages
     install_packages "${package_manager}" "${required_packages[@]}"
     if [[ "${optional_tools}" -eq 1 ]]; then
