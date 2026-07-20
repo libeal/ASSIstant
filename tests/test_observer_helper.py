@@ -416,6 +416,7 @@ class ObserverHelperProtocolTests(unittest.TestCase):
         self.assertEqual(125, exit_code)
         self.assertIn("permission denied for socket /run/test.sock", output)
         self.assertIn("repair-observer", output)
+        self.assertIn("--service-user <web-user>", output)
         self.assertIn("SocketGroup", output)
         self.assertIn("linux-agent-observer-helper.socket", output)
         self.assertNotIn("Traceback", output)

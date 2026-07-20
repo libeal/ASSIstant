@@ -149,6 +149,14 @@ sudo bash linux-agent-install.sh status
 
 如果 Web 控制台报告 `observer_helper_failed` 且错误是 observer socket 权限不足，运行 `repair-observer` 会重新应用当前服务用户对应的 `SocketGroup`，重建 socket inode，并以 Web 服务用户执行 helper 健康检查；它不会切换版本或修改持久配置。
 
+Git 源码目录直接运行时，密码不会用于已存在的 helper socket；必须让 socket 权限匹配实际运行 `bin/agent-web` 的系统用户。若主机已经安装 `linux-agent-observer-helper.socket`，在源码目录执行：
+
+```bash
+sudo bash scripts/install.sh repair-observer --prefix "$PWD" --service-user "$USER"
+```
+
+该源码模式只写入 observer socket 的 systemd drop-in 并重建 socket，不覆盖现有 Web/helper service；完成后恢复 socket/helper 原有的 active 状态，健康检查失败时回滚 drop-in 和运行状态。若 Web 由其他用户运行，请将 `$USER` 替换为该用户；源码快速运行本身未安装 helper unit 时，命令会明确拒绝并提示。
+
 ### Prometheus 指标
 
 Web 控制台提供 `GET /api/metrics`（Prometheus 文本格式，Bearer token 保护）。默认开启，可在配置中设置 `web.metrics_enabled=false` 关闭。

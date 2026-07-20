@@ -68,7 +68,7 @@ usage() {
   linux-agent-install.sh upgrade --version vX.Y.Z [选项]
   linux-agent-install.sh rollback [选项]
   linux-agent-install.sh health [--prefix <目录>]
-  linux-agent-install.sh repair-observer [--prefix <目录>]
+  linux-agent-install.sh repair-observer [--prefix <安装或源码目录>] [--service-user <Web 用户>]
   linux-agent-install.sh status [选项]
   linux-agent-install.sh uninstall [--purge-data] [选项]
 
@@ -213,6 +213,9 @@ done
 if [[ "${NO_SYSTEMD}" -eq 1 && "${EGRESS_MODE}" != "preserve" ]]; then
     fail 'Provider 出站过滤选项仅适用于 systemd 模式'
 fi
+if [[ "${COMMAND}" == "repair-observer" && "${EGRESS_MODE}" != "preserve" ]]; then
+    fail 'repair-observer 不接受 Provider 出站策略选项'
+fi
 if [[ "${#PROVIDER_CIDRS[@]}" -gt 64 ]]; then
     fail '--provider-cidr 最多允许 64 项'
 fi
@@ -272,6 +275,11 @@ ensure_prefix() {
                 if [[ "${LINUX_AGENT_ALLOW_UNSAFE_SYSTEMD_TEST_PREFIX:-0}" == "1" &&
                     "${SYSTEMD_UNIT_PATH}" == "${PREFIX}/"* ]]; then
                     warn "仅测试：允许 systemd 沙箱不可见的安装前缀 ${PREFIX}"
+                elif [[ "${COMMAND}" == "repair-observer" &&
+                    -x "${PREFIX}/bin/agent-web" &&
+                    -f "${PREFIX}/lib/observer_helper.py" &&
+                    -f "${PREFIX}/packaging/linux-agent-observer-helper.socket" ]]; then
+                    :
                 elif [[ ("${COMMAND}" == "health" || "${COMMAND}" == "status") &&
                     -f "${PREFIX}/.install-state.json" &&
                     ! -L "${PREFIX}/.install-state.json" &&
@@ -1126,7 +1134,7 @@ web_health_request() {
 }
 
 observer_helper_health_request() {
-    local helper="${PREFIX}/current/lib/observer_helper.py"
+    local helper="${1:-${PREFIX}/current/lib/observer_helper.py}"
     local socket_path="${LINUX_AGENT_OBSERVER_HELPER_SOCKET:-/run/linux-agent/observer.sock}"
     local current_user
     [[ -f "${helper}" && ! -L "${helper}" ]] || {
@@ -1383,34 +1391,236 @@ do_health() {
     health_request || fail '健康检查失败'
 }
 
-do_repair_observer() {
-    local socket_path="${LINUX_AGENT_OBSERVER_HELPER_SOCKET:-/run/linux-agent/observer.sock}"
-    ensure_prefix existing
-    load_existing_service_identity
-    validate_service_identity
-    [[ "${NO_SYSTEMD}" -eq 0 ]] || fail 'repair-observer 需要 systemd 模式的受管安装'
-    current_version >/dev/null || fail '未检测到当前受管版本，请先执行 install'
-
-    # Re-render the units first so SocketGroup follows the actual Web service
-    # primary group, then recreate the socket inode instead of trusting a
-    # stale socket that survived a manual daemon-reload or an older release.
-    WORK_DIR="$(mktemp -d "${PREFIX}/.install-staging.repair-observer.XXXXXX")"
-    chmod 0700 "${WORK_DIR}"
-    install_systemd_unit
-    systemctl stop linux-agent-web.service
-    systemctl stop linux-agent-observer-helper.service
-    systemctl stop linux-agent-observer-helper.socket
+validate_observer_repair_socket_path() {
+    local socket_path="$1" socket_dir socket_name
     [[ "${socket_path}" == /* && "${socket_path}" != *$'\n'* ]] ||
         fail 'observer helper socket 路径非法'
+    socket_dir="$(dirname -- "${socket_path}")"
+    socket_name="$(basename -- "${socket_path}")"
+    if [[ "${socket_dir}" == "/run/linux-agent" &&
+        "${socket_name}" =~ ^[a-zA-Z0-9_.-]+[.]sock$ ]]; then
+        return 0
+    fi
+    if [[ "${LINUX_AGENT_ALLOW_UNSAFE_SYSTEMD_TEST_PREFIX:-0}" == "1" &&
+        "${SYSTEMD_UNIT_PATH}" == "${PREFIX}/"* &&
+        "${socket_path}" == "${PREFIX}/"* ]]; then
+        warn "仅测试：允许非 /run/linux-agent 的 observer socket ${socket_path}"
+        return 0
+    fi
+    fail 'repair-observer 仅允许重建 /run/linux-agent 目录内的 .sock 文件'
+}
+
+restore_observer_repair_activity() {
+    local web_was_active="$1" socket_was_active="$2" failed=0
+    if [[ "${web_was_active}" -eq 1 ]]; then
+        [[ "${socket_was_active}" -eq 1 ]] || return 1
+        systemctl start linux-agent-observer-helper.socket linux-agent-web.service || failed=1
+    else
+        systemctl stop linux-agent-web.service || failed=1
+        if [[ "${socket_was_active}" -eq 1 ]]; then
+            systemctl start linux-agent-observer-helper.socket || failed=1
+        else
+            systemctl stop linux-agent-observer-helper.service || failed=1
+            systemctl stop linux-agent-observer-helper.socket || failed=1
+        fi
+    fi
+    return "${failed}"
+}
+
+write_source_observer_socket_dropin() {
+    local dropin_dir="$1" dropin_path="$2" service_group="$3" work_dir="$4" target_tmp=""
+    mkdir -p -- "${dropin_dir}" || return 1
+    printf '%s\n%s\n%s\n' \
+        '# Managed by linux-agent-install.sh repair-observer for a source checkout.' \
+        '[Socket]' "SocketGroup=${service_group}" >"${work_dir}/socket-group.conf" || return 1
+    target_tmp="$(mktemp "${dropin_dir}/.10-socket-group.conf.XXXXXX")" || return 1
+    if ! cp -- "${work_dir}/socket-group.conf" "${target_tmp}" ||
+        ! chmod 0644 "${target_tmp}" ||
+        ! mv -f -- "${target_tmp}" "${dropin_path}"; then
+        rm -f -- "${target_tmp}"
+        return 1
+    fi
+}
+
+restore_source_observer_activity() {
+    local socket_was_active="$1" helper_was_active="$2" failed=0
+    if [[ "${socket_was_active}" -eq 1 ]]; then
+        systemctl start linux-agent-observer-helper.socket || failed=1
+        if [[ "${helper_was_active}" -eq 1 ]]; then
+            systemctl start linux-agent-observer-helper.service || failed=1
+        else
+            systemctl stop linux-agent-observer-helper.service || failed=1
+        fi
+    else
+        systemctl stop linux-agent-observer-helper.service || failed=1
+        systemctl stop linux-agent-observer-helper.socket || failed=1
+    fi
+    return "${failed}"
+}
+
+rollback_source_observer_repair() {
+    local dropin_dir="$1" dropin_path="$2" backup_path="$3"
+    local dropin_existed="$4" socket_was_active="$5" helper_was_active="$6" failed=0
+    if [[ "${dropin_existed}" -eq 1 ]]; then
+        cp -p -- "${backup_path}" "${dropin_path}" || failed=1
+    else
+        rm -f -- "${dropin_path}" || failed=1
+        rmdir -- "${dropin_dir}" 2>/dev/null || true
+    fi
+    systemctl daemon-reload || failed=1
+    restore_source_observer_activity "${socket_was_active}" "${helper_was_active}" || failed=1
+    return "${failed}"
+}
+
+do_repair_observer() {
+    local socket_path="${LINUX_AGENT_OBSERVER_HELPER_SOCKET:-/run/linux-agent/observer.sock}"
+    local installed_user="" managed_version="" socket_dropin_dir socket_dropin_path
+    local source_dropin_existed=0 source_helper_was_active=0
+    local web_was_active=0 socket_was_active=0
+    ensure_prefix existing
+    [[ "${NO_SYSTEMD}" -eq 0 ]] || fail 'repair-observer 需要 systemd observer helper'
+    command -v systemctl >/dev/null 2>&1 || fail '缺少 systemctl'
+    validate_observer_repair_socket_path "${socket_path}"
     if [[ -L "${socket_path}" || (-e "${socket_path}" && ! -S "${socket_path}") ]]; then
         fail "拒绝删除非普通 Unix socket: ${socket_path}"
     fi
-    if [[ -S "${socket_path}" ]]; then
-        rm -f -- "${socket_path}"
+
+    if [[ -L "${PREFIX}/current" ]]; then
+        managed_version="$(current_version)"
+        load_existing_service_identity
+        validate_service_identity
+        id "${SERVICE_USER}" >/dev/null 2>&1 || fail "Web 服务用户不存在: ${SERVICE_USER}"
+        SERVICE_GROUP="$(id -gn "${SERVICE_USER}")" || fail "无法确定 Web 服务用户主组: ${SERVICE_USER}"
+
+        # Re-render the units first so SocketGroup follows the actual Web
+        # service primary group, then recreate the socket inode instead of
+        # trusting a stale socket left by an older release or daemon-reload.
+        if systemctl is-active --quiet linux-agent-web.service >/dev/null 2>&1; then
+            web_was_active=1
+        fi
+        if systemctl is-active --quiet linux-agent-observer-helper.socket >/dev/null 2>&1; then
+            socket_was_active=1
+        fi
+        if [[ "${web_was_active}" -eq 1 && "${socket_was_active}" -eq 0 ]]; then
+            fail 'Web 正在运行但其必需的 observer helper socket 已停止；请先显式启动 socket 或停止 Web'
+        fi
+        begin_transaction repair "${managed_version}" "${managed_version}"
+        capture_systemd_state
+        WORK_DIR="$(mktemp -d "${PREFIX}/.install-staging.repair-observer.XXXXXX")"
+        chmod 0700 "${WORK_DIR}"
+        install_systemd_unit
+        if ! systemctl stop linux-agent-web.service \
+            linux-agent-observer-helper.service \
+            linux-agent-observer-helper.socket; then
+            fail '无法停止 observer repair 所需的 systemd unit'
+        fi
+        if [[ -L "${socket_path}" || (-e "${socket_path}" && ! -S "${socket_path}") ]]; then
+            fail "拒绝删除非普通 Unix socket: ${socket_path}"
+        fi
+        if [[ -S "${socket_path}" ]]; then
+            rm -f -- "${socket_path}"
+        fi
+        systemctl start linux-agent-observer-helper.socket linux-agent-web.service ||
+            fail 'observer socket 修复后无法启动临时健康检查服务'
+        wait_for_health >/dev/null || fail 'observer socket 修复后健康检查失败'
+        restore_observer_repair_activity "${web_was_active}" "${socket_was_active}" ||
+            fail 'observer socket 修复后无法恢复原服务运行状态'
+        commit_transaction
+        info 'observer helper socket 已重建，Web 用户权限健康检查通过'
+        return
     fi
-    systemctl start linux-agent-observer-helper.socket linux-agent-web.service
-    wait_for_health >/dev/null || fail 'observer socket 修复后健康检查失败'
-    info 'observer helper socket 已重建，Web 用户权限健康检查通过'
+
+    [[ -x "${PREFIX}/bin/agent-web" &&
+        -f "${PREFIX}/lib/observer_helper.py" &&
+        -f "${PREFIX}/packaging/linux-agent-observer-helper.socket" ]] ||
+        fail '目标既不是受管安装，也不是有效的 Linux Agent 源码目录'
+    if [[ "${SERVICE_USER_EXPLICIT}" -eq 0 ]]; then
+        if [[ -f "${SYSTEMD_UNIT_PATH}" && ! -L "${SYSTEMD_UNIT_PATH}" ]]; then
+            installed_user="$(sed -n 's/^User=//p' "${SYSTEMD_UNIT_PATH}" | head -n 1)"
+        fi
+        [[ -n "${installed_user}" ]] ||
+            fail '源码运行无法确定 Web 用户；请传入 --service-user <实际运行 bin/agent-web 的用户>'
+        SERVICE_USER="${installed_user}"
+    fi
+    validate_service_identity
+    id "${SERVICE_USER}" >/dev/null 2>&1 || fail "Web 服务用户不存在: ${SERVICE_USER}"
+    SERVICE_GROUP="$(id -gn "${SERVICE_USER}")" || fail "无法确定 Web 服务用户主组: ${SERVICE_USER}"
+    [[ "${SERVICE_GROUP}" =~ ^[a-zA-Z_][a-zA-Z0-9_.-]*[$]?$ ]] ||
+        fail "Web 服务用户主组名称不适合写入 systemd unit: ${SERVICE_GROUP}"
+    [[ "${SYSTEMD_UNIT_DIR}" == /* && "${SYSTEMD_UNIT_DIR}" != *$'\n'* ]] ||
+        fail 'systemd unit 目录必须是绝对路径'
+    case "/${SYSTEMD_UNIT_DIR#/}/" in
+        */../* | */./*) fail 'systemd unit 目录不能包含 . 或 .. 路径分量' ;;
+    esac
+    [[ -d "${SYSTEMD_UNIT_DIR}" && ! -L "${SYSTEMD_UNIT_DIR}" ]] ||
+        fail "systemd unit 目录不存在或类型非法: ${SYSTEMD_UNIT_DIR}"
+    [[ "${SYSTEMD_HELPER_SOCKET_PATH}" == "${SYSTEMD_UNIT_DIR}/linux-agent-observer-helper.socket" ]] ||
+        fail 'observer helper socket unit 必须位于 Web unit 的同一 systemd 目录'
+    systemctl cat linux-agent-observer-helper.socket >/dev/null 2>&1 ||
+        fail '未安装 linux-agent-observer-helper.socket；源码快速运行本身不会安装 systemd helper'
+
+    WORK_DIR="$(mktemp -d "${PREFIX}/.install-staging.repair-observer.XXXXXX")"
+    chmod 0700 "${WORK_DIR}"
+    socket_dropin_dir="${SYSTEMD_HELPER_SOCKET_PATH}.d"
+    socket_dropin_path="${socket_dropin_dir}/10-socket-group.conf"
+    if [[ -L "${socket_dropin_dir}" || (-e "${socket_dropin_dir}" && ! -d "${socket_dropin_dir}") ]]; then
+        fail "observer socket drop-in 目录类型非法: ${socket_dropin_dir}"
+    fi
+    if [[ -L "${socket_dropin_path}" || (-e "${socket_dropin_path}" && ! -f "${socket_dropin_path}") ]]; then
+        fail "observer socket drop-in 文件类型非法: ${socket_dropin_path}"
+    fi
+    if [[ -f "${socket_dropin_path}" ]]; then
+        cp -p -- "${socket_dropin_path}" "${WORK_DIR}/original-socket-group.conf"
+        source_dropin_existed=1
+    fi
+    if systemctl is-active --quiet linux-agent-observer-helper.socket >/dev/null 2>&1; then
+        socket_was_active=1
+    fi
+    if systemctl is-active --quiet linux-agent-observer-helper.service >/dev/null 2>&1; then
+        source_helper_was_active=1
+    fi
+    if ! write_source_observer_socket_dropin \
+        "${socket_dropin_dir}" "${socket_dropin_path}" "${SERVICE_GROUP}" "${WORK_DIR}"; then
+        fail '无法写入 observer socket 的源码部署 drop-in'
+    fi
+    if ! systemctl daemon-reload ||
+        ! systemctl stop linux-agent-observer-helper.service linux-agent-observer-helper.socket; then
+        rollback_source_observer_repair \
+            "${socket_dropin_dir}" "${socket_dropin_path}" \
+            "${WORK_DIR}/original-socket-group.conf" "${source_dropin_existed}" \
+            "${socket_was_active}" "${source_helper_was_active}" || true
+        fail '无法重新加载或停止 observer helper socket'
+    fi
+    if [[ -L "${socket_path}" || (-e "${socket_path}" && ! -S "${socket_path}") ]]; then
+        rollback_source_observer_repair \
+            "${socket_dropin_dir}" "${socket_dropin_path}" \
+            "${WORK_DIR}/original-socket-group.conf" "${source_dropin_existed}" \
+            "${socket_was_active}" "${source_helper_was_active}" || true
+        fail "拒绝删除非普通 Unix socket: ${socket_path}"
+    fi
+    if [[ -S "${socket_path}" ]] && ! rm -f -- "${socket_path}"; then
+        rollback_source_observer_repair \
+            "${socket_dropin_dir}" "${socket_dropin_path}" \
+            "${WORK_DIR}/original-socket-group.conf" "${source_dropin_existed}" \
+            "${socket_was_active}" "${source_helper_was_active}" || true
+        fail "无法删除旧 observer helper socket: ${socket_path}"
+    fi
+    if ! systemctl start linux-agent-observer-helper.socket ||
+        ! observer_helper_health_request "${PREFIX}/lib/observer_helper.py" >/dev/null; then
+        rollback_source_observer_repair \
+            "${socket_dropin_dir}" "${socket_dropin_path}" \
+            "${WORK_DIR}/original-socket-group.conf" "${source_dropin_existed}" \
+            "${socket_was_active}" "${source_helper_was_active}" || true
+        fail 'observer socket 修复后仍无法由源码 Web 用户访问'
+    fi
+    if ! restore_source_observer_activity "${socket_was_active}" "${source_helper_was_active}"; then
+        rollback_source_observer_repair \
+            "${socket_dropin_dir}" "${socket_dropin_path}" \
+            "${WORK_DIR}/original-socket-group.conf" "${source_dropin_existed}" \
+            "${socket_was_active}" "${source_helper_was_active}" || true
+        fail 'observer socket 修复后无法恢复原 helper 运行状态'
+    fi
+    info "observer helper socket 已按源码 Web 用户 ${SERVICE_USER}:${SERVICE_GROUP} 重建，权限健康检查通过"
 }
 
 do_status() {

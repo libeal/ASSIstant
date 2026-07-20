@@ -85,7 +85,7 @@ export function createObserverBootstrap(app) {
     if (button) {
       const kind = observerStatusKind(status);
       button.className = `pill status-action risk ${kind}`;
-      button.title = data?.diagnostic || "observer bootstrap status";
+      button.title = data?.error || data?.diagnostic || "observer bootstrap status";
     }
     setText("observerState", status);
     setStatus("observerAuditStatus", status, observerStatusKind(status));
@@ -95,6 +95,11 @@ export function createObserverBootstrap(app) {
 
   function shouldPromptObserverBootstrap(data) {
     return Boolean(data?.requires_permission && data.status === "pending" && !state.observerBootstrapPrompted);
+  }
+
+  function observerHelperNeedsRepair(data) {
+    return data?.status === "observer_helper_failed" ||
+      (data?.method === "helper" && data?.ok === false);
   }
 
   async function loadObserverBootstrapStatus({ prompt = false } = {}) {
@@ -108,6 +113,10 @@ export function createObserverBootstrap(app) {
   }
 
   function openObserverAuditDialog(data = state.observerBootstrap) {
+    if (observerHelperNeedsRepair(data)) {
+      showToast(data?.error || data?.diagnostic || "请先修复 observer helper socket 权限");
+      return;
+    }
     if (!state.token) {
       showToast("Token required");
       return;
@@ -133,6 +142,15 @@ export function createObserverBootstrap(app) {
   }
 
   async function enableObserverAudit() {
+    if (observerHelperNeedsRepair(state.observerBootstrap)) {
+      showToast(
+        state.observerBootstrap?.error ||
+          state.observerBootstrap?.diagnostic ||
+          "请先修复 observer helper socket 权限",
+      );
+      closeObserverAuditDialog();
+      return;
+    }
     const password = $("observerAuditPassword")?.value || "";
     const data = await app.api("/api/observer/bootstrap", {
       method: "POST",
@@ -162,6 +180,7 @@ export function createObserverBootstrap(app) {
 
   return {
     observerStatusKind,
+    observerHelperNeedsRepair,
     setObserverBootstrapState,
     shouldPromptObserverBootstrap,
     loadObserverBootstrapStatus,

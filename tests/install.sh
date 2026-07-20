@@ -246,6 +246,7 @@ if command -v unshare >/dev/null 2>&1 && unshare -Ur true >/dev/null 2>&1; then
     fake_systemd_bin="${tmp_root}/fake-systemd-bin"
     fake_systemd_pidfile="${fake_systemd_dir}/service.pid"
     fake_systemd_helper_pidfile="${fake_systemd_dir}/helper.pid"
+    managed_observer_socket="${managed_prefix}/systemd/observer.sock"
     managed_dist_one="${tmp_root}/managed-dist-one"
     managed_dist_two="${tmp_root}/managed-dist-two"
     failing_dist_three="${tmp_root}/failing-dist-three"
@@ -294,6 +295,11 @@ stop_service() {
 }
 
 start_helper() {
+    if [[ -f "${FAKE_SYSTEMD_STATE}/helper.pid" ]] &&
+        kill -0 "$(<"${FAKE_SYSTEMD_STATE}/helper.pid")" >/dev/null 2>&1; then
+        return 0
+    fi
+    [[ "${FAKE_HELPER_FAIL:-0}" != "1" ]] || return 0
     [[ ! -f "${FAKE_SYSTEMD_PREFIX}/current/FAIL_HELPER" ]] || return 0
     python3 - "${LINUX_AGENT_OBSERVER_HELPER_SOCKET}" <<'PY' \
         >"${FAKE_SYSTEMD_STATE}/helper.stdout" \
@@ -344,12 +350,25 @@ start_service() {
 
 case "${command_name}" in
     daemon-reload) ;;
+    cat) ;;
     is-enabled)
         [[ -f "${FAKE_SYSTEMD_STATE}/enabled" ]]
         ;;
     is-active)
-        if [[ -f "${FAKE_SYSTEMD_STATE}/service.pid" ]] &&
+        active=0
+        if [[ " $* " == *" linux-agent-web.service "* &&
+            -f "${FAKE_SYSTEMD_STATE}/service.pid" ]] &&
             kill -0 "$(<"${FAKE_SYSTEMD_STATE}/service.pid")" >/dev/null 2>&1; then
+            active=1
+        elif [[ " $* " == *" linux-agent-observer-helper.socket "* &&
+            -S "${LINUX_AGENT_OBSERVER_HELPER_SOCKET}" ]]; then
+            active=1
+        elif [[ " $* " == *" linux-agent-observer-helper.service "* &&
+            -f "${FAKE_SYSTEMD_STATE}/helper.pid" ]] &&
+            kill -0 "$(<"${FAKE_SYSTEMD_STATE}/helper.pid")" >/dev/null 2>&1; then
+            active=1
+        fi
+        if [[ "${active}" -eq 1 ]]; then
             [[ " $* " == *" --quiet "* ]] || printf 'active\n'
         else
             [[ " $* " == *" --quiet "* ]] || printf 'inactive\n'
@@ -370,7 +389,13 @@ case "${command_name}" in
         ;;
     restart) start_service ;;
     start)
-        if [[ ! -f "${FAKE_SYSTEMD_STATE}/service.pid" ]] ||
+        if [[ " $* " == *" linux-agent-observer-helper.socket "* &&
+            " $* " != *" linux-agent-web.service "* ]]; then
+            start_helper
+        elif [[ " $* " == *" linux-agent-observer-helper.service "* &&
+            " $* " != *" linux-agent-web.service "* ]]; then
+            start_helper
+        elif [[ ! -f "${FAKE_SYSTEMD_STATE}/service.pid" ]] ||
             ! kill -0 "$(<"${FAKE_SYSTEMD_STATE}/service.pid")" >/dev/null 2>&1; then
             start_service
         fi
@@ -390,7 +415,7 @@ SH
             FAKE_SYSTEMD_PREFIX="${managed_prefix}" \
             FAKE_SYSTEMD_STATE="${fake_systemd_dir}" \
             LINUX_AGENT_SYSTEMD_UNIT_PATH="${managed_unit_path}" \
-            LINUX_AGENT_OBSERVER_HELPER_SOCKET="${fake_systemd_dir}/observer.sock" \
+            LINUX_AGENT_OBSERVER_HELPER_SOCKET="${managed_observer_socket}" \
             LINUX_AGENT_INSTALL_HEALTH_ATTEMPTS=6 \
             LINUX_AGENT_ALLOW_UNSAFE_SYSTEMD_TEST_PREFIX=1 \
             LINUX_AGENT_ALLOW_ROOT_SERVICE_USER_FOR_TESTS=1 \
@@ -432,7 +457,7 @@ SH
     grep -q '^IPAddressAllow=localhost$' "${managed_egress_path}"
     grep -q '^IPAddressAllow=127.0.0.1/32$' "${managed_egress_path}"
     FAKE_SYSTEMD_PREFIX="${managed_prefix}" FAKE_SYSTEMD_STATE="${fake_systemd_dir}" \
-        LINUX_AGENT_OBSERVER_HELPER_SOCKET="${fake_systemd_dir}/observer.sock" \
+        LINUX_AGENT_OBSERVER_HELPER_SOCKET="${managed_observer_socket}" \
         "${fake_systemd_bin}/systemctl" enable --now \
         linux-agent-observer-helper.socket linux-agent-web.service
     run_managed_installer upgrade --version v0.0.1-test --from-dist "${managed_dist_two}"
@@ -441,6 +466,52 @@ SH
         "${managed_prefix}/systemd/linux-agent-observer-helper.service"
     grep -q '^SocketGroup=root$' "${managed_prefix}/systemd/linux-agent-observer-helper.socket"
     grep -q '^DirectoryMode=0755$' "${managed_prefix}/systemd/linux-agent-observer-helper.socket"
+    sed -i 's/^SocketGroup=root$/SocketGroup=stale-group/' \
+        "${managed_prefix}/systemd/linux-agent-observer-helper.socket"
+    run_managed_installer repair-observer
+    grep -q '^SocketGroup=root$' "${managed_prefix}/systemd/linux-agent-observer-helper.socket"
+    rm -f -- "${managed_observer_socket}"
+    if run_managed_installer repair-observer \
+        >"${tmp_root}/managed-inconsistent-state.stdout" \
+        2>"${tmp_root}/managed-inconsistent-state.stderr"; then
+        printf 'managed observer repair unexpectedly changed an inconsistent active state\n' >&2
+        exit 1
+    fi
+    grep -q 'Web 正在运行但其必需的 observer helper socket 已停止' \
+        "${tmp_root}/managed-inconsistent-state.stderr"
+    [[ -f "${fake_systemd_dir}/service.pid" ]]
+    [[ ! -S "${managed_observer_socket}" ]]
+    FAKE_SYSTEMD_PREFIX="${managed_prefix}" FAKE_SYSTEMD_STATE="${fake_systemd_dir}" \
+        LINUX_AGENT_OBSERVER_HELPER_SOCKET="${managed_observer_socket}" \
+        "${fake_systemd_bin}/systemctl" restart linux-agent-web.service
+    for _ in $(seq 1 100); do
+        [[ -S "${managed_observer_socket}" ]] && break
+        sleep 0.02
+    done
+    [[ -S "${managed_observer_socket}" ]]
+    sed -i 's/^SocketGroup=root$/SocketGroup=rollback-group/' \
+        "${managed_prefix}/systemd/linux-agent-observer-helper.socket"
+    : >"${managed_prefix}/current/FAIL_HELPER"
+    if run_managed_installer repair-observer \
+        >"${tmp_root}/managed-repair-failure.stdout" \
+        2>"${tmp_root}/managed-repair-failure.stderr"; then
+        printf 'managed observer repair unexpectedly accepted a failed helper health check\n' >&2
+        exit 1
+    fi
+    rm -f -- "${managed_prefix}/current/FAIL_HELPER"
+    grep -q '^SocketGroup=rollback-group$' \
+        "${managed_prefix}/systemd/linux-agent-observer-helper.socket"
+    [[ -f "${fake_systemd_dir}/service.pid" ]]
+    FAKE_SYSTEMD_PREFIX="${managed_prefix}" FAKE_SYSTEMD_STATE="${fake_systemd_dir}" \
+        LINUX_AGENT_OBSERVER_HELPER_SOCKET="${managed_observer_socket}" \
+        "${fake_systemd_bin}/systemctl" restart linux-agent-web.service
+    for _ in $(seq 1 100); do
+        [[ -S "${managed_observer_socket}" ]] && break
+        sleep 0.02
+    done
+    [[ -S "${managed_observer_socket}" ]]
+    run_managed_installer repair-observer
+    grep -q '^SocketGroup=root$' "${managed_prefix}/systemd/linux-agent-observer-helper.socket"
     managed_egress_sha="$(sha256sum "${managed_egress_path}" | awk '{print $1}')"
     if run_managed_installer upgrade --version v0.0.2-test --from-dist "${failing_dist_three}" \
         >"${tmp_root}/managed-failure.stdout" 2>"${tmp_root}/managed-failure.stderr"; then
@@ -468,7 +539,90 @@ SH
     grep -q '^Environment=LINUX_AGENT_UNIT_MARKER=v2$' "${managed_unit_path}"
     [[ -z "$(find "${managed_prefix}" -maxdepth 1 -name '.linux-agent-web.service.*' -print -quit)" ]]
     FAKE_SYSTEMD_PREFIX="${managed_prefix}" FAKE_SYSTEMD_STATE="${fake_systemd_dir}" \
-        LINUX_AGENT_OBSERVER_HELPER_SOCKET="${fake_systemd_dir}/observer.sock" \
+        LINUX_AGENT_OBSERVER_HELPER_SOCKET="${managed_observer_socket}" \
+        "${fake_systemd_bin}/systemctl" stop linux-agent-web.service
+    run_managed_installer repair-observer
+    [[ ! -f "${fake_systemd_dir}/service.pid" ]]
+    [[ ! -f "${fake_systemd_dir}/helper.pid" ]]
+    [[ ! -S "${managed_observer_socket}" ]]
+
+    source_prefix="${tmp_root}/source-prefix"
+    source_unit_path="${source_prefix}/systemd/linux-agent-web.service"
+    source_helper_socket_path="${source_prefix}/systemd/linux-agent-observer-helper.socket"
+    source_observer_socket="${source_prefix}/systemd/source-observer.sock"
+    mkdir -p "${source_prefix}/bin" "${source_prefix}/lib" \
+        "${source_prefix}/packaging" "${source_prefix}/systemd"
+    cp "${ROOT_DIR}/bin/agent-web" "${source_prefix}/bin/agent-web"
+    cp "${ROOT_DIR}/lib/observer_helper.py" "${source_prefix}/lib/observer_helper.py"
+    cp "${ROOT_DIR}/lib/subprocess_env.py" "${source_prefix}/lib/subprocess_env.py"
+    cp "${ROOT_DIR}/packaging/linux-agent-observer-helper.socket" \
+        "${source_prefix}/packaging/linux-agent-observer-helper.socket"
+    printf '%s\n%s\n' '[Service]' 'User=root' >"${source_unit_path}"
+    cp "${ROOT_DIR}/packaging/linux-agent-observer-helper.socket" "${source_helper_socket_path}"
+
+    run_source_observer_repair() {
+        unshare -Ur env \
+            PATH="${fake_systemd_bin}:${PATH}" \
+            FAKE_SYSTEMD_PREFIX="${source_prefix}" \
+            FAKE_SYSTEMD_STATE="${fake_systemd_dir}" \
+            LINUX_AGENT_SYSTEMD_UNIT_PATH="${source_unit_path}" \
+            LINUX_AGENT_SYSTEMD_HELPER_SOCKET_PATH="${source_helper_socket_path}" \
+            LINUX_AGENT_OBSERVER_HELPER_SOCKET="${source_observer_socket}" \
+            LINUX_AGENT_ALLOW_UNSAFE_SYSTEMD_TEST_PREFIX=1 \
+            LINUX_AGENT_ALLOW_ROOT_SERVICE_USER_FOR_TESTS=1 \
+            "$@" bash "${ROOT_DIR}/scripts/install.sh" repair-observer \
+            --prefix "${source_prefix}" --service-user root
+    }
+
+    if unshare -Ur env \
+        PATH="${fake_systemd_bin}:${PATH}" \
+        LINUX_AGENT_SYSTEMD_UNIT_PATH="${source_unit_path}" \
+        LINUX_AGENT_OBSERVER_HELPER_SOCKET="${tmp_root}/foreign.sock" \
+        LINUX_AGENT_ALLOW_UNSAFE_SYSTEMD_TEST_PREFIX=1 \
+        LINUX_AGENT_ALLOW_ROOT_SERVICE_USER_FOR_TESTS=1 \
+        bash "${ROOT_DIR}/scripts/install.sh" repair-observer \
+        --prefix "${source_prefix}" --service-user root \
+        >"${tmp_root}/unsafe-observer-repair.stdout" \
+        2>"${tmp_root}/unsafe-observer-repair.stderr"; then
+        printf 'source repair unexpectedly accepted an unrelated socket path\n' >&2
+        exit 1
+    fi
+    grep -q '仅允许重建 /run/linux-agent' "${tmp_root}/unsafe-observer-repair.stderr"
+    run_source_observer_repair
+    grep -q '^SocketGroup=root$' \
+        "${source_helper_socket_path}.d/10-socket-group.conf"
+    [[ ! -f "${fake_systemd_dir}/helper.pid" ]]
+    [[ ! -S "${source_observer_socket}" ]]
+
+    if run_source_observer_repair FAKE_HELPER_FAIL=1 \
+        >"${tmp_root}/source-observer-failure.stdout" \
+        2>"${tmp_root}/source-observer-failure.stderr"; then
+        printf 'source repair unexpectedly accepted a failed helper health check\n' >&2
+        exit 1
+    fi
+    grep -q '^SocketGroup=root$' \
+        "${source_helper_socket_path}.d/10-socket-group.conf"
+    [[ ! -f "${fake_systemd_dir}/helper.pid" ]]
+    [[ ! -S "${source_observer_socket}" ]]
+
+    unshare -Ur env \
+        PATH="${fake_systemd_bin}:${PATH}" \
+        FAKE_SYSTEMD_PREFIX="${source_prefix}" \
+        FAKE_SYSTEMD_STATE="${fake_systemd_dir}" \
+        LINUX_AGENT_OBSERVER_HELPER_SOCKET="${source_observer_socket}" \
+        "${fake_systemd_bin}/systemctl" start linux-agent-observer-helper.socket
+    for _ in $(seq 1 100); do
+        [[ -S "${source_observer_socket}" ]] && break
+        sleep 0.02
+    done
+    [[ -S "${source_observer_socket}" ]]
+    [[ -f "${fake_systemd_dir}/helper.pid" ]]
+    run_source_observer_repair
+    [[ -S "${source_observer_socket}" ]]
+    [[ -f "${fake_systemd_dir}/helper.pid" ]]
+
+    FAKE_SYSTEMD_PREFIX="${managed_prefix}" FAKE_SYSTEMD_STATE="${fake_systemd_dir}" \
+        LINUX_AGENT_OBSERVER_HELPER_SOCKET="${source_observer_socket}" \
         "${fake_systemd_bin}/systemctl" stop linux-agent-web.service
     fake_systemd_pidfile=""
     fake_systemd_helper_pidfile=""
