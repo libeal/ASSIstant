@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 
+import os
 import sys
 import unittest
 from pathlib import Path
@@ -10,7 +11,10 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "lib"))
 sys.path.insert(0, str(ROOT / "web"))
 
-import server  # noqa: E402
+# Importing the server initializes authentication. Keep that initialization
+# independent from untracked runtime state in a source checkout.
+with mock.patch.dict(os.environ, {"LINUX_AGENT_WEB_TOKEN": "unit-test-token"}):
+    import server  # noqa: E402
 
 
 class ServerConfigurationTests(unittest.TestCase):
