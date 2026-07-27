@@ -344,7 +344,26 @@ observer_enable_without_password="$(curl --noproxy '*' -sS \
     -H "Content-Type: application/json" \
     -d '{"action":"enable"}' \
     "${base_url}/api/observer/bootstrap")"
-jq -e 'if .ok then .status == "enabled" else (.status | IN("sudo_required","observer_disabled","observer_helper_unavailable","observer_helper_failed")) end' <<<"${observer_enable_without_password}" >/dev/null
+# The source adapter probes host audit tooling, so its fail-closed result varies
+# with sudo, auditd, kernel capabilities, and managed-helper availability.
+if ! jq -e 'if .ok then .status == "enabled" else (.status | IN(
+    "sudo_required",
+    "auditctl_not_found",
+    "ausearch_not_found",
+    "auditctl_failed",
+    "auditctl_permission_denied",
+    "auditctl_timeout",
+    "observer_disabled",
+    "sudo_not_found",
+    "sudo_timeout",
+    "sudo_denied",
+    "observer_helper_unavailable",
+    "observer_helper_failed"
+)) end' <<<"${observer_enable_without_password}" >/dev/null; then
+    printf 'unexpected observer bootstrap response without password: %s\n' \
+        "${observer_enable_without_password}" >&2
+    exit 1
+fi
 
 config_state="$(curl --noproxy '*' -sS -H "Authorization: Bearer ${token}" "${base_url}/api/config")"
 jq -e '.ok == true and (.config.agent_loop.thinking_trace_enabled | type == "boolean") and .config.api_key_configured == true and .config.api_key_source == "config" and .config.api_key_configured_in_config == true and .config.web.token_configured == true and (.config | has("api_key") | not) and (.config | has("api_key_file") | not) and (.config | has("api_key_file_configured") | not) and (.config | has("api_key_migration_recommended") | not)
