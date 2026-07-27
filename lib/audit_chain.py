@@ -15,6 +15,7 @@ stable ``<log>.lock`` file serializes every writer across opening, rotation,
 and append, so a rename never changes the object on which writers coordinate.
 """
 
+import errno
 import fcntl
 import hashlib
 import json
@@ -87,12 +88,38 @@ def _open_flags(base_flags):
     return flags
 
 
+def _open_audit_file(path, base_flags):
+    flags = _open_flags(base_flags)
+    try:
+        return os.open(path, flags | os.O_CREAT | os.O_EXCL, 0o600), True
+    except OSError as exc:
+        if exc.errno != errno.EEXIST:
+            raise
+    return os.open(path, flags), False
+
+
+def _inherit_directory_owner(fd, path):
+    """Give newly-created root audit files to the runtime directory owner."""
+
+    if os.geteuid() != 0:
+        return
+    directory = os.path.dirname(os.path.abspath(os.fspath(path))) or "."
+    metadata = os.stat(directory, follow_symlinks=False)
+    if not stat.S_ISDIR(metadata.st_mode) or metadata.st_mode & (
+        stat.S_IWGRP | stat.S_IWOTH
+    ):
+        raise OSError("audit parent is not a trusted private directory")
+    os.fchown(fd, metadata.st_uid, metadata.st_gid)
+
+
 def _open_lock(lock_path):
-    fd = os.open(lock_path, _open_flags(os.O_RDWR | os.O_CREAT), 0o600)
+    fd, created = _open_audit_file(lock_path, os.O_RDWR)
     try:
         if not stat.S_ISREG(os.fstat(fd).st_mode):
             raise OSError("audit lock path is not a regular file")
         os.fchmod(fd, 0o600)
+        if created:
+            _inherit_directory_owner(fd, lock_path)
     except Exception:
         os.close(fd)
         raise
@@ -100,13 +127,15 @@ def _open_lock(lock_path):
 
 
 def _open_log(path):
-    fd = os.open(path, _open_flags(os.O_RDWR | os.O_APPEND | os.O_CREAT), 0o600)
+    fd, created = _open_audit_file(path, os.O_RDWR | os.O_APPEND)
     try:
         if not stat.S_ISREG(os.fstat(fd).st_mode):
             raise OSError("audit log path is not a regular file")
         # os.open's mode only applies to a newly-created file.  Tighten an
         # existing file too, and refuse the write if that cannot be guaranteed.
         os.fchmod(fd, 0o600)
+        if created:
+            _inherit_directory_owner(fd, path)
     except Exception:
         os.close(fd)
         raise
@@ -877,6 +906,89 @@ def snapshot_chain(path, destination_directory):
         os.close(lock_fd)
 
 
+def rechain_snapshot(path):
+    """Build a new valid chain after an offline snapshot has been redacted."""
+
+    live_path = os.path.abspath(os.fspath(path))
+    directory = os.path.dirname(live_path) or "."
+    basename = os.path.basename(live_path)
+    pattern = re.compile(rf"^{re.escape(basename)}\.([1-9][0-9]*)$")
+    segments = []
+    with os.scandir(directory) as entries:
+        for entry in entries:
+            match = pattern.fullmatch(entry.name)
+            if match is None or entry.is_symlink():
+                continue
+            if entry.is_file(follow_symlinks=False):
+                segments.append((int(match.group(1)), entry.path))
+    ordered = [candidate for _, candidate in sorted(segments)] + [live_path]
+    if not os.path.isfile(live_path) or os.path.islink(live_path):
+        raise OSError("redacted audit snapshot has no regular live segment")
+
+    sequence = 0
+    previous_hash = GENESIS_HASH
+    previous_segment = ""
+    total_events = 0
+    for segment_path in ordered:
+        if not os.path.isfile(segment_path) or os.path.islink(segment_path):
+            raise OSError("redacted audit snapshot segment is not a regular file")
+        events = []
+        with open(segment_path, encoding="utf-8") as handle:
+            for line_number, raw in enumerate(handle, start=1):
+                if not raw.strip():
+                    continue
+                try:
+                    event = _loads_json(raw)
+                except (json.JSONDecodeError, RecursionError, ValueError) as exc:
+                    raise AuditIntegrityError(
+                        f"redacted audit event is invalid at {os.path.basename(segment_path)}:{line_number}"
+                    ) from exc
+                if not isinstance(event, dict):
+                    raise AuditIntegrityError("redacted audit event must be an object")
+                sequence += 1
+                event["seq"] = sequence
+                event["prev_hash"] = previous_hash
+                event.pop("hash", None)
+                if not events:
+                    if previous_segment:
+                        event["rotated_from"] = previous_segment
+                    else:
+                        event.pop("rotated_from", None)
+                else:
+                    event.pop("rotated_from", None)
+                event["hash"] = event_hash(event)
+                previous_hash = event["hash"]
+                events.append(event)
+        if not events:
+            raise AuditIntegrityError(
+                f"redacted audit snapshot segment is empty: {os.path.basename(segment_path)}"
+            )
+        temporary = f"{segment_path}.rechain.{os.getpid()}"
+        descriptor = os.open(temporary, _open_flags(os.O_WRONLY | os.O_CREAT | os.O_EXCL), 0o600)
+        try:
+            for event in events:
+                payload = (
+                    json.dumps(
+                        event,
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                        allow_nan=False,
+                    )
+                    + "\n"
+                ).encode("utf-8")
+                _write_all(descriptor, payload)
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+        os.replace(temporary, segment_path)
+        os.chmod(segment_path, 0o600)
+        previous_segment = os.path.basename(segment_path)
+        total_events += len(events)
+    _fsync_directory(directory)
+    return {"ok": True, "status": "rechained", "events": total_events, "segments": len(ordered)}
+
+
 def _parse_append_options(argv):
     if not argv:
         raise ValueError("audit log path is required")
@@ -995,6 +1107,19 @@ def _cli_snapshot(argv):
     return 0
 
 
+def _cli_rechain(argv):
+    if len(argv) != 1:
+        print("audit_chain: rechain requires <snapshot-file>", file=sys.stderr)
+        return 2
+    try:
+        report = rechain_snapshot(argv[0])
+    except (AuditIntegrityError, OSError, TypeError, ValueError) as exc:
+        print(f"audit_chain: rechain failed: {exc}", file=sys.stderr)
+        return 4
+    print(json.dumps(report, ensure_ascii=False, separators=(",", ":")))
+    return 0
+
+
 def main(argv):
     if len(argv) >= 2 and argv[0] == "append":
         return _cli_append(argv[1:])
@@ -1004,9 +1129,11 @@ def main(argv):
         return _cli_verify(argv[1:])
     if len(argv) >= 2 and argv[0] == "snapshot":
         return _cli_snapshot(argv[1:])
+    if len(argv) >= 2 and argv[0] == "rechain":
+        return _cli_rechain(argv[1:])
     print(
         "usage: audit_chain.py append|serve <file> [options] | verify <file> | "
-        "snapshot <file> <destination-directory>",
+        "snapshot <file> <destination-directory> | rechain <snapshot-file>",
         file=sys.stderr,
     )
     return 2

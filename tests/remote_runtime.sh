@@ -28,6 +28,32 @@ web_port="$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0
 mkdir -p "${runtime_base}"
 SOURCE_DATE_EPOCH=0 bash "${ROOT_DIR}/scripts/build-remote-release.sh" v0.0.0-test "${release_dir}" >/dev/null
 
+# flock is a hard dependency and must fail before the bootstrap downloads even
+# the release manifest. Keep every other bootstrap dependency visible.
+no_flock_bin="${tmp_root}/no-flock-bin"
+no_flock_curl_marker="${tmp_root}/no-flock-curl-invoked"
+mkdir -p "${no_flock_bin}"
+for command_name in bash python3 jq tar sha256sum stat mktemp; do
+    ln -s "$(command -v "${command_name}")" "${no_flock_bin}/${command_name}"
+done
+printf '%s\n' \
+    '#!/usr/bin/env bash' \
+    ': >"${NO_FLOCK_CURL_MARKER:?}"' \
+    'exit 99' >"${no_flock_bin}/curl"
+chmod 0755 "${no_flock_bin}/curl"
+if PATH="${no_flock_bin}" NO_FLOCK_CURL_MARKER="${no_flock_curl_marker}" \
+    XDG_RUNTIME_DIR="${runtime_base}" \
+    LINUX_AGENT_ALLOW_INSECURE_TEST_URL=1 \
+    LINUX_AGENT_RELEASE_BASE_URL="file://${release_dir}" \
+    "${no_flock_bin}/bash" "${release_dir}/linux-agent-cli.sh" doctor \
+    >"${tmp_root}/no-flock.stdout" 2>"${tmp_root}/no-flock.stderr"; then
+    printf 'Remote bootstrap unexpectedly ran without flock\n' >&2
+    exit 1
+fi
+grep -q 'flock.*util-linux' "${tmp_root}/no-flock.stderr"
+[[ ! -e "${no_flock_curl_marker}" ]]
+[[ -z "$(find "${runtime_base}" -mindepth 1 -maxdepth 1 -print -quit)" ]]
+
 run_remote_cli() {
     XDG_RUNTIME_DIR="${runtime_base}" \
         LINUX_AGENT_ALLOW_INSECURE_TEST_URL=1 \
@@ -42,6 +68,7 @@ jq -e '
     and .skills_ok == true
     and .remote.enabled == true
     and .remote.release_version == "v0.0.0-test"
+    and ([.required_commands[] | select(.name == "flock" and .ok == true)] | length == 1)
 ' <<<"${doctor_json}" >/dev/null
 grep -q '浮动 latest' "${latest_stderr}"
 [[ -z "$(find "${runtime_base}" -mindepth 1 -maxdepth 1 -print -quit)" ]]
@@ -117,6 +144,39 @@ fi
 
 web_stdout="${tmp_root}/remote-web.stdout"
 web_stderr="${tmp_root}/remote-web.stderr"
+observer_fake_bin="${tmp_root}/observer-fake-bin"
+mkdir -p "${observer_fake_bin}"
+cat >"${observer_fake_bin}/sudo" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+state="$(dirname "$0")/sudo.state"
+if [[ "${1:-}" == "-n" && "${2:-}" == "true" ]]; then
+    [[ -f "${state}" ]]
+    exit
+fi
+if [[ "${1:-}" == "-S" && "${2:-}" == "-p" && "${4:-}" == "-v" ]]; then
+    IFS= read -r password
+    [[ "${password}" == "remote-observer-password" ]]
+    : >"${state}"
+    exit
+fi
+if [[ "${1:-}" == "-n" ]]; then
+    shift
+    [[ -f "${state}" ]]
+    exec "$@"
+fi
+exit 1
+EOF
+cat >"${observer_fake_bin}/auditctl" <<'EOF'
+#!/usr/bin/env bash
+printf 'enabled 1\n'
+EOF
+cat >"${observer_fake_bin}/ausearch" <<'EOF'
+#!/usr/bin/env bash
+exit 0
+EOF
+chmod 0755 "${observer_fake_bin}/sudo" "${observer_fake_bin}/auditctl" \
+    "${observer_fake_bin}/ausearch"
 
 remote_web_token() {
     local config_file="" token="" token_file=""
@@ -136,8 +196,25 @@ remote_web_token() {
     fi
 }
 
+wait_remote_job() {
+    local job_id="$1" result status
+    for _ in $(seq 1 100); do
+        result="$(curl -fsS -H "Authorization: Bearer ${web_token}" \
+            "http://127.0.0.1:${web_port}/api/jobs/${job_id}")"
+        status="$(jq -r '.status // empty' <<<"${result}")"
+        if [[ "${status}" != "queued" && "${status}" != "running" ]]; then
+            printf '%s\n' "${result}"
+            return 0
+        fi
+        sleep 0.1
+    done
+    printf 'Remote Web job did not finish: %s\n' "${job_id}" >&2
+    return 1
+}
+
 curl -fsSL "file://${release_dir}/linux-agent-web.sh" |
-    XDG_RUNTIME_DIR="${runtime_base}" \
+    PATH="${observer_fake_bin}:${PATH}" \
+        XDG_RUNTIME_DIR="${runtime_base}" \
         LINUX_AGENT_REMOTE_WEB_PORT="${web_port}" \
         LINUX_AGENT_ALLOW_INSECURE_TEST_URL=1 \
         LINUX_AGENT_RELEASE_BASE_URL="file://${release_dir}" \
@@ -162,8 +239,121 @@ if grep -Fq -- "${web_token}" "${web_stdout}" "${web_stderr}"; then
     printf 'remote Web token was echoed to stdout/stderr\n' >&2
     exit 1
 fi
+remote_observer_state="$(curl -fsS -H "Authorization: Bearer ${web_token}" \
+    "http://127.0.0.1:${web_port}/api/observer/bootstrap")"
+jq -e '.managed_execution == false
+    and .requires_permission == true
+    and (.authorization_mode == "root" or .authorization_mode == "sudo_interactive")' \
+    <<<"${remote_observer_state}" >/dev/null
+remote_observer_enabled="$(curl -fsS -X POST \
+    -H "Authorization: Bearer ${web_token}" \
+    -H 'Content-Type: application/json' \
+    -d '{"action":"enable","password":"remote-observer-password"}' \
+    "http://127.0.0.1:${web_port}/api/observer/bootstrap")"
+jq -e '.ok == true and .status == "enabled" and (.method == "root" or .method == "sudo")' \
+    <<<"${remote_observer_enabled}" >/dev/null
+if grep -Fq -- 'remote-observer-password' "${web_stdout}" "${web_stderr}"; then
+    printf 'remote observer password was echoed to stdout/stderr\n' >&2
+    exit 1
+fi
 tools_json="$(curl -fsS -H "Authorization: Bearer ${web_token}" "http://127.0.0.1:${web_port}/api/tools")"
-jq -e '[.scripts[].materialization] | all(. == "available")' <<<"${tools_json}" >/dev/null
+jq -e '
+    ([.scripts[].materialization] | all(. == "available"))
+    and ([.scripts[].origin] | all(. == "builtin"))
+' <<<"${tools_json}" >/dev/null
+
+remote_user_script_v1=$'#!/usr/bin/env bash\nset -euo pipefail\nargs="${1:-}"\n[[ -n "${args}" ]] || args="{}"\npython3 - "${args}" <<PY\nimport json\nimport sys\nprint(json.dumps({"ok": True, "status": "executed", "tool": "remote-user/run", "version": "v1", "args": json.loads(sys.argv[1])}))\nPY'
+remote_user_edit="$(jq -cn --arg content "${remote_user_script_v1}" '{
+    response_type:"skill_edit",
+    skill:{name:"remote-user",description:"Remote user overlay fixture"},
+    scripts:[{name:"run.sh",description:"Accepts an optional JSON object and reports it.",content:$content}],
+    notes:"remote user create"
+}')"
+remote_user_review="$(curl -fsS -X POST \
+    -H "Authorization: Bearer ${web_token}" \
+    -H 'Content-Type: application/json' \
+    -d "$(jq -cn --argjson edit "${remote_user_edit}" '{edit:$edit}')" \
+    "http://127.0.0.1:${web_port}/api/edit/review")"
+if ! jq -e '.ok == true and .status == "approved"
+    and ([.reviews[].review.findings[]? | select(.code == "AST_HEREDOC")] | length) == 1' \
+    <<<"${remote_user_review}" >/dev/null; then
+    printf 'Remote user Skill review returned an unexpected result: %s\n' \
+        "${remote_user_review}" >&2
+    exit 1
+fi
+remote_user_create_job="$(curl -fsS -X POST \
+    -H "Authorization: Bearer ${web_token}" \
+    -H 'Content-Type: application/json' \
+    -d "$(jq -cn --argjson edit "${remote_user_edit}" \
+        '{resource:"edit",action:"apply",payload:{edit:$edit,approve:true}}')" \
+    "http://127.0.0.1:${web_port}/api/jobs")"
+remote_user_create_result="$(wait_remote_job "$(jq -r '.job_id' <<<"${remote_user_create_job}")")"
+jq -e '.status == "succeeded" and .result_status == "edited" and .result.ok == true
+    and (.result.result.skill_dir | endswith("/data/skills/remote-user"))' \
+    <<<"${remote_user_create_result}" >/dev/null
+remote_agent_root="$(find "${runtime_base}" -maxdepth 4 -type d \
+    -path '*/linux-agent-remote.*/agent' -print -quit)"
+[[ -f "${remote_agent_root}/data/skills/remote-user/scripts/run.sh" ]]
+[[ ! -e "${remote_agent_root}/skills/remote-user" && ! -L "${remote_agent_root}/skills/remote-user" ]]
+
+remote_user_script_v2="${remote_user_script_v1/v1/v2}"
+remote_user_edit_v2="$(jq -c --arg content "${remote_user_script_v2}" \
+    '.skill.description = "Remote user overlay fixture updated"
+    | .scripts[0].content = $content
+    | .notes = "remote user update"' <<<"${remote_user_edit}")"
+remote_user_update_job="$(curl -fsS -X POST \
+    -H "Authorization: Bearer ${web_token}" \
+    -H 'Content-Type: application/json' \
+    -d "$(jq -cn --argjson edit "${remote_user_edit_v2}" \
+        '{resource:"edit",action:"apply",payload:{edit:$edit,approve:true}}')" \
+    "http://127.0.0.1:${web_port}/api/jobs")"
+remote_user_update_result="$(wait_remote_job "$(jq -r '.job_id' <<<"${remote_user_update_job}")")"
+jq -e '.status == "succeeded" and .result_status == "edited" and .result.ok == true' \
+    <<<"${remote_user_update_result}" >/dev/null
+grep -q '"version": "v2"' "${remote_agent_root}/data/skills/remote-user/scripts/run.sh"
+
+remote_conflict_script=$'#!/usr/bin/env bash\nset -euo pipefail\nprintf '\''{"ok":true}\\n'\'''
+remote_conflict_edit="$(jq -cn --arg content "${remote_conflict_script}" '{
+    response_type:"skill_edit",
+    skill:{name:"ops-basic",description:"Must conflict with lazy built-in"},
+    scripts:[{name:"run.sh",description:"Accepts a JSON object.",content:$content}]
+}')"
+remote_conflict_job="$(curl -fsS -X POST \
+    -H "Authorization: Bearer ${web_token}" \
+    -H 'Content-Type: application/json' \
+    -d "$(jq -cn --argjson edit "${remote_conflict_edit}" \
+        '{resource:"edit",action:"apply",payload:{edit:$edit,approve:true}}')" \
+    "http://127.0.0.1:${web_port}/api/jobs")"
+remote_conflict_result="$(wait_remote_job "$(jq -r '.job_id' <<<"${remote_conflict_job}")")"
+if ! jq -e '.status == "failed" and .result_status == "failed"
+    and .result.code == "skill_conflict" and .result.result.code == "skill_conflict"' \
+    <<<"${remote_conflict_result}" >/dev/null; then
+    printf 'Remote reserved-name conflict returned an unexpected result: %s\n' \
+        "${remote_conflict_result}" >&2
+    exit 1
+fi
+[[ ! -e "${remote_agent_root}/data/skills/ops-basic" && ! -L "${remote_agent_root}/data/skills/ops-basic" ]]
+
+remote_user_run_job="$(curl -fsS -X POST \
+    -H "Authorization: Bearer ${web_token}" \
+    -H 'Content-Type: application/json' \
+    -d '{"resource":"script","action":"run","payload":{"ref":"remote-user/run","arguments":{"message":"ok"},"approve":true}}' \
+    "http://127.0.0.1:${web_port}/api/jobs")"
+remote_user_run_result="$(wait_remote_job "$(jq -r '.job_id' <<<"${remote_user_run_job}")")"
+if ! jq -e '.status == "succeeded" and .result_status == "executed" and .result.ok == true
+    and ([.result.output_blocks[]? | select(.kind == "json") | .json
+        | select(.tool == "remote-user/run" and .version == "v2")] | length) == 1' \
+    <<<"${remote_user_run_result}" >/dev/null; then
+    printf 'Remote user Skill execution returned an unexpected result: %s\n' \
+        "${remote_user_run_result}" >&2
+    exit 1
+fi
+tools_with_user="$(curl -fsS -H "Authorization: Bearer ${web_token}" \
+    "http://127.0.0.1:${web_port}/api/tools")"
+jq -e '
+    ([.scripts[] | select(.skill == "remote-user") | select(.origin == "user" and .materialization == "ready")] | length) == 1
+    and ([.scripts[] | select(.skill == "ops-basic") | select(.origin == "builtin" and .materialization == "available")] | length > 0)
+' <<<"${tools_with_user}" >/dev/null
 materialize_one="${tmp_root}/materialize-one.json"
 materialize_two="${tmp_root}/materialize-two.json"
 curl -fsS -X POST -H "Authorization: Bearer ${web_token}" -H 'Content-Type: application/json' \
@@ -179,17 +369,45 @@ jq -e '.ok == true and .status == "skill_materialized"' "${materialize_two}" >/d
 tools_after_materialize="$(curl -fsS -H "Authorization: Bearer ${web_token}" "http://127.0.0.1:${web_port}/api/tools")"
 jq -e '
     ([.scripts[] | select(.skill == "os-deep-inspect") | .materialization] | all(. == "ready"))
-    and ([.scripts[] | select(.skill != "os-deep-inspect") | .materialization] | all(. == "available"))
+    and ([.scripts[] | select(.skill == "remote-user") | .materialization] | all(. == "ready"))
+    and ([.scripts[] | select(.skill != "os-deep-inspect" and .skill != "remote-user") | .materialization] | all(. == "available"))
 ' <<<"${tools_after_materialize}" >/dev/null
+remote_skill_review="$(curl -fsS -X POST \
+    -H "Authorization: Bearer ${web_token}" \
+    -H 'Content-Type: application/json' \
+    -d '{"ref":"network-ops-tools/firewall","arguments":{"action":"status"}}' \
+    "http://127.0.0.1:${web_port}/api/script/review")"
+jq -e '
+    .ref == "network-ops-tools/firewall"
+    and (.review | type == "object")
+    and .review.approval_required == true
+' <<<"${remote_skill_review}" >/dev/null
 web_backup="${tmp_root}/remote-web-backup.tar.gz"
-curl -fsS -H "Authorization: Bearer ${web_token}" -o "${web_backup}" \
-    "http://127.0.0.1:${web_port}/api/runtime/backup"
-tar -tzf "${web_backup}" >/dev/null
+web_backup_code="$(curl -sS -w '%{http_code}' \
+    -H "Authorization: Bearer ${web_token}" -o "${web_backup}" \
+    "http://127.0.0.1:${web_port}/api/runtime/backup")"
+if [[ "${web_backup_code}" != "200" ]]; then
+    printf 'Remote Web backup failed with HTTP %s: %s\n' \
+        "${web_backup_code}" "$(<"${web_backup}")" >&2
+    exit 1
+fi
+web_backup_listing="$(tar -tzf "${web_backup}")"
 web_backup_extract="${tmp_root}/remote-web-backup"
 mkdir -p "${web_backup_extract}"
 tar -xzf "${web_backup}" -C "${web_backup_extract}"
+grep -q '^skills/remote-user/scripts/run.sh$' <<<"${web_backup_listing}"
+if grep -q '^skills/os-deep-inspect/' <<<"${web_backup_listing}"; then
+    printf 'remote Web backup contains materialized built-in Skill files\n' >&2
+    exit 1
+fi
+jq -e '.materialized[] | select(.skill == "os-deep-inspect")' \
+    "${web_backup_extract}/skills/materialized.json" >/dev/null
 if grep -R -Fq -- "${web_token}" "${web_backup_extract}"; then
     printf 'remote Web backup contains the Web token\n' >&2
+    exit 1
+fi
+if grep -R -Fq -- 'remote-observer-password' "${web_backup_extract}"; then
+    printf 'remote Web backup contains the observer password\n' >&2
     exit 1
 fi
 grep -R -Eq -- '"stage":"remote_bootstrap_verified"' "${web_backup_extract}/logs"

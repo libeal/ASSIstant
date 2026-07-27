@@ -6,7 +6,28 @@ import {
   filteredAuditSessions,
   nextAuditRenderBatch,
 } from "../web/static/modules/audit-view-utils.js";
+import { auditEventDisplay } from "../web/static/modules/audit.js";
 import { createAuditView } from "../web/static/modules/view-audit.js";
+
+const safeContextDisplay = auditEventDisplay({
+  stage: "request_context_built",
+  payload: { current_request_preview: "safe request", conversation_turns: 2, environment_keys: ["os"] },
+});
+assert.equal(safeContextDisplay.summary, "safe request");
+assert.ok(safeContextDisplay.details.includes("会话轮数：2"));
+assert.ok(safeContextDisplay.details.includes("环境字段：os"));
+
+const verboseContextDisplay = auditEventDisplay({
+  stage: "request_context_built",
+  payload: {
+    current_request: "verbose request",
+    conversation_context: [{}, {}, {}],
+    environment_context: { kernel: "Linux", hostname: "server" },
+  },
+});
+assert.equal(verboseContextDisplay.summary, "verbose request");
+assert.ok(verboseContextDisplay.details.includes("会话轮数：3"));
+assert.ok(verboseContextDisplay.details.includes("环境字段：kernel、hostname"));
 
 const sessions = [
   { session_id: "web_a", status: "ok", summary: "work run" },

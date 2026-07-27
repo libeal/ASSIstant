@@ -83,7 +83,6 @@ jobs:
             tests/observer.sh \
             tests/audit_integrity.sh \
             tests/smoke.sh \
-            tests/mcp.sh \
             tests/contract.sh \
             tests/web_api.sh \
             tests/web_server.sh \

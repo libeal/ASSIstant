@@ -12,6 +12,14 @@ cleanup() {
     rm -rf "${tmp_root}"
 }
 trap cleanup EXIT
+report_failure() {
+    local status=$?
+    local line="${1:-unknown}"
+    trap - ERR
+    printf 'security: failed at line %s (exit=%s)\n' "${line}" "${status}" >&2
+    return "${status}"
+}
+trap 'report_failure "${LINENO}"' ERR
 start_fake_ai_server "$((25000 + RANDOM % 1000))" "${tmp_root}"
 
 # shellcheck source=../lib/common.sh
@@ -36,9 +44,219 @@ source "${ROOT_DIR}/lib/policy.sh"
 source "${ROOT_DIR}/lib/observer.sh"
 # shellcheck source=../lib/executor.sh
 source "${ROOT_DIR}/lib/executor.sh"
+# shellcheck source=../lib/editor.sh
+source "${ROOT_DIR}/lib/editor.sh"
 
 linux_agent_init_env "${ROOT_DIR}"
 linux_agent_load_config
+
+# Config reads must reject ambiguous duplicate keys and non-standard finite
+# values before jq can normalize them. The live Web gate uses the same parser.
+(
+    duplicate_config_file="${tmp_root}/duplicate-config.json"
+    printf '%s\n' '{"web":{"sensitive_edits_enabled":true,"sensitive_edits_enabled":false}}' \
+        >"${duplicate_config_file}"
+    if LINUX_AGENT_CONFIG_FILE="${duplicate_config_file}" \
+        linux_agent_load_config >"${tmp_root}/duplicate-config.out" 2>"${tmp_root}/duplicate-config.err"; then
+        printf 'config loader unexpectedly accepted duplicate JSON keys\n' >&2
+        exit 1
+    fi
+    if LINUX_AGENT_WEB=1 LINUX_AGENT_CONFIG_FILE="${duplicate_config_file}" \
+        linux_agent_web_sensitive_edits_enabled; then
+        printf 'sensitive edit gate unexpectedly accepted duplicate JSON keys\n' >&2
+        exit 1
+    fi
+)
+(
+    non_finite_config_file="${tmp_root}/non-finite-config.json"
+    printf '%s\n' '{"web":{"sensitive_edits_enabled":true},"value":NaN}' \
+        >"${non_finite_config_file}"
+    if LINUX_AGENT_CONFIG_FILE="${non_finite_config_file}" \
+        linux_agent_load_config >"${tmp_root}/non-finite-config.out" 2>"${tmp_root}/non-finite-config.err"; then
+        printf 'config loader unexpectedly accepted a non-finite JSON number\n' >&2
+        exit 1
+    fi
+)
+
+# Skill overlay commits keep both the package and INDEX transactionally
+# recoverable when the final directory fsync or the second rename fails.
+(
+    commit_root="${tmp_root}/skill-commit"
+    user_root="${commit_root}/user"
+    builtin_root="${commit_root}/builtin"
+    mkdir -p "${user_root}/existing/scripts" "${builtin_root}"
+    printf 'old-script\n' >"${user_root}/existing/scripts/run.sh"
+    printf 'old-index\n' >"${user_root}/INDEX.md"
+    mkdir -p "${user_root}/.staging-existing/scripts"
+    printf 'new-script\n' >"${user_root}/.staging-existing/scripts/run.sh"
+    candidate_index="${user_root}/.INDEX-existing.tmp"
+    printf 'new-index\n' >"${candidate_index}"
+    # shellcheck disable=SC2034
+    LINUX_AGENT_MANAGED_MODE=1
+    # shellcheck disable=SC2034
+    LINUX_AGENT_USER_SKILLS_DIR="${user_root}"
+    LINUX_AGENT_BUILTIN_SKILLS_DIR="${builtin_root}"
+    LINUX_AGENT_CONFIG_JSON='{"skills_dir":"/tmp/managed-skill-escape"}'
+    [[ "$(linux_agent_user_skills_dir)" == "${user_root}" ]]
+    [[ "$(linux_agent_skills_dir)" == "${builtin_root}" ]]
+    linux_agent_web_sensitive_edits_enabled() { return 0; }
+    fsync_calls=0
+    linux_agent_fsync_skill_paths() {
+        fsync_calls=$((fsync_calls + 1))
+        [[ "${fsync_calls}" -ne 2 ]]
+    }
+    if linux_agent_commit_staged_skill existing "${user_root}/.staging-existing" "${candidate_index}"; then
+        printf 'skill commit unexpectedly succeeded after fsync failure\n' >&2
+        exit 1
+    fi
+    [[ "$(<"${user_root}/existing/scripts/run.sh")" == 'old-script' ]]
+    [[ "$(<"${user_root}/INDEX.md")" == 'old-index' ]]
+
+    rm -rf "${user_root}/existing" "${user_root}/.staging-existing" "${candidate_index}"
+    mkdir -p "${user_root}/existing/scripts" "${user_root}/.staging-existing/scripts"
+    printf 'old-script\n' >"${user_root}/existing/scripts/run.sh"
+    printf 'old-index\n' >"${user_root}/INDEX.md"
+    printf 'new-script\n' >"${user_root}/.staging-existing/scripts/run.sh"
+    candidate_index="${user_root}/.INDEX-existing.tmp"
+    printf 'new-index\n' >"${candidate_index}"
+    linux_agent_fsync_skill_paths() { return 0; }
+    failing_source="${candidate_index}"
+    failing_target="${user_root}/INDEX.md"
+    mv() {
+        if [[ "${3:-}" == "${failing_source}" && "${4:-}" == "${failing_target}" ]]; then
+            return 1
+        fi
+        command mv "$@"
+    }
+    if linux_agent_commit_staged_skill existing "${user_root}/.staging-existing" "${candidate_index}"; then
+        printf 'skill commit unexpectedly succeeded after index rename failure\n' >&2
+        exit 1
+    fi
+    [[ "$(<"${user_root}/existing/scripts/run.sh")" == 'old-script' ]]
+    [[ "$(<"${user_root}/INDEX.md")" == 'old-index' ]]
+
+    unset -f mv
+    rm -rf "${user_root}/existing" "${user_root}/.staging-existing" "${candidate_index}"
+    mkdir -p "${user_root}/existing/scripts" "${user_root}/.staging-existing/scripts"
+    printf 'old-script\n' >"${user_root}/existing/scripts/run.sh"
+    printf 'old-index\n' >"${user_root}/INDEX.md"
+    printf 'new-script\n' >"${user_root}/.staging-existing/scripts/run.sh"
+    candidate_index="${user_root}/.INDEX-existing.tmp"
+    printf 'new-index\n' >"${candidate_index}"
+    gate_calls=0
+    linux_agent_web_sensitive_edits_enabled() {
+        gate_calls=$((gate_calls + 1))
+        [[ "${gate_calls}" -eq 1 ]]
+    }
+    if linux_agent_commit_staged_skill existing "${user_root}/.staging-existing" "${candidate_index}"; then
+        printf 'skill commit ignored a gate disabled after staging\n' >&2
+        exit 1
+    fi
+    [[ "${LINUX_AGENT_SKILL_COMMIT_STATUS}" == 'sensitive_edits_disabled' ]]
+    [[ "$(<"${user_root}/existing/scripts/run.sh")" == 'old-script' ]]
+    [[ "$(<"${user_root}/INDEX.md")" == 'old-index' ]]
+    [[ -d "${user_root}/.staging-existing" && -f "${candidate_index}" ]]
+
+    # A successful managed commit must leave the Runner-readable, Web-owned
+    # mode contract in place even though mktemp starts with 0700/0600.
+    linux_agent_web_sensitive_edits_enabled() { return 0; }
+    rm -rf "${user_root}/existing" "${user_root}/.staging-existing" "${candidate_index}"
+    mkdir -p "${user_root}/.staging-permissions/scripts" \
+        "${user_root}/.staging-permissions/references" \
+        "${user_root}/.staging-permissions/assets"
+    printf '#!/usr/bin/env bash\nprintf "{}\\n"\n' >"${user_root}/.staging-permissions/scripts/run.sh"
+    printf '# Skill\n' >"${user_root}/.staging-permissions/SKILL.md"
+    printf '{}\n' >"${user_root}/.staging-permissions/manifest.json"
+    printf 'reference\n' >"${user_root}/.staging-permissions/references/note.txt"
+    printf 'asset\n' >"${user_root}/.staging-permissions/assets/blob"
+    candidate_index="${user_root}/.INDEX-permissions.tmp"
+    printf '# index\n' >"${candidate_index}"
+    linux_agent_commit_staged_skill permissions \
+        "${user_root}/.staging-permissions" "${candidate_index}"
+    [[ "$(stat -c '%a' "${user_root}/permissions")" == '2750' ]]
+    [[ "$(stat -c '%a' "${user_root}/permissions/scripts")" == '2750' ]]
+    [[ "$(stat -c '%a' "${user_root}/permissions/scripts/run.sh")" == '750' ]]
+    [[ "$(stat -c '%a' "${user_root}/permissions/SKILL.md")" == '640' ]]
+    [[ "$(stat -c '%a' "${user_root}/permissions/manifest.json")" == '640' ]]
+    [[ "$(stat -c '%a' "${user_root}/permissions/references/note.txt")" == '640' ]]
+    [[ "$(stat -c '%a' "${user_root}/INDEX.md")" == '640' ]]
+
+    # A prepared journal represents an interrupted transaction. Recovery must
+    # restore the old package and index, then remove every transaction artifact.
+    rm -rf "${user_root}/permissions"
+    rm -f "${user_root}/INDEX.md"
+    mkdir -p "${user_root}/recover-prepared/scripts" \
+        "${user_root}/.staging-recover-prepared/scripts"
+    printf 'old-script\n' >"${user_root}/recover-prepared/scripts/run.sh"
+    printf 'old-index\n' >"${user_root}/INDEX.md"
+    printf 'new-script\n' >"${user_root}/.staging-recover-prepared/scripts/run.sh"
+    printf 'new-index\n' >"${user_root}/.INDEX-recover-prepared.tmp"
+    prepared_skill_identity="$(stat -c '%d:%i' "${user_root}/recover-prepared")"
+    prepared_index_identity="$(stat -c '%d:%i' "${user_root}/INDEX.md")"
+    linux_agent_write_skill_commit_journal \
+        "${user_root}" recover-prepared .staging-recover-prepared \
+        .INDEX-recover-prepared.tmp .backup.recover-prepared.fixture \
+        .backup-index.recover-prepared.fixture 1 1 \
+        "${prepared_skill_identity}" "${prepared_index_identity}" prepared
+    mv -T "${user_root}/recover-prepared" "${user_root}/.backup.recover-prepared.fixture"
+    mv -T "${user_root}/INDEX.md" "${user_root}/.backup-index.recover-prepared.fixture"
+    mv -T "${user_root}/.staging-recover-prepared" "${user_root}/recover-prepared"
+
+    # Startup recovery must wait behind an install/restore generation switch.
+    # While the exclusive runtime lock is held, neither the journal nor the
+    # currently visible (new) package may be touched.
+    LINUX_AGENT_DATA_DIR="${commit_root}/data"
+    mkdir -p "${LINUX_AGENT_DATA_DIR}"
+    : >"${LINUX_AGENT_DATA_DIR}/.runtime.lock"
+    chmod 0600 "${LINUX_AGENT_DATA_DIR}/.runtime.lock"
+    exec {runtime_exclusive_fd}<>"${LINUX_AGENT_DATA_DIR}/.runtime.lock"
+    flock -x "${runtime_exclusive_fd}"
+    linux_agent_recover_pending_skill_commit &
+    recovery_pid="$!"
+    sleep 0.2
+    kill -0 "${recovery_pid}"
+    [[ -f "${user_root}/.commit-recovery.json" ]]
+    [[ "$(<"${user_root}/recover-prepared/scripts/run.sh")" == 'new-script' ]]
+    flock -u "${runtime_exclusive_fd}"
+    exec {runtime_exclusive_fd}>&-
+    wait "${recovery_pid}"
+    [[ "$(<"${user_root}/recover-prepared/scripts/run.sh")" == 'old-script' ]]
+    [[ "$(<"${user_root}/INDEX.md")" == 'old-index' ]]
+    [[ ! -e "${user_root}/.commit-recovery.json" && ! -L "${user_root}/.commit-recovery.json" ]]
+    [[ ! -e "${user_root}/.staging-recover-prepared" && ! -L "${user_root}/.staging-recover-prepared" ]]
+    [[ ! -e "${user_root}/.INDEX-recover-prepared.tmp" && ! -L "${user_root}/.INDEX-recover-prepared.tmp" ]]
+    [[ ! -e "${user_root}/.backup.recover-prepared.fixture" && ! -L "${user_root}/.backup.recover-prepared.fixture" ]]
+    [[ ! -e "${user_root}/.backup-index.recover-prepared.fixture" && ! -L "${user_root}/.backup-index.recover-prepared.fixture" ]]
+
+    # Once the committed journal is durable, recovery keeps the new package
+    # and index and limits its work to cleaning the old backups and temporaries.
+    rm -rf "${user_root}/recover-prepared" "${user_root}/INDEX.md"
+    mkdir -p "${user_root}/recover-committed/scripts" \
+        "${user_root}/.backup.recover-committed.fixture/scripts" \
+        "${user_root}/.staging-recover-committed/scripts"
+    printf 'new-script\n' >"${user_root}/recover-committed/scripts/run.sh"
+    printf 'old-script\n' >"${user_root}/.backup.recover-committed.fixture/scripts/run.sh"
+    printf 'stale-staging\n' >"${user_root}/.staging-recover-committed/scripts/run.sh"
+    printf 'new-index\n' >"${user_root}/INDEX.md"
+    printf 'old-index\n' >"${user_root}/.backup-index.recover-committed.fixture"
+    printf 'stale-candidate\n' >"${user_root}/.INDEX-recover-committed.tmp"
+    committed_skill_identity="$(stat -c '%d:%i' "${user_root}/.backup.recover-committed.fixture")"
+    committed_index_identity="$(stat -c '%d:%i' "${user_root}/.backup-index.recover-committed.fixture")"
+    linux_agent_write_skill_commit_journal \
+        "${user_root}" recover-committed .staging-recover-committed \
+        .INDEX-recover-committed.tmp .backup.recover-committed.fixture \
+        .backup-index.recover-committed.fixture 1 1 \
+        "${committed_skill_identity}" "${committed_index_identity}" committed
+
+    linux_agent_recover_pending_skill_commit
+    [[ "$(<"${user_root}/recover-committed/scripts/run.sh")" == 'new-script' ]]
+    [[ "$(<"${user_root}/INDEX.md")" == 'new-index' ]]
+    [[ ! -e "${user_root}/.commit-recovery.json" && ! -L "${user_root}/.commit-recovery.json" ]]
+    [[ ! -e "${user_root}/.staging-recover-committed" && ! -L "${user_root}/.staging-recover-committed" ]]
+    [[ ! -e "${user_root}/.INDEX-recover-committed.tmp" && ! -L "${user_root}/.INDEX-recover-committed.tmp" ]]
+    [[ ! -e "${user_root}/.backup.recover-committed.fixture" && ! -L "${user_root}/.backup.recover-committed.fixture" ]]
+    [[ ! -e "${user_root}/.backup-index.recover-committed.fixture" && ! -L "${user_root}/.backup-index.recover-committed.fixture" ]]
+)
 LINUX_AGENT_CONFIG_JSON="$(jq --arg api_url "${FAKE_AI_URL}" '
     .api_url = $api_url
     | .api_key = "TEST_CONFIG_API_KEY_123456"
@@ -318,7 +536,7 @@ grep -q '"risk_level":"high"' <<<"${review}"
 [[ "$(linux_agent_execution_privilege_from_review "${review}")" == "least" ]]
 
 sudo_review="$(linux_agent_policy_review_text "terminal" "sudo systemctl restart nginx")"
-[[ "$(linux_agent_execution_privilege_from_review "${sudo_review}")" == "current" ]]
+[[ "$(linux_agent_execution_privilege_from_review "${sudo_review}")" == "least" ]]
 
 fake_priv_bin="${tmp_root}/fake-root-bin"
 mkdir -p "${fake_priv_bin}"
@@ -365,9 +583,187 @@ proxy_meta="$(linux_agent_execution_proxy_metadata "least" "true")"
 jq -e '.enabled == true and .requested_privilege == "least" and .execution_user == "root" and .target_user == "nobody" and .prepared_root == true' <<<"${proxy_meta}" >/dev/null
 PATH="${old_path}"
 
+# Managed session-history receives one redacted audit snapshot rather than
+# access to the protected log directory.
+snapshot_logs="${tmp_root}/snapshot-logs"
+snapshot_private_tmp="${tmp_root}/snapshot-private"
+snapshot_runner_tmp="${tmp_root}/snapshot-runner"
+snapshot_session="session_runner_snapshot"
+snapshot_log="${snapshot_logs}/${snapshot_session}.jsonl"
+mkdir -p "${snapshot_logs}" "${snapshot_private_tmp}" "${snapshot_runner_tmp}"
+chmod 2750 "${snapshot_runner_tmp}"
+for event in \
+    '{"timestamp":"2026-07-22T00:00:00Z","session_id":"session_runner_snapshot","stage":"session_started","payload":{"request":"fixture"}}' \
+    '{"timestamp":"2026-07-22T00:00:01Z","session_id":"session_runner_snapshot","stage":"received","payload":{"mode":"terminal","command":"printf previous-output","password":"snapshot-secret-marker"}}' \
+    '{"timestamp":"2026-07-22T00:00:02Z","session_id":"session_runner_snapshot","stage":"terminal_executed","payload":{"status":"executed","exit_code":0,"output_preview":"previous-output"}}' \
+    '{"timestamp":"2026-07-22T00:00:03Z","session_id":"session_runner_snapshot","stage":"received","payload":{"mode":"script","ref":"session-history/last-command-output"}}'; do
+    printf '%s' "${event}" | python3 "${ROOT_DIR}/lib/audit_chain.py" append "${snapshot_log}" >/dev/null
+done
+old_log_dir="${LINUX_AGENT_LOG_DIR}"
+old_tmp_dir="${LINUX_AGENT_TMP_DIR}"
+old_runner_tmp_root="${LINUX_AGENT_RUNNER_TMP_ROOT}"
+old_runner_tmp_dir="${LINUX_AGENT_RUNNER_TMP_DIR}"
+old_builtin_skills="${LINUX_AGENT_BUILTIN_SKILLS_DIR}"
+old_session_id="${LINUX_AGENT_SESSION_ID:-}"
+LINUX_AGENT_LOG_DIR="${snapshot_logs}"
+LINUX_AGENT_TMP_DIR="${snapshot_private_tmp}"
+LINUX_AGENT_RUNNER_TMP_ROOT="${snapshot_runner_tmp}"
+LINUX_AGENT_RUNNER_TMP_DIR="${snapshot_runner_tmp}"
+LINUX_AGENT_BUILTIN_SKILLS_DIR="${ROOT_DIR}/skills"
+LINUX_AGENT_SESSION_ID="${snapshot_session}"
+linux_agent_prepare_session_history_snapshot skill bash \
+    "${ROOT_DIR}/skills/session-history/scripts/last-command-output.sh" \
+    '{}'
+[[ -f "${LINUX_AGENT_RUNNER_AUDIT_SNAPSHOT}" ]]
+[[ "$(stat -c '%a' "${LINUX_AGENT_RUNNER_AUDIT_SNAPSHOT}")" == "640" ]]
+! grep -q 'snapshot-secret-marker' "${LINUX_AGENT_RUNNER_AUDIT_SNAPSHOT}"
+snapshot_history="$(
+    LINUX_AGENT_AUDIT_SNAPSHOT_FILE="${LINUX_AGENT_RUNNER_AUDIT_SNAPSHOT}" \
+        LINUX_AGENT_AUDIT_SNAPSHOT_SESSION_ID="${snapshot_session}" \
+        bash "${ROOT_DIR}/skills/session-history/scripts/last-command-output.sh" \
+        '{}'
+)"
+jq -e '.ok == true and .session_id == "session_runner_snapshot"
+    and .turn.input == "printf previous-output"
+    and .outputs[0].output_preview == "previous-output"' <<<"${snapshot_history}" >/dev/null
+staged_snapshot="${LINUX_AGENT_RUNNER_AUDIT_SNAPSHOT}"
+linux_agent_cleanup_execution_staging
+[[ ! -e "${staged_snapshot}" ]]
+LINUX_AGENT_LOG_DIR="${old_log_dir}"
+LINUX_AGENT_TMP_DIR="${old_tmp_dir}"
+LINUX_AGENT_RUNNER_TMP_ROOT="${old_runner_tmp_root}"
+LINUX_AGENT_RUNNER_TMP_DIR="${old_runner_tmp_dir}"
+LINUX_AGENT_BUILTIN_SKILLS_DIR="${old_builtin_skills}"
+LINUX_AGENT_SESSION_ID="${old_session_id}"
+
+# Managed remote scripts are staged in the Runner-specific tree, not in the
+# Web process's private tmp tree. The client-side classifier must agree with
+# the Runner server's allowlisted tmp root.
+runner_kind_private_tmp="${tmp_root}/runner-kind-private"
+runner_kind_shared_tmp="${tmp_root}/runner-kind-shared"
+mkdir -p "${runner_kind_private_tmp}" "${runner_kind_shared_tmp}"
+runner_kind_script="${runner_kind_shared_tmp}/reviewed.sh"
+printf '#!/usr/bin/env bash\nprintf "{}\\n"\n' >"${runner_kind_script}"
+old_tmp_root="${LINUX_AGENT_TMP_ROOT}"
+old_runner_tmp_root="${LINUX_AGENT_RUNNER_TMP_ROOT}"
+LINUX_AGENT_TMP_ROOT="${runner_kind_private_tmp}"
+LINUX_AGENT_RUNNER_TMP_ROOT="${runner_kind_shared_tmp}"
+[[ "$(linux_agent_runner_kind_for_command bash "${runner_kind_script}" '{}')" == "remote_script" ]]
+LINUX_AGENT_TMP_ROOT="${old_tmp_root}"
+LINUX_AGENT_RUNNER_TMP_ROOT="${old_runner_tmp_root}"
+
 linux_agent_init_env "${ROOT_DIR}"
 linux_agent_load_config
 low_review='{"approved":true,"approval_required":false,"risk_level":"low","findings":[]}'
+
+# Helper-capable Skills may fall through only for fixed read/plan forms.  An
+# ambiguous truthy apply value must be consumed as a helper rejection instead
+# of reaching the ordinary same-UID/Runner execution path.
+helper_fallback_output="${tmp_root}/helper-safe-fallback.out"
+if linux_agent_maybe_execute_host_helper_skill \
+    script '{"ref":"network-ops-tools/firewall"}' \
+    bash "${ROOT_DIR}/skills/network-ops-tools/scripts/firewall.sh" \
+    '{"action":"status"}' >"${helper_fallback_output}"; then
+    printf 'read-only firewall request was incorrectly consumed by the helper route\n' >&2
+    exit 1
+fi
+[[ ! -s "${helper_fallback_output}" ]]
+ambiguous_helper_result="$(linux_agent_maybe_execute_host_helper_skill \
+    script '{"ref":"network-ops-tools/firewall"}' \
+    bash "${ROOT_DIR}/skills/network-ops-tools/scripts/firewall.sh" \
+    '{"action":"apply","apply":"yes","confirm":"APPLY_FIREWALL_CHANGE"}')"
+jq -e '.ok == false and .status == "helper_rejected"
+    and .execution_proxy.isolation == "host_helper"' \
+    <<<"${ambiguous_helper_result}" >/dev/null
+hosts_plan_output="${tmp_root}/hosts-plan-fallback.out"
+if linux_agent_maybe_execute_host_helper_skill \
+    script '{"ref":"network-ops-tools/hosts-file-editor"}' \
+    bash "${ROOT_DIR}/skills/network-ops-tools/scripts/hosts-file-editor.sh" \
+    '{"action":"add","apply":false,"ip":"127.0.0.1","hostname":"fixture.test"}' \
+    >"${hosts_plan_output}"; then
+    printf 'non-applying hosts plan was incorrectly consumed by the helper route\n' >&2
+    exit 1
+fi
+[[ ! -s "${hosts_plan_output}" ]]
+direct_apply_output="${tmp_root}/helper-direct-apply.out"
+if linux_agent_maybe_execute_host_helper_skill \
+    script '{"ref":"network-ops-tools/firewall"}' \
+    bash "${ROOT_DIR}/skills/network-ops-tools/scripts/firewall.sh" \
+    '{"action":"apply","apply":true,"confirm":"APPLY_FIREWALL_CHANGE","port":443}' \
+    >"${direct_apply_output}"; then
+    printf 'source-runtime firewall apply was incorrectly consumed by the helper route\n' >&2
+    exit 1
+fi
+[[ ! -s "${direct_apply_output}" ]]
+
+export LINUX_AGENT_MANAGED_MODE=1
+managed_apply_result="$(linux_agent_maybe_execute_host_helper_skill \
+    script '{"ref":"network-ops-tools/firewall"}' \
+    bash "${ROOT_DIR}/skills/network-ops-tools/scripts/firewall.sh" \
+    '{"action":"apply","apply":true,"confirm":"APPLY_FIREWALL_CHANGE","port":443}')"
+jq -e '.ok == false and .status == "helper_unavailable"
+    and .execution_proxy.isolation == "host_helper"' \
+    <<<"${managed_apply_result}" >/dev/null
+export LINUX_AGENT_MANAGED_MODE=0
+
+skill_success="$(linux_agent_normalize_skill_execution_result '{"ok":true,"exit_code":0,"output":{"ok":true,"status":"done"}}')"
+skill_false="$(linux_agent_normalize_skill_execution_result '{"ok":true,"exit_code":0,"output":{"ok":false,"status":"business_failed"}}')"
+skill_missing="$(linux_agent_normalize_skill_execution_result '{"ok":true,"exit_code":0,"output":{"status":"missing_ok"}}')"
+skill_bad_type="$(linux_agent_normalize_skill_execution_result '{"ok":true,"exit_code":0,"output":{"ok":"true"}}')"
+skill_nonzero="$(linux_agent_normalize_skill_execution_result '{"ok":false,"exit_code":7,"output":{"ok":true}}')"
+jq -e '.ok == true and .status == "done"' <<<"${skill_success}" >/dev/null
+jq -e '.ok == false and .status == "business_failed" and .code == "skill_reported_failure"' <<<"${skill_false}" >/dev/null
+jq -e '.ok == false and .status == "invalid_skill_output"' <<<"${skill_missing}" >/dev/null
+jq -e '.ok == false and .status == "invalid_skill_output"' <<<"${skill_bad_type}" >/dev/null
+jq -e '.ok == false and .status == "skill_exit_failed"' <<<"${skill_nonzero}" >/dev/null
+
+# 显式 false 的审批开关必须生效：jq 的 `//` 会把显式 false 当缺失，
+# 此回归确保默认 true 的 approvals.auto.* 能被用户显式关闭。
+approvals_config_backup="${LINUX_AGENT_CONFIG_JSON}"
+LINUX_AGENT_CONFIG_JSON="$(jq '.approvals.auto = {skill_readonly:false, local_analyze:false, file_match:true}' <<<"${LINUX_AGENT_CONFIG_JSON}")"
+[[ "$(linux_agent_auto_approval_enabled skill_readonly)" == "false" ]]
+[[ "$(linux_agent_auto_approval_enabled local_analyze)" == "false" ]]
+[[ "$(linux_agent_auto_approval_enabled file_match)" == "true" ]]
+[[ "$(linux_agent_auto_approval_enabled file_patch)" == "false" ]]
+LINUX_AGENT_CONFIG_JSON="${approvals_config_backup}"
+
+# Skill business JSON is parsed from stdout only; harmless diagnostics on
+# stderr must not turn an otherwise successful Skill into invalid JSON.
+skill_stream_config="${LINUX_AGENT_CONFIG_JSON}"
+LINUX_AGENT_CONFIG_JSON="$(jq '.observer.enabled="disabled" | .observer.require=false' <<<"${LINUX_AGENT_CONFIG_JSON}")"
+skill_stream_result="$(
+    LINUX_AGENT_EXECUTION_PRIVILEGE=current linux_agent_execute_observed_command_output \
+        script '{"kind":"skill-stream-test"}' -- \
+        bash -c 'printf '\''{"ok":true,"status":"done"}\n'\''; printf '\''diagnostic\n'\'' >&2'
+)"
+jq -e '.ok == true and .output.ok == true and .stderr == "diagnostic"' <<<"${skill_stream_result}" >/dev/null
+skill_multi_result="$(
+    LINUX_AGENT_EXECUTION_PRIVILEGE=current linux_agent_execute_observed_command_output \
+        script '{"kind":"skill-multi-test"}' -- \
+        bash -c 'printf '\''{"ok":true}\n{"ok":true}\n'\'''
+)"
+jq -e '.ok == false and .status == "invalid_skill_output"' <<<"${skill_multi_result}" >/dev/null
+LINUX_AGENT_CONFIG_JSON="${skill_stream_config}"
+
+degraded_audit_summary="$(linux_agent_audit_safe_summary terminal_executed \
+    '{"ok":true,"exit_code":0,"output":{"raw":"ok"},"execution_proxy":{"isolation":"degraded_same_uid","requested_privilege":"least","execution_user":"tester","target_user":null,"prepared_root":false}}')"
+jq -e '.execution_proxy.isolation == "degraded_same_uid"
+    and .execution_proxy.execution_user == "tester"
+    and .execution_proxy.prepared_root == false' <<<"${degraded_audit_summary}" >/dev/null
+old_audit_log="${LINUX_AGENT_AUDIT_LOG:-}"
+old_session_id="${LINUX_AGENT_SESSION_ID:-}"
+LINUX_AGENT_AUDIT_LOG="${tmp_root}/degraded-execution.jsonl"
+LINUX_AGENT_SESSION_ID="session_degraded_execution"
+linux_agent_log_event terminal_executed \
+    '{"ok":true,"exit_code":0,"output":{"raw":"ok"},"execution_proxy":{"isolation":"degraded_same_uid","requested_privilege":"least","execution_user":"tester","target_user":null,"prepared_root":false}}' \
+    true
+jq -e 'select(.stage == "terminal_executed")
+    | .execution_isolation == "degraded_same_uid"
+      and .execution_user == "tester"
+      and .payload.execution_proxy.isolation == "degraded_same_uid"' \
+    "${LINUX_AGENT_AUDIT_LOG}" >/dev/null
+LINUX_AGENT_AUDIT_LOG="${old_audit_log}"
+LINUX_AGENT_SESSION_ID="${old_session_id}"
 no_backup_cleanup_review="$(linux_agent_backup_policy_review \
     "ops-basic/safe-log-cleanup" \
     '{"path":"/tmp/example.log","dry_run":false}' \
@@ -459,6 +855,32 @@ jq -e '.status == "executed"
     and .results[0].result.ok == true
     and .results[0].result.output.tool == "mcp.stdio-tools.echo"
     and .results[0].result.output.structuredContent.echo == "hello"' <<<"${mcp_execution}" >/dev/null
+
+unknown_remote_execution="$(
+    linux_agent_download_remote_script() {
+        printf '#!/usr/bin/env bash\nvendor-diagnostic --status\n' >"$2"
+    }
+    unknown_remote_plan="$(jq -cn '{
+        response_type:"work_plan",
+        summary:"unknown remote command guard",
+        continue_decision:{should_continue:false, reason:"test"},
+        steps:[{
+            id:"remote-unknown",
+            title:"run unknown remote command",
+            executor_type:"remote_script",
+            url:"https://example.test/unknown.sh",
+            arguments:{},
+            reason:"test non-interactive command guard",
+            expected_effect:"must be blocked",
+            risk_level:"low",
+            rollback_hint:"none"
+        }]
+    }')"
+    linux_agent_execute_work_plan "${unknown_remote_plan}" "unknown remote command" "{}"
+)"
+jq -e '.status == "blocked"
+    and ([.findings[] | select(.code == "NONINTERACTIVE_UNKNOWN_COMMAND_BLOCKED")] | length) == 1' \
+    <<<"${unknown_remote_execution}" >/dev/null
 # Reset globals consumed by the sourced executor module.
 # shellcheck disable=SC2034
 LINUX_AGENT_API_MODE=0

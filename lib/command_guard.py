@@ -24,6 +24,10 @@ from subprocess_env import build_subprocess_env
 
 SEPARATORS = {";", "&&", "||", "&"}
 PIPE_OPERATORS = {"|", "|&"}
+SHELL_CONDITION_PREFIXES = {"if", "elif", "while", "until"}
+SHELL_BODY_PREFIXES = {"then", "do", "else", "!", "{"}
+SHELL_DECLARATION_PREFIXES = {"for", "select", "case", "function"}
+SHELL_TERMINATORS = {"fi", "done", "esac", "}"}
 REDIRECT_OPERATORS = {
     ">",
     ">>",
@@ -68,6 +72,61 @@ FORWARDER_OPTIONS_WITH_ARG = {
 INTERACTIVE = {"htop", "watch", "less", "more", "vi", "vim", "nano", "tmux", "screen", "iotop"}
 COUNTED_LOOP = {"vmstat", "iostat", "pidstat", "mpstat", "sar", "jstat"}
 DEFERRED_EXEC = {"eval", "source", "."}
+# Bash builtins are command heads, but are not external programs.  Keeping
+# these in the known set prevents the lightweight lexer from treating normal
+# loop/condition plumbing as an unknown executable.
+SHELL_BUILTINS = {
+    "alias",
+    "bg",
+    "bind",
+    "break",
+    "builtin",
+    "caller",
+    "command",
+    "compgen",
+    "complete",
+    "compopt",
+    "continue",
+    "declare",
+    "dirs",
+    "disown",
+    "enable",
+    "eval",
+    "exec",
+    "exit",
+    "export",
+    "fc",
+    "fg",
+    "getopts",
+    "hash",
+    "help",
+    "history",
+    "jobs",
+    "let",
+    "local",
+    "logout",
+    "mapfile",
+    "popd",
+    "pushd",
+    "read",
+    "readarray",
+    "readonly",
+    "return",
+    "set",
+    "shift",
+    "shopt",
+    "source",
+    "suspend",
+    "times",
+    "trap",
+    "type",
+    "typeset",
+    "ulimit",
+    "umask",
+    "unalias",
+    "unset",
+    "wait",
+}
 INTERPRETERS = {"python", "python2", "python3", "perl", "ruby", "node", "nodejs", "lua", "php"}
 # Inline-code-execution flags per interpreter. These run code supplied on the
 # command line (like `sh -c`) rather than from a file. Kept per-interpreter on
@@ -204,6 +263,98 @@ ALIASES = {
     "view": "vi",
     "vimdiff": "vi",
 }
+
+# Commands which the AST guard understands as ordinary, non-wrapper command
+# heads.  A command outside this set is not necessarily unsafe, but it must
+# never be silently auto-approved: callers receive an approval finding (or a
+# hard block for a dynamic head) and can make the decision with context.
+KNOWN_COMMANDS = {
+    "[",
+    "awk",
+    "basename",
+    "bash",
+    "cat",
+    "cd",
+    "chmod",
+    "chown",
+    "chgrp",
+    "cp",
+    "cut",
+    "date",
+    "df",
+    "diff",
+    "dirname",
+    "du",
+    "echo",
+    "env",
+    "false",
+    "find",
+    "free",
+    "findmnt",
+    "getent",
+    "getconf",
+    "grep",
+    "head",
+    "hostname",
+    "id",
+    "install",
+    "ip",
+    "journalctl",
+    "jq",
+    "kill",
+    "killall",
+    "less",
+    "ln",
+    "ls",
+    "lsof",
+    "mkdir",
+    "mktemp",
+    "mount",
+    "mv",
+    "netstat",
+    "nproc",
+    "od",
+    "paste",
+    "perl",
+    "pgrep",
+    "printf",
+    "ps",
+    "pwd",
+    "readlink",
+    "realpath",
+    "rm",
+    "rmdir",
+    "rsync",
+    "sed",
+    "seq",
+    "set",
+    "sha256sum",
+    "sh",
+    "sleep",
+    "sort",
+    "stat",
+    "ss",
+    "systemctl",
+    "tail",
+    "tar",
+    "tee",
+    "test",
+    "timeout",
+    "top",
+    "touch",
+    "tr",
+    "true",
+    "uname",
+    "uniq",
+    "unzip",
+    "uptime",
+    "wc",
+    "wget",
+    "which",
+    "xargs",
+    "zcat",
+    "zsh",
+} | SHELLS | WRAPPERS | FORWARDERS | INTERPRETERS | DESTRUCTIVE | WRITE_VERBS | PERMISSION_VERBS | SHELL_BUILTINS
 SERVICE_ACTIONS = {"restart", "stop", "disable"}
 PROTECTED_SERVICES = {
     "sshd",
@@ -246,6 +397,19 @@ class CommandNode:
     tokens: list[str]
     pipeline_id: int
     wrapper_chain: list[str]
+
+
+@dataclass
+class HeredocNode:
+    """One parsed here-document and the command redirect that consumes it."""
+
+    delimiter: str
+    quoted: bool
+    strip_tabs: bool
+    body: str
+    declaration: str
+    command: CommandNode | None = None
+    error: str = ""
 
 
 def finding(
@@ -296,7 +460,169 @@ def canonical(head: str) -> str:
 
 
 def is_assignment(token: str) -> bool:
-    return re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", token) is not None
+    return re.match(r"^[A-Za-z_][A-Za-z0-9_]*\+?=", token) is not None
+
+
+FUNCTION_DECLARATION = re.compile(
+    r"(?m)(^|[;\n][ \t]*)(?:function[ \t]+)?"
+    r"([A-Za-z_][A-Za-z0-9_]*)[ \t]*(?:\([ \t]*\))?[ \t]*\{"
+)
+
+
+def shell_function_names(text: str) -> set[str]:
+    """Return statically declared Bash function names."""
+
+    return {match.group(2) for match in FUNCTION_DECLARATION.finditer(text)}
+
+
+def strip_function_declaration_headers(text: str) -> str:
+    """Keep function bodies visible while removing non-command headers."""
+
+    return FUNCTION_DECLARATION.sub(lambda match: f"{match.group(1)}{{", text)
+
+
+def is_dynamic_command_head(token: str) -> bool:
+    """Return whether a command head depends on shell runtime expansion."""
+
+    return (
+        not token
+        or "__SUBSTITUTION__" in token
+        or "__PROCESS_SUBSTITUTION__" in token
+        or "__ARITHMETIC__" in token
+        or "$" in token
+        or token.startswith("<(")
+        or token.startswith(">(")
+    )
+
+
+def dynamic_command_head_findings(text: str) -> list[dict]:
+    """Find runtime-expanded command heads at unambiguous shell boundaries.
+
+    The lightweight shlex AST cannot model Bash ``if``/``[[``/``case`` syntax,
+    so command-node inspection produces false positives for whole Skill files.
+    This scanner intentionally recognizes only explicit command boundaries and
+    optional assignments/wrappers before the expanded head.
+    """
+
+    segments: list[str] = []
+    current: list[str] = []
+    quote = ""
+    escaped = False
+    conditional_depth = 0
+    substitution_depth = 0
+    index = 0
+    while index < len(text):
+        char = text[index]
+        pair = text[index : index + 2]
+        if escaped:
+            current.append(char)
+            escaped = False
+            index += 1
+            continue
+        if char == "\\" and quote != "'":
+            current.append(char)
+            escaped = True
+            index += 1
+            continue
+        if pair == "$(":
+            current.extend(pair)
+            substitution_depth += 1
+            index += 2
+            continue
+        if char == ")" and substitution_depth:
+            current.append(char)
+            substitution_depth -= 1
+            index += 1
+            continue
+        if quote:
+            current.append(char)
+            if char == quote:
+                quote = ""
+            index += 1
+            continue
+        if char in {"'", '"', "`"}:
+            quote = char
+            current.append(char)
+            index += 1
+            continue
+        if pair == "[[":
+            conditional_depth += 1
+            current.extend(pair)
+            index += 2
+            continue
+        if pair == "]]" and conditional_depth:
+            conditional_depth -= 1
+            current.extend(pair)
+            index += 2
+            continue
+        if conditional_depth == 0 and substitution_depth == 0 and (
+            char in {"\n", ";"} or pair in {"&&", "||"} or char == "|"
+        ):
+            segments.append("".join(current))
+            current = []
+            index += 2 if pair in {"&&", "||"} else 1
+            continue
+        current.append(char)
+        index += 1
+    segments.append("".join(current))
+
+    results = []
+    control_words = {"for", "case", "select", "function"}
+    prefix_words = {"then", "do", "else", "!", "{"}
+    for raw_segment in segments:
+        segment = raw_segment.strip()
+        if not segment or segment.startswith("#"):
+            continue
+        # A case pattern is data, not an executable command head.
+        if segment.endswith(")") and not segment.startswith("$("):
+            continue
+        normalized, _substitution_findings, _fragments = strip_and_collect_substitutions(
+            segment, 2
+        )
+        try:
+            tokens = shlex.split(normalized, comments=False, posix=True)
+        except ValueError:
+            continue
+        if not tokens:
+            continue
+        while tokens and tokens[0] in prefix_words:
+            tokens.pop(0)
+        # ``if``/``elif``/``while``/``until`` introduce an executable test
+        # command.  They are command boundaries for this scanner, not inert
+        # control words: a runtime-expanded command in that position must be
+        # blocked just like one after a semicolon.  Declarations and case
+        # syntax still require the specialised parser and are skipped here.
+        if tokens and tokens[0] in {"if", "elif", "while", "until"}:
+            tokens.pop(0)
+            while tokens and tokens[0] in prefix_words:
+                tokens.pop(0)
+        if not tokens or tokens[0] in control_words or tokens[0] in {"[[", "((", "fi", "done", "esac", "}"}:
+            continue
+        while tokens and is_assignment(tokens[0]):
+            tokens.pop(0)
+        while tokens and canonical(tokens[0]) in WRAPPERS:
+            wrapper_head = canonical(tokens.pop(0))
+            if wrapper_head == "env":
+                while tokens and (tokens[0].startswith("-") or is_assignment(tokens[0])):
+                    tokens.pop(0)
+            else:
+                while tokens and tokens[0].startswith("-"):
+                    tokens.pop(0)
+        if not tokens:
+            continue
+        head = tokens[0]
+        if is_dynamic_command_head(head):
+            results.append(
+                finding(
+                    "critical",
+                    "AST_DYNAMIC_COMMAND_HEAD",
+                    "命令头依赖变量或命令替换，无法安全确定实际执行程序。",
+                    category="dynamic_execution",
+                    node="command_head",
+                    text=segment[:500],
+                )
+            )
+    return results
 
 
 def is_number(token: str) -> bool:
@@ -310,6 +636,251 @@ def is_fd_dup_destination(token: str) -> bool:
 def normalize_shell_spacing_markers(text: str) -> tuple[str, bool]:
     normalized = re.sub(r"\$\{IFS[^}]*\}|\$IFS\b", " ", text)
     return normalized, normalized != text
+
+
+MAX_HEREDOC_BODY_BYTES = 1_048_576
+MAX_ANALYSIS_INPUT_BYTES = 4_194_304
+
+
+def _heredoc_declarations(line: str) -> list[tuple[str, bool, bool]]:
+    """Return delimiter, quote state and tab-stripping for redirects on a line.
+
+    This is intentionally a small lexical pass rather than a regular
+    expression.  It ignores redirect-looking text inside quotes and comments,
+    accepts mixed quoted delimiter words, and leaves unsupported/dynamic forms
+    to the fail-closed validation in :func:`extract_heredocs`.
+    """
+
+    declarations: list[tuple[str, bool, bool]] = []
+    quote = ""
+    escaped = False
+    index = 0
+    while index < len(line):
+        char = line[index]
+        if escaped:
+            escaped = False
+            index += 1
+            continue
+        if char == "\\" and quote != "'":
+            escaped = True
+            index += 1
+            continue
+        if quote:
+            if char == quote:
+                quote = ""
+            index += 1
+            continue
+        if char in {"'", '"'}:
+            quote = char
+            index += 1
+            continue
+        if char == "#" and (index == 0 or line[index - 1].isspace()):
+            break
+        if line.startswith("<<<", index):
+            index += 3
+            continue
+        if index > 0 and line[index - 1] == "<":
+            index += 1
+            continue
+        if not line.startswith("<<", index):
+            index += 1
+            continue
+
+        cursor = index + 2
+        strip_tabs = False
+        if cursor < len(line) and line[cursor] == "-":
+            strip_tabs = True
+            cursor += 1
+        while cursor < len(line) and line[cursor] in " \t":
+            cursor += 1
+        raw: list[str] = []
+        word_quote = ""
+        word_escaped = False
+        quoted = False
+        while cursor < len(line):
+            current = line[cursor]
+            if word_escaped:
+                raw.append(current)
+                word_escaped = False
+                quoted = True
+                cursor += 1
+                continue
+            if current == "\\" and word_quote != "'":
+                word_escaped = True
+                quoted = True
+                cursor += 1
+                continue
+            if word_quote:
+                if current == word_quote:
+                    word_quote = ""
+                    quoted = True
+                else:
+                    raw.append(current)
+                cursor += 1
+                continue
+            if current in {"'", '"'}:
+                word_quote = current
+                quoted = True
+                cursor += 1
+                continue
+            if current.isspace() or current in ";|&()<>":
+                break
+            raw.append(current)
+            cursor += 1
+        delimiter = "".join(raw)
+        if word_quote or word_escaped:
+            delimiter = ""
+        declarations.append((delimiter, quoted, strip_tabs))
+        index = max(cursor, index + 2)
+    return declarations
+
+
+def extract_heredocs(text: str) -> tuple[str, list[HeredocNode]]:
+    """Mask data lines while retaining executable heredoc semantics."""
+
+    lines = text.splitlines(keepends=True)
+    output: list[str] = []
+    nodes: list[HeredocNode] = []
+    pending: list[HeredocNode] = []
+    body_parts: list[str] = []
+    body_bytes = 0
+
+    for line in lines:
+        if pending:
+            node = pending[0]
+            candidate = line.rstrip("\r\n")
+            if node.strip_tabs:
+                candidate = candidate.lstrip("\t")
+            if candidate == node.delimiter:
+                node.body = "".join(body_parts)
+                pending.pop(0)
+                body_parts = []
+                body_bytes = 0
+            else:
+                body_bytes += len(line.encode("utf-8", errors="replace"))
+                if body_bytes <= MAX_HEREDOC_BODY_BYTES:
+                    body_parts.append(line.lstrip("\t") if node.strip_tabs else line)
+                elif not node.error:
+                    node.error = "here-document body exceeds the analysis byte limit"
+                    body_parts = []
+            output.append("\n" if line.endswith(("\n", "\r")) else "")
+            continue
+
+        declarations = _heredoc_declarations(line)
+        output.append(line)
+        for delimiter, quoted, strip_tabs in declarations:
+            node = HeredocNode(
+                delimiter=delimiter,
+                quoted=quoted,
+                strip_tabs=strip_tabs,
+                body="",
+                declaration=line.strip(),
+            )
+            if not delimiter or len(delimiter.encode("utf-8", errors="replace")) > 256:
+                node.error = "here-document delimiter is missing or unsupported"
+            nodes.append(node)
+            pending.append(node)
+
+    if pending:
+        pending[0].body = "".join(body_parts)
+        for node in pending:
+            if not node.error:
+                node.error = "here-document delimiter was not found"
+    return "".join(output), nodes
+
+
+def _redirect_heredoc_count(tokens: Iterable[str]) -> int:
+    values = list(tokens)
+    count = 0
+    for index, token in enumerate(values):
+        if token in {"<<", "<<-"}:
+            count += 1
+        elif token.isdigit() and index + 1 < len(values) and values[index + 1] in {"<<", "<<-"}:
+            # The following redirect token is counted in its own iteration.
+            continue
+    return count
+
+
+def _uses_stdin_as_program(head: str, argv: Iterable[str]) -> bool:
+    args = list(argv)
+    if head in SHELLS and any(
+        token == "--command"
+        or (token.startswith("-") and not token.startswith("--") and "c" in token[1:])
+        for token in args
+    ):
+        return False
+    if head in INTERPRETERS and interpreter_inline_exec(head, args):
+        return False
+
+    options_with_arg = INTERPRETER_OPTIONS_WITH_ARG.get(head, set())
+    index = 0
+    while index < len(args):
+        token = args[index]
+        if token == "--":
+            index += 1
+            break
+        if token == "-":
+            return True
+        if not token.startswith("-"):
+            return False
+        if head in SHELLS and token in {"-O", "+O", "--rcfile", "--init-file"}:
+            index += 2
+            continue
+        if option_takes_value(token, options_with_arg):
+            index += 1 if token.startswith("--") and "=" in token else 2
+            continue
+        index += 1
+    return index >= len(args) or (index < len(args) and args[index] == "-")
+
+
+def executable_policy_text(text: str, depth: int = 0) -> str:
+    """Return only text whose shell/interpreter semantics can execute it.
+
+    Regex and file-vault policies consume this projection so quoted data
+    heredocs do not become false commands, while shell stdin and unquoted
+    expansion fragments remain visible to those policy layers.
+    """
+
+    if depth >= 3:
+        return text
+    shell_text, heredocs = extract_heredocs(text)
+    if any(node.error for node in heredocs):
+        return text
+    normalized, _substitution_findings, _fragments = strip_and_collect_substitutions(
+        shell_text, depth
+    )
+    tokens, token_error = tokenize(strip_function_declaration_headers(normalized))
+    if token_error:
+        return text
+    commands = split_commands(tokens, [])
+    heredoc_index = 0
+    for command in commands:
+        for _unused in range(_redirect_heredoc_count(command.tokens)):
+            if heredoc_index >= len(heredocs):
+                return text
+            heredocs[heredoc_index].command = command
+            heredoc_index += 1
+    if heredoc_index != len(heredocs):
+        return text
+
+    executable = [shell_text]
+    for node in heredocs:
+        if not node.quoted:
+            _cleaned, _findings, fragments = strip_and_collect_substitutions(
+                node.body, depth
+            )
+            executable.extend(
+                executable_policy_text(fragment, depth + 1) for fragment in fragments
+            )
+        if node.command is None or not _uses_stdin_as_program(
+            node.command.head, node.command.argv
+        ):
+            continue
+        if node.command.head in SHELLS:
+            executable.append(executable_policy_text(node.body, depth + 1))
+        elif node.command.head in INTERPRETERS:
+            executable.append(node.body)
+    return "\n".join(executable)
 
 
 def protected_path(value: str) -> bool:
@@ -334,6 +905,11 @@ def protected_path(value: str) -> bool:
 
 
 def tokenize(text: str) -> tuple[list[str], str | None]:
+    # Newlines are converted to explicit separators below, so shlex's comment
+    # mode would let a shebang/comment consume the rest of the script. Remove
+    # whole-line shell comments first and keep inline ``#`` characters as argv.
+    text = re.sub(r"(?m)^[ \t]*#.*(?:\n|$)", "\n", text)
+    text = preserve_command_newlines(text)
     try:
         lexer = shlex.shlex(text, posix=True, punctuation_chars=True)
         lexer.whitespace_split = True
@@ -341,6 +917,77 @@ def tokenize(text: str) -> tuple[list[str], str | None]:
         return list(lexer), None
     except ValueError as exc:
         return [], str(exc)
+
+
+def preserve_command_newlines(text: str) -> str:
+    """Turn shell command newlines into separators before ``shlex`` runs.
+
+    ``shlex`` treats every newline as ordinary whitespace, which can fold a
+    later command into the preceding command's argv.  Keep newlines inside
+    quotes and escaped line continuations intact, and ignore a newline after a
+    list/pipeline operator because the following line is still the same shell
+    command list.
+    """
+
+    output: list[str] = []
+    quote = ""
+    segment_has_content = False
+    index = 0
+    while index < len(text):
+        char = text[index]
+        pair = text[index : index + 2]
+
+        if char == "\\" and quote != "'":
+            if index + 1 < len(text) and text[index + 1] == "\n":
+                output.append(" ")
+                index += 2
+                continue
+            output.append(char)
+            if index + 1 < len(text):
+                output.append(text[index + 1])
+                segment_has_content = True
+                index += 2
+            else:
+                index += 1
+            continue
+
+        if quote:
+            output.append(char)
+            if char == quote:
+                quote = ""
+            index += 1
+            continue
+
+        if char in {"'", '"', "`"}:
+            quote = char
+            output.append(char)
+            segment_has_content = True
+            index += 1
+            continue
+
+        if char == "\n":
+            output.append(" ; " if segment_has_content else " ")
+            segment_has_content = False
+            index += 1
+            continue
+
+        if pair in {"&&", "||", "|&"}:
+            output.extend(pair)
+            segment_has_content = False
+            index += 2
+            continue
+        if char in {";", "|", "&"} and pair != "&>":
+            output.append(char)
+            segment_has_content = False
+            index += 1
+            continue
+
+        output.append(char)
+        if not char.isspace():
+            segment_has_content = True
+        index += 1
+
+    return "".join(output)
 
 
 def matching_paren(text: str, start: int) -> int:
@@ -512,6 +1159,8 @@ def split_commands(tokens: list[str], findings: list[dict]) -> list[CommandNode]
     commands: list[CommandNode] = []
     current: list[str] = []
     pipeline_id = 0
+    compound_state = ""
+    case_phases: list[str] = []
 
     def flush() -> None:
         nonlocal current
@@ -524,6 +1173,23 @@ def split_commands(tokens: list[str], findings: list[dict]) -> list[CommandNode]
         if head_index >= len(args):
             current = []
             return
+
+        raw_syntax_head = args[head_index]
+        if raw_syntax_head in SHELL_DECLARATION_PREFIXES:
+            current = []
+            return
+        if raw_syntax_head in SHELL_TERMINATORS or raw_syntax_head in {"[[", "(("}:
+            current = []
+            return
+        if raw_syntax_head in SHELL_CONDITION_PREFIXES | SHELL_BODY_PREFIXES:
+            head_index += 1
+            while head_index < len(args) and args[head_index] in SHELL_BODY_PREFIXES:
+                head_index += 1
+            while head_index < len(args) and is_assignment(args[head_index]):
+                head_index += 1
+            if head_index >= len(args):
+                current = []
+                return
         raw_head = args[head_index]
         argv = args[head_index + 1 :]
         head, argv, wrappers = strip_wrappers(raw_head, argv, findings)
@@ -532,6 +1198,49 @@ def split_commands(tokens: list[str], findings: list[dict]) -> list[CommandNode]
         current = []
 
     for tok in tokens:
+        # ``shlex`` exposes Bash compound syntax as punctuation, so keep
+        # condition and arithmetic expressions out of the command stream.  A
+        # condition can contain ``||`` and regex alternation without creating
+        # new executable command heads.
+        if compound_state:
+            if compound_state == "[[" and tok == "]]":
+                compound_state = ""
+            elif compound_state == "((" and (tok == "))" or tok.endswith("));")):
+                compound_state = ""
+            continue
+        if tok in {"[[", "(("}:
+            current = []
+            compound_state = tok
+            continue
+
+        # Case labels are data, while commands between a label's ``)`` and
+        # ``;;`` remain executable and must still be inspected.
+        if case_phases:
+            phase = case_phases[-1]
+            if phase == "header":
+                if tok == "in":
+                    case_phases[-1] = "pattern"
+                continue
+            if phase == "pattern":
+                if tok == ")":
+                    case_phases[-1] = "body"
+                continue
+            if tok in {";;", ";&", ";;&"}:
+                flush()
+                case_phases[-1] = "pattern"
+                continue
+            if tok == "esac":
+                flush()
+                case_phases.pop()
+                continue
+            if tok == "case" and not current:
+                case_phases.append("header")
+                continue
+
+        if tok == "case" and (not current or all(item in SHELL_BODY_PREFIXES for item in current)):
+            current = []
+            case_phases.append("header")
+            continue
         if tok in PIPE_OPERATORS:
             flush()
             continue
@@ -615,8 +1324,81 @@ def target_paths(argv: Iterable[str]) -> list[str]:
     return out
 
 
-def has_protected_target(argv: Iterable[str]) -> bool:
-    return any(protected_path(t) for t in target_paths(argv))
+def archive_write_targets(argv: list[str]) -> list[str]:
+    """Return tar paths that can receive writes.
+
+    ``tar`` mixes archive names, source members, and ``-C`` directories in
+    one argv.  Treating every non-option token as a write target makes a
+    normal backup such as ``tar -czf archive -C / etc`` look like a write to
+    ``/``.  Only the archive file is a destination for create/update modes;
+    extraction mode writes below an explicit ``-C`` directory.
+    """
+
+    operation = ""
+    archive: list[str] = []
+    directories: list[str] = []
+    index = 0
+    while index < len(argv):
+        token = argv[index]
+        if token in {"--create", "--append", "--update", "--concatenate"}:
+            operation = "write_archive"
+        elif token in {"--extract", "--get"}:
+            operation = "extract"
+        elif token in {"--list", "--diff"}:
+            operation = "read_archive"
+        elif token in {"--file", "--directory"}:
+            if index + 1 < len(argv):
+                value = argv[index + 1]
+                if token == "--file":
+                    archive.append(value)
+                else:
+                    directories.append(value)
+                index += 1
+        elif token.startswith("--file="):
+            archive.append(token.split("=", 1)[1])
+        elif token.startswith("--directory="):
+            directories.append(token.split("=", 1)[1])
+        elif token.startswith("-") and token != "-":
+            flags = token[1:]
+            if "x" in flags:
+                operation = "extract"
+            elif any(flag in flags for flag in "cruA"):
+                operation = "write_archive"
+            elif "t" in flags:
+                operation = "read_archive"
+            if "f" in flags:
+                suffix = flags.split("f", 1)[1]
+                if suffix:
+                    archive.append(suffix)
+                elif index + 1 < len(argv):
+                    archive.append(argv[index + 1])
+                    index += 1
+            if "C" in flags:
+                suffix = flags.split("C", 1)[1]
+                if suffix:
+                    directories.append(suffix)
+                elif index + 1 < len(argv):
+                    directories.append(argv[index + 1])
+                    index += 1
+        index += 1
+
+    if operation == "extract":
+        return directories
+    if operation == "write_archive":
+        return archive
+    return []
+
+
+def mutation_target_paths(head: str, argv: list[str]) -> list[str]:
+    if head == "tar":
+        return archive_write_targets(argv)
+    return target_paths(argv)
+
+
+def has_protected_target(argv: Iterable[str], head: str | None = None) -> bool:
+    values = list(argv)
+    paths = mutation_target_paths(head, values) if head else target_paths(values)
+    return any(protected_path(t) for t in paths)
 
 
 def archive_command_is_readonly(head: str, argv: list[str]) -> bool:
@@ -644,7 +1426,7 @@ def rsync_is_dry_run(argv: list[str]) -> bool:
 
 
 def add_file_write_finding(findings: list[dict], head: str, argv: list[str], text: str) -> None:
-    severity = "critical" if has_protected_target(argv) else "high"
+    severity = "critical" if has_protected_target(argv, head) else "high"
     if severity == "critical" and head == "tee":
         code = "AST_PROTECTED_REDIRECT"
     elif severity == "critical":
@@ -861,10 +1643,26 @@ def forwarder_subcommand(head: str, argv: Iterable[str]) -> list[str]:
     return args[index:]
 
 
-def check_command_rules(cmd: CommandNode, findings: list[dict]) -> None:
+def check_command_rules(
+    cmd: CommandNode,
+    findings: list[dict],
+    declared_functions: set[str] | None = None,
+) -> None:
     head = cmd.head
     argv = cmd.argv
     text = " ".join(cmd.tokens)
+
+    if head not in KNOWN_COMMANDS and head not in (declared_functions or set()):
+        findings.append(
+            finding(
+                "high",
+                "AST_UNKNOWN_COMMAND",
+                "命令不在静态守卫登记表中，禁止自动批准；非交互执行必须阻止。",
+                category="unknown_command",
+                command_head=head,
+                text=text,
+            )
+        )
 
     if head in DESTRUCTIVE | WRITE_VERBS | PERMISSION_VERBS and command_requests_help(argv):
         return
@@ -1228,9 +2026,41 @@ def bash_syntax_check(text: str) -> str | None:
     return None
 
 
-def analyze(text: str, mode: str = "local", depth: int = 0, syntax_check: bool = True) -> list[dict]:
+def analyze(
+    text: str,
+    mode: str = "local",
+    depth: int = 0,
+    syntax_check: bool = True,
+    declared_functions: set[str] | None = None,
+) -> list[dict]:
     findings: list[dict] = []
-    if depth == 0 and ":(){:|:&};:" in re.sub(r"\s+", "", text):
+    if len(text) > MAX_ANALYSIS_INPUT_BYTES or len(
+        text.encode("utf-8", errors="replace")
+    ) > MAX_ANALYSIS_INPUT_BYTES:
+        return [
+            finding(
+                "critical",
+                "AST_INPUT_TOO_LARGE",
+                "Command text exceeds the structured analysis byte limit.",
+                category="syntax",
+                node="input",
+            )
+        ]
+    shell_text, heredocs = extract_heredocs(text)
+    for node in heredocs:
+        if node.error:
+            findings.append(
+                finding(
+                    "critical",
+                    "AST_HEREDOC_PARSE_FAILED",
+                    "Here-document could not be analysed safely.",
+                    category="syntax",
+                    node="heredoc",
+                    text=node.error,
+                )
+            )
+    findings.extend(dynamic_command_head_findings(shell_text))
+    if depth == 0 and ":(){:|:&};:" in re.sub(r"\s+", "", shell_text):
         findings.append(finding("critical", "AST_DESTRUCTIVE_COMMAND", "Fork bomb pattern is blocked.", category="destructive", text="fork bomb"))
 
     if syntax_check and depth == 0:
@@ -1247,7 +2077,7 @@ def analyze(text: str, mode: str = "local", depth: int = 0, syntax_check: bool =
                 )
             )
 
-    normalized_text, used_spacing_markers = normalize_shell_spacing_markers(text)
+    normalized_text, used_spacing_markers = normalize_shell_spacing_markers(shell_text)
     if used_spacing_markers:
         findings.append(
             finding(
@@ -1261,9 +2091,19 @@ def analyze(text: str, mode: str = "local", depth: int = 0, syntax_check: bool =
 
     cleaned, sub_findings, fragments = strip_and_collect_substitutions(normalized_text, depth)
     findings.extend(sub_findings)
+    visible_functions = set(declared_functions or ()) | shell_function_names(cleaned)
     for fragment in fragments:
-        findings.extend(analyze(fragment, mode=mode, depth=depth + 1, syntax_check=False))
+        findings.extend(
+            analyze(
+                fragment,
+                mode=mode,
+                depth=depth + 1,
+                syntax_check=False,
+                declared_functions=visible_functions,
+            )
+        )
 
+    cleaned = strip_function_declaration_headers(cleaned)
     tokens, token_error = tokenize(cleaned)
     if token_error:
         findings.append(
@@ -1278,20 +2118,128 @@ def analyze(text: str, mode: str = "local", depth: int = 0, syntax_check: bool =
         )
         return dedupe(findings)
     commands = split_commands(tokens, findings)
+    heredoc_index = 0
+    for command in commands:
+        for _unused in range(_redirect_heredoc_count(command.tokens)):
+            if heredoc_index >= len(heredocs):
+                findings.append(
+                    finding(
+                        "critical",
+                        "AST_HEREDOC_PARSE_FAILED",
+                        "Here-document redirect could not be matched to its body.",
+                        category="syntax",
+                        node="heredoc",
+                        text=" ".join(command.tokens),
+                    )
+                )
+                break
+            heredocs[heredoc_index].command = command
+            heredoc_index += 1
+    if heredoc_index != len(heredocs):
+        findings.append(
+            finding(
+                "critical",
+                "AST_HEREDOC_PARSE_FAILED",
+                "Here-document body could not be matched to an executable command.",
+                category="syntax",
+                node="heredoc",
+                text=heredocs[heredoc_index].declaration if heredoc_index < len(heredocs) else text,
+            )
+        )
+
+    for node in heredocs:
+        if node.error:
+            continue
+        if not node.quoted:
+            _cleaned_body, expansion_findings, expansion_fragments = strip_and_collect_substitutions(
+                node.body, depth
+            )
+            findings.extend(expansion_findings)
+            for fragment in expansion_fragments:
+                findings.extend(
+                    analyze(
+                        fragment,
+                        mode=mode,
+                        depth=depth + 1,
+                        syntax_check=False,
+                        declared_functions=visible_functions,
+                    )
+                )
+        if node.command is None or not _uses_stdin_as_program(
+            node.command.head, node.command.argv
+        ):
+            continue
+        if node.command.head in SHELLS and depth < 3:
+            findings.extend(
+                analyze(
+                    node.body,
+                    mode=mode,
+                    depth=depth + 1,
+                    syntax_check=False,
+                    declared_functions=visible_functions,
+                )
+            )
+        elif node.command.head in SHELLS:
+            findings.append(
+                finding(
+                    "critical",
+                    "AST_RECURSION_LIMIT",
+                    "Nested shell input exceeds the structured analysis depth limit.",
+                    category="syntax",
+                    command_head=node.command.head,
+                    node="heredoc",
+                )
+            )
+        elif node.command.head in INTERPRETERS:
+            findings.append(
+                finding(
+                    "high",
+                    "AST_INTERPRETER_STDIN",
+                    "Interpreter executes program text supplied through a here-document.",
+                    category="wrapper",
+                    command_head=node.command.head,
+                    node="heredoc",
+                    text=node.declaration,
+                )
+            )
     for cmd in commands:
-        check_command_rules(cmd, findings)
+        check_command_rules(cmd, findings, visible_functions)
         if depth < 3 and cmd.head in TRANSPARENT_FORWARDERS:
             forwarded = forwarder_subcommand(cmd.head, cmd.argv)
             if forwarded:
-                findings.extend(analyze(shlex.join(forwarded), mode=mode, depth=depth + 1, syntax_check=False))
+                findings.extend(
+                    analyze(
+                        shlex.join(forwarded),
+                        mode=mode,
+                        depth=depth + 1,
+                        syntax_check=False,
+                        declared_functions=visible_functions,
+                    )
+                )
         if depth < 3 and cmd.head == "timeout":
             forwarded = timeout_subcommand(cmd.argv)
             if forwarded:
-                findings.extend(analyze(shlex.join(forwarded), mode=mode, depth=depth + 1, syntax_check=False))
+                findings.extend(
+                    analyze(
+                        shlex.join(forwarded),
+                        mode=mode,
+                        depth=depth + 1,
+                        syntax_check=False,
+                        declared_functions=visible_functions,
+                    )
+                )
         if depth < 3 and cmd.head in SHELLS:
             for index, arg in enumerate(cmd.argv):
                 if (arg == "--command" or (arg.startswith("-") and not arg.startswith("--") and "c" in arg[1:])) and index + 1 < len(cmd.argv):
-                    findings.extend(analyze(cmd.argv[index + 1], mode=mode, depth=depth + 1, syntax_check=False))
+                    findings.extend(
+                        analyze(
+                            cmd.argv[index + 1],
+                            mode=mode,
+                            depth=depth + 1,
+                            syntax_check=False,
+                            declared_functions=visible_functions,
+                        )
+                    )
                     break
     check_remote_pipe(commands, findings)
 
@@ -1329,8 +2277,12 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--mode", default="local", choices=["local", "remote"])
     parser.add_argument("--no-syntax-check", action="store_true")
+    parser.add_argument("--policy-text", action="store_true")
     args = parser.parse_args()
     text = sys.stdin.read()
+    if args.policy_text:
+        sys.stdout.write(executable_policy_text(text))
+        return 0
     findings = analyze(text, mode=args.mode, syntax_check=not args.no_syntax_check)
     json.dump(findings, sys.stdout, ensure_ascii=False, separators=(",", ":"))
     sys.stdout.write("\n")

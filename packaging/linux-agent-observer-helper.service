@@ -9,6 +9,8 @@ Type=simple
 User=root
 Group=root
 ExecStart=/usr/bin/python3 /opt/linux-agent/current/lib/observer_helper.py serve
+Environment=LINUX_AGENT_SERVICE_USER=linux-agent
+Environment=LINUX_AGENT_DATA_DIR=/opt/linux-agent/data
 Restart=on-failure
 RestartSec=2s
 NoNewPrivileges=yes

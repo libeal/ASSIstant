@@ -96,7 +96,7 @@ class SessionResourceBoundaryTest(unittest.TestCase):
             self.assertFalse(turns.exists())
 
 
-class SessionStoreTransactionTest(unittest.TestCase):
+class _SessionStoreTransactionCases:
     def setUp(self):
         self.temp_dir = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp_dir.cleanup)
@@ -874,8 +874,8 @@ class SessionStoreTransactionTest(unittest.TestCase):
         self.assertFalse(journal_path.exists())
 
 
-class AppendOnlyTurnsTest(SessionStoreTransactionTest):
-    """The append-only turns target keeps completion O(1), not O(N^2)."""
+class SessionStoreTransactionTest(_SessionStoreTransactionCases, unittest.TestCase):
+    """Session transactions include append-only turn persistence regressions."""
 
     def test_sequential_jobs_append_turns_without_rewriting(self):
         # Completing many work jobs into one workspace must not rewrite the whole

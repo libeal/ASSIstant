@@ -171,6 +171,16 @@ async function connect() {
     if (health?.status === "unauthorized") localStorage.removeItem("linuxAgentToken");
     throw new Error(health?.error || health?.status || "连接失败");
   }
+  state.healthSnapshot = health;
+  const isolation = String(health.execution?.isolation || "unavailable");
+  const isolationKind = isolation === "runner_uid" ? "low" : "high";
+  setStatus("executionIsolation", `execution: ${isolation}`, isolationKind);
+  const isolationElement = $("executionIsolation");
+  if (isolationElement) {
+    isolationElement.title = Object.values(health.execution?.helpers || {})
+      .map((helper) => `${helper?.name || "helper"}: ${helper?.status || "unavailable"}`)
+      .join("; ");
+  }
   setLayoutRunId(health.web_server?.run_id || "");
   setStatus("connectionState", "online", "ok");
   setText("rootPath", health.root || "connected");

@@ -26,6 +26,13 @@ function payloadOf(event) {
   return event?.payload && typeof event.payload === "object" ? event.payload : (event || {});
 }
 
+function conversationTurnCount(payload) {
+  if (Number.isInteger(payload?.conversation_turns) && payload.conversation_turns >= 0) {
+    return payload.conversation_turns;
+  }
+  return Array.isArray(payload?.conversation_context) ? payload.conversation_context.length : 0;
+}
+
 function stepName(payload) {
   const mcpRef = payload?.step?.mcp_server && payload?.step?.mcp_tool ? `${payload.step.mcp_server}/${payload.step.mcp_tool}` : "";
   return payload?.step?.title || payload?.step?.id || payload?.step?.skill_script || mcpRef || payload?.step?.command_preview || "步骤";
@@ -113,9 +120,12 @@ export function auditEventDisplay(event, pretty = (value) => JSON.stringify(valu
     summary = `主题：${payload.topic || "unknown"}`;
     if (Array.isArray(payload.context_keys) && payload.context_keys.length) details.push(`上下文字段：${payload.context_keys.join("、")}`);
   } else if (stage === "request_context_built") {
-    summary = payload.current_request_preview || "模型上下文已构建";
-    details.push(`会话轮数：${payload.conversation_turns ?? 0}`);
-    if (Array.isArray(payload.environment_keys) && payload.environment_keys.length) details.push(`环境字段：${payload.environment_keys.join("、")}`);
+    summary = payload.current_request_preview || payload.current_request || "模型上下文已构建";
+    details.push(`会话轮数：${conversationTurnCount(payload)}`);
+    const environmentKeys = Array.isArray(payload.environment_keys)
+      ? payload.environment_keys
+      : (payload.environment_context && typeof payload.environment_context === "object" ? Object.keys(payload.environment_context) : []);
+    if (environmentKeys.length) details.push(`环境字段：${environmentKeys.join("、")}`);
   } else if (stage === "planned") {
     summary = payload.summary_preview || `生成 ${payload.step_count ?? 0} 个步骤`;
     details.push(`步骤数：${payload.step_count ?? 0}`);

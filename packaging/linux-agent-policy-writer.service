@@ -1,0 +1,45 @@
+[Unit]
+Description=Linux Agent narrow policy writer
+Requires=linux-agent-policy-writer.socket
+After=linux-agent-policy-writer.socket
+PartOf=linux-agent-web.service
+
+[Service]
+Type=simple
+User=root
+Group=root
+WorkingDirectory=/opt/linux-agent/current
+ExecStart=/usr/bin/python3 /opt/linux-agent/current/lib/policy_helper.py serve
+Environment=LINUX_AGENT_SERVICE_USER=linux-agent
+Environment=LINUX_AGENT_DATA_DIR=/opt/linux-agent/data
+Environment=LINUX_AGENT_RELEASE_ROOT=/opt/linux-agent/current
+Environment=LINUX_AGENT_POLICY_DEFAULT_ROOT=/opt/linux-agent/current/policies
+Environment=LINUX_AGENT_POLICY_OVERLAY_ROOT=/opt/linux-agent/data/policies
+Environment=LINUX_AGENT_CONFIG_PATH=/opt/linux-agent/data/config/config.json
+Restart=on-failure
+RestartSec=2s
+NoNewPrivileges=yes
+# CAP_CHOWN is required to retain the configured data/policies group on the
+# atomically replaced file and its recovery snapshot.
+CapabilityBoundingSet=CAP_DAC_OVERRIDE CAP_FOWNER CAP_CHOWN
+AmbientCapabilities=CAP_DAC_OVERRIDE CAP_FOWNER CAP_CHOWN
+RestrictAddressFamilies=AF_UNIX
+IPAddressDeny=any
+ProtectSystem=strict
+ReadWritePaths=/opt/linux-agent/data
+ProtectHome=yes
+PrivateTmp=yes
+ProtectControlGroups=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectKernelLogs=yes
+ProtectClock=yes
+PrivateDevices=yes
+LockPersonality=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+StandardOutput=journal
+StandardError=journal

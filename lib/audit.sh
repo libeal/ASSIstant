@@ -10,7 +10,7 @@ LINUX_AGENT_LAST_BUSINESS_STATUS=""
 declare -a LINUX_AGENT_AUDIT_CHAIN_ARGS=()
 
 linux_agent_audit_boundaries_path() {
-    printf '%s/policies/audit-boundaries.json\n' "${LINUX_AGENT_ROOT}"
+    linux_agent_policy_path audit-boundaries.json
 }
 
 linux_agent_audit_chain_writer() {
@@ -784,7 +784,27 @@ linux_agent_audit_safe_summary() {
                 stderr_preview:(if ($r.stderr? | type) == "string" then ($r.stderr | preview) else null end),
                 result_count:(if ($r.results? | type) == "array" then ($r.results | length) else null end),
                 output_keys:(if ($r.output? | type) == "object" then ($r.output | keys) else null end),
-                finding_count:(if ($r.findings? | type) == "array" then ($r.findings | length) else null end)
+                finding_count:(if ($r.findings? | type) == "array" then ($r.findings | length) else null end),
+                execution_proxy:(
+                    if ($r.execution_proxy? | type) == "object" then {
+                        isolation:($r.execution_proxy.isolation // null),
+                        requested_privilege:($r.execution_proxy.requested_privilege // null),
+                        execution_user:($r.execution_proxy.execution_user // null),
+                        target_user:($r.execution_proxy.target_user // null),
+                        prepared_root:(
+                            if ($r.execution_proxy | has("prepared_root")) then
+                                $r.execution_proxy.prepared_root
+                            else null end
+                        ),
+                        helper:($r.execution_proxy.helper // null),
+                        available:(
+                            if ($r.execution_proxy | has("available")) then
+                                $r.execution_proxy.available
+                            else null end
+                        ),
+                        error:($r.execution_proxy.error // null)
+                    } else null end
+                )
             } else null end;
         def fallback:
             if type == "object" then
@@ -1082,7 +1102,7 @@ linux_agent_log_event() {
     local stage="$1"
     local payload="${2:-}"
     local required="${3:-false}"
-    local safe_payload event_execution_user
+    local safe_payload event_execution_user event_execution_isolation
     [[ -n "${LINUX_AGENT_AUDIT_LOG:-}" ]] || return 0
     [[ -z "${payload}" ]] && payload='{}'
     if [[ "${stage}" == "finished" ]] && printf '%s' "${payload}" | jq -e . >/dev/null 2>&1; then
@@ -1103,6 +1123,11 @@ linux_agent_log_event() {
     if [[ -z "${event_execution_user}" ]]; then
         event_execution_user="${LINUX_AGENT_EXECUTION_USER:-${LINUX_AGENT_SYSTEM_USER:-unknown}}"
     fi
+    event_execution_isolation="$(jq -r '
+        [.. | objects | .execution_proxy? // empty
+         | .isolation // empty]
+        | first // empty
+    ' <<<"${safe_payload}" 2>/dev/null || true)"
     local event chain_rc=0
     event="$(jq -cn \
         --arg ts "$(linux_agent_now_iso)" \
@@ -1112,6 +1137,7 @@ linux_agent_log_event() {
         --arg job_id "${LINUX_AGENT_JOB_ID:-}" \
         --arg system_user "${LINUX_AGENT_SYSTEM_USER:-unknown}" \
         --arg execution_user "${event_execution_user}" \
+        --arg execution_isolation "${event_execution_isolation}" \
         --argjson payload "${safe_payload}" \
         '{
             schema_version:1,
@@ -1122,6 +1148,7 @@ linux_agent_log_event() {
             job_id:$job_id,
             system_user:$system_user,
             execution_user:$execution_user,
+            execution_isolation:(if $execution_isolation == "" then null else $execution_isolation end),
             payload:$payload
         }')"
     linux_agent_audit_write_event "${event}" || chain_rc=$?
@@ -1348,7 +1375,13 @@ linux_agent_show_audit() {
               elif $s == "sensed" then
                 "主题=" + (($p.topic // "unknown") | tostring) + "；上下文字段=" + ((($p.context_keys // []) | join(",")) | tostring)
               elif $s == "request_context_built" then
-                "模式=" + (($p.mode // "unknown") | tostring) + "；当前请求=" + (($p.current_request_preview // "") | tostring)
+                "模式=" + (($p.mode // "unknown") | tostring)
+                + "；当前请求=" + (($p.current_request_preview // $p.current_request // "") | tostring)
+                + "；会话轮数=" + ((
+                    if ($p.conversation_turns? | type) == "number" then $p.conversation_turns
+                    elif ($p.conversation_context? | type) == "array" then ($p.conversation_context | length)
+                    else 0 end
+                ) | tostring)
               elif $s == "planned" or $s == "revision_planned" or $s == "repair_planned" then
                 "摘要=" + (($p.summary_preview // "") | tostring) + "；步骤数=" + (($p.step_count // 0) | tostring)
               elif $s == "step_policy_checked" then

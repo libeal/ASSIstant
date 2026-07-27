@@ -74,7 +74,7 @@
  * @property {string} [provider_id]
  * @property {Record<string, unknown>} [agent_loop]
  * @property {{enabled?: boolean, allow_api_key_transmission?: boolean, release_version?: string}} [remote]
- * @property {{enabled?: boolean, host?: string, port?: number, metrics_enabled?: boolean}} [web]
+ * @property {{enabled?: boolean, host?: string, port?: number, metrics_enabled?: boolean, sensitive_edits_enabled?: boolean}} [web]
  * @property {number} [context_turns]
  * @property {{enabled?: boolean}} [command_guard]
  * @property {boolean} [api_key_configured]
@@ -110,8 +110,6 @@
  * @property {Record<string, any>|null} editPackage
  * @property {Array<Record<string, any>>} policyFiles
  * @property {string} currentPolicyPath
- * @property {string} policySudoPassword
- * @property {boolean} policySudoUnlocked
  * @property {Record<string, any>|null} auditBoundaries
  * @property {Array<Record<string, any>>|null} skillTree
  * @property {{markdown: string[], scripts: string[]}} skillFiles
@@ -142,6 +140,7 @@
  * @property {string} auditTimelineUnavailableReason
  * @property {string} currentAuditSession
  * @property {ConfigSnapshot|null} configSnapshot
+ * @property {Record<string, any>|null} healthSnapshot
  * @property {boolean} commandGuardEnabled
  * @property {Record<string, any>} configOriginal
  * @property {Record<string, any>} configDraft
@@ -258,13 +257,11 @@
  * @property {ViewAction} runDoctor
  * @property {ViewAction} updatePolicyEditState
  * @property {ViewAction} loadPolicies
- * @property {ViewAction} unlockPolicy
  * @property {ViewAction} validatePolicy
  * @property {ViewAction} savePolicy
  * @property {ViewAction} openPolicyFile
  * @property {ViewAction} closePolicyFileDialog
  * @property {ViewAction} toggleCommandGuard
- * @property {ViewAction} lockPolicy
  * @property {ViewAction} readPolicy
  *
  * @typedef {object} SkillsViewContract

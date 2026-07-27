@@ -104,17 +104,133 @@ linux_agent_api_web_config_json() {
         }'
 }
 
+linux_agent_api_helper_state_json() {
+    local name="$1" socket_path="$2" probe="${3:-}" response="" error=""
+    if [[ ! -S "${socket_path}" ]]; then
+        jq -cn --arg name "${name}" --arg socket "${socket_path}" \
+            '{name:$name,status:"unavailable",available:false,socket:$socket}'
+        return 0
+    fi
+    if [[ -z "${probe}" || ! -f "${probe}" || -L "${probe}" ]]; then
+        jq -cn --arg name "${name}" --arg socket "${socket_path}" \
+            '{name:$name,status:"unavailable",available:false,socket:$socket,error:"helper client is unavailable"}'
+        return 0
+    fi
+    case "${name}" in
+        runner)
+            if ! response="$(timeout 6s python3 "${probe}" ping --socket "${socket_path}" 2>/dev/null)"; then
+                error="runner ping failed"
+            fi
+            ;;
+        host-ops | policy-writer)
+            if ! response="$(timeout 6s python3 "${probe}" request --socket "${socket_path}" ping --params '{}' --summary "Health check ${name}" 2>/dev/null)"; then
+                error="${name} ping failed"
+            fi
+            ;;
+        observer)
+            if timeout 6s python3 "${probe}" request --socket "${socket_path}" ping >/dev/null 2>&1; then
+                response='{"ok":true,"status":"ready"}'
+            else
+                error="observer ping failed"
+            fi
+            ;;
+        *)
+            error="unknown helper"
+            ;;
+    esac
+    if [[ -z "${error}" ]] && jq -e '.ok == true and (.status == "ready" or .status == "ok")' >/dev/null 2>&1 <<<"${response}"; then
+        jq -cn --arg name "${name}" --arg socket "${socket_path}" \
+            '{name:$name,status:"ready",available:true,socket:$socket}'
+    else
+        [[ -n "${error}" ]] || error="helper returned a non-ready response"
+        jq -cn --arg name "${name}" --arg socket "${socket_path}" --arg error "${error}" \
+            '{name:$name,status:"unavailable",available:false,socket:$socket,error:$error}'
+    fi
+}
+
+linux_agent_api_execution_health_json() {
+    local managed=false helper_required=false isolation="degraded_same_uid"
+    local runner_socket="${LINUX_AGENT_RUNNER_SOCKET:-/run/linux-agent/runner.sock}"
+    local host_socket="${LINUX_AGENT_HOST_HELPER_SOCKET:-/run/linux-agent/host-ops.sock}"
+    local policy_socket="${LINUX_AGENT_POLICY_HELPER_SOCKET:-/run/linux-agent/policy-writer.sock}"
+    local observer_socket="${LINUX_AGENT_OBSERVER_HELPER_SOCKET:-/run/linux-agent/observer.sock}"
+    local runner host_ops policy_writer observer ready=true
+    local runner_client host_client policy_client observer_client
+    runner_client="${LINUX_AGENT_ROOT}/lib/runner.py"
+    host_client="${LINUX_AGENT_ROOT}/lib/host_ops_helper.py"
+    policy_client="${LINUX_AGENT_ROOT}/lib/policy_helper.py"
+    observer_client="${LINUX_AGENT_ROOT}/lib/observer_helper.py"
+
+    if linux_agent_managed_mode_enabled; then
+        managed=true
+    fi
+    if linux_agent_managed_execution_enabled; then
+        helper_required=true
+        if [[ -S "${runner_socket}" ]]; then
+            isolation="runner_uid"
+        else
+            isolation="unavailable"
+            ready=false
+        fi
+    fi
+    runner="$(linux_agent_api_helper_state_json runner "${runner_socket}" "${runner_client}")"
+    host_ops="$(linux_agent_api_helper_state_json host-ops "${host_socket}" "${host_client}")"
+    policy_writer="$(linux_agent_api_helper_state_json policy-writer "${policy_socket}" "${policy_client}")"
+    observer="$(linux_agent_api_helper_state_json observer "${observer_socket}" "${observer_client}")"
+
+    if [[ "${helper_required}" == "true" ]] &&
+        { [[ "$(jq -r '.status' <<<"${runner}")" != "ready" ]] ||
+            [[ "$(jq -r '.status' <<<"${host_ops}")" != "ready" ]] ||
+            [[ "$(jq -r '.status' <<<"${policy_writer}")" != "ready" ]]; }; then
+        ready=false
+        isolation="unavailable"
+    fi
+    if [[ "${helper_required}" == "true" ]] &&
+        [[ "$(linux_agent_config_bool_default '.observer.require' 'false')" == "true" ]] &&
+        [[ "$(jq -r '.status' <<<"${observer}")" != "ready" ]]; then
+        ready=false
+    fi
+
+    jq -cn \
+        --arg isolation "${isolation}" \
+        --argjson managed "${managed}" \
+        --argjson helper_required "${helper_required}" \
+        --argjson ready "${ready}" \
+        --argjson runner "${runner}" \
+        --argjson host_ops "${host_ops}" \
+        --argjson policy_writer "${policy_writer}" \
+        --argjson observer "${observer}" '
+        {
+            managed:$managed,
+            helper_required:$helper_required,
+            ready:$ready,
+            isolation:$isolation,
+            runner:$runner,
+            helpers:{host_ops:$host_ops,policy_writer:$policy_writer,observer:$observer}
+        }'
+}
+
 linux_agent_api_health() {
     jq -cn \
         --arg root "${LINUX_AGENT_ROOT}" \
         --arg version "$(linux_agent_config_get_default '.remote.release_version' 'local')" \
         --argjson web "$(linux_agent_api_web_config_json)" \
         --argjson remote "$(linux_agent_remote_state_json)" \
-        '{ok:true, status:"ok", app:"linux-agent", version:(if $version == "" then "local" else $version end), root:$root, web:$web, remote:$remote}'
+        --argjson execution "$(linux_agent_api_execution_health_json)" \
+        '{
+            ok:true,
+            status:(if $execution.ready then "ok" else "degraded" end),
+            app:"linux-agent",
+            version:(if $version == "" then "local" else $version end),
+            root:$root,
+            web:$web,
+            remote:$remote,
+            execution:$execution
+        }'
 }
 
 linux_agent_api_tools_list() {
-    local index_text scripts line ref description risk materialization
+    local index_text scripts line ref description risk materialization origin
     index_text="$(linux_agent_skill_index_text 2>/dev/null || true)"
     scripts='[]'
     while IFS= read -r line; do
@@ -123,9 +239,14 @@ linux_agent_api_tools_list() {
         description="$(sed -n 's/^- `[^`]*`: \(.*\)$/\1/p' <<<"${line}")"
         ref="${ref%.sh}"
         risk="$(linux_agent_skill_declared_risk "${ref}")"
+        origin="$(linux_agent_skill_package_origin "${ref%%/*}" 2>/dev/null || true)"
+        if [[ -z "${origin}" ]] && linux_agent_remote_builtin_pending "${ref%%/*}"; then
+            origin="builtin"
+        fi
+        [[ -n "${origin}" ]] || origin="unknown"
         materialization="local"
         if linux_agent_remote_mode_enabled; then
-            if linux_agent_remote_skill_ready "${ref%%/*}"; then
+            if [[ "${origin}" == "user" ]] || linux_agent_remote_skill_ready "${ref%%/*}"; then
                 materialization="ready"
             else
                 materialization="available"
@@ -138,8 +259,9 @@ linux_agent_api_tools_list() {
             --arg script "${ref#*/}" \
             --arg description "${description}" \
             --arg risk "${risk}" \
+            --arg origin "${origin}" \
             --arg materialization "${materialization}" \
-            '$prior + [{ref:$ref, skill:$skill, script:$script, description:$description, risk:$risk, materialization:$materialization}]')"
+            '$prior + [{ref:$ref, skill:$skill, script:$script, description:$description, risk:$risk, origin:$origin, materialization:$materialization}]')"
     done <<<"${index_text}"
 
     jq -cn --arg index_text "${index_text}" --argjson scripts "${scripts}" --argjson remote "$(linux_agent_remote_state_json)" \
@@ -542,8 +664,28 @@ linux_agent_api_script_review() {
 
 linux_agent_api_script_run() {
     local payload="$1"
-    local review_json ref args result final_status script_path subject envelope
+    local review_json enforced_review ref args result final_status script_path subject envelope
+    LINUX_AGENT_API_MODE=1
     review_json="$(linux_agent_api_script_review "${payload}")"
+    enforced_review="$(linux_agent_block_noninteractive_unknown_command_review "$(jq -c '.review // {}' <<<"${review_json}")")"
+    review_json="$(jq -c \
+        --argjson review "${enforced_review}" \
+        --argjson blocks "$(linux_agent_output_blocks_from_review "${enforced_review}")" '
+        .review = $review
+        | .ok = (($review.approved // false) == true)
+        | .status = (if (($review.approved // false) == true)
+                     then (if (($review.approval_required // false) == true) then "approval_required" else "approved" end)
+                     else "blocked" end)
+        | .output_blocks = $blocks
+        | .timeline = ((.timeline // []) | map(
+            .status = (if (($review.approved // false) == true)
+                       then (if (($review.approval_required // false) == true) then "approval_required" else "approved" end)
+                       else "blocked" end)
+            | .review = $review
+            | .summary = ($review.risk_level // "low")
+            | .output_blocks = $blocks
+        ))
+    ' <<<"${review_json}")"
     ref="$(jq -r '.ref // empty' <<<"${review_json}")"
     args="$(jq -c '.arguments // {}' <<<"${review_json}")"
     linux_agent_log_event "received" "$(jq -cn --arg ref "${ref}" --argjson args "${args}" '{mode:"script", ref:$ref, arguments:$args}')"
@@ -687,7 +829,7 @@ linux_agent_api_edit_review() {
 
 linux_agent_api_edit_apply() {
     local payload="$1"
-    local edit_json result final_status
+    local edit_json result final_status result_status
     edit_json="$(jq -c '.edit // .' <<<"${payload}")"
     if [[ "$(jq -r '.approve // false' <<<"${payload}")" != "true" ]]; then
         jq -cn '{ok:false, status:"rejected", error:"approve=true is required to save a skill edit package."}'
@@ -698,11 +840,25 @@ linux_agent_api_edit_apply() {
     if [[ "$(jq -r '.ok // false' <<<"${result}")" == "true" ]]; then
         final_status="edited"
     else
-        final_status="$(jq -r '.status // "failed"' <<<"${result}")"
+        result_status="$(jq -r '.status // "failed"' <<<"${result}")"
+        if [[ "${result_status}" == "skill_conflict" ]]; then
+            final_status="failed"
+        else
+            final_status="${result_status}"
+        fi
     fi
     linux_agent_log_event "finished" "$(jq -cn --arg status "${final_status}" '{status:$status}')"
     jq -cn --arg status "${final_status}" --argjson result "${result}" \
-        '{ok:($result.ok // false), status:$status, result:$result}'
+        '{
+            ok:($result.ok // false),
+            status:$status,
+            result:$result,
+            timeline:[],
+            approval_card:null,
+            output_blocks:[]
+        }
+        + (if (($result.code // "") | length) > 0 then {code:$result.code} else {} end)
+        + (if (($result.error // "") | length) > 0 then {error:$result.error} else {} end)'
 }
 
 linux_agent_api_policy_validate() {
@@ -854,7 +1010,7 @@ linux_agent_api_dispatch_raw() {
 
 linux_agent_api_normalize_envelope() {
     local schema_file="${LINUX_AGENT_ROOT}/schema/domain.json"
-    local schema='{"schema_version":1,"protocol_version":"1.0.0","error_codes":{}}'
+    local schema='{"schema_version":1,"protocol_version":"1.2.0","error_codes":{}}'
     if [[ -f "${schema_file}" ]] && jq -e 'type == "object"' "${schema_file}" >/dev/null 2>&1; then
         schema="$(jq -c . "${schema_file}")"
     fi
@@ -865,7 +1021,7 @@ linux_agent_api_normalize_envelope() {
         else
             . + {
                 schema_version:($schema.schema_version // 1),
-                protocol_version:($schema.protocol_version // "1.0.0")
+                protocol_version:($schema.protocol_version // "1.2.0")
             }
             | (
                 has("timeline")

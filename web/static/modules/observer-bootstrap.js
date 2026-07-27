@@ -89,6 +89,24 @@ export function createObserverBootstrap(app) {
     }
     setText("observerState", status);
     setStatus("observerAuditStatus", status, observerStatusKind(status));
+    const passwordAllowed = Boolean(data?.password_allowed);
+    const passwordField = $("observerAuditPasswordField");
+    const password = $("observerAuditPassword");
+    if (passwordField) passwordField.hidden = !passwordAllowed;
+    if (password) {
+      password.disabled = !passwordAllowed;
+      if (!passwordAllowed) password.value = "";
+    }
+    const description = $("observerAuditDescription");
+    if (description) {
+      if (passwordAllowed) {
+        description.textContent = "源码版、远程临时版或无 systemd 安装可在本机页面验证一次 sudo；密码只进入本机 sudo 标准输入，不会保存或写入日志。";
+      } else if (data?.authorization_mode === "root") {
+        description.textContent = "当前 Web 进程可直接检查本机 auditd，不需要 sudo 密码。";
+      } else {
+        description.textContent = "正式托管安装只使用本机 observer helper，不接收或传输服务器 sudo 密码。";
+      }
+    }
     const output = $("observerAuditOutput");
     if (output && data) output.textContent = pretty(data);
   }
@@ -131,7 +149,7 @@ export function createObserverBootstrap(app) {
     } else {
       dialog.setAttribute("open", "");
     }
-    password?.focus();
+    if (state.observerBootstrap?.password_allowed) password?.focus();
   }
 
   function closeObserverAuditDialog() {
@@ -151,12 +169,16 @@ export function createObserverBootstrap(app) {
       closeObserverAuditDialog();
       return;
     }
-    const password = $("observerAuditPassword")?.value || "";
+    const passwordInput = $("observerAuditPassword");
+    const body = { action: "enable" };
+    if (state.observerBootstrap?.password_allowed) {
+      body.password = passwordInput?.value || "";
+    }
     const data = await app.api("/api/observer/bootstrap", {
       method: "POST",
-      body: { action: "enable", password },
+      body,
     });
-    if ($("observerAuditPassword")) $("observerAuditPassword").value = "";
+    if (passwordInput) passwordInput.value = "";
     setObserverBootstrapState(data);
     if (data.ok && data.status === "enabled") {
       closeObserverAuditDialog();
@@ -171,7 +193,8 @@ export function createObserverBootstrap(app) {
       method: "POST",
       body: { action: "skip" },
     });
-    if ($("observerAuditPassword")) $("observerAuditPassword").value = "";
+    const password = $("observerAuditPassword");
+    if (password) password.value = "";
     setObserverBootstrapState(data);
     closeObserverAuditDialog();
     showToast(data.logged ? "已记录未启用审计" : "已跳过审计授权");

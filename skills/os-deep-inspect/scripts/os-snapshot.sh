@@ -23,7 +23,24 @@ journal_lines="$(jq -r '.journal_lines // 30' <<<"${arguments_json}")"
 [[ "${journal_lines}" -le 100 ]] || journal_lines=100
 
 run_text() {
-    "$@" 2>&1 || true
+    local command="${1:-}"
+    [[ -n "${command}" ]] || return 127
+    shift
+    case "${command}" in
+        ip) ip "$@" 2>&1 || true ;;
+        ss) ss "$@" 2>&1 || true ;;
+        netstat) netstat "$@" 2>&1 || true ;;
+        journalctl) journalctl "$@" 2>&1 || true ;;
+        hostname) hostname "$@" 2>&1 || true ;;
+        uname) uname "$@" 2>&1 || true ;;
+        uptime) uptime "$@" 2>&1 || true ;;
+        free) free "$@" 2>&1 || true ;;
+        df) df "$@" 2>&1 || true ;;
+        findmnt) findmnt "$@" 2>&1 || true ;;
+        systemctl) systemctl "$@" 2>&1 || true ;;
+        ps) ps "$@" 2>&1 || true ;;
+        *) return 127 ;;
+    esac
 }
 
 network_interfaces=""

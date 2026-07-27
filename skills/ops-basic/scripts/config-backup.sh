@@ -35,14 +35,12 @@ if [[ -z "${resolved_path}" || -L "${resolved_path}" ]]; then
     exit 0
 fi
 resolved_backup_root="$(realpath -m -- "${backup_root}" 2>/dev/null || true)"
-case "${resolved_backup_root}" in
-    "${resolved_path}" | "${resolved_path}"/*)
-        jq -cn \
-            --arg path "${resolved_path}" \
-            '{ok:false, tool:"system.config.backup", path:$path, error:"备份目录不能位于目标路径内。"}'
-        exit 0
-        ;;
-esac
+if [[ "${resolved_backup_root}" == "${resolved_path}" || "${resolved_backup_root}" == "${resolved_path}/"* ]]; then
+    jq -cn \
+        --arg path "${resolved_path}" \
+        '{ok:false, tool:"system.config.backup", path:$path, error:"备份目录不能位于目标路径内。"}'
+    exit 0
+fi
 mkdir -p -- "${resolved_backup_root}"
 chmod 0700 -- "${resolved_backup_root}"
 safe_name="$(printf '%s' "${resolved_path}" | sed 's#^/##; s#[/[:space:]]#_#g')"

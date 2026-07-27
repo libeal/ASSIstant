@@ -82,6 +82,153 @@ substitution_result="$(linux_agent_policy_review_text "shell" 'echo $(cat /etc/p
 grep -q '"approval_required": true' <<<"$(jq . <<<"${substitution_result}")"
 grep -q 'AST_COMMAND_SUBSTITUTION' <<<"${substitution_result}"
 
+dynamic_head_result="$(linux_agent_policy_review_text "shell" '$COMMAND --version')"
+jq -e '.approved == false and .risk_level == "critical"
+    and ([.findings[] | select(.code == "AST_DYNAMIC_COMMAND_HEAD")] | length) == 1' \
+    <<<"${dynamic_head_result}" >/dev/null
+
+standalone_dynamic_head="$(linux_agent_policy_review_text "shell" '${COMMAND}')"
+jq -e '.approved == false and .risk_level == "critical"
+    and ([.findings[] | select(.code == "AST_DYNAMIC_COMMAND_HEAD")] | length) == 1' \
+    <<<"${standalone_dynamic_head}" >/dev/null
+
+positional_dynamic_head="$(linux_agent_policy_review_text "shell" '"$@"')"
+jq -e '.approved == false and .risk_level == "critical"
+    and ([.findings[] | select(.code == "AST_DYNAMIC_COMMAND_HEAD")] | length) == 1' \
+    <<<"${positional_dynamic_head}" >/dev/null
+
+substitution_head_result="$(linux_agent_policy_review_text "shell" '$(printf uname) -a')"
+jq -e '.approved == false and .risk_level == "critical"
+    and ([.findings[] | select(.code == "AST_DYNAMIC_COMMAND_HEAD")] | length) == 1' \
+    <<<"${substitution_head_result}" >/dev/null
+
+heredoc_body_result="$(linux_agent_policy_review_text "shell" $'python3 - <<\'PY\'\n$COMMAND --version\nvendor-diagnostic --status\nPY\n')"
+jq -e '.approved == true and .approval_required == true
+    and ([.findings[] | select(.code == "AST_HEREDOC")] | length) == 1
+    and ([.findings[] | select(.code == "AST_INTERPRETER_STDIN")] | length) == 1
+    and ([.findings[] | select(.code == "AST_DYNAMIC_COMMAND_HEAD" or .code == "AST_UNKNOWN_COMMAND")] | length) == 0' \
+    <<<"${heredoc_body_result}" >/dev/null
+
+shell_heredoc_mutation_result="$(linux_agent_policy_review_text "shell" $'bash <<\'PAYLOAD\'\nrm -rf /tmp/heredoc-guard-regression\nPAYLOAD\n')"
+jq -e '.approved == false and .risk_level == "critical"
+    and ([.findings[] | select(.code == "AST_HEREDOC")] | length) == 1
+    and ([.findings[] | select(.code == "AST_FILE_MUTATION_REQUIRES_SKILL" and .command_head == "rm")] | length) == 1' \
+    <<<"${shell_heredoc_mutation_result}" >/dev/null
+
+expanded_data_heredoc_result="$(linux_agent_policy_review_text "shell" $'cat <<PAYLOAD\n$(rm -rf /tmp/heredoc-expansion-regression)\nPAYLOAD\n')"
+jq -e '.approved == false and .risk_level == "critical"
+    and ([.findings[] | select(.code == "AST_COMMAND_SUBSTITUTION")] | length) == 1
+    and ([.findings[] | select(.code == "AST_FILE_MUTATION_REQUIRES_SKILL" and .command_head == "rm")] | length) == 1' \
+    <<<"${expanded_data_heredoc_result}" >/dev/null
+
+backtick_data_heredoc_result="$(linux_agent_policy_review_text "shell" $'cat <<PAYLOAD\n`rm -rf /tmp/heredoc-backtick-regression`\nPAYLOAD\n')"
+jq -e '.approved == false and .risk_level == "critical"
+    and ([.findings[] | select(.code == "AST_COMMAND_SUBSTITUTION")] | length) == 1
+    and ([.findings[] | select(.code == "AST_FILE_MUTATION_REQUIRES_SKILL" and .command_head == "rm")] | length) == 1' \
+    <<<"${backtick_data_heredoc_result}" >/dev/null
+
+process_data_heredoc_result="$(linux_agent_policy_review_text "shell" $'cat <<PAYLOAD\n<(rm -rf /tmp/heredoc-process-regression)\nPAYLOAD\n')"
+jq -e '.approved == false and .risk_level == "critical"
+    and ([.findings[] | select(.code == "AST_PROCESS_SUBSTITUTION")] | length) == 1
+    and ([.findings[] | select(.code == "AST_FILE_MUTATION_REQUIRES_SKILL" and .command_head == "rm")] | length) == 1' \
+    <<<"${process_data_heredoc_result}" >/dev/null
+
+quoted_data_heredoc_result="$(linux_agent_policy_review_text "shell" $'cat <<\'PAYLOAD\'\n$(rm -rf /tmp/not-executed)\nPAYLOAD\n')"
+jq -e '.approved == true and .approval_required == true
+    and ([.findings[] | select(.code == "AST_HEREDOC")] | length) == 1
+    and ([.findings[] | select(.code == "AST_COMMAND_SUBSTITUTION" or .code == "AST_FILE_MUTATION_REQUIRES_SKILL")] | length) == 0' \
+    <<<"${quoted_data_heredoc_result}" >/dev/null
+
+tabbed_multi_heredoc_result="$(linux_agent_policy_review_text "shell" $'cat <<-\'DATA\' <<SECOND\n\tplain data\n\tDATA\n$(rm -rf /tmp/multi-heredoc-expansion)\nSECOND\n')"
+jq -e '([.findings[] | select(.code == "AST_HEREDOC")] | length) >= 1
+    and ([.findings[] | select(.code == "AST_COMMAND_SUBSTITUTION")] | length) >= 1
+    and ([.findings[] | select(.code == "AST_FILE_MUTATION_REQUIRES_SKILL" and .severity == "critical")] | length) >= 1' \
+    <<<"${tabbed_multi_heredoc_result}" >/dev/null
+
+malformed_heredoc_result="$(linux_agent_policy_review_text "shell" $'cat <<\'NEVER\'\nunterminated data\n')"
+jq -e '.approved == false
+    and ([.findings[] | select(.code == "AST_HEREDOC_PARSE_FAILED" and .severity == "critical")] | length) >= 1' \
+    <<<"${malformed_heredoc_result}" >/dev/null
+
+heredoc_followup_result="$(linux_agent_policy_review_text "shell" $'python3 - <<\'PY\'\nprint("data")\nPY\n$COMMAND --version\n')"
+jq -e '.approved == false and .risk_level == "critical"
+    and ([.findings[] | select(.code == "AST_DYNAMIC_COMMAND_HEAD")] | length) == 1' \
+    <<<"${heredoc_followup_result}" >/dev/null
+
+multiline_unknown_result="$(linux_agent_policy_review_text "shell" $'printf ok\nvendor-diagnostic --status\n')"
+jq -e '.approved == true and .approval_required == true and .risk_level == "high"
+    and ([.findings[] | select(.code == "AST_UNKNOWN_COMMAND" and .command_head == "vendor-diagnostic")] | length) == 1' \
+    <<<"${multiline_unknown_result}" >/dev/null
+
+multiline_mutation_result="$(linux_agent_policy_review_text "shell" $'printf ok\nrm /tmp/agent-multiline-write-test\n')"
+jq -e '.approved == false and .risk_level == "critical"
+    and ([.findings[] | select(.code == "AST_FILE_MUTATION_REQUIRES_SKILL" and .command_head == "rm")] | length) == 1' \
+    <<<"${multiline_mutation_result}" >/dev/null
+
+heredoc_static_followup_result="$(linux_agent_policy_review_text "shell" $'python3 - <<\'PY\'\nprint("data")\nPY\nrm /tmp/agent-heredoc-write-test\n')"
+jq -e '.approved == false and .risk_level == "critical"
+    and ([.findings[] | select(.code == "AST_FILE_MUTATION_REQUIRES_SKILL" and .command_head == "rm")] | length) == 1
+    and ([.findings[] | select(.code == "AST_UNKNOWN_COMMAND" and .command_head == "print") ] | length) == 0' \
+    <<<"${heredoc_static_followup_result}" >/dev/null
+
+process_substitution_head_result="$(linux_agent_policy_review_text "shell" '<(printf uname) -a')"
+jq -e '.approved == false and .risk_level == "critical"
+    and ([.findings[] | select(.code == "AST_DYNAMIC_COMMAND_HEAD")] | length) == 1' \
+    <<<"${process_substitution_head_result}" >/dev/null
+
+arithmetic_head_result="$(linux_agent_policy_review_text "shell" '$((1 + 1)) -a')"
+jq -e '.approved == false and .risk_level == "critical"
+    and ([.findings[] | select(.code == "AST_DYNAMIC_COMMAND_HEAD")] | length) == 1' \
+    <<<"${arithmetic_head_result}" >/dev/null
+
+conditional_dynamic_head_result="$(linux_agent_policy_review_text "shell" 'if "$cmd"; then printf ok; fi')"
+jq -e '.approved == false and .risk_level == "critical"
+    and ([.findings[] | select(.code == "AST_DYNAMIC_COMMAND_HEAD")] | length) == 1' \
+    <<<"${conditional_dynamic_head_result}" >/dev/null
+
+loop_substitution_head_result="$(linux_agent_policy_review_text "shell" 'while "$(printf uname)"; do break; done')"
+jq -e '.approved == false and .risk_level == "critical"
+    and ([.findings[] | select(.code == "AST_DYNAMIC_COMMAND_HEAD")] | length) == 1' \
+    <<<"${loop_substitution_head_result}" >/dev/null
+
+compound_condition_result="$(linux_agent_policy_review_text "shell" \
+    'if [[ ! "${min_size_mb}" =~ ^[0-9]+$ || "${min_size_mb}" -le 0 ]]; then exit 0; fi')"
+jq -e '([.findings[] | select(.code == "AST_UNKNOWN_COMMAND")] | length) == 0' \
+    <<<"${compound_condition_result}" >/dev/null
+
+case_pattern_result="$(linux_agent_policy_review_text "shell" \
+    'case "${root}" in /var/log | /var/log/* | /tmp | /tmp/*) ;; *) jq -cn "{}"; exit 0 ;; esac')"
+jq -e '([.findings[] | select(.code == "AST_UNKNOWN_COMMAND")] | length) == 0' \
+    <<<"${case_pattern_result}" >/dev/null
+
+regex_condition_result="$(linux_agent_policy_review_text "shell" \
+    'if [[ "${path}" =~ (mysql|mariadb|postgres|pgsql|journal|audit|wtmp|btmp|secure|auth) ]]; then continue; fi')"
+jq -e '([.findings[] | select(.code == "AST_UNKNOWN_COMMAND")] | length) == 0' \
+    <<<"${regex_condition_result}" >/dev/null
+
+loop_builtin_result="$(linux_agent_policy_review_text "shell" \
+    'while IFS= read -r path; do trap '\''printf cleanup'\'' EXIT; if ((count >= limit)); then break; fi; done < <(find /tmp -type f | sort)')"
+jq -e '([.findings[] | select(.code == "AST_UNKNOWN_COMMAND")] | length) == 0' \
+    <<<"${loop_builtin_result}" >/dev/null
+
+local_function_result="$(linux_agent_policy_review_text "shell" 'inspect() { printf ok; }; inspect')"
+jq -e '([.findings[] | select(.code == "AST_UNKNOWN_COMMAND")] | length) == 0' \
+    <<<"${local_function_result}" >/dev/null
+
+local_function_unknown_body="$(linux_agent_policy_review_text "shell" 'inspect() { vendor-diagnostic --status; }; inspect')"
+jq -e '([.findings[] | select(.code == "AST_UNKNOWN_COMMAND" and .command_head == "vendor-diagnostic")] | length) == 1' \
+    <<<"${local_function_unknown_body}" >/dev/null
+
+env_dynamic_head_result="$(linux_agent_policy_review_text "shell" 'env "$cmd" --version')"
+jq -e '.approved == false and .risk_level == "critical"
+    and ([.findings[] | select(.code == "AST_DYNAMIC_COMMAND_HEAD")] | length) == 1' \
+    <<<"${env_dynamic_head_result}" >/dev/null
+
+unknown_head_result="$(linux_agent_policy_review_text "shell" "vendor-diagnostic --status")"
+jq -e '.approved == true and .approval_required == true and .risk_level == "high"
+    and ([.findings[] | select(.code == "AST_UNKNOWN_COMMAND")] | length) == 1' \
+    <<<"${unknown_head_result}" >/dev/null
+
 wrapper_result="$(linux_agent_policy_review_text "shell" "bash -c 'rm -rf /tmp/demo'")"
 grep -q '"approved": false' <<<"$(jq . <<<"${wrapper_result}")"
 grep -q '"approval_required": true' <<<"$(jq . <<<"${wrapper_result}")"
@@ -307,6 +454,18 @@ rm -rf "${audit_summary_dir}"
 
 policy_validation="$(linux_agent_validate_policy_file "")"
 jq -e '.ok == true and .status == "valid" and (.files | length) >= 4' <<<"${policy_validation}" >/dev/null
+
+policy_overlay_fixture="$(mktemp -d)"
+printf '%s\n' '{"retired":true}' >"${policy_overlay_fixture}/retired-policy.json"
+original_user_policies_dir="${LINUX_AGENT_USER_POLICIES_DIR}"
+LINUX_AGENT_USER_POLICIES_DIR="${policy_overlay_fixture}"
+orphan_policy_validation="$(linux_agent_validate_policy_file "")"
+jq -e '.ok == true and .status == "valid"
+    and .orphaned == ["retired-policy.json"]
+    and ([.findings[] | select(.code == "POLICY_OVERLAY_ORPHANED" and .severity == "medium")] | length) == 1' \
+    <<<"${orphan_policy_validation}" >/dev/null
+LINUX_AGENT_USER_POLICIES_DIR="${original_user_policies_dir}"
+rm -rf "${policy_overlay_fixture}"
 
 policy_cli_validation="$(bash "${ROOT_DIR}/bin/agent" policy validate risk-rules.json)"
 jq -e '.ok == true and .status == "valid" and .path == "risk-rules.json"' <<<"${policy_cli_validation}" >/dev/null

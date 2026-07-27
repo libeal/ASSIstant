@@ -23,6 +23,9 @@ class SubprocessEnvTests(unittest.TestCase):
             "LINUX_AGENT_REMOTE_RELEASE_BASE": "https://releases.example/v1",
             "LINUX_AGENT_REMOTE_PREFLIGHT": '{"ok":true}',
             "LINUX_AGENT_OBSERVER_HELPER_SOCKET": "/run/linux-agent/custom.sock",
+            "LINUX_AGENT_RUNNER_SOCKET": "/run/linux-agent/custom-runner.sock",
+            "LINUX_AGENT_HOST_HELPER_SOCKET": "/run/linux-agent/custom-host-ops.sock",
+            "LINUX_AGENT_POLICY_HELPER_SOCKET": "/run/linux-agent/custom-policy-writer.sock",
             "LINUX_AGENT_AUDIT_WRITER_KEY": "writer-secret",
             "OPENAI_API_KEY": "openai-secret",
             "SSH_AUTH_SOCK": "/tmp/agent.sock",
@@ -43,6 +46,18 @@ class SubprocessEnvTests(unittest.TestCase):
         self.assertEqual(
             env["LINUX_AGENT_OBSERVER_HELPER_SOCKET"],
             "/run/linux-agent/custom.sock",
+        )
+        self.assertEqual(
+            env["LINUX_AGENT_RUNNER_SOCKET"],
+            "/run/linux-agent/custom-runner.sock",
+        )
+        self.assertEqual(
+            env["LINUX_AGENT_HOST_HELPER_SOCKET"],
+            "/run/linux-agent/custom-host-ops.sock",
+        )
+        self.assertEqual(
+            env["LINUX_AGENT_POLICY_HELPER_SOCKET"],
+            "/run/linux-agent/custom-policy-writer.sock",
         )
         self.assertNotIn("AWS_SECRET_ACCESS_KEY", env)
         self.assertNotIn("GITHUB_TOKEN", env)

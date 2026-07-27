@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+"""Unit tests for MCP client protocol and resource boundaries."""
 
 import importlib.util
 import io

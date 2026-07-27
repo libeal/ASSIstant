@@ -5,15 +5,31 @@ secret lookup, remote-mode policy, and URL-security helpers are injected by the
 adapter so this module has no dependency on ``web.server`` or process globals.
 """
 
-import http.client
 import json
 import re
-import socket
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urlencode, urlparse, urlunparse
+
+from pinned_http import (
+    NoRedirectHandler,
+    PinnedHTTPHandler,
+    PinnedHTTPSHandler,
+    PinnedHTTPConnection,
+    PinnedHTTPSConnection,
+    PinnedHTTPPolicyError,
+    open_validated_url,
+)
+
+# Compatibility aliases retained for callers that imported the former private
+# connection classes from this module.
+_NoRedirectHandler = NoRedirectHandler
+_PinnedHTTPHandler = PinnedHTTPHandler
+_PinnedHTTPSHandler = PinnedHTTPSHandler
+_PinnedHTTPConnection = PinnedHTTPConnection
+_PinnedHTTPSConnection = PinnedHTTPSConnection
 
 
 DEFAULT_MODEL_RESPONSE_LIMIT = 1024 * 1024
@@ -128,81 +144,6 @@ def extract_model_ids(payload, parser):
     return sorted(clean)
 
 
-def _pinned_socket(addresses, port, timeout):
-    last_error = None
-    for address in addresses:
-        try:
-            return socket.create_connection((address, port), timeout=timeout)
-        except OSError as exc:
-            last_error = exc
-    if last_error is not None:
-        raise last_error
-    raise OSError("Provider hostname did not resolve to a usable address.")
-
-
-class _PinnedHTTPConnection(http.client.HTTPConnection):
-    def __init__(self, host, *args, resolved_addresses=None, **kwargs):
-        super().__init__(host, *args, **kwargs)
-        self.resolved_addresses = tuple(resolved_addresses or ())
-
-    def connect(self):
-        self.sock = _pinned_socket(self.resolved_addresses, self.port, self.timeout)
-        if self._tunnel_host:
-            self._tunnel()
-
-
-class _PinnedHTTPSConnection(http.client.HTTPSConnection):
-    def __init__(self, host, *args, resolved_addresses=None, **kwargs):
-        super().__init__(host, *args, **kwargs)
-        self.resolved_addresses = tuple(resolved_addresses or ())
-
-    def connect(self):
-        self.sock = _pinned_socket(self.resolved_addresses, self.port, self.timeout)
-        if self._tunnel_host:
-            self._tunnel()
-        server_hostname = self._tunnel_host or self.host
-        self.sock = self._context.wrap_socket(self.sock, server_hostname=server_hostname)
-
-
-class _PinnedHTTPHandler(urllib.request.HTTPHandler):
-    def __init__(self, resolved_addresses):
-        super().__init__()
-        self.resolved_addresses = tuple(resolved_addresses)
-
-    def http_open(self, request):
-        addresses = self.resolved_addresses
-
-        class Connection(_PinnedHTTPConnection):
-            def __init__(self, host, *args, **kwargs):
-                super().__init__(host, *args, resolved_addresses=addresses, **kwargs)
-
-        return self.do_open(Connection, request)
-
-
-class _PinnedHTTPSHandler(urllib.request.HTTPSHandler):
-    def __init__(self, resolved_addresses):
-        super().__init__()
-        self.resolved_addresses = tuple(resolved_addresses)
-
-    def https_open(self, request):
-        addresses = self.resolved_addresses
-
-        class Connection(_PinnedHTTPSConnection):
-            def __init__(self, host, *args, **kwargs):
-                super().__init__(host, *args, resolved_addresses=addresses, **kwargs)
-
-        return self.do_open(
-            Connection,
-            request,
-            context=self._context,
-        )
-
-
-class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
-    def redirect_request(self, request, file_pointer, code, message, headers, new_url):
-        return None
-
-
 def _redacted_text(value, secret=""):
     text = str(value or "")
     if secret:
@@ -238,6 +179,7 @@ class ProviderService:
         self._key_resolver = key_resolver
         self._remote_mode = bool(remote_mode)
         self._security = security_helpers
+        self._custom_fetcher = fetch_json
         self._fetcher = fetch_json or self._fetch_json_url
         self._response_limit = max(1, int(response_limit))
 
@@ -329,16 +271,37 @@ class ProviderService:
             raise TypeError("key_resolver must return (api_key, source)")
         return str(resolved[0] or ""), str(resolved[1] or "missing")
 
-    def _fetch_json_url(self, url, headers, timeout, secret, resolved_addresses):
-        request = urllib.request.Request(url, headers=headers, method="GET")
-        opener = urllib.request.build_opener(
-            _NoRedirectHandler(),
-            urllib.request.ProxyHandler({}),
-            _PinnedHTTPHandler(resolved_addresses),
-            _PinnedHTTPSHandler(resolved_addresses),
-        )
+    def _fetch_json_url(
+        self,
+        url,
+        headers,
+        timeout,
+        secret,
+        resolved_addresses,
+        *,
+        validate_url=None,
+    ):
+        # Direct callers that do not provide policy validation retain the old
+        # no-redirect behavior.  The production path supplies a validator that
+        # rechecks provider policy and DNS addresses for every hop.
+        if validate_url is None:
+            def validate_url(candidate):
+                if candidate != url:
+                    raise PinnedHTTPPolicyError(
+                        "unsafe_redirect",
+                        "provider redirect requires URL revalidation",
+                        url=candidate,
+                    )
+                return candidate, resolved_addresses
         try:
-            with opener.open(request, timeout=timeout) as response:
+            response, _final_url, _addresses, _chain = open_validated_url(
+                url,
+                validate_url=validate_url,
+                headers=headers,
+                timeout=timeout,
+                max_redirects=5,
+            )
+            with response:
                 body = response.read(self._response_limit + 1)
                 if len(body) > self._response_limit:
                     return None, {
@@ -346,6 +309,12 @@ class ProviderService:
                         "status": "provider_response_too_large",
                         "error": "Model list response is too large.",
                     }
+        except PinnedHTTPPolicyError as exc:
+            return None, {
+                "ok": False,
+                "status": exc.code,
+                "error": str(exc),
+            }
         except urllib.error.HTTPError as exc:
             try:
                 detail = exc.read(400).decode("utf-8", errors="replace")
@@ -498,7 +467,48 @@ class ProviderService:
             "User-Agent": "LinuxAgentWeb/1.0",
         }
         headers.update(provider_auth_headers(auth, api_key))
-        payload, error = self._fetcher(url, headers, timeout, api_key, resolved_addresses)
+        validate_redirect = None
+        if self._custom_fetcher is None:
+            def validate_redirect_candidate(candidate):
+                checked, validation_error, addresses = self._security.inspect_url(
+                    candidate,
+                    security,
+                )
+                if validation_error:
+                    raise PinnedHTTPPolicyError(
+                        validation_error,
+                        self._security.error_message(validation_error),
+                        url=candidate,
+                    )
+                if auth != "none" and api_key:
+                    candidate_host = self._security.url_host(checked)
+                    if not self._security.host_is_trusted(candidate_host, trusted_hosts):
+                        status = (
+                            "provider_url_override_blocked"
+                            if body_api_url
+                            and self._security.url_host(body_api_url) == candidate_host
+                            else "provider_host_not_allowed"
+                        )
+                        raise PinnedHTTPPolicyError(
+                            status,
+                            self._security.error_message(status),
+                            url=checked,
+                        )
+                return checked, addresses
+
+            validate_redirect = validate_redirect_candidate
+
+        if self._custom_fetcher is None:
+            payload, error = self._fetch_json_url(
+                url,
+                headers,
+                timeout,
+                api_key,
+                resolved_addresses,
+                validate_url=validate_redirect,
+            )
+        else:
+            payload, error = self._fetcher(url, headers, timeout, api_key, resolved_addresses)
         if error:
             result = dict(error)
             result["provider"] = provider_id

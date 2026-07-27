@@ -30,10 +30,11 @@ sudo bash install.sh --provider-cidr 203.0.113.0/24
 
 安装器会要求 Bash 4.3+、Python 3.10+ 和 GNU coreutils/findutils/tar，并在启动前用 `systemd-analyze verify` 检查 unit。SELinux 已启用时会对安装目录、unit 和 helper runtime 执行 `restorecon`；Enforcing 模式缺少 `restorecon` 时安装失败，而不是留下只在服务启动后才暴露的 EACCES。安装包不是原生 `.rpm`，升级、回滚和卸载都使用包内 `release/linux-agent-install.sh`。
 
-安装器默认安装到 `/opt/linux-agent` 并写入 systemd unit。安装期间会先停止遗留实例，再临时启动新版本完成健康检查，检查结束后自动停止 Web、observer socket 和 helper。安装器不会修改原有开机启用状态；全新安装默认未启用。需要正式运行时显式执行：
+安装器默认安装到 `/opt/linux-agent` 并写入 Web、Runner、observer、host-ops、policy-writer 全部 systemd unit。安装期间会先停止遗留实例，再临时启动新版本完成健康检查，检查结束后自动停止这些服务。安装器不会修改原有开机启用状态；全新安装默认未启用。Runner socket 为 `0600`，三个特权 helper socket 为 `0660` 且只允许 Web 服务组访问。需要正式运行时显式执行：
 
 ```bash
-sudo systemctl enable --now linux-agent-observer-helper.socket linux-agent-web.service
+sudo systemctl enable --now linux-agent-observer-helper.socket linux-agent-runner.socket \
+  linux-agent-host-ops.socket linux-agent-policy-writer.socket linux-agent-web.service
 ```
 
 如果 Web 控制台报告 `observer_helper_failed` 且错误是 observer socket 权限不足，先用当前版本安装器重建 unit 和 socket：
@@ -46,4 +47,8 @@ sudo bash linux-agent-install.sh repair-observer
 
 源码 checkout 运行 Web 时，使用 `sudo bash scripts/install.sh repair-observer --prefix "$PWD" --service-user "$USER"`。源码模式还会安装 root 所有的 helper 运行副本并覆盖 helper service 的 `ExecStart`，避免 systemd 继续执行旧版 `/opt/linux-agent/current` 或被 `ProtectHome=yes` 隐藏的源码目录。
 
-启动前应先编辑 `/opt/linux-agent/data/config/config.json` 设置 Provider 和 API key。示例 Web token 固定为 `0123`，仅适合受控环境，生产部署必须替换。测试或无 systemd 环境可传 `--skip-dependencies --no-systemd --prefix <目录>`；若通过 sudo 执行，安装器会将整个 prefix 归属给显式 `--service-user` 或 `SUDO_USER`，避免后续普通用户无法读取配置、写入日志和升级。卸载默认保留 `data/`；确认不再需要配置和审计数据时使用 `uninstall --purge-data`，该选项也会删除安装器创建的服务用户。
+启动前应先编辑 `/opt/linux-agent/data/config/config.json` 设置 Provider 和 API key。示例 `web.token` 为空，启动时由 CSPRNG 生成临时 Bearer token；不要把真实 token 或 API key 写入发布目录。`web.sensitive_edits_enabled` 是配置中心展示的敏感只读开关，默认/缺失为 `true`，只能由本机管理员直接修改；关闭后 Web 仍可做 Skill/策略草稿、diff、review 和 validate，但最终写入返回 403。
+
+安装边界分为四类：源码 checkout 和已验证 remote runtime 由当前 UID 持有本地 overlay；Remote 的内置 Skill 固定在 `skills/`、用户 Skill 固定在 `data/skills/`，只允许导出 backup，不允许就地 restore；`--no-systemd` 使用持久 release/data 布局，但仍是安装用户的 `degraded_same_uid`；managed systemd 则分离 Web、Runner 和 root helper。四类都把 `flock`（`util-linux`）作为硬依赖并使用 `data/.runtime.lock`：前三类当前 UID、`0600`，managed 为 Web:Runner 组、`0640`。普通业务持共享锁；source、`--no-systemd` 和 managed restore 与持久安装的升级/回滚切换持独占锁，managed restore 仅本机 root 可用，不会因此授予 Web root 写权限。
+
+测试或无 systemd 环境可传 `--skip-dependencies --no-systemd --prefix <目录>`；该形态不要求不存在的 Runner/helper socket。loopback Web 可通过本机 sudo 标准输入一次性启用 observer，非 loopback 监听不接受密码。卸载默认保留 `data/`；确认不再需要配置、Skill overlay、策略和审计数据时使用 `uninstall --purge-data`。

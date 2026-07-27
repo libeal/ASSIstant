@@ -90,21 +90,18 @@ export function createPolicyView(app) {
     app.printOutput("doctorOutput", data);
   }
 
+  function sensitiveEditsEnabled() {
+    const value = state.configSnapshot?.web?.sensitive_edits_enabled;
+    return value === undefined || value === true;
+  }
+
   function updatePolicyEditState() {
-    const unlocked = state.policySudoUnlocked;
-    document.querySelectorAll(".policy-edit").forEach((el) => {
-      if (el instanceof HTMLButtonElement
-        || el instanceof HTMLInputElement
-        || el instanceof HTMLSelectElement
-        || el instanceof HTMLTextAreaElement) {
-        el.disabled = !unlocked;
-      }
-    });
-    if ($("policyEditor")) $("policyEditor").disabled = !unlocked;
-    if ($("policySaveBtn")) $("policySaveBtn").disabled = !unlocked || !state.currentPolicyPath;
-    if ($("policyBoundaryOptions")) $("policyBoundaryOptions").hidden = !unlocked;
-    setStatus("policyLockPill", unlocked ? "可编辑" : "已锁定", unlocked ? "ok" : "medium");
-    setText("policyEditMode", unlocked ? "本次会话可编辑" : "只读");
+    const enabled = sensitiveEditsEnabled();
+    if ($("policyEditor")) $("policyEditor").disabled = false;
+    if ($("policySaveBtn")) $("policySaveBtn").disabled = !enabled || !state.currentPolicyPath;
+    if ($("policyBoundaryOptions")) $("policyBoundaryOptions").hidden = false;
+    setStatus("policyLockPill", enabled ? "允许保存" : "仅草稿", enabled ? "ok" : "medium");
+    setText("policyEditMode", enabled ? "Web 保存已启用" : "Web 保存已禁用");
     renderCommandGuardState();
     renderPolicyFileDialog();
   }
@@ -117,13 +114,15 @@ export function createPolicyView(app) {
       "policyGuardDescription",
       enabled
         ? "用于拦截高风险命令；关闭后仍保留正则规则和文件保险箱保护。"
-        : "当前只保留正则规则和文件保险箱保护；重新启用需要 sudo 核对。",
+        : "当前只保留正则规则和文件保险箱保护。",
     );
     const button = $("policyGuardToggleBtn");
     if (button) {
-      button.disabled = !state.policySudoUnlocked;
+      button.disabled = !sensitiveEditsEnabled();
       button.textContent = enabled ? "关闭检查" : "启用检查";
-      button.title = state.policySudoUnlocked ? "需要 sudo 授权才能切换" : "请先核对服务器密码";
+      button.title = sensitiveEditsEnabled()
+        ? "使用当前 Web Bearer 授权切换"
+        : "服务器已禁用 Web 敏感编辑";
     }
   }
 
@@ -199,24 +198,6 @@ export function createPolicyView(app) {
     return data;
   }
 
-  async function unlockPolicy() {
-    const password = $("policyPassword").value;
-    const data = await app.api("/api/policies/sudo-check", { method: "POST", body: { password } });
-    app.printOutput("policyOutput", data);
-    if (!data.ok) {
-      state.policySudoPassword = "";
-      state.policySudoUnlocked = false;
-      updatePolicyEditState();
-      showToast(data.error || data.status || "sudo failed");
-      return;
-    }
-    state.policySudoPassword = password;
-    state.policySudoUnlocked = true;
-    $("policyPassword").value = "";
-    updatePolicyEditState();
-    showToast("策略编辑已解锁");
-  }
-
   async function validatePolicy({ silent = false } = {}) {
     const data = await app.api("/api/policies/validate", {
       method: "POST",
@@ -236,7 +217,7 @@ export function createPolicyView(app) {
 
   function renderPolicyFileDialog() {
     const path = state.currentPolicyPath || "未选择文件";
-    const editing = state.policySudoUnlocked;
+    const canSave = sensitiveEditsEnabled();
     const editor = $("policyEditor");
     const preview = $("policyFilePreview");
     const saveButton = $("policySaveBtn");
@@ -244,18 +225,18 @@ export function createPolicyView(app) {
     setText(
       "policyFileDialogMeta",
       state.currentPolicyPath
-        ? (editing ? "编辑状态：修改内容后保存当前文件。" : "只读状态：查看当前策略文件的完整内容。")
+        ? (canSave ? "修改内容后可保存当前文件。" : "可编辑和校验草稿；服务器已禁止保存。")
         : "选择文件后点击“查阅文件”。",
     );
     if (editor) {
-      editor.disabled = !editing;
-      editor.hidden = !editing;
+      editor.disabled = false;
+      editor.hidden = false;
     }
     if (preview) {
       preview.textContent = editor?.value || "暂无文件内容。";
-      preview.hidden = editing;
+      preview.hidden = true;
     }
-    if (saveButton) saveButton.disabled = !editing || !state.currentPolicyPath;
+    if (saveButton) saveButton.disabled = !canSave || !state.currentPolicyPath;
   }
 
   function openPolicyFileDialog() {
@@ -267,7 +248,7 @@ export function createPolicyView(app) {
     } else {
       dialog.setAttribute("open", "");
     }
-    if (state.policySudoUnlocked) $("policyEditor")?.focus();
+    $("policyEditor")?.focus();
   }
 
   function closePolicyFileDialog() {
@@ -278,18 +259,17 @@ export function createPolicyView(app) {
   }
 
   async function toggleCommandGuard() {
-    if (!state.policySudoUnlocked) {
-      showToast("请先核对服务器密码");
+    if (!sensitiveEditsEnabled()) {
+      showToast("服务器已禁用 Web 敏感编辑");
       return;
     }
     const enabled = state.commandGuardEnabled === false;
     const data = await app.api("/api/policies/command-guard", {
       method: "POST",
-      body: { enabled, password: state.policySudoPassword },
+      body: { enabled },
     });
     app.printOutput("policyOutput", data);
     if (!data.ok) {
-      if (String(data.status || "").startsWith("sudo_")) lockPolicy();
       showToast(data.error || data.status || "命令安全检查切换失败");
       return;
     }
@@ -299,15 +279,8 @@ export function createPolicyView(app) {
     showToast(state.commandGuardEnabled ? "命令安全检查已启用" : "命令安全检查已关闭");
   }
 
-  function lockPolicy() {
-    state.policySudoPassword = "";
-    state.policySudoUnlocked = false;
-    updatePolicyEditState();
-    showToast("策略编辑已锁定");
-  }
-
   async function savePolicy() {
-    if (!state.policySudoUnlocked) return showToast("sudo unlock required");
+    if (!sensitiveEditsEnabled()) return showToast("服务器已禁用 Web 敏感编辑");
     const validation = await validatePolicy({ silent: true });
     if (!validation.ok) {
       showToast(validation.error || validation.status || "策略校验失败，未保存");
@@ -318,12 +291,10 @@ export function createPolicyView(app) {
       body: {
         path: state.currentPolicyPath,
         content: $("policyEditor").value,
-        password: state.policySudoPassword,
       },
     });
     app.printOutput("policyOutput", data);
     if (!data.ok) {
-      if (String(data.status || "").startsWith("sudo_")) lockPolicy();
       showToast(data.error || data.status || "保存失败");
       return;
     }
@@ -461,13 +432,11 @@ export function createPolicyView(app) {
     loadPolicySummaries,
     readPolicyJson,
     readPolicy,
-    unlockPolicy,
     validatePolicy,
     renderPolicyFileDialog,
     openPolicyFileDialog,
     closePolicyFileDialog,
     toggleCommandGuard,
-    lockPolicy,
     savePolicy,
     openPolicyFile,
     appendRuleRow,

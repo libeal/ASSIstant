@@ -72,6 +72,40 @@ timeout_meta="$(linux_agent_run_observed_process \
 jq -e '.exit_code == 124 and .timed_out == true and .observer.status == "timed_out"' <<<"${timeout_meta}" >/dev/null
 LINUX_AGENT_CONFIG_JSON="$(jq '.execution.timeout_sec=300' <<<"${LINUX_AGENT_CONFIG_JSON}")"
 
+missing_runner_stdout="${tmp_root}/missing-runner.stdout"
+missing_runner_stderr="${tmp_root}/missing-runner.stderr"
+export LINUX_AGENT_RUNNER_RESULT_FILE="${LINUX_AGENT_TMP_DIR}/runner-result.missing.json"
+missing_runner_meta="$(linux_agent_run_observed_process \
+    "observer_missing_runner_metadata" \
+    '{"kind":"runner-metadata-test"}' \
+    "${missing_runner_stdout}" \
+    "${missing_runner_stderr}" \
+    -- bash -c 'printf runner-output')"
+jq -e '.exit_code == 125
+    and .output_integrity_unknown == true
+    and .observer.status == "guard_unavailable"' <<<"${missing_runner_meta}" >/dev/null
+
+runner_metadata_file="${LINUX_AGENT_TMP_DIR}/runner-result.priority.json"
+export LINUX_AGENT_RUNNER_RESULT_FILE="${runner_metadata_file}"
+printf '%s\n' '{"protocol_version":"1.2.0","request_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","ok":false,"status":"invalid_output","exit_code":125,"output_integrity_unknown":true}' >"${runner_metadata_file}"
+chmod 0600 "${runner_metadata_file}"
+LINUX_AGENT_CONFIG_JSON="$(jq '.execution.max_output_bytes=4096' <<<"${LINUX_AGENT_CONFIG_JSON}")"
+runner_cap_stdout="${tmp_root}/runner-cap.stdout"
+runner_cap_stderr="${tmp_root}/runner-cap.stderr"
+runner_cap_meta="$(linux_agent_run_observed_process \
+    "observer_runner_outer_cap" \
+    '{"kind":"runner-metadata-test"}' \
+    "${runner_cap_stdout}" \
+    "${runner_cap_stderr}" \
+    -- python3 -c 'import sys; sys.stdout.write("x" * 8192)')"
+jq -e '.exit_code == 125
+    and .output_capped == true
+    and .output_integrity_unknown == false
+    and .observer.status == "output_capped"' <<<"${runner_cap_meta}" >/dev/null
+LINUX_AGENT_CONFIG_JSON="$(jq '.execution.max_output_bytes=1048576' <<<"${LINUX_AGENT_CONFIG_JSON}")"
+rm -f -- "${runner_metadata_file}"
+unset LINUX_AGENT_RUNNER_RESULT_FILE
+
 # A daemonized descendant may outlive the direct command while retaining both
 # FIFO writers. The limiter must fail closed in bounded time instead of waiting
 # for that descendant to exit.
@@ -833,6 +867,29 @@ unset TEST_AUDIT_FAIL_STAGE
     jq -e '.available == false and .privilege == "none" and .reason_code == "observer_privilege_disabled"' \
         <<<"${disabled_preflight}" >/dev/null
     [[ ! -s "${helper_calls}" ]]
+
+    # Only managed execution requires the dedicated helper. Source Web keeps
+    # the direct root/cached-sudo compatibility path.
+    LINUX_AGENT_CONFIG_JSON="$(jq '.observer.privilege="sudo_interactive"' <<<"${LINUX_AGENT_CONFIG_JSON}")"
+    export LINUX_AGENT_WEB=1
+    export LINUX_AGENT_MANAGED_MODE=1
+    linux_agent_observer_helper_available() {
+        return 1
+    }
+    managed_missing_helper_preflight="$(linux_agent_observer_preflight)"
+    jq -e '.available == false and .reason_code == "observer_helper_unavailable" and .sudo_available == null' \
+        <<<"${managed_missing_helper_preflight}" >/dev/null
+    if linux_agent_observer_auditctl -s 2>"${tmp_root}/managed-observer.err"; then
+        printf 'managed observer unexpectedly used sudo fallback\n' >&2
+        exit 1
+    fi
+
+    export LINUX_AGENT_MANAGED_MODE=0
+    export LINUX_AGENT_INSTALL_PREFIX=""
+    source_web_preflight="$(PATH="${fake_bin}:${PATH}" linux_agent_observer_preflight)"
+    jq -e '.available == true and (.privilege == "root" or .privilege == "sudo")' \
+        <<<"${source_web_preflight}" >/dev/null
+    PATH="${fake_bin}:${PATH}" linux_agent_observer_auditctl -s >/dev/null
 )
 
 printf 'observer: ok\n'

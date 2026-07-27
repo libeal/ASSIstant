@@ -30,6 +30,27 @@ PR_SET_PDEATHSIG = 1
 POSIX_PROCESS_GROUPS = os.name == "posix" and hasattr(os, "killpg")
 
 
+def _reject_json_constant(value):
+    raise ValueError(f"non-finite JSON value is not allowed: {value}")
+
+
+def _reject_duplicate_keys(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f"duplicate JSON key is not allowed: {key}")
+        result[key] = value
+    return result
+
+
+def _strict_json_loads(raw):
+    return json.loads(
+        raw,
+        object_pairs_hook=_reject_duplicate_keys,
+        parse_constant=_reject_json_constant,
+    )
+
+
 def _set_linux_parent_death_signal(signum):
     """Ask Linux to signal this process when its creating parent thread dies."""
 
@@ -765,6 +786,25 @@ class ExecutionService:
 
     @classmethod
     def _result_envelope(cls, outcome, resource, timeout):
+        def invalid_output():
+            text, display_truncated = cls._limited_text(outcome.stdout, 4000)
+            return {
+                "ok": False,
+                "status": "invalid_agent_output",
+                "code": "invalid_agent_output",
+                "error": "Agent stdout must be a JSON object with a boolean ok field.",
+                "timeline": [],
+                "approval_card": None,
+                "output_blocks": [
+                    {
+                        "kind": "stdout",
+                        "title": "Agent stdout",
+                        "text": text,
+                        "truncated_bytes": display_truncated,
+                    }
+                ],
+            }
+
         if outcome.output_limit_exceeded:
             result = {
                 "ok": False,
@@ -787,25 +827,11 @@ class ExecutionService:
                 )
         else:
             try:
-                result = json.loads(outcome.stdout) if outcome.stdout else {}
-            except json.JSONDecodeError:
+                result = _strict_json_loads(outcome.stdout) if outcome.stdout else None
+            except (json.JSONDecodeError, ValueError):
                 result = None
-            if not isinstance(result, dict):
-                text, display_truncated = cls._limited_text(outcome.stdout, 4000)
-                result = {
-                    "ok": False,
-                    "status": "invalid_agent_output",
-                    "timeline": [],
-                    "approval_card": None,
-                    "output_blocks": [
-                        {
-                            "kind": "stdout",
-                            "title": "Agent stdout",
-                            "text": text,
-                            "truncated_bytes": display_truncated,
-                        }
-                    ],
-                }
+            if not isinstance(result, dict) or type(result.get("ok")) is not bool:
+                result = invalid_output()
 
         result_was_cancelled = result.get("status") == "cancelled"
         process_was_terminated = bool(
@@ -832,10 +858,14 @@ class ExecutionService:
             result["status"] = "cancelled"
             result.setdefault("error", "Job process was terminated.")
 
-        result.setdefault(
-            "ok",
-            outcome.returncode == 0 and bool(result.get("ok", False)),
-        )
+        if not completed_before_cancel:
+            result["ok"] = bool(
+                not outcome.timed_out
+                and not cancelled
+                and not outcome.output_limit_exceeded
+                and outcome.returncode == 0
+                and result.get("ok") is True
+            )
         result.setdefault(
             "status",
             "completed" if outcome.returncode == 0 else "failed",

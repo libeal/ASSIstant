@@ -158,11 +158,11 @@ set -euo pipefail
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 if [[ "${1:-}" == "api" && "${2:-}" == "doctor" && "${3:-}" == "run" ]]; then
-    printf '%s\n' '{"ok":true,"status":"not_in_domain_schema","schema_version":1,"protocol_version":"1.0.0","doctor":{}}'
+    printf '%s\n' '{"ok":true,"status":"not_in_domain_schema","schema_version":1,"protocol_version":"1.2.0","doctor":{}}'
     exit 0
 fi
 if [[ "${1:-}" == "api" && "${2:-}" == "terminal" && "${3:-}" == "run" ]]; then
-    printf '%s\n' '{"ok":true,"status":"executed","schema_version":1,"protocol_version":"1.0.0"}'
+    printf '%s\n' '{"ok":true,"status":"executed","schema_version":1,"protocol_version":"1.2.0"}'
     exit 0
 fi
 exec bash "${script_dir}/agent.real" "$@"
@@ -342,9 +342,9 @@ fi
 observer_enable_without_password="$(curl --noproxy '*' -sS \
     -H "Authorization: Bearer ${token}" \
     -H "Content-Type: application/json" \
-    -d '{"action":"enable","password":""}' \
+    -d '{"action":"enable"}' \
     "${base_url}/api/observer/bootstrap")"
-jq -e 'if .ok then .status == "enabled" else (.status | IN("sudo_required","auditctl_not_found","ausearch_not_found","auditctl_failed","auditctl_permission_denied","auditctl_timeout","observer_disabled","sudo_not_found","sudo_timeout","sudo_denied")) end' <<<"${observer_enable_without_password}" >/dev/null
+jq -e 'if .ok then .status == "enabled" else (.status | IN("sudo_required","observer_disabled","observer_helper_unavailable","observer_helper_failed")) end' <<<"${observer_enable_without_password}" >/dev/null
 
 config_state="$(curl --noproxy '*' -sS -H "Authorization: Bearer ${token}" "${base_url}/api/config")"
 jq -e '.ok == true and (.config.agent_loop.thinking_trace_enabled | type == "boolean") and .config.api_key_configured == true and .config.api_key_source == "config" and .config.api_key_configured_in_config == true and .config.web.token_configured == true and (.config | has("api_key") | not) and (.config | has("api_key_file") | not) and (.config | has("api_key_file_configured") | not) and (.config | has("api_key_migration_recommended") | not)
@@ -358,7 +358,19 @@ jq -e '.ok == true and (.config.agent_loop.thinking_trace_enabled | type == "boo
     and .config.approvals.auto.file_patch == false
     and .config.agent_loop.max_iterations == 12
     and .config.execution.timeout_sec == 300
-    and .config.remote.allow_api_key_transmission == false' <<<"${config_state}" >/dev/null
+    and .config.remote.allow_api_key_transmission == false
+    and .config.web.sensitive_edits_enabled == true' <<<"${config_state}" >/dev/null
+
+readonly_config_file="${tmp_root}/readonly-config.json"
+readonly_config_code="$(curl --noproxy '*' -sS -o "${readonly_config_file}" -w '%{http_code}' \
+    -H "Authorization: Bearer ${token}" \
+    -H "Content-Type: application/json" \
+    -d '{"key":"web.sensitive_edits_enabled","value":false}' \
+    "${base_url}/api/config/update" || true)"
+[[ "${readonly_config_code}" == "403" ]]
+jq -e '.ok == false and .status == "readonly_config_field" and .code == "readonly_config_field"' \
+    "${readonly_config_file}" >/dev/null
+jq -e '.web | has("sensitive_edits_enabled") | not' "${project}/config/config.json" >/dev/null
 
 providers_state="$(curl --noproxy '*' -sS -H "Authorization: Bearer ${token}" "${base_url}/api/config/providers")"
 jq -e '.ok == true and .status == "listed"
@@ -575,7 +587,8 @@ sense_resource="$(curl --noproxy '*' -sS \
 jq -e '.ok == true and .topic == "resource" and .sense.topic == "resource"' <<<"${sense_resource}" >/dev/null
 
 policies="$(curl --noproxy '*' -sS -H "Authorization: Bearer ${token}" "${base_url}/api/policies")"
-jq -e '.ok == true and .requires_sudo_to_edit == true
+jq -e '.ok == true and .authorization == "web_bearer"
+    and (.requires_sudo_to_edit | not)
     and any(.files[]?.path; . == "audit-boundaries.json")
     and any(.files[]?.path; . == "file-vault.json")' <<<"${policies}" >/dev/null
 
@@ -656,13 +669,23 @@ vault_policy_validate="$(curl --noproxy '*' -sS \
     "${base_url}/api/policies/validate")"
 jq -e '.ok == true and .status == "valid" and .validation.ok == true' <<<"${vault_policy_validate}" >/dev/null
 
-vault_policy_write_payload="$(jq -cn --arg content "${vault_policy_content}" '{path:"file-vault.json",content:$content,password:""}')"
+vault_policy_write_payload="$(jq -cn --arg content "${vault_policy_content}" '{path:"file-vault.json",content:$content}')"
 vault_policy_write="$(curl --noproxy '*' -sS \
     -H "Authorization: Bearer ${token}" \
     -H "Content-Type: application/json" \
     -d "${vault_policy_write_payload}" \
     "${base_url}/api/policies/write")"
-jq -e 'if .ok then .status == "saved" and (.method == "root" or .method == "sudo") else .status == "sudo_required" end' <<<"${vault_policy_write}" >/dev/null
+jq -e '.ok == true and .status == "saved" and (.method | IN("root", "direct", "policy_helper"))' <<<"${vault_policy_write}" >/dev/null
+
+legacy_password_marker="legacy-sudo-password-must-not-persist-314159"
+legacy_sudo_check_payload="$(jq -cn --arg password "${legacy_password_marker}" '{password:$password}')"
+legacy_sudo_check="$(curl --noproxy '*' -sS \
+    -H "Authorization: Bearer ${token}" \
+    -H 'Content-Type: application/json' \
+    -d "${legacy_sudo_check_payload}" \
+    "${base_url}/api/policies/sudo-check")"
+jq -e '.ok == true and .status == "authorization_not_required" and .method == "web_bearer" and .deprecated == true' \
+    <<<"${legacy_sudo_check}" >/dev/null
 
 grep -q 'id="policyEditVaultBtn"' "${project}/web/static/index.html"
 grep -q 'id="policyInspectBtn"' "${project}/web/static/index.html"
@@ -673,11 +696,11 @@ grep -q 'file-vault.json' "${project}/web/static/modules/view-policy.js"
 command_guard_state="$(curl --noproxy '*' -sS \
     -H "Authorization: Bearer ${token}" \
     -H 'Content-Type: application/json' \
-    -d '{"enabled":true,"password":""}' \
+    -d '{"enabled":true}' \
     "${base_url}/api/policies/command-guard")"
-jq -e 'if .ok then .status == "updated" and .command_guard.enabled == true else (.status | IN("sudo_required","sudo_not_found","sudo_timeout","sudo_denied")) end' <<<"${command_guard_state}" >/dev/null
+jq -e '.ok == true and .status == "updated" and .command_guard.enabled == true' <<<"${command_guard_state}" >/dev/null
 
-policy_write_payload="$(jq -cn --rawfile content "${project}/policies/audit-boundaries.json" '{path:"audit-boundaries.json", content:$content, password:""}')"
+policy_write_payload="$(jq -cn --rawfile content "${project}/policies/audit-boundaries.json" '{path:"audit-boundaries.json", content:$content}')"
 policy_validate="$(curl --noproxy '*' -sS \
     -H "Authorization: Bearer ${token}" \
     -H "Content-Type: application/json" \
@@ -698,7 +721,73 @@ policy_write="$(curl --noproxy '*' -sS \
     -H "Content-Type: application/json" \
     -d "${policy_write_payload}" \
     "${base_url}/api/policies/write")"
-jq -e 'if .ok then .status == "saved" and (.method == "root" or .method == "sudo") else .status == "sudo_required" end' <<<"${policy_write}" >/dev/null
+jq -e '.ok == true and .status == "saved" and (.method | IN("root", "direct", "policy_helper"))' <<<"${policy_write}" >/dev/null
+
+if grep -R -Fq -- "${legacy_password_marker}" \
+    "${project}/logs" "${tmp_root}/server.out" "${tmp_root}/server.err"; then
+    printf 'legacy policy password was persisted or logged\n' >&2
+    exit 1
+fi
+
+# A local administrator can change the read-only switch directly. Every Web
+# mutation must observe the new value immediately while read/review/validation
+# paths remain usable.
+tmp_config="$(mktemp)"
+jq '.web.sensitive_edits_enabled = false' "${project}/config/config.json" >"${tmp_config}"
+mv "${tmp_config}" "${project}/config/config.json"
+disabled_config="$(curl --noproxy '*' -sS \
+    -H "Authorization: Bearer ${token}" "${base_url}/api/config")"
+jq -e '.config.web.sensitive_edits_enabled == false' <<<"${disabled_config}" >/dev/null
+
+disabled_policy_read="$(curl --noproxy '*' -sS \
+    -H "Authorization: Bearer ${token}" \
+    -H 'Content-Type: application/json' \
+    -d '{"path":"file-vault.json"}' \
+    "${base_url}/api/policies/read")"
+jq -e '.ok == true and .status == "read"' <<<"${disabled_policy_read}" >/dev/null
+disabled_policy_validate="$(curl --noproxy '*' -sS \
+    -H "Authorization: Bearer ${token}" \
+    -H 'Content-Type: application/json' \
+    -d "${vault_policy_validate_payload}" \
+    "${base_url}/api/policies/validate")"
+jq -e '.ok == true and .status == "valid"' <<<"${disabled_policy_validate}" >/dev/null
+
+disabled_policy_file="${tmp_root}/disabled-policy-write.json"
+disabled_policy_code="$(curl --noproxy '*' -sS -o "${disabled_policy_file}" -w '%{http_code}' \
+    -H "Authorization: Bearer ${token}" \
+    -H 'Content-Type: application/json' \
+    -d "${vault_policy_write_payload}" \
+    "${base_url}/api/policies/write" || true)"
+[[ "${disabled_policy_code}" == "403" ]]
+jq -e '.ok == false and .code == "sensitive_edits_disabled"' "${disabled_policy_file}" >/dev/null
+
+disabled_invalid_policy_file="${tmp_root}/disabled-invalid-policy-write.json"
+disabled_invalid_policy_code="$(curl --noproxy '*' -sS -o "${disabled_invalid_policy_file}" -w '%{http_code}' \
+    -H "Authorization: Bearer ${token}" \
+    -H 'Content-Type: application/json' \
+    -d '{"path":"file-vault.json","content":"not-json"}' \
+    "${base_url}/api/policies/write" || true)"
+[[ "${disabled_invalid_policy_code}" == "403" ]]
+jq -e '.ok == false and .code == "sensitive_edits_disabled"' "${disabled_invalid_policy_file}" >/dev/null
+
+disabled_guard_file="${tmp_root}/disabled-command-guard.json"
+disabled_guard_code="$(curl --noproxy '*' -sS -o "${disabled_guard_file}" -w '%{http_code}' \
+    -H "Authorization: Bearer ${token}" \
+    -H 'Content-Type: application/json' \
+    -d '{"enabled":false}' \
+    "${base_url}/api/policies/command-guard" || true)"
+[[ "${disabled_guard_code}" == "403" ]]
+jq -e '.ok == false and .code == "sensitive_edits_disabled"' "${disabled_guard_file}" >/dev/null
+jq -e '.command_guard.enabled == true' "${project}/config/config.json" >/dev/null
+
+disabled_materialize_file="${tmp_root}/disabled-materialize.json"
+disabled_materialize_code="$(curl --noproxy '*' -sS -o "${disabled_materialize_file}" -w '%{http_code}' \
+    -H "Authorization: Bearer ${token}" \
+    -H 'Content-Type: application/json' \
+    -d '{"skill":"ops-basic"}' \
+    "${base_url}/api/skills/materialize" || true)"
+[[ "${disabled_materialize_code}" == "403" ]]
+jq -e '.ok == false and .code == "sensitive_edits_disabled"' "${disabled_materialize_file}" >/dev/null
 
 job_poll_attempts=300
 work_payload="$(jq -cn '{resource:"work", action:"run", payload:{input:"查看cpu占用"}}')"
@@ -709,8 +798,8 @@ work_job_one="$(curl --noproxy '*' -sS \
     "${base_url}/api/jobs")"
 work_job_one_id="$(jq -r '.job_id' <<<"${work_job_one}")"
 [[ "${work_job_one_id}" =~ ^[0-9a-f]+$ ]]
-# Submit a second Work Job before polling the first. Both must snapshot the
-# same empty workspace context and then run in private sessions.
+# Submit a second Work Job before polling the first. Each Job must use the
+# workspace snapshot recorded when it was admitted, independent of scheduling.
 work_job_two="$(curl --noproxy '*' -sS \
     -H "Authorization: Bearer ${token}" \
     -H "Content-Type: application/json" \
@@ -729,9 +818,12 @@ for _ in $(seq 1 "${job_poll_attempts}"); do
     sleep 0.2
 done
 [[ "${work_status_one}" == "succeeded" ]]
-jq -e '.result_status == "executed" and .result_ok == true
+if ! jq -e '.result_status == "executed" and .result_ok == true
     and ([.result.timeline[]? | select(.kind == "execution") | .output_blocks[]? | select(.kind == "json") | .json | select(.tool == "system.resource.inspect")] | length) > 0
-    and ([.result.output_blocks[]? | select(.title == "执行流程") | .text | contains("# 工作计划") and contains("步骤输出")] | any)' <<<"${work_result_one}" >/dev/null
+    and ([.result.output_blocks[]? | select(.title == "执行流程") | .text | contains("# 工作计划") and contains("步骤输出")] | any)' <<<"${work_result_one}" >/dev/null; then
+    jq '{status, result_status, result_ok, result}' <<<"${work_result_one}" >&2
+    exit 1
+fi
 completed_metrics="$(curl --noproxy '*' -sS -H "Authorization: Bearer ${token}" "${base_url}/api/metrics")"
 printf '%s\n' "${completed_metrics}" | grep -Eq 'linux_agent_jobs\{status="succeeded"\} [1-9][0-9]*'
 printf '%s\n' "${completed_metrics}" | grep -Eq 'linux_agent_jobs_completed_total\{result="succeeded"\} [1-9][0-9]*'
@@ -870,35 +962,76 @@ jq -e \
       and all(.events[]? | select(.stage == "job_session_merged");
           (.outbox_event_id | type) == "string"
           and .outbox_event_id == .payload.outbox_event_id)
-      and ([.events[]? | select(.stage == "received" or .stage == "step_running")] | length) == 0
-' <<<"${workspace_audit}" >/dev/null
+      and ([.events[]? | select(
+          (.stage == "received" or .stage == "step_running")
+          and ((.job_id // .payload.job_id // "") | IN($one, $two, $slow))
+      )] | length) == 0
+' <<<"${workspace_audit}" >/dev/null || {
+    jq '{
+        ok,
+        timeline_source:.web_timeline.source,
+        timeline_turn_count:(.web_timeline.turns | length),
+        turns:[.web_timeline.turns[]? | {
+            source,
+            context_eligible,
+            history_merged_count,
+            result_timeline_type:(.result.timeline | type)
+        }],
+        merged_job_ids:[.events[]? | select(.stage == "job_session_merged") | .payload.job_id],
+        invalid_merge_outbox_count:([.events[]? | select(
+            .stage == "job_session_merged"
+            and ((.outbox_event_id | type) != "string" or .outbox_event_id != .payload.outbox_event_id)
+        )] | length),
+        private_lifecycle_event_count:([.events[]? | select(
+            (.stage == "received" or .stage == "step_running")
+            and ((.job_id // .payload.job_id // "") | IN($one, $two, $slow))
+        )] | length)
+    }' <<<"${workspace_audit}" >&2
+    exit 1
+}
 
 work_one_audit="$(read_audit_session "${work_one_session_id}")"
 work_two_audit="$(read_audit_session "${work_two_session_id}")"
 slow_private_audit="$(read_audit_session "${slow_work_session_id}")"
 jq -e --arg session_id "${work_one_session_id}" --arg job_id "${work_job_one_id}" '
+    def request_context_turn_count:
+        if (.payload.conversation_turns? | type) == "number" then .payload.conversation_turns
+        elif (.payload.conversation_context? | type) == "array" then (.payload.conversation_context | length)
+        else null end;
     .ok == true
     and .web_timeline.source == "persisted"
     and (.web_timeline.turns | length) == 1
     and all(.events[]; .session_id == $session_id)
     and ([.events[]? | select(.job_id != null and .job_id != $job_id)] | length) == 0
-    and ([.events[]? | select(.stage == "request_context_built") | .payload.conversation_turns] | first) == 0
+    and ([.events[]? | select(.stage == "request_context_built") | request_context_turn_count] | first) == 0
+    and ([.events[]? | select(.stage == "session_started") | .payload.history_snapshot_count] | first) == 0
 ' <<<"${work_one_audit}" >/dev/null
 jq -e --arg session_id "${work_two_session_id}" --arg job_id "${work_job_two_id}" '
+    def request_context_turn_count:
+        if (.payload.conversation_turns? | type) == "number" then .payload.conversation_turns
+        elif (.payload.conversation_context? | type) == "array" then (.payload.conversation_context | length)
+        else null end;
     .ok == true
     and .web_timeline.source == "persisted"
     and (.web_timeline.turns | length) == 1
     and all(.events[]; .session_id == $session_id)
     and ([.events[]? | select(.job_id != null and .job_id != $job_id)] | length) == 0
-    and ([.events[]? | select(.stage == "request_context_built") | .payload.conversation_turns] | first) == 0
+    and ([.events[]? | select(.stage == "request_context_built") | request_context_turn_count] | first)
+        == ([.events[]? | select(.stage == "session_started") | .payload.history_snapshot_count] | first)
 ' <<<"${work_two_audit}" >/dev/null
 jq -e --arg session_id "${slow_work_session_id}" --arg job_id "${slow_work_job_id}" '
+    def request_context_turn_count:
+        if (.payload.conversation_turns? | type) == "number" then .payload.conversation_turns
+        elif (.payload.conversation_context? | type) == "array" then (.payload.conversation_context | length)
+        else null end;
     .ok == true
     and .web_timeline.source == "persisted"
     and (.web_timeline.turns | length) == 1
     and all(.events[]; .session_id == $session_id)
     and ([.events[]? | select(.job_id != null and .job_id != $job_id)] | length) == 0
-    and ([.events[]? | select(.stage == "request_context_built") | .payload.conversation_turns] | first) >= 1
+    and ([.events[]? | select(.stage == "request_context_built") | request_context_turn_count] | first)
+        == ([.events[]? | select(.stage == "session_started") | .payload.history_snapshot_count] | first)
+    and ([.events[]? | select(.stage == "session_started") | .payload.history_snapshot_count] | first) >= 1
 ' <<<"${slow_private_audit}" >/dev/null
 jq -e 'type == "array"' "${project}/tmp/web/jobs/${work_job_one_id}.history.json" >/dev/null
 jq -e 'type == "array"' "${project}/tmp/web/jobs/${work_job_two_id}.history.json" >/dev/null
@@ -996,7 +1129,12 @@ done
 left_job_session_id="$(jq -r '.session_id' <<<"${work_result_after_leave}")"
 left_job_audit="$(read_audit_session "${left_job_session_id}")"
 jq -e '
-    ([.events[]? | select(.stage == "request_context_built") | .payload.conversation_turns] | first) == 0
+    def request_context_turn_count:
+        if (.payload.conversation_turns? | type) == "number" then .payload.conversation_turns
+        elif (.payload.conversation_context? | type) == "array" then (.payload.conversation_context | length)
+        else null end;
+    ([.events[]? | select(.stage == "request_context_built") | request_context_turn_count] | first) == 0
+    and ([.events[]? | select(.stage == "session_started") | .payload.history_snapshot_count] | first) == 0
     and .web_timeline.source == "persisted"
 ' <<<"${left_job_audit}" >/dev/null
 left_workspace_state="$(curl --noproxy '*' -sS -H "Authorization: Bearer ${token}" "${base_url}/api/session/state")"
@@ -1304,9 +1442,12 @@ for _ in $(seq 1 "${job_poll_attempts}"); do
     fi
     sleep 0.2
 done
-jq -e '.status == "succeeded" and .result_status == "approval_required"
+if ! jq -e '.status == "succeeded" and .result_status == "approval_required"
     and .result.ok == false
-    and (.result.execution_state | type) == "object"' <<<"${approval_result}" >/dev/null
+    and (.result.execution_state | type) == "object"' <<<"${approval_result}" >/dev/null; then
+    jq '{status, result_status, result_ok, result: {status: .result.status, error: .result.error, code: .result.code, execution_state: .result.execution_state, response: .result.response}}' <<<"${approval_result}" >&2
+    exit 1
+fi
 
 approval_state_pending="$(curl --noproxy '*' -sS -H "Authorization: Bearer ${token}" "${base_url}/api/session/state")"
 jq -e \
@@ -1364,6 +1505,34 @@ jq -e \
     and .turns[-1].context_eligible == true
     and .turns[-1].history_merged_count > 0
 ' <<<"${approval_state_final}" >/dev/null
+
+# Planning and review remain available while sensitive writes are disabled.
+# Keep this synchronous workspace activity after the Job isolation assertions
+# so their admitted-history snapshots remain deterministic.
+disabled_edit_plan="$(curl --noproxy '*' -sS \
+    -H "Authorization: Bearer ${token}" \
+    -H 'Content-Type: application/json' \
+    -d '{"input":"创建一个 Web gate 测试 skill"}' \
+    "${base_url}/api/edit/plan")"
+jq -e '.ok == true and .status == "planned"' <<<"${disabled_edit_plan}" >/dev/null
+disabled_edit="$(jq -c '.edit' <<<"${disabled_edit_plan}")"
+disabled_edit_review_payload="$(jq -cn --argjson edit "${disabled_edit}" '{edit:$edit}')"
+disabled_edit_review="$(curl --noproxy '*' -sS \
+    -H "Authorization: Bearer ${token}" \
+    -H 'Content-Type: application/json' \
+    -d "${disabled_edit_review_payload}" \
+    "${base_url}/api/edit/review")"
+jq -e '.ok == true and .status == "approved"' <<<"${disabled_edit_review}" >/dev/null
+disabled_edit_apply_payload="$(jq -cn --argjson edit "${disabled_edit}" \
+    '{resource:"edit",action:"apply",payload:{edit:$edit,approve:true}}')"
+disabled_edit_apply_file="${tmp_root}/disabled-edit-apply.json"
+disabled_edit_apply_code="$(curl --noproxy '*' -sS -o "${disabled_edit_apply_file}" -w '%{http_code}' \
+    -H "Authorization: Bearer ${token}" \
+    -H 'Content-Type: application/json' \
+    -d "${disabled_edit_apply_payload}" \
+    "${base_url}/api/jobs" || true)"
+[[ "${disabled_edit_apply_code}" == "403" ]]
+jq -e '.ok == false and .code == "sensitive_edits_disabled"' "${disabled_edit_apply_file}" >/dev/null
 
 # SQLite(WAL) job store is the durable backend.
 [[ -f "${project}/tmp/web/jobs.db" ]]

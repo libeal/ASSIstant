@@ -18,7 +18,7 @@ class DomainContract:
             raise TypeError("domain schema must be an object")
         self.schema = schema
         self.schema_version = int(schema.get("schema_version", 1))
-        self.protocol_version = str(schema.get("protocol_version") or "1.0.0")
+        self.protocol_version = str(schema.get("protocol_version") or "1.2.0")
         self.job_statuses = frozenset(schema.get("job_status") or ())
         self.step_statuses = frozenset(schema.get("step_status") or ())
         self.work_statuses = frozenset(schema.get("work_status") or ())
@@ -36,6 +36,12 @@ class DomainContract:
             or ()
         )
         self.risk_levels = frozenset(schema.get("risk_level") or ())
+        self.skill_execution_classes = frozenset(
+            schema.get("skill_execution_class") or {"runner", "host_helper"}
+        )
+        self.skill_capabilities = frozenset(
+            schema.get("skill_capability") or {"", "firewall.apply", "hosts.apply"}
+        )
         self.executor_types = frozenset(schema.get("executor_type") or ())
         self.approval_types = frozenset(schema.get("approval_type") or ())
         self.approval_actions = frozenset(schema.get("approval_action") or ())
@@ -354,7 +360,17 @@ class DomainContract:
         return event
 
     def validate_skill_manifest(self, manifest):
-        self._require_fields("skill_manifest", manifest)
+        if not isinstance(manifest, dict):
+            raise DomainValidationError("skill_manifest must be an object")
+        required = list(self._required("skill_manifest"))
+        missing = [field for field in required if field not in manifest]
+        if missing:
+            raise DomainValidationError(
+                f"skill_manifest is missing required fields: {', '.join(missing)}"
+            )
+        schema_version = manifest.get("schema_version")
+        if isinstance(schema_version, bool) or not isinstance(schema_version, int) or schema_version != 1:
+            raise DomainValidationError("skill_manifest schema_version must be 1")
         if re.fullmatch(r"[a-z0-9][a-z0-9-]*", str(manifest.get("name") or "")) is None:
             raise DomainValidationError("skill_manifest name is unsupported")
         for name in ("name", "description"):
@@ -380,6 +396,42 @@ class DomainContract:
                     f"skill_manifest script {index} name is unsupported"
                 )
             script_names.append(script_name)
+            missing_fields = [
+                field
+                for field in ("risk", "execution_class", "capability")
+                if field not in script
+            ]
+            if missing_fields:
+                raise DomainValidationError(
+                    f"skill_manifest script {index} is missing required fields: "
+                    + ", ".join(missing_fields)
+                )
+            risk = script.get("risk")
+            if not isinstance(risk, str) or risk not in self.risk_levels:
+                raise DomainValidationError(
+                    f"skill_manifest script {index} risk is unsupported"
+                )
+            execution_class = script.get("execution_class")
+            if execution_class not in self.skill_execution_classes:
+                raise DomainValidationError(
+                    f"skill_manifest script {index} execution_class is unsupported"
+                )
+            capability = script.get("capability")
+            if not isinstance(capability, str) or capability not in self.skill_capabilities:
+                raise DomainValidationError(
+                    f"skill_manifest script {index} capability is unsupported"
+                )
+            if execution_class == "runner" and capability != "":
+                raise DomainValidationError(
+                    f"skill_manifest script {index} runner capability must be empty"
+                )
+            if execution_class == "host_helper" and capability not in {
+                "firewall.apply",
+                "hosts.apply",
+            }:
+                raise DomainValidationError(
+                    f"skill_manifest script {index} host_helper capability is unsupported"
+                )
         if len(script_names) != len(set(script_names)):
             raise DomainValidationError("skill_manifest script names must be unique")
         return manifest

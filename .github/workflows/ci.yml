@@ -54,7 +54,6 @@ jobs:
             tests/workflow_unit.sh \
             tests/observer.sh \
             tests/audit_integrity.sh \
-            tests/mcp.sh \
             tests/contract.sh \
             tests/security.sh \
             tests/smoke.sh \

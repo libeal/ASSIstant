@@ -3,6 +3,11 @@
 set -euo pipefail
 
 LINUX_AGENT_API_INPUT_JSON='[]'
+LINUX_AGENT_EXECUTION_ISOLATION_STATE="degraded_same_uid"
+LINUX_AGENT_EXECUTION_PREPARE_ERROR_CODE=""
+LINUX_AGENT_RUNNER_AUDIT_SNAPSHOT=""
+LINUX_AGENT_RUNNER_AUDIT_SNAPSHOT_SESSION=""
+LINUX_AGENT_EXECUTION_STAGING_PATHS=()
 
 linux_agent_api_read_input_line() {
     local result_var="$1"
@@ -70,27 +75,219 @@ linux_agent_least_privilege_user() {
 }
 
 linux_agent_execution_privilege_from_review() {
-    local review_json="$1"
-    local privileged_finding
-
-    privileged_finding="$(jq -r '
-        [(.findings // [])[] | select((.severity == "high" or .severity == "critical") and
-            ((.code == "REGEX_WARN")
-             or (.code == "PROTECTED_SERVICE")
-             or (.code == "PROTECTED_PATH")
-             or (.category == "privilege")
-             or (.category == "protected_path")
-             or (.category == "protected_service")))]
-        | length > 0
-    ' <<<"${review_json}" 2>/dev/null || printf 'false')"
-    if [[ "${privileged_finding}" == "true" ]]; then
-        printf 'current\n'
-    else
-        printf 'least\n'
-    fi
+    # Policy findings control approval only.  They must never be allowed to
+    # turn an ordinary command into a root/current-UID execution path.
+    # Privileged operations use an explicit host-helper contract instead.
+    printf 'least\n'
 }
 
 # output_command_ref is a nameref used to populate the caller's command array.
+# shellcheck disable=SC2034
+linux_agent_runner_socket() {
+    printf '%s\n' "${LINUX_AGENT_RUNNER_SOCKET:-/run/linux-agent/runner.sock}"
+}
+
+linux_agent_runner_kind_for_command() {
+    local first="${1:-}" second="${2:-}" resolved builtin user tmp
+    if [[ "${first}" == "bash" && "${second}" == "-lc" && $# -eq 3 ]]; then
+        printf 'terminal\n'
+        return 0
+    fi
+    if [[ "${first}" == "bash" && $# -eq 3 ]]; then
+        resolved="$(readlink -f -- "${second}" 2>/dev/null || true)"
+        [[ -n "${resolved}" ]] || return 1
+        builtin="$(readlink -f -- "${LINUX_AGENT_BUILTIN_SKILLS_DIR:-${LINUX_AGENT_ROOT}/skills}" 2>/dev/null || true)"
+        user="$(readlink -f -- "${LINUX_AGENT_USER_SKILLS_DIR:-${LINUX_AGENT_ROOT}/data/skills}" 2>/dev/null || true)"
+        tmp="$(readlink -f -- "${LINUX_AGENT_RUNNER_TMP_ROOT:-${LINUX_AGENT_TMP_ROOT:-${LINUX_AGENT_ROOT}/tmp}}" 2>/dev/null || true)"
+        if [[ -n "${builtin}" && "${resolved}" == "${builtin}/"* ]] ||
+            [[ -n "${user}" && "${resolved}" == "${user}/"* ]]; then
+            printf 'skill\n'
+            return 0
+        fi
+        if [[ -n "${tmp}" && "${resolved}" == "${tmp}/"* ]]; then
+            printf 'remote_script\n'
+            return 0
+        fi
+        return 1
+    fi
+    if [[ "${first}" == "python3" && "${second}" == "${LINUX_AGENT_ROOT}/lib/mcp_client.py" && $# -eq 6 ]]; then
+        printf 'mcp\n'
+        return 0
+    fi
+    return 1
+}
+
+linux_agent_cleanup_execution_staging() {
+    local path resolved root
+    root="$(readlink -f -- "${LINUX_AGENT_RUNNER_TMP_ROOT:-}" 2>/dev/null || true)"
+    for path in "${LINUX_AGENT_EXECUTION_STAGING_PATHS[@]:-}"; do
+        [[ -n "${path}" && -n "${root}" ]] || continue
+        resolved="$(readlink -f -- "${path}" 2>/dev/null || true)"
+        if [[ -n "${resolved}" && "${resolved}" != "${root}" && "${resolved}" == "${root}/"* &&
+            -f "${resolved}" && ! -L "${path}" ]]; then
+            rm -f -- "${resolved}"
+        fi
+    done
+    if [[ -n "${LINUX_AGENT_RUNNER_RESULT_FILE:-}" &&
+        "${LINUX_AGENT_RUNNER_RESULT_FILE}" == "${LINUX_AGENT_TMP_DIR}"/runner-result.*.json ]]; then
+        rm -f -- "${LINUX_AGENT_RUNNER_RESULT_FILE}"
+    fi
+    LINUX_AGENT_EXECUTION_STAGING_PATHS=()
+    LINUX_AGENT_RUNNER_AUDIT_SNAPSHOT=""
+    LINUX_AGENT_RUNNER_AUDIT_SNAPSHOT_SESSION=""
+    LINUX_AGENT_RUNNER_RESULT_FILE=""
+}
+
+linux_agent_runner_result_metadata() {
+    local path="${LINUX_AGENT_RUNNER_RESULT_FILE:-}" owner mode
+    [[ -n "${path}" && "${path}" == "${LINUX_AGENT_TMP_DIR}"/runner-result.*.json &&
+        -f "${path}" && ! -L "${path}" ]] || return 1
+    owner="$(stat -c '%u' -- "${path}" 2>/dev/null || true)"
+    mode="$(stat -c '%a' -- "${path}" 2>/dev/null || true)"
+    [[ "${owner}" == "$(id -u)" && "${mode}" == "600" ]] || return 1
+    jq -e -c '
+        type == "object"
+        and .protocol_version == "1.2.0"
+        and (.request_id | type == "string" and test("^[0-9a-f]{32}$"))
+        and (.ok | type == "boolean")
+        and (.status | type == "string" and length > 0)
+        and (.exit_code | type == "number" and floor == . and . >= 0 and . <= 255)
+        and ((.timed_out // false) | type == "boolean")
+        and ((.cancelled // false) | type == "boolean")
+        and ((.output_capped // false) | type == "boolean")
+        and ((.output_integrity_unknown // false) | type == "boolean")
+        and ((.stdout_truncated_bytes // 0) | type == "number" and floor == . and . >= 0)
+        and ((.stderr_truncated_bytes // 0) | type == "number" and floor == . and . >= 0)
+    ' "${path}" 2>/dev/null
+}
+
+linux_agent_prepare_session_history_snapshot() {
+    local runner_kind="$1"
+    shift
+    local script_path expected_path arguments session_id latest_log
+    local private_stage snapshot_path segment line staged_file verify_report
+
+    LINUX_AGENT_RUNNER_AUDIT_SNAPSHOT=""
+    LINUX_AGENT_RUNNER_AUDIT_SNAPSHOT_SESSION=""
+    [[ "${runner_kind}" == "skill" && $# -eq 3 && "${1:-}" == "bash" ]] || return 0
+    script_path="$(readlink -f -- "${2:-}" 2>/dev/null || true)"
+    expected_path="$(readlink -f -- \
+        "${LINUX_AGENT_BUILTIN_SKILLS_DIR:-${LINUX_AGENT_ROOT}/skills}/session-history/scripts/last-command-output.sh" \
+        2>/dev/null || true)"
+    [[ -n "${script_path}" && "${script_path}" == "${expected_path}" ]] || return 0
+
+    arguments="${3:-}"
+    jq -e 'type == "object"' <<<"${arguments}" >/dev/null 2>&1 || return 0
+    session_id="$(jq -r '.session_id // empty' <<<"${arguments}")"
+    [[ -n "${session_id}" ]] || session_id="${LINUX_AGENT_SESSION_ID:-}"
+    if [[ -z "${session_id}" ]]; then
+        latest_log="$(find "${LINUX_AGENT_LOG_DIR}" -maxdepth 1 -type f -name 'session*.jsonl' \
+            -printf '%T@ %f\n' 2>/dev/null | sort -rn | head -n 1 | awk '{print $2}')"
+        session_id="${latest_log%.jsonl}"
+    fi
+    [[ -n "${session_id}" && "${session_id}" =~ ^[A-Za-z0-9_.-]+$ ]] || return 0
+    [[ -f "${LINUX_AGENT_LOG_DIR}/${session_id}.jsonl" &&
+        ! -L "${LINUX_AGENT_LOG_DIR}/${session_id}.jsonl" ]] || return 0
+
+    private_stage="$(mktemp -d "${LINUX_AGENT_TMP_DIR}/runner-audit-stage.XXXXXX")" || {
+        LINUX_AGENT_EXECUTION_PREPARE_ERROR_CODE="runner_unavailable"
+        return 1
+    }
+    chmod 0700 "${private_stage}"
+    if ! snapshot_path="$(linux_agent_audit_snapshot "${session_id}" "${private_stage}" 2>/dev/null)"; then
+        rm -rf -- "${private_stage}"
+        LINUX_AGENT_EXECUTION_PREPARE_ERROR_CODE="audit_integrity_broken"
+        return 1
+    fi
+    if ! verify_report="$(linux_agent_audit_verify_chain "${session_id}" "${snapshot_path}" 2>/dev/null)" ||
+        [[ "$(jq -r '.ok // false' <<<"${verify_report}" 2>/dev/null || printf false)" != "true" ]]; then
+        rm -rf -- "${private_stage}"
+        LINUX_AGENT_EXECUTION_PREPARE_ERROR_CODE="audit_integrity_broken"
+        return 1
+    fi
+
+    staged_file="$(mktemp "${LINUX_AGENT_RUNNER_TMP_DIR}/audit-snapshot.XXXXXX.jsonl")" || {
+        rm -rf -- "${private_stage}"
+        LINUX_AGENT_EXECUTION_PREPARE_ERROR_CODE="runner_unavailable"
+        return 1
+    }
+    chmod 0600 "${staged_file}"
+    while IFS= read -r segment; do
+        while IFS= read -r line || [[ -n "${line}" ]]; do
+            if ! linux_agent_sanitize_json "${line}" 200000 >>"${staged_file}"; then
+                rm -f -- "${staged_file}"
+                rm -rf -- "${private_stage}"
+                LINUX_AGENT_EXECUTION_PREPARE_ERROR_CODE="audit_integrity_broken"
+                return 1
+            fi
+        done <"${segment}"
+    done < <(linux_agent_audit_segment_paths "${snapshot_path}")
+    rm -rf -- "${private_stage}"
+    chmod 0640 "${staged_file}" || {
+        rm -f -- "${staged_file}"
+        LINUX_AGENT_EXECUTION_PREPARE_ERROR_CODE="runner_unavailable"
+        return 1
+    }
+    LINUX_AGENT_EXECUTION_STAGING_PATHS+=("${staged_file}")
+    LINUX_AGENT_RUNNER_AUDIT_SNAPSHOT="${staged_file}"
+    LINUX_AGENT_RUNNER_AUDIT_SNAPSHOT_SESSION="${session_id}"
+}
+
+linux_agent_prepare_managed_runner_command() {
+    local output_var="$1"
+    shift
+    local -n output_ref="${output_var}"
+    local socket_path runner_path runner_kind metadata_file
+    local -a scrub_env runner_options=()
+    socket_path="$(linux_agent_runner_socket)"
+    runner_path="${LINUX_AGENT_ROOT}/lib/runner.py"
+    if [[ ! -f "${runner_path}" || -L "${runner_path}" ]]; then
+        LINUX_AGENT_EXECUTION_PREPARE_ERROR_CODE="runner_unavailable"
+        return 1
+    fi
+    if [[ ! -S "${socket_path}" ]]; then
+        LINUX_AGENT_EXECUTION_PREPARE_ERROR_CODE="runner_unavailable"
+        return 1
+    fi
+    if ! runner_kind="$(linux_agent_runner_kind_for_command "$@")"; then
+        LINUX_AGENT_EXECUTION_PREPARE_ERROR_CODE="runner_rejected"
+        return 1
+    fi
+    if ! linux_agent_prepare_session_history_snapshot "${runner_kind}" "$@"; then
+        return 1
+    fi
+    metadata_file="$(mktemp "${LINUX_AGENT_TMP_DIR}/runner-result.XXXXXX.json")" || {
+        LINUX_AGENT_EXECUTION_PREPARE_ERROR_CODE="runner_unavailable"
+        return 1
+    }
+    chmod 0600 "${metadata_file}" || {
+        rm -f -- "${metadata_file}"
+        LINUX_AGENT_EXECUTION_PREPARE_ERROR_CODE="runner_unavailable"
+        return 1
+    }
+    LINUX_AGENT_RUNNER_RESULT_FILE="${metadata_file}"
+    if [[ -n "${LINUX_AGENT_RUNNER_AUDIT_SNAPSHOT}" ]]; then
+        runner_options=(
+            --audit-snapshot "${LINUX_AGENT_RUNNER_AUDIT_SNAPSHOT}"
+            --audit-snapshot-session "${LINUX_AGENT_RUNNER_AUDIT_SNAPSHOT_SESSION}"
+        )
+    fi
+    linux_agent_build_execution_environment scrub_env
+    # The nameref assignment populates the caller's prepared command array.
+    # shellcheck disable=SC2034
+    output_ref=(
+        "${scrub_env[@]}"
+        python3 "${runner_path}" request
+        --socket "${socket_path}"
+        --kind "${runner_kind}"
+        --metadata-file "${metadata_file}"
+        "${runner_options[@]}"
+        -- "$@"
+    )
+    LINUX_AGENT_EXECUTION_ISOLATION_STATE="runner_uid"
+    return 0
+}
+
 # shellcheck disable=SC2034
 linux_agent_build_execution_environment() {
     local output_var="$1"
@@ -106,6 +303,7 @@ linux_agent_build_execution_environment() {
         LINUX_AGENT_REMOTE_MODE LINUX_AGENT_REMOTE_RELEASE_VERSION
         LINUX_AGENT_REMOTE_STORAGE_BACKEND LINUX_AGENT_SESSION_ID
         LINUX_AGENT_REQUEST_ID LINUX_AGENT_JOB_ID
+        LINUX_AGENT_EXECUTION_TIMEOUT_SEC LINUX_AGENT_EXECUTION_MAX_OUTPUT_BYTES
     )
 
     output_env_ref=(env -i --)
@@ -128,6 +326,18 @@ linux_agent_prepare_execution_command() {
     shift 2
     local -n output_command_ref="${output_var}"
     output_command_ref=()
+    linux_agent_cleanup_execution_staging
+    LINUX_AGENT_EXECUTION_PREPARE_ERROR_CODE=""
+    LINUX_AGENT_EXECUTION_ISOLATION_STATE="degraded_same_uid"
+
+    if linux_agent_managed_execution_enabled 2>/dev/null; then
+        LINUX_AGENT_EXECUTION_TIMEOUT_SEC="$(linux_agent_execution_timeout_sec)"
+        LINUX_AGENT_EXECUTION_MAX_OUTPUT_BYTES="$(linux_agent_execution_max_output_bytes)"
+        if ! linux_agent_prepare_managed_runner_command "${output_var}" "$@"; then
+            return 1
+        fi
+        return 0
+    fi
 
     local -a scrub_env
 
@@ -169,7 +379,9 @@ linux_agent_execution_proxy_metadata() {
     local prepared_root="$2"
     local error_message="${3:-}"
     local target_user=""
-    if [[ "${requested_privilege}" == "least" && "$(id -u)" -eq 0 ]]; then
+    if [[ "${LINUX_AGENT_EXECUTION_ISOLATION_STATE:-}" == "runner_uid" ]]; then
+        target_user="${LINUX_AGENT_RUNNER_USER:-linux-agent-runner}"
+    elif [[ "${requested_privilege}" == "least" && "$(id -u)" -eq 0 ]]; then
         target_user="$(linux_agent_least_privilege_user 2>/dev/null || true)"
     fi
 
@@ -179,15 +391,274 @@ linux_agent_execution_proxy_metadata() {
         --arg target_user "${target_user}" \
         --arg prepared_root "${prepared_root}" \
         --arg error "${error_message}" \
+        --arg isolation "${LINUX_AGENT_EXECUTION_ISOLATION_STATE:-degraded_same_uid}" \
         --argjson enabled "$(linux_agent_min_privilege_proxy_enabled)" \
         '{
             enabled:$enabled,
             requested_privilege:$requested_privilege,
             execution_user:$execution_user,
             target_user:(if $target_user == "" then null else $target_user end),
-            prepared_root:($prepared_root == "true"),
+            prepared_root:(($prepared_root == "true") and $isolation != "runner_uid"),
+            isolation:$isolation,
             error:(if $error == "" then null else $error end)
         }'
+}
+
+linux_agent_host_helper_socket() {
+    printf '%s\n' "${LINUX_AGENT_HOST_HELPER_SOCKET:-/run/linux-agent/host-ops.sock}"
+}
+
+linux_agent_host_helper_result() {
+    local ref="$1" operation="$2" params="$3" response stdout_text
+    local helper_client="${LINUX_AGENT_ROOT}/lib/host_ops_helper.py"
+    local socket_path summary
+    local -a scrub_env
+    socket_path="$(linux_agent_host_helper_socket)"
+    summary="Apply reviewed ${operation} operation for ${ref}"
+    if [[ ! -f "${helper_client}" || -L "${helper_client}" || ! -S "${socket_path}" ]]; then
+        jq -cn --arg ref "${ref}" '{
+            ok:false,
+            status:"helper_unavailable",
+            code:"helper_unavailable",
+            error_code:"helper_unavailable",
+            exit_code:126,
+            output:{ok:false, status:"helper_unavailable", tool:$ref, error:"Required host helper is unavailable."},
+            execution_proxy:{isolation:"host_helper", helper:"host-ops", available:false}
+        }'
+        return 0
+    fi
+    linux_agent_build_execution_environment scrub_env
+    response="$(
+        "${scrub_env[@]}" python3 "${helper_client}" request \
+            --socket "${socket_path}" \
+            "${operation}" \
+            --params "${params}" \
+            --summary "${summary}" 2>&1
+    )" || true
+    if ! jq -e 'type == "object"' >/dev/null 2>&1 <<<"${response}"; then
+        jq -cn --arg ref "${ref}" --arg error "${response}" '{
+            ok:false,
+            status:"helper_unavailable",
+            code:"helper_unavailable",
+            error_code:"helper_unavailable",
+            exit_code:126,
+            output:{ok:false, status:"helper_unavailable", tool:$ref, error:$error},
+            execution_proxy:{isolation:"host_helper", helper:"host-ops", available:false}
+        }'
+        return 0
+    fi
+    stdout_text="$(jq -c --arg ref "${ref}" '. + {tool:$ref}' <<<"${response}")"
+    jq -cn \
+        --argjson helper "${stdout_text}" \
+        '{
+            ok:($helper.ok == true),
+            status:($helper.status // (if $helper.ok == true then "executed" else "helper_failed" end)),
+            code:($helper.code // null),
+            error_code:($helper.code // null),
+            exit_code:(if $helper.ok == true then 0 else 1 end),
+            output:$helper,
+            execution_proxy:{isolation:"host_helper", helper:"host-ops", available:true}
+        }'
+}
+
+linux_agent_host_helper_skill_params() {
+    local ref="$1" args="$2" capability origin action apply confirm expected_sha
+    capability="$(linux_agent_skill_capability "${ref}")"
+    origin="$(linux_agent_skill_package_origin "${ref%%/*}" 2>/dev/null || printf invalid)"
+    if [[ "${origin}" != "builtin" ]]; then
+        jq -cn --arg ref "${ref}" ' {
+            ok:false, status:"helper_rejected", code:"helper_rejected",
+            error_code:"helper_rejected", exit_code:126,
+            output:{ok:false, status:"helper_rejected", tool:$ref,
+                    error:"User Skills cannot request host-helper execution."},
+            execution_proxy:{isolation:"host_helper", helper:"host-ops", available:false}
+        }'
+        return 0
+    fi
+    [[ "$(linux_agent_skill_execution_class "${ref}")" == "host_helper" ]] || return 1
+    if [[ "${origin}" != "builtin" ]]; then
+        jq -cn '{handled:true, error:"User Skills cannot request host helper capabilities."}'
+        return 0
+    fi
+    action="$(jq -r '.action // "" | ascii_downcase' <<<"${args}")"
+    apply="$(jq -r '.apply // false' <<<"${args}")"
+    confirm="$(jq -r '.confirm // ""' <<<"${args}")"
+    case "${ref}:${capability}" in
+        network-ops-tools/firewall:firewall.apply)
+            jq -e '
+                (.action | type == "string" and ascii_downcase == "apply")
+                and (.apply | type == "boolean" and . == true)
+                and (.confirm | type == "string" and . == "APPLY_FIREWALL_CHANGE")
+            ' <<<"${args}" >/dev/null 2>&1 || return 1
+            if [[ "${confirm}" != "APPLY_FIREWALL_CHANGE" ]]; then
+                return 1
+            fi
+            jq -c '
+                (.rule // {}) as $rule
+                | {
+                    backend:(.backend // "ufw"),
+                    decision:($rule.decision // .decision // "allow"),
+                    protocol:($rule.protocol // .protocol // "tcp"),
+                    port:($rule.port // .port // 0),
+                    source:($rule.source // .source // "any")
+                }
+            ' <<<"${args}"
+            ;;
+        network-ops-tools/hosts-file-editor:hosts.apply)
+            jq -e '
+                (.action | type == "string" and ((ascii_downcase == "add") or (ascii_downcase == "remove")))
+                and (.apply | type == "boolean" and . == true)
+                and (.confirm | type == "string" and . == "APPLY_HOSTS_CHANGE")
+            ' <<<"${args}" >/dev/null 2>&1 || return 1
+            if [[ "${confirm}" != "APPLY_HOSTS_CHANGE" ]]; then
+                return 1
+            fi
+            if [[ "$(jq -r '.path // "/etc/hosts"' <<<"${args}")" != "/etc/hosts" ||
+            ! -f /etc/hosts || -L /etc/hosts ]]; then
+                jq -cn '{handled:true, error:"host helper only permits the regular /etc/hosts target."}'
+                return 0
+            fi
+            expected_sha="$(sha256sum /etc/hosts | awk '{print $1}')"
+            jq -c --arg expected_sha "${expected_sha}" '
+                {
+                    action:(.action | ascii_downcase),
+                    ip:(.ip // ""),
+                    hostnames:(
+                        if (.hostnames | type) == "array" then .hostnames
+                        elif (.hostname | type) == "string" and .hostname != "" then [.hostname]
+                        else [] end
+                    ),
+                    hostname:(.hostname // .query // ""),
+                    merge:(.merge // false),
+                    expected_sha256:$expected_sha
+                }
+            ' <<<"${args}"
+            ;;
+        *)
+            jq -cn '{handled:true, error:"Built-in Skill helper capability does not match the release allowlist."}'
+            ;;
+    esac
+}
+
+linux_agent_maybe_execute_host_helper_skill() {
+    local scope="$1" subject_json="$2"
+    shift 2
+    local ref args capability params error execution_class origin action apply_state
+    [[ "${scope}" == "script" || "${scope}" == "step_skill_script" ]] || return 1
+    [[ "${1:-}" == "bash" && $# -eq 3 ]] || return 1
+    ref="$(jq -r '.ref // .step.skill_script // empty' <<<"${subject_json}")"
+    [[ -n "${ref}" ]] || return 1
+    args="${3:-}"
+    execution_class="$(linux_agent_skill_execution_class "${ref}" 2>/dev/null || printf invalid)"
+    [[ "${execution_class}" == "host_helper" ]] || return 1
+
+    # A host-helper declaration is an execution boundary.  Only the explicitly
+    # read/plan forms may fall through to the ordinary runner; malformed or
+    # potentially mutating arguments must be consumed and rejected here so a
+    # source-runtime/root process can never execute the privileged script
+    # directly after helper routing fails.
+    if ! jq -e 'type == "object"' >/dev/null 2>&1 <<<"${args}"; then
+        jq -cn --arg ref "${ref}" ' {
+            ok:false, status:"helper_rejected", code:"helper_rejected",
+            error_code:"helper_rejected", exit_code:126,
+            output:{ok:false, status:"helper_rejected", tool:$ref,
+                    error:"Host-helper Skill arguments must be a JSON object."},
+            execution_proxy:{isolation:"host_helper", helper:"host-ops", available:false}
+        }'
+        return 0
+    fi
+    capability="$(linux_agent_skill_capability "${ref}")"
+    origin="$(linux_agent_skill_package_origin "${ref%%/*}" 2>/dev/null || printf invalid)"
+    action="$(jq -r '
+        if (has("action") | not) then ""
+        elif (.action | type) == "string" then (.action | ascii_downcase)
+        else "__invalid__" end
+    ' <<<"${args}")"
+    apply_state="$(jq -r '
+        if (has("apply") | not) then "missing"
+        elif (.apply | type) != "boolean" then "invalid"
+        elif .apply then "true" else "false" end
+    ' <<<"${args}")"
+
+    case "${ref}:${capability}" in
+        network-ops-tools/firewall:firewall.apply)
+            case "${action}:${apply_state}" in
+                :missing | :false | status:* | plan:*) return 1 ;;
+                apply:true)
+                    if ! linux_agent_managed_execution_enabled 2>/dev/null; then
+                        return 1
+                    fi
+                    ;;
+                *)
+                    jq -cn --arg ref "${ref}" ' {
+                        ok:false, status:"helper_rejected", code:"helper_rejected",
+                        error_code:"helper_rejected", exit_code:126,
+                        output:{ok:false, status:"helper_rejected", tool:$ref,
+                                error:"Firewall apply requires boolean apply=true and the fixed confirmation token."},
+                        execution_proxy:{isolation:"host_helper", helper:"host-ops", available:false}
+                    }'
+                    return 0
+                    ;;
+            esac
+            ;;
+        network-ops-tools/hosts-file-editor:hosts.apply)
+            case "${action}:${apply_state}" in
+                :missing | :false | add:missing | add:false | remove:missing | remove:false | read:* | search:* | plan-add:* | plan-remove:*) return 1 ;;
+                add:true | remove:true)
+                    if ! linux_agent_managed_execution_enabled 2>/dev/null; then
+                        return 1
+                    fi
+                    ;;
+                *)
+                    jq -cn --arg ref "${ref}" ' {
+                        ok:false, status:"helper_rejected", code:"helper_rejected",
+                        error_code:"helper_rejected", exit_code:126,
+                        output:{ok:false, status:"helper_rejected", tool:$ref,
+                                error:"Hosts apply requires boolean apply=true and the fixed confirmation token."},
+                        execution_proxy:{isolation:"host_helper", helper:"host-ops", available:false}
+                    }'
+                    return 0
+                    ;;
+            esac
+            ;;
+        *)
+            jq -cn --arg ref "${ref}" ' {
+                ok:false, status:"helper_rejected", code:"helper_rejected",
+                error_code:"helper_rejected", exit_code:126,
+                output:{ok:false, status:"helper_rejected", tool:$ref,
+                        error:"Built-in Skill helper capability is not allowlisted."},
+                execution_proxy:{isolation:"host_helper", helper:"host-ops", available:false}
+            }'
+            return 0
+            ;;
+    esac
+
+    if ! params="$(linux_agent_host_helper_skill_params "${ref}" "${args}")"; then
+        jq -cn --arg ref "${ref}" ' {
+            ok:false, status:"helper_rejected", code:"helper_rejected",
+            error_code:"helper_rejected", exit_code:126,
+            output:{ok:false, status:"helper_rejected", tool:$ref,
+                    error:"Host-helper Skill arguments failed the fixed schema."},
+            execution_proxy:{isolation:"host_helper", helper:"host-ops", available:false}
+        }'
+        return 0
+    fi
+    if [[ "$(jq -r '.handled // false' <<<"${params}")" == "true" ]]; then
+        error="$(jq -r '.error // "host helper request was rejected"' <<<"${params}")"
+        jq -cn --arg ref "${ref}" --arg error "${error}" '{
+            ok:false,
+            status:"helper_rejected",
+            code:"helper_rejected",
+            error_code:"helper_rejected",
+            exit_code:126,
+            output:{ok:false, status:"helper_rejected", tool:$ref, error:$error},
+            execution_proxy:{isolation:"host_helper", helper:"host-ops", available:false}
+        }'
+        return 0
+    fi
+    capability="$(linux_agent_skill_capability "${ref}")"
+    linux_agent_host_helper_result "${ref}" "${capability}" "${params}"
+    return 0
 }
 
 linux_agent_confirm_execution() {
@@ -720,6 +1191,34 @@ linux_agent_terminal_review() {
     printf '%s\n' "${review}"
 }
 
+linux_agent_noninteractive_unknown_command() {
+    local review="$1"
+    [[ "${LINUX_AGENT_API_MODE:-0}" == "1" ]] || return 1
+    jq -e '[.findings[]? | select(.code == "AST_UNKNOWN_COMMAND")] | length > 0' \
+        <<<"${review}" >/dev/null 2>&1
+}
+
+linux_agent_block_noninteractive_unknown_command_review() {
+    local review="$1"
+    if ! linux_agent_noninteractive_unknown_command "${review}"; then
+        printf '%s\n' "${review}"
+        return 0
+    fi
+    jq -c '
+        .approved = false
+        | .approval_required = true
+        | .risk_level = "critical"
+        | .findings = ((.findings // []) + [{
+            severity:"critical",
+            code:"NONINTERACTIVE_UNKNOWN_COMMAND_BLOCKED",
+            source:"policy",
+            category:"unknown_command",
+            action:"block",
+            message:"Unknown commands are blocked in non-interactive execution."
+        }])
+    ' <<<"${review}"
+}
+
 linux_agent_print_work_execution_status() {
     local execution_json="$1"
     jq -r '
@@ -850,7 +1349,7 @@ linux_agent_prepare_remote_step() {
         return 1
     fi
 
-    tmp_path="${LINUX_AGENT_TMP_DIR}/remote_$(date +%Y%m%d_%H%M%S)_${RANDOM}.sh"
+    tmp_path="${LINUX_AGENT_RUNNER_TMP_DIR:-${LINUX_AGENT_TMP_DIR}}/remote_$(date +%Y%m%d_%H%M%S)_${RANDOM}.sh"
     if ! linux_agent_download_remote_script "${url}" "${tmp_path}"; then
         rm -f -- "${tmp_path}"
         jq -cn --arg error "远程脚本下载失败。" --arg url "${url}" '{ok:false, error:$error, url:$url}'
@@ -875,6 +1374,13 @@ linux_agent_prepare_remote_step() {
             '{ok:false, error:$error, url:$url, sha256:$sha256, size_bytes:$size}'
         return 1
     fi
+    if linux_agent_managed_mode_enabled 2>/dev/null; then
+        chmod 0640 "${tmp_path}" || {
+            rm -f -- "${tmp_path}"
+            jq -cn --arg error "无法设置 Runner 脚本读取权限。" '{ok:false, error:$error}'
+            return 1
+        }
+    fi
 
     line_count="$(awk 'END {print NR + 0}' "${tmp_path}")"
     raw_preview="$(head -n 40 "${tmp_path}")"
@@ -895,6 +1401,57 @@ linux_agent_prepare_remote_step() {
         }' <<<"${step_json}"
 }
 
+linux_agent_normalize_skill_execution_result() {
+    local result_json="$1"
+
+    jq -c '
+        if (.output_integrity_unknown // false) == true then
+            .ok = false
+            | .status = (.status // "invalid_output")
+            | .code = (.code // "invalid_output")
+            | .error_code = (.error_code // .code)
+            | .error = (.error // "Skill output integrity could not be established.")
+        elif (.output_capped // false) == true then
+            .ok = false
+            | .status = (.status // "output_limit_exceeded")
+            | .code = (.code // "output_limit_exceeded")
+            | .error_code = (.error_code // .code)
+            | .error = (.error // "Skill output exceeded the configured limit.")
+        elif (.timed_out // false) == true then
+            .ok = false
+            | .status = (.status // "timed_out")
+            | .code = (.code // "timed_out")
+            | .error_code = (.error_code // .code)
+        elif (.exit_code | type) != "number" or .exit_code != 0 then
+            .ok = false
+            | .status = (.status // "skill_exit_failed")
+            | .code = (.code // "skill_exit_failed")
+            | .error_code = (.error_code // .code)
+        elif (.output | type) != "object" then
+            .ok = false
+            | .status = "invalid_skill_output"
+            | .code = "invalid_skill_output"
+            | .error_code = "invalid_skill_output"
+            | .error = "Skill stdout must be one JSON object with ok=true."
+        elif (.output | has("ok") | not) or ((.output.ok | type) != "boolean") then
+            .ok = false
+            | .status = "invalid_skill_output"
+            | .code = "invalid_skill_output"
+            | .error_code = "invalid_skill_output"
+            | .error = "Skill JSON output must contain a boolean ok field."
+        elif .output.ok != true then
+            .ok = false
+            | .status = (.output.status // "skill_reported_failure")
+            | .code = (.output.code // "skill_reported_failure")
+            | .error_code = (.output.error_code // .code)
+            | .error = (.output.error // "Skill reported ok=false.")
+        else
+            .ok = true
+            | (if (.output.status // null) != null then .status = .output.status else . end)
+        end
+    ' <<<"${result_json}"
+}
+
 linux_agent_execute_observed_command_output() {
     local scope="$1"
     local subject_json="$2"
@@ -910,18 +1467,32 @@ linux_agent_execute_observed_command_output() {
         return 0
     fi
 
+    if linux_agent_maybe_execute_host_helper_skill "${scope}" "${subject_json}" "$@"; then
+        return 0
+    fi
+
     local stdout_file stderr_file run_meta exit_code observer stdout_text stderr_text combined timed_out
+    local is_skill_scope=false parsed_output="" parsed_output_is_json=false
+    local result_json
     local requested_privilege proxy_meta proxy_error
     local -a prepared_command
 
     requested_privilege="${LINUX_AGENT_EXECUTION_PRIVILEGE:-least}"
     if ! linux_agent_prepare_execution_command "${requested_privilege}" prepared_command "$@"; then
-        proxy_error="least privilege proxy is unavailable; refusing to run as root without an explicit privileged path"
+        if [[ "${LINUX_AGENT_EXECUTION_PREPARE_ERROR_CODE:-}" == "runner_unavailable" ]]; then
+            proxy_error="managed execution runner is unavailable; refusing same-UID fallback"
+        elif [[ "${LINUX_AGENT_EXECUTION_PREPARE_ERROR_CODE:-}" == "runner_rejected" ]]; then
+            proxy_error="managed execution request is outside the runner contract"
+        else
+            proxy_error="least privilege proxy is unavailable; refusing to run as root without an explicit privileged path"
+        fi
         proxy_meta="$(linux_agent_execution_proxy_metadata "${requested_privilege}" "false" "${proxy_error}")"
         jq -cn \
             --arg output "${proxy_error}" \
+            --arg code "${LINUX_AGENT_EXECUTION_PREPARE_ERROR_CODE:-execution_proxy_unavailable}" \
             --argjson proxy "${proxy_meta}" \
-            '{ok:false, exit_code:126, output:{raw:$output}, execution_proxy:$proxy}'
+            '{ok:false, status:$code, code:$code, error_code:$code, exit_code:126, output:{raw:$output}, execution_proxy:$proxy}'
+        linux_agent_cleanup_execution_staging
         return 0
     fi
     if [[ "${requested_privilege}" == "least" && "$(id -u)" -eq 0 ]]; then
@@ -934,6 +1505,7 @@ linux_agent_execute_observed_command_output() {
     stderr_file="$(mktemp "${LINUX_AGENT_TMP_DIR}/observer.stderr.XXXXXX")"
 
     run_meta="$(linux_agent_run_observed_process "${scope}" "${subject_json}" "${stdout_file}" "${stderr_file}" -- "${prepared_command[@]}")"
+    linux_agent_cleanup_execution_staging
     if jq -e '.blocked_result | type == "object"' >/dev/null 2>&1 <<<"${run_meta}"; then
         rm -f "${stdout_file}" "${stderr_file}"
         jq -c '.blocked_result' <<<"${run_meta}"
@@ -953,48 +1525,100 @@ linux_agent_execute_observed_command_output() {
     stderr_text="$(head -c "${max_output_bytes}" "${stderr_file}" 2>/dev/null || true)"
     rm -f "${stdout_file}" "${stderr_file}"
 
-    combined="${stdout_text}"
-    if [[ -n "${stderr_text}" ]]; then
-        if [[ -n "${combined}" ]]; then
-            combined="${combined}"$'\n'"${stderr_text}"
+    if [[ "${scope}" == "script" || "${scope}" == "step_skill_script" ]]; then
+        is_skill_scope=true
+        # Skill protocol is stdout-only. Keep stderr as diagnostics instead
+        # of allowing it to corrupt the machine-readable business result.
+        # Slurping also rejects concatenated JSON documents.
+        if parsed_output="$(printf '%s' "${stdout_text}" | jq -cs 'if length == 1 then .[0] else error("expected exactly one JSON value") end' 2>/dev/null)"; then
+            parsed_output_is_json=true
+            combined="${parsed_output}"
         else
-            combined="${stderr_text}"
+            combined="${stdout_text}"
         fi
-    fi
-
-    if [[ "${output_truncated}" == "true" ]]; then
-        if [[ -n "${combined}" ]]; then
-            combined="${combined}"$'\n'"[output capped at ${max_output_bytes} bytes per stream]"
-        else
-            combined="[output capped at ${max_output_bytes} bytes per stream]"
-        fi
-    fi
-
-    if printf '%s' "${combined}" | jq -e . >/dev/null 2>&1; then
-        jq -cn \
-            --argjson output "$(printf '%s' "${combined}" | jq -c .)" \
-            --argjson exit_code "${exit_code}" \
-            --argjson timed_out "${timed_out}" \
-            --argjson observer "${observer}" \
-            --argjson proxy "${proxy_meta}" \
-            --argjson output_capped "${output_truncated}" \
-            --argjson output_integrity_unknown "${output_integrity_unknown}" \
-            --argjson stdout_truncated_bytes "${stdout_truncated_bytes}" \
-            --argjson stderr_truncated_bytes "${stderr_truncated_bytes}" \
-            '{ok:($exit_code == 0), exit_code:$exit_code, timed_out:$timed_out, output:$output, observer:$observer, execution_proxy:$proxy, output_capped:$output_capped, output_integrity_unknown:$output_integrity_unknown, stdout_truncated_bytes:$stdout_truncated_bytes, stderr_truncated_bytes:$stderr_truncated_bytes} + (if $output_integrity_unknown then {status:"invalid_output", code:"invalid_output", error_code:"invalid_output"} elif $output_capped then {status:"output_limit_exceeded", code:"output_limit_exceeded", error_code:"output_limit_exceeded"} elif $timed_out then {status:"timed_out"} else {} end)'
     else
-        jq -cn \
-            --arg output "${combined}" \
-            --argjson exit_code "${exit_code}" \
-            --argjson timed_out "${timed_out}" \
-            --argjson observer "${observer}" \
-            --argjson proxy "${proxy_meta}" \
-            --argjson output_capped "${output_truncated}" \
-            --argjson output_integrity_unknown "${output_integrity_unknown}" \
-            --argjson stdout_truncated_bytes "${stdout_truncated_bytes}" \
-            --argjson stderr_truncated_bytes "${stderr_truncated_bytes}" \
-            '{ok:($exit_code == 0), exit_code:$exit_code, timed_out:$timed_out, output:{raw:(if $timed_out and $output == "" then "执行超过配置的 execution.timeout_sec，已终止。" else $output end)}, observer:$observer, execution_proxy:$proxy, output_capped:$output_capped, output_integrity_unknown:$output_integrity_unknown, stdout_truncated_bytes:$stdout_truncated_bytes, stderr_truncated_bytes:$stderr_truncated_bytes} + (if $output_integrity_unknown then {status:"invalid_output", code:"invalid_output", error_code:"invalid_output"} elif $output_capped then {status:"output_limit_exceeded", code:"output_limit_exceeded", error_code:"output_limit_exceeded"} elif $timed_out then {status:"timed_out"} else {} end)'
+        combined="${stdout_text}"
+        if [[ -n "${stderr_text}" ]]; then
+            if [[ -n "${combined}" ]]; then
+                combined="${combined}"$'\n'"${stderr_text}"
+            else
+                combined="${stderr_text}"
+            fi
+        fi
+
+        if [[ "${output_truncated}" == "true" ]]; then
+            if [[ -n "${combined}" ]]; then
+                combined="${combined}"$'\n'"[output capped at ${max_output_bytes} bytes per stream]"
+            else
+                combined="[output capped at ${max_output_bytes} bytes per stream]"
+            fi
+        fi
     fi
+
+    if [[ "${is_skill_scope}" == "true" && "${parsed_output_is_json}" == "true" ]]; then
+        result_json="$(
+            jq -cn \
+                --argjson output "${parsed_output}" \
+                --arg stderr "${stderr_text}" \
+                --argjson exit_code "${exit_code}" \
+                --argjson timed_out "${timed_out}" \
+                --argjson observer "${observer}" \
+                --argjson proxy "${proxy_meta}" \
+                --argjson output_capped "${output_truncated}" \
+                --argjson output_integrity_unknown "${output_integrity_unknown}" \
+                --argjson stdout_truncated_bytes "${stdout_truncated_bytes}" \
+                --argjson stderr_truncated_bytes "${stderr_truncated_bytes}" \
+                '{ok:($exit_code == 0), exit_code:$exit_code, timed_out:$timed_out, output:$output, stderr:$stderr, observer:$observer, execution_proxy:$proxy, output_capped:$output_capped, output_integrity_unknown:$output_integrity_unknown, stdout_truncated_bytes:$stdout_truncated_bytes, stderr_truncated_bytes:$stderr_truncated_bytes} + (if $output_integrity_unknown then {status:"invalid_output", code:"invalid_output", error_code:"invalid_output"} elif $output_capped then {status:"output_limit_exceeded", code:"output_limit_exceeded", error_code:"output_limit_exceeded"} elif $timed_out then {status:"timed_out", code:"timed_out", error_code:"timed_out"} else {} end)'
+        )"
+    elif [[ "${is_skill_scope}" == "true" ]]; then
+        result_json="$(
+            jq -cn \
+                --arg output "${combined}" \
+                --arg stderr "${stderr_text}" \
+                --argjson exit_code "${exit_code}" \
+                --argjson timed_out "${timed_out}" \
+                --argjson observer "${observer}" \
+                --argjson proxy "${proxy_meta}" \
+                --argjson output_capped "${output_truncated}" \
+                --argjson output_integrity_unknown "${output_integrity_unknown}" \
+                --argjson stdout_truncated_bytes "${stdout_truncated_bytes}" \
+                --argjson stderr_truncated_bytes "${stderr_truncated_bytes}" \
+                '{ok:($exit_code == 0), exit_code:$exit_code, timed_out:$timed_out, output:{raw:(if $timed_out and $output == "" then "执行超过配置的 execution.timeout_sec，已终止。" else $output end)}, stderr:$stderr, observer:$observer, execution_proxy:$proxy, output_capped:$output_capped, output_integrity_unknown:$output_integrity_unknown, stdout_truncated_bytes:$stdout_truncated_bytes, stderr_truncated_bytes:$stderr_truncated_bytes} + (if $output_integrity_unknown then {status:"invalid_output", code:"invalid_output", error_code:"invalid_output"} elif $output_capped then {status:"output_limit_exceeded", code:"output_limit_exceeded", error_code:"output_limit_exceeded"} elif $timed_out then {status:"timed_out", code:"timed_out", error_code:"timed_out"} else {} end)'
+        )"
+    elif printf '%s' "${combined}" | jq -e . >/dev/null 2>&1; then
+        result_json="$(
+            jq -cn \
+                --argjson output "$(printf '%s' "${combined}" | jq -c .)" \
+                --argjson exit_code "${exit_code}" \
+                --argjson timed_out "${timed_out}" \
+                --argjson observer "${observer}" \
+                --argjson proxy "${proxy_meta}" \
+                --argjson output_capped "${output_truncated}" \
+                --argjson output_integrity_unknown "${output_integrity_unknown}" \
+                --argjson stdout_truncated_bytes "${stdout_truncated_bytes}" \
+                --argjson stderr_truncated_bytes "${stderr_truncated_bytes}" \
+                '{ok:($exit_code == 0), exit_code:$exit_code, timed_out:$timed_out, output:$output, observer:$observer, execution_proxy:$proxy, output_capped:$output_capped, output_integrity_unknown:$output_integrity_unknown, stdout_truncated_bytes:$stdout_truncated_bytes, stderr_truncated_bytes:$stderr_truncated_bytes} + (if $output_integrity_unknown then {status:"invalid_output", code:"invalid_output", error_code:"invalid_output"} elif $output_capped then {status:"output_limit_exceeded", code:"output_limit_exceeded", error_code:"output_limit_exceeded"} elif $timed_out then {status:"timed_out"} else {} end)'
+        )"
+    else
+        result_json="$(
+            jq -cn \
+                --arg output "${combined}" \
+                --argjson exit_code "${exit_code}" \
+                --argjson timed_out "${timed_out}" \
+                --argjson observer "${observer}" \
+                --argjson proxy "${proxy_meta}" \
+                --argjson output_capped "${output_truncated}" \
+                --argjson output_integrity_unknown "${output_integrity_unknown}" \
+                --argjson stdout_truncated_bytes "${stdout_truncated_bytes}" \
+                --argjson stderr_truncated_bytes "${stderr_truncated_bytes}" \
+                '{ok:($exit_code == 0), exit_code:$exit_code, timed_out:$timed_out, output:{raw:(if $timed_out and $output == "" then "执行超过配置的 execution.timeout_sec，已终止。" else $output end)}, observer:$observer, execution_proxy:$proxy, output_capped:$output_capped, output_integrity_unknown:$output_integrity_unknown, stdout_truncated_bytes:$stdout_truncated_bytes, stderr_truncated_bytes:$stderr_truncated_bytes} + (if $output_integrity_unknown then {status:"invalid_output", code:"invalid_output", error_code:"invalid_output"} elif $output_capped then {status:"output_limit_exceeded", code:"output_limit_exceeded", error_code:"output_limit_exceeded"} elif $timed_out then {status:"timed_out"} else {} end)'
+        )"
+    fi
+
+    if [[ "${scope}" == "script" || "${scope}" == "step_skill_script" ]]; then
+        result_json="$(linux_agent_normalize_skill_execution_result "${result_json}")"
+    fi
+    printf '%s\n' "${result_json}"
 }
 
 linux_agent_execute_step_command() {
@@ -1041,8 +1665,12 @@ linux_agent_prepare_mcp_arguments_file() {
     local args_json="$1"
     local args_file target_user
 
-    args_file="$(mktemp "${LINUX_AGENT_TMP_DIR}/mcp.args.XXXXXX")"
-    chmod 600 "${args_file}" 2>/dev/null || true
+    args_file="$(mktemp "${LINUX_AGENT_RUNNER_TMP_DIR:-${LINUX_AGENT_TMP_DIR}}/mcp.args.XXXXXX")"
+    if linux_agent_managed_mode_enabled 2>/dev/null; then
+        chmod 0640 "${args_file}" 2>/dev/null || true
+    else
+        chmod 0600 "${args_file}" 2>/dev/null || true
+    fi
     printf '%s\n' "${args_json}" >"${args_file}"
     if [[ "$(id -u)" -eq 0 && "$(linux_agent_min_privilege_proxy_enabled)" == "true" ]]; then
         target_user="$(linux_agent_least_privilege_user 2>/dev/null || true)"
@@ -1633,6 +2261,13 @@ linux_agent_execute_work_plan() {
         fi
         step_review_text="$(linux_agent_step_review_material "${step}")"
         review="$(linux_agent_policy_review_step "${step}" "${step_review_text}" "$(case "$(jq -r '.executor_type' <<<"${step}")" in remote_script) printf 'remote' ;; mcp_tool) printf 'mcp' ;; *) printf 'local' ;; esac)")"
+        case "$(jq -r '.executor_type' <<<"${step}")" in
+            shell | skill_script | remote_script)
+                # These step types all execute shell source. Unknown static
+                # command heads must remain fail-closed in API/work-plan mode.
+                review="$(linux_agent_block_noninteractive_unknown_command_review "${review}")"
+                ;;
+        esac
         if [[ "$(jq -r '.executor_type' <<<"${step}")" == "skill_script" ]]; then
             review="$(linux_agent_backup_policy_review "$(jq -r '.skill_script // empty' <<<"${step}")" "$(linux_agent_step_arguments_json "${step}")" "${review}")"
         fi

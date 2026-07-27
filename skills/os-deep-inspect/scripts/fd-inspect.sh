@@ -27,10 +27,13 @@ if [[ -n "${pid}" && ! "${pid}" =~ ^[0-9]+$ ]]; then
 fi
 
 run_text() {
+    local command="${1:-}"
+    [[ "${command}" == "lsof" ]] || return 127
+    shift
     if command -v timeout >/dev/null 2>&1; then
-        timeout 10s "$@" 2>&1 || true
+        timeout 10s lsof "$@" 2>&1 || true
     else
-        "$@" 2>&1 || true
+        lsof "$@" 2>&1 || true
     fi
 }
 

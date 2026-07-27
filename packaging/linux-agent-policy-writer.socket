@@ -1,0 +1,15 @@
+[Unit]
+Description=Linux Agent policy writer socket
+PartOf=linux-agent-web.service
+
+[Socket]
+ListenStream=/run/linux-agent/policy-writer.sock
+Service=linux-agent-policy-writer.service
+SocketUser=root
+SocketGroup=linux-agent
+SocketMode=0660
+DirectoryMode=0755
+RemoveOnStop=yes
+
+[Install]
+WantedBy=sockets.target

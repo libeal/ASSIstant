@@ -38,6 +38,36 @@ dist_three="${tmp_root}/dist-three"
 SOURCE_DATE_EPOCH=0 bash "${ROOT_DIR}/scripts/build-remote-release.sh" v0.0.0-test "${dist_one}"
 SOURCE_DATE_EPOCH=0 bash "${ROOT_DIR}/scripts/build-remote-release.sh" v0.0.1-test "${dist_two}"
 SOURCE_DATE_EPOCH=0 bash "${ROOT_DIR}/scripts/build-remote-release.sh" v0.0.2-test "${dist_three}"
+tar -xOzf "${dist_one}/linux-agent-core.tar.gz" config/config.example.json |
+    jq -e '.web.token == "" and .web.sensitive_edits_enabled == true' >/dev/null
+
+no_flock_bin="${tmp_root}/no-flock-bin"
+no_flock_prefix="${tmp_root}/no-flock-prefix"
+mkdir -p "${no_flock_bin}"
+for command_name in bash curl python3 jq sha256sum stat mktemp readlink cp mv ln mkdir chmod \
+    find sort awk tar gzip sed grep date id chown dirname basename seq timeout; do
+    ln -s "$(command -v "${command_name}")" "${no_flock_bin}/${command_name}"
+done
+if PATH="${no_flock_bin}" "${no_flock_bin}/bash" "${ROOT_DIR}/bin/agent" doctor \
+    >"${tmp_root}/no-flock-cli.stdout" 2>"${tmp_root}/no-flock-cli.stderr"; then
+    printf 'CLI unexpectedly ran without flock\n' >&2
+    exit 1
+fi
+grep -q '缺少依赖命令: flock' "${tmp_root}/no-flock-cli.stderr"
+if PATH="${no_flock_bin}" "${no_flock_bin}/bash" "${ROOT_DIR}/bin/agent-web" \
+    >"${tmp_root}/no-flock-web.stdout" 2>"${tmp_root}/no-flock-web.stderr"; then
+    printf 'Web launcher unexpectedly ran without flock\n' >&2
+    exit 1
+fi
+grep -q '缺少依赖命令: flock' "${tmp_root}/no-flock-web.stderr"
+if PATH="${no_flock_bin}" "${no_flock_bin}/bash" "${ROOT_DIR}/scripts/install.sh" install \
+    --version v0.0.0-test --from-dist "${dist_one}" --prefix "${no_flock_prefix}" \
+    --no-systemd >"${tmp_root}/no-flock.stdout" 2>"${tmp_root}/no-flock.stderr"; then
+    printf 'installer unexpectedly ran without flock\n' >&2
+    exit 1
+fi
+grep -q 'flock.*util-linux' "${tmp_root}/no-flock.stderr"
+[[ ! -e "${no_flock_prefix}" ]]
 
 repack_core_for_test() {
     local dist_dir="$1"
@@ -93,11 +123,33 @@ grep -q '^Type=notify$' "${prefix}/current/packaging/linux-agent-web.service"
 grep -q '^ReadWritePaths=/opt/linux-agent/data$' "${prefix}/current/packaging/linux-agent-web.service"
 grep -q '^CapabilityBoundingSet=CAP_AUDIT_CONTROL CAP_AUDIT_READ CAP_DAC_READ_SEARCH$' \
     "${prefix}/current/packaging/linux-agent-observer-helper.service"
+grep -q '^CapabilityBoundingSet=CAP_NET_ADMIN CAP_DAC_OVERRIDE CAP_FOWNER CAP_CHOWN$' \
+    "${prefix}/current/packaging/linux-agent-host-ops.service"
+grep -q '^CapabilityBoundingSet=CAP_DAC_OVERRIDE CAP_FOWNER CAP_CHOWN$' \
+    "${prefix}/current/packaging/linux-agent-policy-writer.service"
+grep -q '^CapabilityBoundingSet=$' \
+    "${prefix}/current/packaging/linux-agent-runner.service"
 grep -q '^SocketMode=0660$' "${prefix}/current/packaging/linux-agent-observer-helper.socket"
 grep -q '^DirectoryMode=0755$' "${prefix}/current/packaging/linux-agent-observer-helper.socket"
+grep -q '^CPUQuota=200%$' "${prefix}/current/packaging/linux-agent-runner.service"
+grep -q '^MemoryMax=1G$' "${prefix}/current/packaging/linux-agent-runner.service"
+grep -q '^TasksMax=256$' "${prefix}/current/packaging/linux-agent-runner.service"
+grep -q '^SocketUser=linux-agent$' "${prefix}/current/packaging/linux-agent-runner.socket"
+grep -q '^SocketGroup=linux-agent$' "${prefix}/current/packaging/linux-agent-runner.socket"
+grep -q '^SocketMode=0600$' "${prefix}/current/packaging/linux-agent-runner.socket"
+for unit in linux-agent-observer-helper.service linux-agent-runner.service \
+    linux-agent-host-ops.service linux-agent-policy-writer.service; do
+    grep -q '^Environment=LINUX_AGENT_SERVICE_USER=linux-agent$' \
+        "${prefix}/current/packaging/${unit}"
+done
+grep -q 'InaccessiblePaths=.*observer.sock.*host-ops.sock.*policy-writer.sock' \
+    "${prefix}/current/packaging/linux-agent-runner.service"
+grep -q 'InaccessiblePaths=.*data/policies' \
+    "${prefix}/current/packaging/linux-agent-runner.service"
 grep -q '^IPAddressDeny=any$' "${prefix}/current/packaging/dropins/10-provider-egress.conf.example"
 [[ "$(readlink "${prefix}/releases/v0.0.0-test/config")" == "../../data/config" ]]
 [[ "$(stat -c '%a' "${prefix}/data/config/config.json")" == "600" ]]
+[[ "$(stat -c '%a' "${prefix}/data/.runtime.lock")" == "600" ]]
 expected_runtime_user="$(id -un)"
 expected_runtime_uid="$(id -u)"
 expected_runtime_gid="$(id -g)"
@@ -111,7 +163,21 @@ done
 jq -e '.remote.enabled == true and .remote.release_version == "v0.0.0-test"' \
     "${prefix}/data/config/config.json" >/dev/null
 health_json="$(bash "${prefix}/current/bin/agent" api health)"
-jq -e '.ok == true and .version == "v0.0.0-test"' <<<"${health_json}" >/dev/null
+jq -e '.ok == true and .status == "ok" and .version == "v0.0.0-test"
+    and .execution.managed == true
+    and .execution.helper_required == false
+    and .execution.ready == true
+    and .execution.isolation == "degraded_same_uid"' <<<"${health_json}" >/dev/null
+(
+    # shellcheck source=../lib/common.sh
+    source "${prefix}/current/lib/common.sh"
+    linux_agent_init_env "${prefix}/current"
+    linux_agent_managed_mode_enabled
+    if linux_agent_managed_execution_enabled; then
+        printf 'no-systemd install was incorrectly classified as helper-managed execution\n' >&2
+        exit 1
+    fi
+)
 skills_json="$(bash "${prefix}/current/bin/agent" api skills validate '{}')"
 jq -e '.ok == true' <<<"${skills_json}" >/dev/null
 while IFS= read -r skill_name; do
@@ -172,6 +238,41 @@ if bash "${ROOT_DIR}/scripts/install.sh" install \
 fi
 grep -q 'archive member is too large' "${tmp_root}/bomb.stderr"
 [[ ! -e "${bomb_prefix}/current" ]]
+
+# Manifest refs are a typed contract.  jq must reject forged object, number,
+# and null values rather than accepting them through string coercion.
+first_manifest_skill="$(jq -r '.skills | keys[0]' "${dist_one}/release-manifest.json")"
+for bad_ref_kind in object number null; do
+    bad_ref_dist="${tmp_root}/bad-ref-${bad_ref_kind}-dist"
+    bad_ref_prefix="${tmp_root}/bad-ref-${bad_ref_kind}-prefix"
+    cp -a "${dist_one}" "${bad_ref_dist}"
+    case "${bad_ref_kind}" in
+        object)
+            jq --arg skill "${first_manifest_skill}" \
+                '.skills[$skill].refs[0].ref = {}' \
+                "${bad_ref_dist}/release-manifest.json" >"${bad_ref_dist}/release-manifest.json.tmp"
+            ;;
+        number)
+            jq --arg skill "${first_manifest_skill}" \
+                '.skills[$skill].refs[0].ref = 7' \
+                "${bad_ref_dist}/release-manifest.json" >"${bad_ref_dist}/release-manifest.json.tmp"
+            ;;
+        null)
+            jq --arg skill "${first_manifest_skill}" \
+                '.skills[$skill].refs[0].ref = null' \
+                "${bad_ref_dist}/release-manifest.json" >"${bad_ref_dist}/release-manifest.json.tmp"
+            ;;
+    esac
+    mv "${bad_ref_dist}/release-manifest.json.tmp" "${bad_ref_dist}/release-manifest.json"
+    if bash "${ROOT_DIR}/scripts/install.sh" install \
+        --version v0.0.0-test --from-dist "${bad_ref_dist}" --prefix "${bad_ref_prefix}" --no-systemd \
+        >"${tmp_root}/bad-ref-${bad_ref_kind}.stdout" \
+        2>"${tmp_root}/bad-ref-${bad_ref_kind}.stderr"; then
+        printf 'install unexpectedly accepted a %s manifest ref\n' "${bad_ref_kind}" >&2
+        exit 1
+    fi
+    grep -q 'release manifest 契约无效' "${tmp_root}/bad-ref-${bad_ref_kind}.stderr"
+done
 
 tampered_installer="${tmp_root}/tampered-installer.sh"
 cp "${ROOT_DIR}/scripts/install.sh" "${tampered_installer}"
@@ -257,6 +358,12 @@ if command -v unshare >/dev/null 2>&1 && unshare -Ur true >/dev/null 2>&1; then
     fake_systemd_pidfile="${fake_systemd_dir}/service.pid"
     fake_systemd_helper_pidfile="${fake_systemd_dir}/helper.pid"
     managed_observer_socket="${managed_prefix}/systemd/observer.sock"
+    managed_runner_socket="${managed_prefix}/systemd/runner.sock"
+    managed_host_socket="${managed_prefix}/systemd/host-ops.sock"
+    managed_policy_socket="${managed_prefix}/systemd/policy-writer.sock"
+    export LINUX_AGENT_RUNNER_SOCKET="${managed_runner_socket}"
+    export LINUX_AGENT_HOST_HELPER_SOCKET="${managed_host_socket}"
+    export LINUX_AGENT_POLICY_HELPER_SOCKET="${managed_policy_socket}"
     managed_observer_state="${managed_prefix}/systemd/observer-capabilities.json"
     managed_dist_one="${tmp_root}/managed-dist-one"
     managed_dist_two="${tmp_root}/managed-dist-two"
@@ -302,7 +409,8 @@ stop_service() {
         wait "${helper_pid}" 2>/dev/null || true
         rm -f -- "${FAKE_SYSTEMD_STATE}/helper.pid"
     fi
-    rm -f -- "${LINUX_AGENT_OBSERVER_HELPER_SOCKET}"
+    rm -f -- "${LINUX_AGENT_OBSERVER_HELPER_SOCKET}" "${LINUX_AGENT_RUNNER_SOCKET}" \
+        "${LINUX_AGENT_HOST_HELPER_SOCKET}" "${LINUX_AGENT_POLICY_HELPER_SOCKET}"
 }
 
 start_helper() {
@@ -312,20 +420,28 @@ start_helper() {
     fi
     [[ "${FAKE_HELPER_FAIL:-0}" != "1" ]] || return 0
     [[ ! -f "${FAKE_SYSTEMD_PREFIX}/current/FAIL_HELPER" ]] || return 0
-    python3 - "${LINUX_AGENT_OBSERVER_HELPER_SOCKET}" <<'PY' \
+    python3 - "${LINUX_AGENT_OBSERVER_HELPER_SOCKET}" "${LINUX_AGENT_RUNNER_SOCKET}" \
+        "${LINUX_AGENT_HOST_HELPER_SOCKET}" "${LINUX_AGENT_POLICY_HELPER_SOCKET}" <<'PY' \
         >"${FAKE_SYSTEMD_STATE}/helper.stdout" \
         2>"${FAKE_SYSTEMD_STATE}/helper.stderr" &
 import json
 import os
+import select
 import socket
 import sys
 
-path = sys.argv[1]
-with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as server:
-    server.bind(path)
-    os.chmod(path, 0o660)
-    server.listen()
+socket_kinds = dict(zip(sys.argv[1:], ("observer", "runner", "host-ops", "policy-writer")))
+servers = []
+try:
+    for path, kind in socket_kinds.items():
+        server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        server.bind(path)
+        os.chmod(path, 0o660)
+        server.listen()
+        servers.append(server)
     while True:
+        readable, _, _ = select.select(servers, [], [])
+        server = readable[0]
         connection, _ = server.accept()
         with connection:
             payload = bytearray()
@@ -336,15 +452,30 @@ with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as server:
                 payload.extend(chunk)
             request = json.loads(payload.decode("utf-8"))
             operation = request.get("operation")
-            operation_ok = operation in ("ping", "status")
-            response = {
-                "ok": operation_ok,
-                "status": "ready" if operation_ok else "invalid_request",
-                "exit_code": 0 if operation_ok else 126,
-                "stdout": "enabled 1\n" if operation == "status" else "",
-                "stderr": "" if operation_ok else "unsupported test operation",
-            }
+            kind = socket_kinds[server.getsockname()]
+            operation_ok = operation in (("ping", "status") if kind == "observer" else ("ping",))
+            if kind == "observer":
+                response = {
+                    "ok": operation_ok,
+                    "status": "ready" if operation_ok else "invalid_request",
+                    "exit_code": 0 if operation_ok else 126,
+                    "stdout": "enabled 1\n" if operation == "status" else "",
+                    "stderr": "" if operation_ok else "unsupported test operation",
+                    "protocol_version": request.get("protocol_version", "1.2.0"),
+                    "request_id": request.get("request_id", ""),
+                }
+            else:
+                response = {
+                    "ok": operation_ok,
+                    "status": "ready" if operation_ok else "helper_rejected",
+                    "helper": kind,
+                    "protocol_version": request.get("protocol_version", "1.2.0"),
+                    "request_id": request.get("request_id", ""),
+                }
             connection.sendall(json.dumps(response).encode("utf-8") + b"\n")
+finally:
+    for server in servers:
+        server.close()
 PY
     printf '%s\n' "$!" >"${FAKE_SYSTEMD_STATE}/helper.pid"
 }
@@ -378,6 +509,15 @@ case "${command_name}" in
         elif [[ " $* " == *" linux-agent-observer-helper.service "* &&
             -f "${FAKE_SYSTEMD_STATE}/helper.pid" ]] &&
             kill -0 "$(<"${FAKE_SYSTEMD_STATE}/helper.pid")" >/dev/null 2>&1; then
+            active=1
+        elif [[ " $* " == *" linux-agent-runner.socket "* &&
+            -S "${LINUX_AGENT_RUNNER_SOCKET}" ]]; then
+            active=1
+        elif [[ " $* " == *" linux-agent-host-ops.socket "* &&
+            -S "${LINUX_AGENT_HOST_HELPER_SOCKET}" ]]; then
+            active=1
+        elif [[ " $* " == *" linux-agent-policy-writer.socket "* &&
+            -S "${LINUX_AGENT_POLICY_HELPER_SOCKET}" ]]; then
             active=1
         fi
         if [[ "${active}" -eq 1 ]]; then
@@ -448,6 +588,9 @@ SH
             FAKE_SYSTEMD_STATE="${fake_systemd_dir}" \
             LINUX_AGENT_SYSTEMD_UNIT_PATH="${managed_unit_path}" \
             LINUX_AGENT_OBSERVER_HELPER_SOCKET="${managed_observer_socket}" \
+            LINUX_AGENT_RUNNER_SOCKET="${managed_runner_socket}" \
+            LINUX_AGENT_HOST_HELPER_SOCKET="${managed_host_socket}" \
+            LINUX_AGENT_POLICY_HELPER_SOCKET="${managed_policy_socket}" \
             LINUX_AGENT_OBSERVER_HELPER_STATE="${managed_observer_state}" \
             LINUX_AGENT_INSTALL_HEALTH_ATTEMPTS=6 \
             LINUX_AGENT_ALLOW_UNSAFE_SYSTEMD_TEST_PREFIX=1 \
@@ -485,6 +628,8 @@ SH
         printf 'managed install unexpectedly enabled systemd units\n' >&2
         exit 1
     fi
+    [[ "$(stat -c '%a' "${managed_prefix}/data/.runtime.lock")" == "640" ]]
+    [[ "$(stat -c '%u:%g' "${managed_prefix}/data/.runtime.lock")" == "$(id -u):$(id -g)" ]]
     managed_egress_path="${managed_prefix}/systemd/linux-agent-web.service.d/10-provider-egress.conf"
     grep -q '^IPAddressDeny=any$' "${managed_egress_path}"
     grep -q '^IPAddressAllow=localhost$' "${managed_egress_path}"
@@ -501,6 +646,26 @@ SH
         "${managed_prefix}/systemd/linux-agent-observer-helper.service"
     grep -q '^SocketGroup=root$' "${managed_prefix}/systemd/linux-agent-observer-helper.socket"
     grep -q '^DirectoryMode=0755$' "${managed_prefix}/systemd/linux-agent-observer-helper.socket"
+    grep -q '^SocketUser=root$' "${managed_prefix}/systemd/linux-agent-runner.socket"
+    grep -q '^SocketGroup=root$' "${managed_prefix}/systemd/linux-agent-runner.socket"
+    grep -q '^SocketMode=0600$' "${managed_prefix}/systemd/linux-agent-runner.socket"
+    grep -q '^SocketGroup=root$' "${managed_prefix}/systemd/linux-agent-host-ops.socket"
+    grep -q '^SocketMode=0660$' "${managed_prefix}/systemd/linux-agent-host-ops.socket"
+    grep -q '^SocketGroup=root$' "${managed_prefix}/systemd/linux-agent-policy-writer.socket"
+    grep -q '^SocketMode=0660$' "${managed_prefix}/systemd/linux-agent-policy-writer.socket"
+    for unit in linux-agent-observer-helper.service linux-agent-runner.service \
+        linux-agent-host-ops.service linux-agent-policy-writer.service; do
+        grep -q '^Environment=LINUX_AGENT_SERVICE_USER=root$' \
+            "${managed_prefix}/systemd/${unit}"
+    done
+    for helper_socket in "${managed_observer_socket}" "${managed_host_socket}" \
+        "${managed_policy_socket}"; do
+        [[ -S "${helper_socket}" ]]
+        [[ "$(stat -c '%a' "${helper_socket}")" == "660" ]]
+    done
+    [[ -S "${managed_runner_socket}" ]]
+    # The fake socket server creates all sockets as 0660; the rendered unit is
+    # the authoritative permission assertion in this namespace-only test.
     grep -q '^verify$' "${fake_systemd_dir}/commands"
     if FAKE_SYSTEMD_ANALYZE_FAIL=1 run_managed_installer repair-observer \
         >"${tmp_root}/systemd-verify.stdout" 2>"${tmp_root}/systemd-verify.stderr"; then
@@ -605,6 +770,7 @@ SH
     cp "${ROOT_DIR}/bin/agent-web" "${source_prefix}/bin/agent-web"
     cp "${ROOT_DIR}/lib/observer_helper.py" "${source_prefix}/lib/observer_helper.py"
     cp "${ROOT_DIR}/lib/subprocess_env.py" "${source_prefix}/lib/subprocess_env.py"
+    cp "${ROOT_DIR}/lib/helper_protocol.py" "${source_prefix}/lib/helper_protocol.py"
     cp "${ROOT_DIR}/packaging/linux-agent-observer-helper.service" \
         "${source_prefix}/packaging/linux-agent-observer-helper.service"
     cp "${ROOT_DIR}/packaging/linux-agent-observer-helper.socket" \
@@ -654,6 +820,9 @@ SH
     [[ "${source_runtime_helper}" == "${source_runtime_root}/"*/observer_helper.py ]]
     [[ -x "${source_runtime_helper}" ]]
     [[ -f "$(dirname -- "${source_runtime_helper}")/subprocess_env.py" ]]
+    [[ -f "$(dirname -- "${source_runtime_helper}")/helper_protocol.py" ]]
+    grep -q '^Environment=LINUX_AGENT_SERVICE_USER=root$' \
+        "${source_helper_service_path}.d/10-source-runtime.conf"
     [[ "$(stat -c '%u:%g' "${source_runtime_helper}")" == "$(id -u):$(id -g)" ]]
     [[ ! -f "${fake_systemd_dir}/helper.pid" ]]
     [[ ! -S "${source_observer_socket}" ]]
@@ -696,6 +865,8 @@ SH
 else
     printf 'install: user namespaces unavailable; managed systemd transaction scenario skipped\n'
 fi
+unset LINUX_AGENT_RUNNER_SOCKET LINUX_AGENT_HOST_HELPER_SOCKET \
+    LINUX_AGENT_POLICY_HELPER_SOCKET
 
 port="$((24000 + RANDOM % 1000))"
 config_tmp="${tmp_root}/config.json"
@@ -738,8 +909,21 @@ if ! kill -0 "${web_pid}" >/dev/null 2>&1; then
     sed -n '1,160p' "${tmp_root}/web.stderr" >&2
     exit 1
 fi
+installed_observer_state="$(curl --noproxy '*' -fsS \
+    -H 'Authorization: Bearer install-health-token' \
+    "http://127.0.0.1:${port}/api/observer/bootstrap")"
+jq -e '.managed_execution == false
+    and (.authorization_mode == "root" or .authorization_mode == "sudo_interactive")' \
+    <<<"${installed_observer_state}" >/dev/null
 installer_health="$(bash "${ROOT_DIR}/scripts/install.sh" health --prefix "${prefix}")"
-jq -e '.ok == true and .status == "ok"' <<<"${installer_health}" >/dev/null
+jq -e '
+    .ok == true and
+    .status == "ok" and
+    .execution.managed == true and
+    .execution.helper_required == false and
+    .execution.ready == true and
+    .execution.isolation == "degraded_same_uid"
+' <<<"${installer_health}" >/dev/null
 find "${prefix}/data/logs" -maxdepth 1 -type f -name 'web_*.jsonl' -print -quit | grep -q .
 wait "${notify_pid}"
 notify_pid=""

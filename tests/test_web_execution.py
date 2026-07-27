@@ -105,6 +105,9 @@ elif mode == "completed_then_wait":
     print(json.dumps({"ok": True, "status": "executed"}), flush=True)
     Path(payload["ready_file"]).write_text("ready", encoding="utf-8")
     time.sleep(60)
+elif mode == "agent_output":
+    print(payload.get("stdout", ""), end="", flush=True)
+    raise SystemExit(int(payload.get("exit_code", 0)))
 else:
     print(json.dumps({
         "ok": True,
@@ -223,6 +226,41 @@ class ExecutionServiceTest(unittest.TestCase):
             block for block in result["output_blocks"] if block["title"] == "Agent runtime"
         )
         self.assertEqual(0, runtime["json"]["exit_code"])
+
+    def test_result_requires_strict_json_boolean_ok_and_zero_exit(self):
+        nonzero = self.service.run_sync(
+            "terminal",
+            "run",
+            {
+                "fixture": "agent_output",
+                "stdout": '{"ok":true,"status":"executed"}\n',
+                "exit_code": 7,
+            },
+            timeout=2,
+        )
+        self.assertFalse(nonzero["ok"])
+        runtime = next(
+            block for block in nonzero["output_blocks"] if block["title"] == "Agent runtime"
+        )
+        self.assertEqual(7, runtime["json"]["exit_code"])
+
+        invalid_outputs = (
+            '{"status":"executed"}\n',
+            '{"ok":"true","status":"executed"}\n',
+            '{"ok":false,"ok":true,"status":"executed"}\n',
+            '{"ok":true,"value":NaN,"status":"executed"}\n',
+        )
+        for stdout in invalid_outputs:
+            with self.subTest(stdout=stdout):
+                result = self.service.run_sync(
+                    "terminal",
+                    "run",
+                    {"fixture": "agent_output", "stdout": stdout},
+                    timeout=2,
+                )
+                self.assertFalse(result["ok"])
+                self.assertEqual("invalid_agent_output", result["status"])
+                self.assertEqual("invalid_agent_output", result["code"])
 
     def test_external_command_uses_bounded_process_lifecycle(self):
         outcome = self.service.run_external_sync(

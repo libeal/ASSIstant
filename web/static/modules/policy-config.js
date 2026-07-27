@@ -142,5 +142,6 @@ export const CONFIG_READONLY_FIELDS = [
   { key: "web.host", label: "web.host", comment: "当前配置文件中的监听地址，改动需重启生效。" },
   { key: "web.port", label: "web.port", comment: "当前配置文件中的监听端口，改动需重启生效。" },
   { key: "web.token_configured", label: "web.token", comment: "只显示 token 是否已配置，不回显 token 明文。" },
+  { key: "web.sensitive_edits_enabled", label: "web.sensitive_edits_enabled", comment: "敏感只读项；仅本机管理员可修改。关闭后 Web 仍可编辑草稿和校验，但不能保存 Skill 或策略。" },
   { key: "web.job_retention_hours", label: "web.job_retention_hours", comment: "后端保留 job 文件的小时数，当前进程可能需重启才完全生效。" },
 ];

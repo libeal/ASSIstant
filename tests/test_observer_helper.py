@@ -16,6 +16,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "lib"))
 
 import observer_helper  # noqa: E402
+import helper_protocol  # noqa: E402
 
 
 class ObserverHelperProtocolTests(unittest.TestCase):
@@ -308,6 +309,23 @@ class ObserverHelperProtocolTests(unittest.TestCase):
             )
             self.assertTrue(response["ok"])
 
+    def test_capability_state_rejects_symlinked_file_and_parent(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            outside = root / "outside.json"
+            outside.write_text("{}\n", encoding="utf-8")
+            linked_file = root / "linked.json"
+            linked_file.symlink_to(outside)
+            with self.assertRaisesRegex(RuntimeError, "cannot be opened safely"):
+                observer_helper.configure_capability_state(linked_file)
+
+            real_parent = root / "real-parent"
+            real_parent.mkdir()
+            linked_parent = root / "linked-parent"
+            linked_parent.symlink_to(real_parent, target_is_directory=True)
+            with self.assertRaisesRegex(RuntimeError, "symbolic link"):
+                observer_helper.configure_capability_state(linked_parent / "state.json")
+
     def test_disconnected_peer_does_not_escape_connection_handler(self):
         server, client = socket.socketpair()
         try:
@@ -318,7 +336,7 @@ class ObserverHelperProtocolTests(unittest.TestCase):
                 return_value=(os.getpid(), os.geteuid(), os.getegid()),
             ):
                 with contextlib.redirect_stderr(io.StringIO()):
-                    observer_helper.handle_connection(server)
+                    observer_helper.handle_connection(server, os.geteuid())
         finally:
             server.close()
 
@@ -329,7 +347,7 @@ class ObserverHelperProtocolTests(unittest.TestCase):
             "_peer_credentials",
             side_effect=OSError("peer credentials unavailable"),
         ), contextlib.redirect_stderr(io.StringIO()):
-            observer_helper.handle_connection(connection)
+            observer_helper.handle_connection(connection, os.geteuid())
 
         response = json.loads(
             connection.sendall.call_args.args[0].decode("utf-8")
@@ -340,14 +358,18 @@ class ObserverHelperProtocolTests(unittest.TestCase):
 
     def test_ping_proves_socket_transport_without_running_auditctl(self):
         connection = mock.MagicMock()
-        connection.recv.return_value = b'{"operation":"ping"}\n'
+        request = helper_protocol.build_request("ping", {}, summary="ping")
+        connection.recv.side_effect = [
+            helper_protocol.canonical_json(request) + b"\n",
+            b"",
+        ]
         with mock.patch.object(
             observer_helper,
             "_peer_credentials",
             return_value=(os.getpid(), os.geteuid(), os.getegid()),
         ), mock.patch.object(observer_helper, "run_command") as run_command:
             with contextlib.redirect_stderr(io.StringIO()):
-                observer_helper.handle_connection(connection)
+                observer_helper.handle_connection(connection, os.geteuid())
         response = json.loads(
             connection.sendall.call_args.args[0].decode("utf-8")
         )
@@ -360,31 +382,50 @@ class ObserverHelperProtocolTests(unittest.TestCase):
                 "exit_code": 0,
                 "stdout": "",
                 "stderr": "",
+                "protocol_version": helper_protocol.PROTOCOL_VERSION,
+                "request_id": request["request_id"],
             },
         )
         run_command.assert_not_called()
 
     def test_client_request_rejects_invalid_responses(self):
         responses = (
-            (b"", "empty response"),
-            (b"not-json", "invalid UTF-8 JSON"),
-            (b"[]", "must be a JSON object"),
-            (b'{"exit_code":true}', "exit_code is invalid"),
+            ({"stdout": [], "stderr": "", "exit_code": 0}, "streams must be strings"),
+            ({"stdout": "", "stderr": "", "exit_code": True}, "exit_code is invalid"),
+            (
+                {"stdout": "x" * (observer_helper.MAX_STREAM_BYTES + 1), "stderr": "", "exit_code": 0},
+                "streams exceed the client limit",
+            ),
         )
-        for payload, expected in responses:
-            with self.subTest(payload=payload):
-                connection = mock.MagicMock()
-                connection.__enter__.return_value = connection
-                connection.recv.side_effect = [payload, b""]
+        for response, expected in responses:
+            with self.subTest(response=response):
                 with mock.patch.object(
-                    observer_helper.socket,
-                    "socket",
-                    return_value=connection,
+                    observer_helper,
+                    "protocol_client_request",
+                    return_value=response,
                 ), self.assertRaisesRegex(
                     observer_helper.HelperRequestError,
                     expected,
                 ):
                     observer_helper.client_request("/run/test.sock", {"operation": "status"})
+
+    def test_socket_request_requires_exact_peer_uid_and_fixed_params(self):
+        request = helper_protocol.build_request("ping", {}, summary="ping")
+        connection = mock.MagicMock()
+        connection.recv.side_effect = [
+            helper_protocol.canonical_json(request) + b"\n",
+            b"",
+        ]
+        with mock.patch.object(
+            observer_helper,
+            "_peer_credentials",
+            return_value=(os.getpid(), os.geteuid(), os.getegid()),
+        ), contextlib.redirect_stderr(io.StringIO()):
+            observer_helper.handle_connection(connection, os.geteuid() + 1)
+        response = json.loads(connection.sendall.call_args.args[0].decode("utf-8"))
+        self.assertFalse(response["ok"])
+        self.assertEqual(response["code"], "helper_rejected")
+        self.assertIn("not authorized", response["stderr"])
 
     def test_request_transport_failure_returns_controlled_diagnostic(self):
         failures = (

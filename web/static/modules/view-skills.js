@@ -73,6 +73,11 @@ export function createSkillsView(app) {
   const contextMetaByTurnPure = app.contextMetaByTurnPure;
   let sessionTurnCounter = app.sessionTurnCounterRef;
 
+  function sensitiveEditsEnabled() {
+    const value = state.configSnapshot?.web?.sensitive_edits_enabled;
+    return value === undefined || value === true;
+  }
+
   async function loadSense(topic = $("senseTopicSelect")?.value || "all") {
     setStatus("senseStatus", "loading", "medium");
     const data = await app.api("/api/sense", { method: "POST", body: { topic } });
@@ -255,7 +260,7 @@ export function createSkillsView(app) {
           ? '<span class="pill risk low">ready</span>'
           : materialization === "materializing"
             ? '<button class="btn secondary compact-btn" type="button" disabled aria-busy="true">加载中</button>'
-            : `<button class="btn secondary compact-btn" type="button" data-materialize-skill="${escapeHtml(tool.skill || group)}">${materialization === "failed" ? "重试加载" : "加载 Skill"}</button>`;
+            : `<button class="btn secondary compact-btn" type="button" data-materialize-skill="${escapeHtml(tool.skill || group)}"${sensitiveEditsEnabled() ? "" : " disabled title=\"服务器已禁用 Web 敏感编辑\""}>${materialization === "failed" ? "重试加载" : "加载 Skill"}</button>`;
       row.className = "clickable";
       row.dataset.path = scriptPath;
       row.innerHTML = `
@@ -285,6 +290,10 @@ export function createSkillsView(app) {
 
   async function materializeSkill(skill) {
     if (!skill) return;
+    if (!sensitiveEditsEnabled()) {
+      showToast("服务器已禁用 Web 敏感编辑");
+      return;
+    }
     state.tools.forEach((tool) => {
       if (tool.skill === skill) tool.materialization = "materializing";
     });
@@ -448,7 +457,10 @@ export function createSkillsView(app) {
     }
     markEditDirty();
     if (reviewButton) reviewButton.disabled = false;
-    if (applyButton) applyButton.disabled = false;
+    if (applyButton) {
+      applyButton.disabled = !sensitiveEditsEnabled();
+      applyButton.title = sensitiveEditsEnabled() ? "保存 Skill" : "服务器已禁用 Web 敏感编辑";
+    }
   }
 
   function gatherEditPackage() {
@@ -494,6 +506,7 @@ export function createSkillsView(app) {
   }
 
   async function applyEdit() {
+    if (!sensitiveEditsEnabled()) return showToast("服务器已禁用 Web 敏感编辑");
     const edit = gatherEditPackage();
     const job = await app.createJob("edit", "apply", { edit, approve: true });
     const completed = await app.pollJob(job.job_id, "editJobStatus", "editOutput");

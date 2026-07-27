@@ -9,6 +9,7 @@ ROOT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 # 以便 Web 和未来 remote bootstrap 复用同一套执行链路。
 # shellcheck source=../lib/common.sh
 source "${ROOT_DIR}/lib/common.sh"
+linux_agent_require_command flock || exit 1
 linux_agent_require_python_runtime
 # shellcheck source=../lib/config.sh
 source "${ROOT_DIR}/lib/config.sh"
@@ -51,6 +52,10 @@ source "${ROOT_DIR}/lib/orchestrator.sh"
 
 linux_agent_init_env "${ROOT_DIR}"
 linux_agent_load_config
+if ! linux_agent_recover_pending_skill_commit; then
+    linux_agent_print_error "检测到未完成的 Skill 提交事务，恢复失败；已停止启动以避免读取不一致的用户 Skill。"
+    exit 1
+fi
 
 LINUX_AGENT_MAIN_COMMAND=""
 LINUX_AGENT_COMMAND_FINISHED=0
@@ -86,6 +91,7 @@ linux_agent_on_exit() {
     set +e
     final_status="$(linux_agent_status_for_exit_code "${exit_code}")"
     linux_agent_finish_run "${final_status}" "${exit_code}"
+    linux_agent_runtime_lock_release
 }
 
 linux_agent_on_int() {
@@ -131,7 +137,9 @@ linux_agent_usage() {
                                 校验审计日志 hash 链完整性
   agent audit export <session-id>|--all [--output <目录>]
                                 导出审计日志、完整性报告与校验清单
-  agent backup <output.tar.gz>  导出 remote runtime 脱敏备份
+  agent backup <output.tar.gz>  导出 runtime 脱敏备份
+  agent restore <archive.tar.gz>
+                                从可信脱敏备份恢复用户数据
 
 REPL 命令:
   /work                         切换到工作模式
@@ -220,7 +228,15 @@ linux_agent_interactive() {
             break
         fi
         [[ -z "${user_input}" ]] && continue
-        linux_agent_log_turn_started "${current_mode}" "${user_input}" || return $?
+        if ! linux_agent_runtime_lock_shared; then
+            linux_agent_print_error "runtime 正在恢复或切换版本，请稍后重试。"
+            return 1
+        fi
+        linux_agent_log_turn_started "${current_mode}" "${user_input}" || {
+            turn_status=$?
+            linux_agent_runtime_lock_release
+            return "${turn_status}"
+        }
         set +e
         if [[ "${current_mode}" == "terminal" ]]; then
             linux_agent_process_terminal_request "${user_input}"
@@ -231,8 +247,10 @@ linux_agent_interactive() {
         set -e
         if [[ "${turn_status}" -eq 0 ]]; then
             linux_agent_log_turn_finished "${current_mode}" "${LINUX_AGENT_LAST_BUSINESS_STATUS:-completed}"
+            linux_agent_runtime_lock_release
         else
             linux_agent_log_turn_finished "${current_mode}" "failed"
+            linux_agent_runtime_lock_release
             return "${turn_status}"
         fi
     done
@@ -379,6 +397,14 @@ main() {
             fi
             linux_agent_backup_runtime "$1"
             ;;
+        restore)
+            shift || true
+            if [[ $# -ne 1 ]]; then
+                linux_agent_print_error "请提供一个已有的 .tar.gz 备份路径。"
+                exit 1
+            fi
+            linux_agent_restore_runtime "$1"
+            ;;
         -h | --help | help)
             linux_agent_usage
             ;;
@@ -393,20 +419,55 @@ main() {
 linux_agent_run() {
     local command="${1:-interactive}"
     local argument_count="$#"
+    local restore_lifecycle_lock=0
 
     if [[ "${command}" == "audit" ]]; then
+        linux_agent_runtime_lock_shared || return 1
         main "$@"
-        return $?
+        local audit_status=$?
+        linux_agent_runtime_lock_release
+        return "${audit_status}"
     fi
     if [[ "${command}" == "api" && "$(linux_agent_api_needs_session "${2:-health}" "${3:-}")" != "true" ]]; then
+        linux_agent_runtime_lock_shared || return 1
         main "$@"
-        return $?
+        local api_status=$?
+        linux_agent_runtime_lock_release
+        return "${api_status}"
+    fi
+    if [[ "${command}" != "interactive" && "${command}" != "restore" ]]; then
+        if ! linux_agent_runtime_lock_shared; then
+            linux_agent_print_error "runtime 正在恢复或切换版本，请稍后重试。"
+            return 1
+        fi
+    elif [[ "${command}" == "restore" ]]; then
+        if ! linux_agent_runtime_lock_shared; then
+            linux_agent_print_error "runtime 正在恢复或切换版本，请稍后重试。"
+            return 1
+        fi
+        restore_lifecycle_lock=1
     fi
 
     LINUX_AGENT_MAIN_COMMAND="${command}"
-    linux_agent_start_session "agent ${command}" || return $?
-    linux_agent_prepare_conversation_history_file || return $?
-    linux_agent_log_command_started "${command}" "argument_count=${argument_count}" || return $?
+    linux_agent_start_session "agent ${command}" || {
+        local start_status=$?
+        linux_agent_runtime_lock_release
+        return "${start_status}"
+    }
+    linux_agent_prepare_conversation_history_file || {
+        local history_status=$?
+        linux_agent_runtime_lock_release
+        return "${history_status}"
+    }
+    linux_agent_log_command_started "${command}" "argument_count=${argument_count}" || {
+        local log_status=$?
+        linux_agent_runtime_lock_release
+        return "${log_status}"
+    }
+    if [[ "${restore_lifecycle_lock}" -eq 1 ]]; then
+        linux_agent_runtime_lock_release
+        restore_lifecycle_lock=0
+    fi
 
     trap linux_agent_on_exit EXIT
     trap linux_agent_on_int INT
@@ -416,7 +477,11 @@ linux_agent_run() {
     main "$@"
     local exit_code=$?
     LINUX_AGENT_FINAL_STATUS="$(linux_agent_status_for_exit_code "${exit_code}")"
+    if [[ "${command}" == "restore" ]]; then
+        linux_agent_runtime_lock_shared || return 1
+    fi
     linux_agent_finish_run "${LINUX_AGENT_FINAL_STATUS}" "${exit_code}"
+    linux_agent_runtime_lock_release
     trap - EXIT INT TERM TSTP
     return "${exit_code}"
 }

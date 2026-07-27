@@ -41,8 +41,13 @@ JSON_SAFE_INTEGER_MAX = 9007199254740991
 
 
 def read_project_config():
+    resolved_root = ROOT.resolve()
+    if resolved_root.parent.name == "releases":
+        config_path = resolved_root.parent.parent / "data" / "config" / "config.json"
+    else:
+        config_path = ROOT / "config" / "config.json"
     try:
-        with (ROOT / "config" / "config.json").open("r", encoding="utf-8") as handle:
+        with config_path.open("r", encoding="utf-8") as handle:
             return json.load(handle)
     except FileNotFoundError:
         return {}

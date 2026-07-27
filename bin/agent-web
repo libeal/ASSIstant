@@ -11,6 +11,10 @@ ROOT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 source "${ROOT_DIR}/lib/common.sh"
 # shellcheck source=../lib/config.sh
 source "${ROOT_DIR}/lib/config.sh"
+# shellcheck source=../lib/skills.sh
+source "${ROOT_DIR}/lib/skills.sh"
+# shellcheck source=../lib/editor.sh
+source "${ROOT_DIR}/lib/editor.sh"
 
 require_command() {
     local name="$1"
@@ -32,9 +36,14 @@ generate_token() {
 
 require_command jq
 require_command python3
+require_command flock
 linux_agent_require_python_runtime
 linux_agent_init_env "${ROOT_DIR}"
 linux_agent_load_config
+if ! linux_agent_recover_pending_skill_commit; then
+    linux_agent_print_error "检测到未完成的 Skill 提交事务，恢复失败；已停止 Web 启动以避免读取不一致的用户 Skill。"
+    exit 1
+fi
 
 enabled="$(config_get '.web.enabled' 'true')"
 case "${enabled,,}" in
@@ -55,7 +64,12 @@ max_job_attempts="$(config_get '.web.max_job_attempts' '3')"
 cancel_grace="$(config_get '.web.cancel_grace_sec' '2')"
 
 [[ -n "${host}" ]] || host="127.0.0.1"
-if [[ "${LINUX_AGENT_REMOTE_MODE:-0}" == "1" ]]; then
+if linux_agent_managed_execution_enabled; then
+    # Managed releases are exposed through an SSH tunnel only.  Keep this
+    # enforced in the launcher even if an administrator's persisted config
+    # still contains a broad source-runtime bind address.
+    host="127.0.0.1"
+elif [[ "${LINUX_AGENT_REMOTE_MODE:-0}" == "1" ]]; then
     host="127.0.0.1"
     if [[ -n "${LINUX_AGENT_REMOTE_WEB_PORT:-}" ]]; then
         port="${LINUX_AGENT_REMOTE_WEB_PORT}"
@@ -91,6 +105,7 @@ if [[ -z "${token}" ]]; then
 fi
 
 export LINUX_AGENT_ROOT="${ROOT_DIR}"
+export LINUX_AGENT_DATA_DIR
 export LINUX_AGENT_WEB_HOST="${host}"
 export LINUX_AGENT_WEB_PORT="${port}"
 export LINUX_AGENT_WEB_TOKEN="${token}"

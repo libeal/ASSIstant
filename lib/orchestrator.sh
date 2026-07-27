@@ -631,6 +631,7 @@ linux_agent_process_script_request() {
 
     material="$(printf 'skill_script=%s\narguments=%s\n%s\n' "${ref}" "${arguments_json}" "$(linux_agent_skill_script_content "${ref}")")"
     review="$(linux_agent_policy_review_text "script:${ref}" "${material}")"
+    review="$(linux_agent_block_noninteractive_unknown_command_review "${review}")"
     review="$(linux_agent_backup_policy_review "${ref}" "${arguments_json}" "${review}")"
     linux_agent_log_event "script_policy_checked" "${review}"
     if ! linux_agent_output_json_enabled; then
@@ -706,6 +707,19 @@ linux_agent_process_terminal_request() {
         return 0
     fi
 
+    if linux_agent_noninteractive_unknown_command "${review}"; then
+        result="$(jq -cn --arg command "${command_text}" --argjson review "${review}" \
+            '{ok:false, status:"blocked", code:"forbidden", error_code:"forbidden", error:"Unknown commands are blocked in non-interactive execution.", command:$command, review:$review}')"
+        linux_agent_log_event "terminal_blocked" "${result}"
+        if linux_agent_output_json_enabled; then
+            linux_agent_print_execution_protocol_json "终端输出" "${result}"
+        else
+            linux_agent_print_terminal_result "$(jq -c '. + {exit_code:126, stdout:"", stderr:.error}' <<<"${result}")"
+        fi
+        linux_agent_log_event "finished" "$(jq -cn '{status:"blocked"}')"
+        return 0
+    fi
+
     if [[ "$(jq -r '.approval_required' <<<"${review}")" == "true" && "${approve}" != "true" ]]; then
         printf '终端命令审查风险: %s，发现项: %s\n' "$(jq -r '.risk_level' <<<"${review}")" "$(jq '.findings | length' <<<"${review}")" >&2
         if [[ "${LINUX_AGENT_API_MODE:-0}" == "1" ]]; then
@@ -752,14 +766,20 @@ linux_agent_process_terminal_request() {
 
     command_args=(bash -lc "${command_text}")
     if ! linux_agent_prepare_execution_command "$(linux_agent_execution_privilege_from_review "${review}")" prepared_command "${command_args[@]}"; then
-        proxy_error="least privilege proxy is unavailable; refusing to run as root without an explicit privileged path"
+        if [[ "${LINUX_AGENT_EXECUTION_PREPARE_ERROR_CODE:-}" == "runner_unavailable" ]]; then
+            proxy_error="managed execution runner is unavailable; refusing same-UID fallback"
+        elif [[ "${LINUX_AGENT_EXECUTION_PREPARE_ERROR_CODE:-}" == "runner_rejected" ]]; then
+            proxy_error="managed execution request is outside the runner contract"
+        else
+            proxy_error="least privilege proxy is unavailable; refusing to run as root without an explicit privileged path"
+        fi
         proxy_meta="$(linux_agent_execution_proxy_metadata "$(linux_agent_execution_privilege_from_review "${review}")" "false" "${proxy_error}")"
         result="$(jq -cn \
             --arg command "${command_text}" \
-            --arg status "failed" \
+            --arg status "${LINUX_AGENT_EXECUTION_PREPARE_ERROR_CODE:-execution_proxy_unavailable}" \
             --arg stderr_text "${proxy_error}" \
             --argjson proxy "${proxy_meta}" \
-            '{ok:false, status:$status, command:$command, exit_code:126, stdout:"", stderr:$stderr_text, execution_proxy:$proxy}')"
+            '{ok:false, status:$status, code:$status, error_code:$status, command:$command, exit_code:126, stdout:"", stderr:$stderr_text, execution_proxy:$proxy}')"
         linux_agent_log_event "terminal_executed" "${result}"
         if linux_agent_output_json_enabled; then
             linux_agent_print_execution_protocol_json "终端输出" "${result}"
@@ -776,6 +796,7 @@ linux_agent_process_terminal_request() {
         proxy_meta="$(linux_agent_execution_proxy_metadata "$(linux_agent_execution_privilege_from_review "${review}")" "false")"
     fi
     run_meta="$(linux_agent_run_observed_process "terminal" "${subject}" "${stdout_file}" "${stderr_file}" -- "${prepared_command[@]}")"
+    linux_agent_cleanup_execution_staging
     exit_code="$(jq -r '.exit_code' <<<"${run_meta}")"
     observer="$(jq -c '.observer' <<<"${run_meta}")"
 

@@ -21,13 +21,17 @@ cp -a \
     "${ROOT_DIR}/web" \
     "${tmp_root}/"
 cp "${tmp_root}/config/config.example.json" "${tmp_root}/config/config.json"
-mkdir -p "${tmp_root}/logs"
+mkdir -p "${tmp_root}/logs" "${tmp_root}/data"
+: >"${tmp_root}/data/.runtime.lock"
+chmod 0600 "${tmp_root}/data/.runtime.lock"
 printf '%s\n' '{"stage":"finished","payload":{"status":"ok"}}' >"${tmp_root}/logs/session_web_backup.jsonl"
 
 LINUX_AGENT_ROOT="${tmp_root}" LINUX_AGENT_REMOTE_MODE=1 python3 - <<'PY'
 import importlib.util
 import json
 import os
+import stat
+import tempfile
 from pathlib import Path
 
 root = Path(os.environ["LINUX_AGENT_ROOT"])
@@ -99,6 +103,43 @@ backup_path = Path(backup["path"])
 assert backup_path.is_file()
 assert b"memory-only-secret" not in backup_path.read_bytes()
 backup_path.unlink()
+
+# A managed release must never ask the Web process to create an archive beside
+# the immutable release directory.  Simulate that layout while keeping the
+# actual CLI root at the fixture so backup.sh still sees a valid runtime.
+with tempfile.TemporaryDirectory(prefix="linux-agent-managed-backup-") as managed:
+    managed_prefix = Path(managed)
+    managed_data = managed_prefix / "data"
+    (managed_data / "tmp").mkdir(parents=True)
+    managed_release = managed_prefix / "releases" / "v-test"
+    managed_release.mkdir(parents=True)
+    old_root_marker = module._ROOT_RESOLVED
+    old_data_root = module.DATA_ROOT
+    old_managed_layout = module.MANAGED_LAYOUT
+    module._ROOT_RESOLVED = managed_release.resolve()
+    module.DATA_ROOT = managed_data
+    module.MANAGED_LAYOUT = True
+    try:
+        managed_backup = module.create_runtime_backup()
+        assert managed_backup["ok"] is True, managed_backup
+        managed_path = Path(managed_backup["path"])
+        assert managed_path.parent == managed_data / "tmp" / "web-backups"
+        assert stat.S_IMODE(managed_path.parent.stat().st_mode) == 0o700
+        assert managed_path.is_file()
+        managed_path.unlink()
+        managed_path.parent.rmdir()
+        (managed_data / "tmp").rmdir()
+        outside = managed_prefix / "outside"
+        outside.mkdir()
+        (managed_data / "tmp").symlink_to(outside, target_is_directory=True)
+        blocked_backup = module.create_runtime_backup()
+        assert blocked_backup["ok"] is False, blocked_backup
+        assert blocked_backup["status"] == "backup_unavailable", blocked_backup
+        assert not (outside / "web-backups").exists()
+    finally:
+        module._ROOT_RESOLVED = old_root_marker
+        module.DATA_ROOT = old_data_root
+        module.MANAGED_LAYOUT = old_managed_layout
 PY
 
 outside_skills="${tmp_root}/outside-skills"

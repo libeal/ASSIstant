@@ -3,11 +3,15 @@
 set -euo pipefail
 
 linux_agent_risk_rules_path() {
-    printf '%s/policies/risk-rules.json\n' "${LINUX_AGENT_ROOT}"
+    linux_agent_policy_path risk-rules.json
 }
 
 linux_agent_file_vault_policy_path() {
-    printf '%s\n' "${LINUX_AGENT_FILE_VAULT_POLICY_PATH:-${LINUX_AGENT_ROOT}/policies/file-vault.json}"
+    if [[ -n "${LINUX_AGENT_FILE_VAULT_POLICY_PATH:-}" ]]; then
+        printf '%s\n' "${LINUX_AGENT_FILE_VAULT_POLICY_PATH}"
+    else
+        linux_agent_policy_path file-vault.json
+    fi
 }
 
 linux_agent_file_vault_guard_path() {
@@ -94,7 +98,10 @@ linux_agent_policy_ast_findings() {
         return 0
     fi
 
-    if [[ "${text}" == skill_script=* || "${text}" == mcp_tool=* ]]; then
+    # MCP payloads are not shell source and must be reviewed by their own
+    # protocol/schema checks.  Skill scripts, however, are shell programs and
+    # need the same dynamic-head and unknown-command guard as terminal input.
+    if [[ "${text}" == mcp_tool=* ]]; then
         printf '[]\n'
         return 0
     fi
@@ -226,24 +233,28 @@ linux_agent_policy_review_text() {
     local text="$2"
     local mode="${3:-local}"
     local execution_mode="${4:-work}"
-    local ast blocked warn remote protected_paths protected_services vault_match vault_findings findings
+    local ast blocked warn remote protected_paths protected_services vault_match vault_findings findings review_json scan_text
 
     ast="$(linux_agent_policy_ast_findings "${text}" "${mode}")"
+    scan_text="${text}"
+    if [[ -f "${LINUX_AGENT_ROOT}/lib/command_guard.py" ]] && command -v python3 >/dev/null 2>&1; then
+        scan_text="$(printf '%s' "${text}" | python3 "${LINUX_AGENT_ROOT}/lib/command_guard.py" --policy-text 2>/dev/null)" || scan_text="${text}"
+    fi
     case "${subject}" in
         skill:* | script:* | edit:*)
             ast="$(jq -c 'map(select(.code != "AST_FILE_MUTATION_REQUIRES_SKILL"))' <<<"${ast}")"
             ;;
     esac
-    blocked="$(linux_agent_policy_match_patterns '.blocked_patterns' "${text}" "critical" "REGEX_BLOCKED")"
-    warn="$(linux_agent_policy_match_patterns '.warn_patterns' "${text}" "high" "REGEX_WARN")"
-    protected_paths="$(linux_agent_policy_match_patterns '.protected_paths' "${text}" "critical" "PROTECTED_PATH")"
-    protected_services="$(linux_agent_policy_match_patterns '.protected_services' "${text}" "high" "PROTECTED_SERVICE")"
+    blocked="$(linux_agent_policy_match_patterns '.blocked_patterns' "${scan_text}" "critical" "REGEX_BLOCKED")"
+    warn="$(linux_agent_policy_match_patterns '.warn_patterns' "${scan_text}" "high" "REGEX_WARN")"
+    protected_paths="$(linux_agent_policy_match_patterns '.protected_paths' "${scan_text}" "critical" "PROTECTED_PATH")"
+    protected_services="$(linux_agent_policy_match_patterns '.protected_services' "${scan_text}" "high" "PROTECTED_SERVICE")"
     if [[ "${mode}" == "remote" ]]; then
-        remote="$(linux_agent_policy_match_patterns '.remote_script_blocked_patterns' "${text}" "critical" "REMOTE_REGEX_BLOCKED")"
+        remote="$(linux_agent_policy_match_patterns '.remote_script_blocked_patterns' "${scan_text}" "critical" "REMOTE_REGEX_BLOCKED")"
     else
         remote='[]'
     fi
-    vault_match="$(linux_agent_policy_file_vault_match "${text}")"
+    vault_match="$(linux_agent_policy_file_vault_match "${scan_text}")"
     if [[ "${execution_mode}" == "terminal" ]] &&
         [[ "$(jq -r '.matched // false' <<<"${vault_match}")" == "true" ]] &&
         [[ "$(jq -r '.action // "unknown"' <<<"${vault_match}")" == "modify" ]]; then
@@ -303,7 +314,7 @@ linux_agent_policy_review_text() {
         --argjson protected_services "${protected_services}" \
         --argjson vault "${vault_findings}")"
 
-    jq -cn \
+    review_json="$(jq -cn \
         --arg subject "${subject}" \
         --arg execution_mode "${execution_mode}" \
         --argjson file_vault "${vault_match}" \
@@ -322,7 +333,13 @@ linux_agent_policy_review_text() {
                 else "low" end
             ),
             findings:$findings
-        }'
+        }')"
+    if [[ "${subject}" == skill:* || "${subject}" == script:* ]] &&
+        declare -F linux_agent_filter_builtin_skill_review >/dev/null 2>&1; then
+        linux_agent_filter_builtin_skill_review "${subject#*:}" "${review_json}"
+    else
+        printf '%s\n' "${review_json}"
+    fi
 }
 
 linux_agent_policy_review_step() {
@@ -335,6 +352,22 @@ linux_agent_policy_review_step() {
     step_risk="$(jq -r '.risk_level // "low"' <<<"${step_json}")"
     executor_type="$(jq -r '.executor_type // empty' <<<"${step_json}")"
     review="$(linux_agent_policy_review_text "${subject}" "${text}" "${mode}" "work")"
+    if [[ "${executor_type}" == "skill_script" ]] &&
+        declare -F linux_agent_filter_builtin_skill_review >/dev/null 2>&1; then
+        ref="$(jq -r '.skill_script // empty' <<<"${step_json}")"
+        review="$(jq -c '
+            .findings = [.findings[]? | select(.code != "AST_FILE_MUTATION_REQUIRES_SKILL")]
+            | .approved = (([.findings[]? | select(.severity == "critical")] | length) == 0)
+            | .approval_required = ((.findings | length) > 0)
+            | .risk_level = (
+                if any(.findings[]?; .severity == "critical") then "critical"
+                elif any(.findings[]?; .severity == "high") then "high"
+                elif any(.findings[]?; .severity == "medium") then "medium"
+                else "low" end
+            )
+        ' <<<"${review}")"
+        review="$(linux_agent_filter_builtin_skill_review "${ref}" "${review}")"
+    fi
     review="$(jq -c --arg step_risk "${step_risk}" --arg mode "${mode}" '
         .approval_required = (.approval_required or ($step_risk == "medium") or ($step_risk == "high") or ($step_risk == "critical"))
         | .risk_level = (
@@ -676,7 +709,7 @@ linux_agent_validate_policy_file() {
         linux_agent_validate_policy_content "${path}" ""
         return 0
     fi
-    full_path="${LINUX_AGENT_ROOT}/policies/${path}"
+    full_path="$(linux_agent_policy_path "${path}" 2>/dev/null || true)"
     if [[ ! -f "${full_path}" ]]; then
         jq -cn --arg path "${path}" '{ok:false, status:"not_found", path:$path, findings:[{severity:"critical", code:"POLICY_FILE_MISSING", path:$path, message:"策略文件不存在。"}]}'
         return 0
@@ -685,10 +718,12 @@ linux_agent_validate_policy_file() {
 }
 
 linux_agent_validate_policies() {
-    local policies_dir="${LINUX_AGENT_ROOT}/policies"
+    local policies_dir="${LINUX_AGENT_BUILTIN_POLICIES_DIR:-${LINUX_AGENT_ROOT}/policies}"
+    local overlay_dir="${LINUX_AGENT_USER_POLICIES_DIR:-${LINUX_AGENT_ROOT}/data/policies}"
     local findings='[]'
     local files='[]'
-    local file rel result
+    local orphaned='[]'
+    local file rel result name
 
     while IFS= read -r file; do
         [[ -n "${file}" ]] || continue
@@ -698,6 +733,29 @@ linux_agent_validate_policies() {
         findings="$(jq -cn --argjson prior "${findings}" --argjson next "$(jq '.findings // []' <<<"${result}")" '$prior + $next')"
     done < <(find "${policies_dir}" -maxdepth 1 -type f -name '*.json' 2>/dev/null | sort)
 
-    jq -cn --argjson files "${files}" --argjson findings "${findings}" \
-        '{ok:(([$findings[]? | select(.severity == "critical")] | length) == 0), status:(if (([$findings[]? | select(.severity == "critical")] | length) == 0) then "valid" else "invalid" end), files:$files, findings:$findings}'
+    if [[ (-e "${overlay_dir}" || -L "${overlay_dir}") &&
+        (! -d "${overlay_dir}" || -L "${overlay_dir}") ]]; then
+        findings="$(linux_agent_policy_add_validation_finding \
+            "${findings}" critical POLICY_OVERLAY_ROOT_INVALID "${overlay_dir}" \
+            "策略 overlay 必须是非符号链接目录。")"
+    elif [[ -d "${overlay_dir}" ]]; then
+        while IFS= read -r file; do
+            [[ -n "${file}" ]] || continue
+            name="$(basename "${file}")"
+            if [[ -L "${file}" ]]; then
+                findings="$(linux_agent_policy_add_validation_finding \
+                    "${findings}" critical POLICY_OVERLAY_ENTRY_INVALID "${name}" \
+                    "策略 overlay 文件不能是符号链接。")"
+            elif [[ ! -f "${policies_dir}/${name}" || -L "${policies_dir}/${name}" ]]; then
+                orphaned="$(jq -cn --argjson prior "${orphaned}" --arg name "${name}" '$prior + [$name]')"
+                findings="$(linux_agent_policy_add_validation_finding \
+                    "${findings}" medium POLICY_OVERLAY_ORPHANED "${name}" \
+                    "策略 overlay 已不在当前 release 登记中，将被忽略。")"
+            fi
+        done < <(find "${overlay_dir}" -mindepth 1 -maxdepth 1 \
+            \( -type f -o -type l \) -name '*.json' 2>/dev/null | sort)
+    fi
+
+    jq -cn --argjson files "${files}" --argjson findings "${findings}" --argjson orphaned "${orphaned}" \
+        '{ok:(([$findings[]? | select(.severity == "critical")] | length) == 0), status:(if (([$findings[]? | select(.severity == "critical")] | length) == 0) then "valid" else "invalid" end), files:$files, orphaned:$orphaned, findings:$findings}'
 }

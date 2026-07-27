@@ -101,6 +101,24 @@ class DomainContractTest(unittest.TestCase):
             ),
         )
 
+    def test_api_result_accepts_degraded_health(self):
+        degraded = {
+            "ok": True,
+            "status": "degraded",
+            "execution": {"ready": False, "isolation": "unavailable"},
+            "root": "/opt/linux-agent/current",
+            "web": {},
+            "schema_version": self.contract.schema_version,
+            "protocol_version": self.contract.protocol_version,
+        }
+        self.assertIs(
+            degraded,
+            self.contract.validate_api_result(
+                degraded,
+                required_fields={"root": str, "web": dict, "execution": dict},
+            ),
+        )
+
     def test_api_result_uses_full_execution_contract_when_requested(self):
         result = self.result()
         self.assertIs(
@@ -289,13 +307,25 @@ class DomainContractTest(unittest.TestCase):
             self.contract.validate_audit_event({**audit_event, "hash": "not-a-hash"})
 
         manifest = {
+            "schema_version": 1,
             "name": "ops-basic",
             "description": "operations",
-            "scripts": [{"name": "resource-inspect.sh"}],
+            "scripts": [
+                {
+                    "name": "resource-inspect.sh",
+                    "risk": "low",
+                    "execution_class": "runner",
+                    "capability": "",
+                }
+            ],
         }
         self.assertIs(manifest, self.contract.validate_skill_manifest(manifest))
         with self.assertRaises(DomainValidationError):
             self.contract.validate_skill_manifest({**manifest, "scripts": ["bad"]})
+        with self.assertRaisesRegex(DomainValidationError, "missing required fields"):
+            self.contract.validate_skill_manifest(
+                {**manifest, "scripts": [{"name": "resource-inspect.sh"}]}
+            )
 
     def test_execution_result_validates_embedded_work_plan(self):
         result = self.result()

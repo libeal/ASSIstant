@@ -95,7 +95,7 @@ validate_non_empty() {
 }
 
 validate_config() {
-    local failures=0
+    local failures=0 config_payload
 
     require_command jq || failures=$((failures + 1))
     require_command python3 || failures=$((failures + 1))
@@ -109,8 +109,9 @@ validate_config() {
     fi
     print_ok "找到 config/config.json"
 
-    if ! jq -e . "${CONFIG_FILE}" >/dev/null 2>&1; then
-        print_error "config/config.json 不是合法 JSON"
+    config_payload="$(<"${CONFIG_FILE}")"
+    if ! linux_agent_config_validate_json_strict "${config_payload}"; then
+        print_error "config/config.json 必须是无重复键、无非有限数值的合法 JSON 对象"
         return 1
     fi
     print_ok "config/config.json JSON 格式合法"

@@ -123,8 +123,6 @@ export function bindApplicationEvents(app, shell) {
       app.updateConfigDraftFromControl(button);
     });
     on("doctorRunBtn", "click", () => safeAction(app.runDoctor));
-    on("policyUnlockBtn", "click", () => safeAction(app.unlockPolicy));
-    on("policyLockBtn", "click", app.lockPolicy);
     on("policyReloadBtn", "click", () => safeAction(app.loadPolicies));
     on("policyValidateBtn", "click", () => safeAction(app.validatePolicy));
     on("policySaveBtn", "click", () => safeAction(app.savePolicy));

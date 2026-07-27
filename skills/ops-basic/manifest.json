@@ -1,0 +1,16 @@
+{
+    "schema_version": 1,
+    "name": "ops-basic",
+    "description": "Linux 基础运维诊断与安全维护脚本。",
+    "scripts": [
+        {"name": "config-backup.sh", "risk": "medium", "execution_class": "runner", "capability": ""},
+        {"name": "disk-hotspots.sh", "risk": "low", "execution_class": "runner", "capability": ""},
+        {"name": "log-cleanup-plan.sh", "risk": "low", "execution_class": "runner", "capability": ""},
+        {"name": "log-search.sh", "risk": "low", "execution_class": "runner", "capability": ""},
+        {"name": "process-inspect.sh", "risk": "low", "execution_class": "runner", "capability": ""},
+        {"name": "resource-inspect.sh", "risk": "low", "execution_class": "runner", "capability": ""},
+        {"name": "safe-log-cleanup.sh", "risk": "high", "execution_class": "runner", "capability": ""},
+        {"name": "service-inspect.sh", "risk": "low", "execution_class": "runner", "capability": ""},
+        {"name": "service-restart-plan.sh", "risk": "low", "execution_class": "runner", "capability": ""}
+    ]
+}

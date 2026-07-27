@@ -5,6 +5,9 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
 LOG_DIR="${LINUX_AGENT_LOG_DIR:-${ROOT_DIR}/logs}"
+SNAPSHOT_FILE="${LINUX_AGENT_AUDIT_SNAPSHOT_FILE:-}"
+SNAPSHOT_SESSION_ID="${LINUX_AGENT_AUDIT_SNAPSHOT_SESSION_ID:-}"
+CURRENT_SESSION_ID="${SNAPSHOT_SESSION_ID:-${LINUX_AGENT_SESSION_ID:-}}"
 
 arguments_json="${1:-}"
 [[ -z "${arguments_json}" ]] && arguments_json='{}'
@@ -15,9 +18,9 @@ fi
 
 session_id="$(jq -r '.session_id // empty' <<<"${arguments_json}")"
 if [[ -z "${session_id}" ]]; then
-    session_id="${LINUX_AGENT_SESSION_ID:-}"
+    session_id="${CURRENT_SESSION_ID}"
 fi
-if [[ -z "${session_id}" ]]; then
+if [[ -z "${session_id}" && -z "${SNAPSHOT_FILE}" ]]; then
     latest_log="$(find "${LOG_DIR}" -maxdepth 1 -type f -name 'session*.jsonl' -printf '%T@ %f\n' 2>/dev/null | sort -rn | head -n 1 | awk '{print $2}')"
     session_id="${latest_log%.jsonl}"
 fi
@@ -27,7 +30,11 @@ if [[ -z "${session_id}" || ! "${session_id}" =~ ^[A-Za-z0-9_.-]+$ ]]; then
     exit 0
 fi
 
-log_file="${LOG_DIR}/${session_id}.jsonl"
+if [[ -n "${SNAPSHOT_FILE}" ]]; then
+    log_file="${SNAPSHOT_FILE}"
+else
+    log_file="${LOG_DIR}/${session_id}.jsonl"
+fi
 if [[ ! -f "${log_file}" ]]; then
     jq -cn --arg session_id "${session_id}" '{ok:false, tool:"session.history.last-command-output", session_id:$session_id, error:"audit session not found"}'
     exit 0
@@ -35,7 +42,7 @@ fi
 
 if jq -e 'has("turn_offset")' <<<"${arguments_json}" >/dev/null; then
     turn_offset="$(jq -r '.turn_offset' <<<"${arguments_json}")"
-elif [[ -n "${LINUX_AGENT_SESSION_ID:-}" && "${session_id}" == "${LINUX_AGENT_SESSION_ID}" ]]; then
+elif [[ -n "${CURRENT_SESSION_ID}" && "${session_id}" == "${CURRENT_SESSION_ID}" ]]; then
     turn_offset=1
 else
     turn_offset=0

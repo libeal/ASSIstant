@@ -1,0 +1,44 @@
+[Unit]
+Description=Linux Agent unprivileged execution runner
+Requires=linux-agent-runner.socket
+After=linux-agent-runner.socket
+PartOf=linux-agent-web.service
+
+[Service]
+Type=simple
+User=linux-agent-runner
+Group=linux-agent-runner
+WorkingDirectory=/opt/linux-agent/current
+ExecStart=/usr/bin/python3 /opt/linux-agent/current/lib/runner.py serve
+Environment=HOME=/var/lib/linux-agent-runner
+Environment=LINUX_AGENT_SERVICE_USER=linux-agent
+Environment=LINUX_AGENT_ROOT=/opt/linux-agent/current
+Environment=LINUX_AGENT_DATA_DIR=/opt/linux-agent/data
+Environment=LINUX_AGENT_TMP_ROOT=/opt/linux-agent/data/runner-tmp
+Restart=on-failure
+RestartSec=2s
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+PrivateTmp=yes
+ProtectHome=yes
+ProtectControlGroups=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectKernelLogs=yes
+ProtectClock=yes
+PrivateDevices=yes
+LockPersonality=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources @mount @swap @reboot @raw-io
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+InaccessiblePaths=/opt/linux-agent/data/config /opt/linux-agent/data/logs /opt/linux-agent/data/policies /run/linux-agent/runner.sock /run/linux-agent/observer.sock /run/linux-agent/host-ops.sock /run/linux-agent/policy-writer.sock
+CPUQuota=200%
+MemoryMax=1G
+TasksMax=256
+StandardOutput=journal
+StandardError=journal

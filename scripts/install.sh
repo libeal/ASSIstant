@@ -14,6 +14,10 @@ SERVICE_GROUP="linux-agent"
 SERVICE_USER_EXPLICIT=0
 SERVICE_USER_CREATED=0
 SERVICE_USER_CREATED_THIS_RUN=0
+RUNNER_USER="${LINUX_AGENT_RUNNER_USER:-linux-agent-runner}"
+RUNNER_GROUP="${LINUX_AGENT_RUNNER_GROUP:-linux-agent-runner}"
+RUNNER_USER_CREATED=0
+RUNNER_USER_CREATED_THIS_RUN=0
 REQUIRE_SIGNATURE=0
 NO_SYSTEMD=0
 KEEP=2
@@ -26,6 +30,12 @@ SYSTEMD_UNIT_PATH="${LINUX_AGENT_SYSTEMD_UNIT_PATH:-/etc/systemd/system/linux-ag
 SYSTEMD_UNIT_DIR="${SYSTEMD_UNIT_PATH%/*}"
 SYSTEMD_HELPER_SERVICE_PATH="${LINUX_AGENT_SYSTEMD_HELPER_SERVICE_PATH:-${SYSTEMD_UNIT_DIR}/linux-agent-observer-helper.service}"
 SYSTEMD_HELPER_SOCKET_PATH="${LINUX_AGENT_SYSTEMD_HELPER_SOCKET_PATH:-${SYSTEMD_UNIT_DIR}/linux-agent-observer-helper.socket}"
+SYSTEMD_RUNNER_SERVICE_PATH="${LINUX_AGENT_SYSTEMD_RUNNER_SERVICE_PATH:-${SYSTEMD_UNIT_DIR}/linux-agent-runner.service}"
+SYSTEMD_RUNNER_SOCKET_PATH="${LINUX_AGENT_SYSTEMD_RUNNER_SOCKET_PATH:-${SYSTEMD_UNIT_DIR}/linux-agent-runner.socket}"
+SYSTEMD_HOST_SERVICE_PATH="${LINUX_AGENT_SYSTEMD_HOST_SERVICE_PATH:-${SYSTEMD_UNIT_DIR}/linux-agent-host-ops.service}"
+SYSTEMD_HOST_SOCKET_PATH="${LINUX_AGENT_SYSTEMD_HOST_SOCKET_PATH:-${SYSTEMD_UNIT_DIR}/linux-agent-host-ops.socket}"
+SYSTEMD_POLICY_SERVICE_PATH="${LINUX_AGENT_SYSTEMD_POLICY_SERVICE_PATH:-${SYSTEMD_UNIT_DIR}/linux-agent-policy-writer.service}"
+SYSTEMD_POLICY_SOCKET_PATH="${LINUX_AGENT_SYSTEMD_POLICY_SOCKET_PATH:-${SYSTEMD_UNIT_DIR}/linux-agent-policy-writer.socket}"
 SYSTEMD_EGRESS_DROPIN_PATH="${LINUX_AGENT_SYSTEMD_EGRESS_DROPIN_PATH:-${SYSTEMD_UNIT_DIR}/linux-agent-web.service.d/10-provider-egress.conf}"
 TRANSACTION_MODE=""
 TRANSACTION_OLD_VERSION=""
@@ -33,6 +43,7 @@ TRANSACTION_TARGET_VERSION=""
 TRANSACTION_BACKUP_DIR=""
 TRANSACTION_COMMITTED=0
 CONFIG_STATE_CAPTURED=0
+PERSISTENT_DATA_STATE_CAPTURED=0
 SYSTEMD_STATE_CAPTURED=0
 SYSTEMD_UNIT_EXISTED=0
 SYSTEMD_HELPER_SERVICE_EXISTED=0
@@ -46,11 +57,14 @@ INSTALL_STATE_CAPTURED=0
 INSTALL_STATE_EXISTED=0
 INSTALL_STATE_SERVICE_USER=""
 INSTALL_STATE_SERVICE_USER_CREATED=0
+INSTALL_STATE_RUNNER_USER=""
+INSTALL_STATE_RUNNER_USER_CREATED=0
 INSTALL_STATE_NO_SYSTEMD=0
 OBSERVER_STATE_CAPTURED=0
 OBSERVER_STATE_EXISTED=0
 OBSERVER_STATE_PATH=""
 OBSERVER_STATE_BACKUP_PATH=""
+RUNTIME_LOCK_FD=""
 
 fail() {
     printf '[install:error] %s\n' "$*" >&2
@@ -66,7 +80,7 @@ info() {
 }
 
 validate_runtime_compatibility() {
-    local curl_help
+    local curl_help tar_help
     if ((BASH_VERSINFO[0] < 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] < 3))); then
         fail "Bash 版本过低: ${BASH_VERSION}；需要 Bash 4.3+"
     fi
@@ -74,7 +88,8 @@ validate_runtime_compatibility() {
         fail "Python 版本过低: $(python3 -V 2>&1)；需要 Python 3.10+"
     stat -c '%a' / >/dev/null 2>&1 || fail '当前 stat 不支持 GNU -c 选项'
     find / -maxdepth 0 -printf '' >/dev/null 2>&1 || fail '当前 find 不支持 GNU -printf 选项'
-    tar --help 2>&1 | grep -q -- '--sort' || fail '当前 tar 不支持 GNU --sort 选项'
+    tar_help="$(tar --help 2>&1 || true)"
+    grep -q -- '--sort' <<<"${tar_help}" || fail '当前 tar 不支持 GNU --sort 选项'
     date --iso-8601=seconds >/dev/null 2>&1 || fail '当前 date 不支持 GNU --iso-8601 选项'
     curl_help="$(curl --help all 2>/dev/null || curl --help 2>/dev/null || true)"
     grep -q -- '--proto ' <<<"${curl_help}" || fail '当前 curl 不支持 --proto 安全选项'
@@ -129,6 +144,9 @@ cleanup() {
             "${PREFIX}"/.install-rollback.*) rm -rf -- "${TRANSACTION_BACKUP_DIR}" ;;
             *) warn "拒绝清理非预期 rollback 目录: ${TRANSACTION_BACKUP_DIR}" ;;
         esac
+    fi
+    if declare -F release_runtime_transaction_lock >/dev/null 2>&1; then
+        release_runtime_transaction_lock
     fi
     return "${exit_status}"
 }
@@ -210,6 +228,12 @@ case "/${PREFIX#/}/" in
     */../* | */./*) fail '--prefix 不能包含 . 或 .. 路径分量' ;;
 esac
 [[ "${SERVICE_USER}" =~ ^[a-z_][a-z0-9_-]*[$]?$ ]] || fail '--service-user 格式非法'
+if [[ "${LINUX_AGENT_ALLOW_ROOT_SERVICE_USER_FOR_TESTS:-0}" == "1" && "${SERVICE_USER}" == "root" ]]; then
+    RUNNER_USER="root"
+    RUNNER_GROUP="root"
+fi
+[[ "${RUNNER_USER}" =~ ^[a-z_][a-z0-9_-]*[$]?$ ]] || fail 'Runner 用户格式非法'
+[[ "${RUNNER_GROUP}" =~ ^[a-z_][a-z0-9_-]*[$]?$ ]] || fail 'Runner 用户组格式非法'
 [[ "${KEEP}" =~ ^[0-9]+$ && "${KEEP}" -ge 1 && "${KEEP}" -le 100 ]] ||
     fail '--keep 必须是 1-100 的整数'
 
@@ -226,8 +250,9 @@ if [[ "${NO_SYSTEMD}" -eq 0 && "${COMMAND}" != "health" && "${COMMAND}" != "stat
     [[ "${EUID}" -eq 0 ]] || fail '操作 systemd 需要 root；测试或容器环境请使用 --no-systemd'
 fi
 
+command -v flock >/dev/null 2>&1 || fail '缺少依赖命令: flock（请安装 util-linux）'
 for command_name in bash curl python3 jq sha256sum stat mktemp readlink cp mv ln mkdir chmod \
-    find sort awk tar gzip sed grep date id chown dirname basename seq; do
+    find sort awk tar gzip sed grep date id chown dirname basename seq timeout; do
     command -v "${command_name}" >/dev/null 2>&1 || fail "缺少依赖命令: ${command_name}"
 done
 validate_runtime_compatibility
@@ -280,7 +305,7 @@ if [[ "${NO_SYSTEMD}" -eq 0 ]]; then
 fi
 
 ensure_prefix() {
-    local mode="${1:-create}"
+    local mode="${1:-create}" persistent_root
     if [[ -L "${PREFIX}" || (-e "${PREFIX}" && ! -d "${PREFIX}") ]]; then
         fail "安装前缀必须是普通目录且不能是符号链接: ${PREFIX}"
     fi
@@ -291,6 +316,11 @@ ensure_prefix() {
     fi
     PREFIX="$(readlink -f -- "${PREFIX}")"
     [[ "${PREFIX}" != "/" ]] || fail '拒绝使用根目录作为安装前缀'
+    for persistent_root in "${PREFIX}/data" "${PREFIX}/releases"; do
+        if [[ -L "${persistent_root}" || (-e "${persistent_root}" && ! -d "${persistent_root}") ]]; then
+            fail "安装目录边界必须是普通目录且不能是符号链接: ${persistent_root}"
+        fi
+    done
     if [[ "${NO_SYSTEMD}" -eq 0 ]]; then
         case "${PREFIX}/" in
             /home/* | /root/* | /run/user/* | /tmp/* | /var/tmp/*)
@@ -315,6 +345,79 @@ ensure_prefix() {
     fi
 }
 
+assert_plain_directory() {
+    local path="$1"
+    [[ -L "${path}" || (-e "${path}" && ! -d "${path}") ]] && return 1
+    return 0
+}
+
+assert_plain_file() {
+    local path="$1"
+    [[ -L "${path}" || (-e "${path}" && ! -f "${path}") ]] && return 1
+    return 0
+}
+
+acquire_runtime_transaction_lock() {
+    local lock_path="${PREFIX}/data/.runtime.lock"
+    [[ -z "${RUNTIME_LOCK_FD}" ]] || return 0
+    mkdir -p -- "${PREFIX}/data"
+    assert_plain_file "${lock_path}" || fail "runtime 事务锁类型非法: ${lock_path}"
+    if [[ ! -e "${lock_path}" ]]; then
+        (umask 077 && set -C && : >"${lock_path}") 2>/dev/null || true
+    fi
+    assert_plain_file "${lock_path}" || fail '无法安全创建 runtime 事务锁'
+    exec {RUNTIME_LOCK_FD}<>"${lock_path}" || fail '无法打开 runtime 事务锁'
+    flock -x "${RUNTIME_LOCK_FD}" || fail '无法取得 runtime 安装事务锁'
+}
+
+release_runtime_transaction_lock() {
+    if [[ -n "${RUNTIME_LOCK_FD:-}" ]]; then
+        flock -u "${RUNTIME_LOCK_FD}" 2>/dev/null || true
+        exec {RUNTIME_LOCK_FD}>&-
+        RUNTIME_LOCK_FD=""
+    fi
+}
+
+fsync_file_and_directory() {
+    local file_path="$1"
+    local directory_path="${2:-$(dirname -- "${file_path}")}"
+    python3 - "${file_path}" "${directory_path}" <<'PY'
+import os
+import sys
+
+file_path, directory_path = sys.argv[1:]
+file_descriptor = os.open(file_path, os.O_RDONLY)
+try:
+    os.fsync(file_descriptor)
+finally:
+    os.close(file_descriptor)
+directory_descriptor = os.open(directory_path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+try:
+    os.fsync(directory_descriptor)
+finally:
+    os.close(directory_descriptor)
+PY
+}
+
+atomic_copy_regular_file() {
+    local source="$1"
+    local target="$2"
+    local mode="${3:-0644}"
+    local parent temp
+    parent="$(dirname -- "${target}")"
+    assert_plain_directory "${parent}" || return 1
+    assert_plain_file "${source}" || return 1
+    assert_plain_file "${target}" || return 1
+    temp="$(mktemp "${parent}/.${target##*/}.XXXXXX")" || return 1
+    if ! cp -- "${source}" "${temp}" || ! chmod "${mode}" "${temp}" ||
+        ! fsync_file_and_directory "${temp}" "${parent}" ||
+        ! mv -f -- "${temp}" "${target}" ||
+        ! fsync_file_and_directory "${target}" "${parent}"; then
+        rm -f -- "${temp}"
+        return 1
+    fi
+}
+
 install_state_path() {
     printf '%s/.install-state.json\n' "${PREFIX}"
 }
@@ -334,9 +437,13 @@ read_install_state() {
         and (.service_user | type == "string")
         and (.service_user_created | type == "boolean")
         and (.service_user == "" or (.service_user | test("^[a-z_][a-z0-9_-]*[$]?$")))
+        and ((has("runner_user") | not) or (.runner_user | type == "string" and (. == "" or test("^[a-z_][a-z0-9_-]*[$]?$"))))
+        and ((has("runner_user_created") | not) or (.runner_user_created | type == "boolean"))
     ' "${state_path}" >/dev/null || fail '安装状态文件契约无效'
     INSTALL_STATE_SERVICE_USER="$(jq -er '.service_user' "${state_path}")"
     INSTALL_STATE_SERVICE_USER_CREATED="$(jq -er 'if .service_user_created then 1 else 0 end' "${state_path}")"
+    INSTALL_STATE_RUNNER_USER="$(jq -r '.runner_user // ""' "${state_path}")"
+    INSTALL_STATE_RUNNER_USER_CREATED="$(jq -r 'if .runner_user_created // false then 1 else 0 end' "${state_path}")"
     INSTALL_STATE_NO_SYSTEMD="$(jq -er 'if .no_systemd then 1 else 0 end' "${state_path}")"
     return 0
 }
@@ -380,6 +487,13 @@ load_existing_service_identity() {
             SERVICE_USER="${INSTALL_STATE_SERVICE_USER}"
             SERVICE_USER_CREATED="${INSTALL_STATE_SERVICE_USER_CREATED}"
         fi
+        if [[ -n "${INSTALL_STATE_RUNNER_USER}" ]]; then
+            RUNNER_USER="${INSTALL_STATE_RUNNER_USER}"
+            RUNNER_USER_CREATED="${INSTALL_STATE_RUNNER_USER_CREATED}"
+            if id "${RUNNER_USER}" >/dev/null 2>&1; then
+                RUNNER_GROUP="$(id -gn "${RUNNER_USER}")"
+            fi
+        fi
         return 0
     fi
     [[ "${NO_SYSTEMD}" -eq 0 ]] || return 0
@@ -403,10 +517,12 @@ write_install_state() {
     jq -S -n \
         --arg prefix "${PREFIX}" \
         --arg service_user "${service_user}" \
+        --arg runner_user "$([[ "${NO_SYSTEMD}" -eq 0 ]] && printf '%s' "${RUNNER_USER}" || printf '')" \
         --argjson installed "${installed}" \
         --argjson no_systemd "$([[ "${NO_SYSTEMD}" -eq 1 ]] && printf true || printf false)" \
         --argjson service_user_created "$([[ "${NO_SYSTEMD}" -eq 0 && "${SERVICE_USER_CREATED}" -eq 1 ]] && printf true || printf false)" \
-        '{schema_version:1,prefix:$prefix,installed:$installed,no_systemd:$no_systemd,service_user:$service_user,service_user_created:$service_user_created}' \
+        --argjson runner_user_created "$([[ "${NO_SYSTEMD}" -eq 0 && "${RUNNER_USER_CREATED}" -eq 1 ]] && printf true || printf false)" \
+        '{schema_version:1,prefix:$prefix,installed:$installed,no_systemd:$no_systemd,service_user:$service_user,service_user_created:$service_user_created,runner_user:$runner_user,runner_user_created:$runner_user_created}' \
         >"${state_tmp}" || {
         rm -f -- "${state_tmp}"
         fail '无法写入安装状态文件'
@@ -425,13 +541,14 @@ begin_transaction() {
     local mode="$1"
     local old_version="$2"
     local target_version="$3"
-    local name source backup state_path
+    local state_path
 
     TRANSACTION_MODE="${mode}"
     TRANSACTION_OLD_VERSION="${old_version}"
     TRANSACTION_TARGET_VERSION="${target_version}"
     TRANSACTION_COMMITTED=0
     CONFIG_STATE_CAPTURED=0
+    PERSISTENT_DATA_STATE_CAPTURED=0
     SYSTEMD_STATE_CAPTURED=0
     SYSTEMD_UNIT_EXISTED=0
     SYSTEMD_HELPER_SERVICE_EXISTED=0
@@ -448,9 +565,29 @@ begin_transaction() {
     OBSERVER_STATE_PATH=""
     OBSERVER_STATE_BACKUP_PATH=""
     SERVICE_USER_CREATED_THIS_RUN=0
+    RUNNER_USER_CREATED_THIS_RUN=0
     TRANSACTION_BACKUP_DIR="$(mktemp -d "${PREFIX}/.install-rollback.XXXXXX")"
     chmod 0700 "${TRANSACTION_BACKUP_DIR}"
     mkdir -p "${TRANSACTION_BACKUP_DIR}/config"
+    state_path="$(install_state_path)"
+    if [[ -L "${state_path}" || (-e "${state_path}" && ! -f "${state_path}") ]]; then
+        fail "安装状态文件类型非法: ${state_path}"
+    fi
+    if [[ -f "${state_path}" ]]; then
+        cp -p -- "${state_path}" "${TRANSACTION_BACKUP_DIR}/install-state.json"
+        INSTALL_STATE_EXISTED=1
+    fi
+    INSTALL_STATE_CAPTURED=1
+}
+
+capture_persistent_data_state() {
+    local name source backup unsafe marker marker_backup
+    mkdir -p "${TRANSACTION_BACKUP_DIR}/config" "${TRANSACTION_BACKUP_DIR}/persistent"
+
+    assert_plain_directory "${PREFIX}/data" ||
+        fail "持久数据目录类型非法: ${PREFIX}/data"
+    assert_plain_directory "${PREFIX}/data/config" ||
+        fail "持久配置目录类型非法: ${PREFIX}/data/config"
 
     for name in config.json config.example.json ai-providers.json; do
         source="${PREFIX}/data/config/${name}"
@@ -463,19 +600,40 @@ begin_transaction() {
         fi
     done
     CONFIG_STATE_CAPTURED=1
-    state_path="$(install_state_path)"
-    if [[ -L "${state_path}" || (-e "${state_path}" && ! -f "${state_path}") ]]; then
-        fail "安装状态文件类型非法: ${state_path}"
+
+    : >"${TRANSACTION_BACKUP_DIR}/persistent/directories.tsv"
+    for name in skills policies migration-reports migration-conflicts; do
+        source="${PREFIX}/data/${name}"
+        backup="${TRANSACTION_BACKUP_DIR}/persistent/${name}"
+        if [[ -L "${source}" || (-e "${source}" && ! -d "${source}") ]]; then
+            fail "持久数据备份源类型非法: ${source}"
+        fi
+        if [[ -d "${source}" ]]; then
+            unsafe="$(find "${source}" -mindepth 1 \( -type l -o -type b -o -type c -o -type p -o -type s \) -print -quit)"
+            [[ -z "${unsafe}" ]] || fail "持久数据包含不安全文件类型: ${unsafe}"
+            cp -a -- "${source}" "${backup}"
+            printf '%s\t1\n' "${name}" >>"${TRANSACTION_BACKUP_DIR}/persistent/directories.tsv"
+        else
+            printf '%s\t0\n' "${name}" >>"${TRANSACTION_BACKUP_DIR}/persistent/directories.tsv"
+        fi
+    done
+
+    marker="${PREFIX}/data/.overlay-layout-v1.json"
+    marker_backup="${TRANSACTION_BACKUP_DIR}/persistent/overlay-layout-v1.json"
+    if [[ -L "${marker}" || (-e "${marker}" && ! -f "${marker}") ]]; then
+        fail "overlay 布局标记类型非法: ${marker}"
     fi
-    if [[ -f "${state_path}" ]]; then
-        cp -p -- "${state_path}" "${TRANSACTION_BACKUP_DIR}/install-state.json"
-        INSTALL_STATE_EXISTED=1
+    if [[ -f "${marker}" ]]; then
+        cp -p -- "${marker}" "${marker_backup}"
+        printf '1\n' >"${TRANSACTION_BACKUP_DIR}/persistent/marker-existed"
+    else
+        printf '0\n' >"${TRANSACTION_BACKUP_DIR}/persistent/marker-existed"
     fi
-    INSTALL_STATE_CAPTURED=1
+    PERSISTENT_DATA_STATE_CAPTURED=1
 }
 
 capture_systemd_state() {
-    local path backup_name existed_var egress_dir
+    local path backup_name existed_var egress_dir unit enabled active
     [[ "${NO_SYSTEMD}" -eq 0 ]] || return 0
     command -v systemctl >/dev/null 2>&1 || fail '缺少 systemctl'
     egress_dir="$(dirname -- "${SYSTEMD_EGRESS_DROPIN_PATH}")"
@@ -497,6 +655,34 @@ ${SYSTEMD_HELPER_SERVICE_PATH}	linux-agent-observer-helper.service	SYSTEMD_HELPE
 ${SYSTEMD_HELPER_SOCKET_PATH}	linux-agent-observer-helper.socket	SYSTEMD_HELPER_SOCKET_EXISTED
 ${SYSTEMD_EGRESS_DROPIN_PATH}	10-provider-egress.conf	SYSTEMD_EGRESS_DROPIN_EXISTED
 EOF
+    mkdir -p "${TRANSACTION_BACKUP_DIR}/systemd-extra"
+    : >"${TRANSACTION_BACKUP_DIR}/systemd-extra/files.tsv"
+    while IFS=$'\t' read -r path backup_name; do
+        if [[ -L "${path}" || (-e "${path}" && ! -f "${path}") ]]; then
+            fail "现有 systemd unit 类型非法: ${path}"
+        fi
+        if [[ -f "${path}" ]]; then
+            cp -p -- "${path}" "${TRANSACTION_BACKUP_DIR}/systemd-extra/${backup_name}"
+            printf '%s\t%s\t1\n' "${path}" "${backup_name}" >>"${TRANSACTION_BACKUP_DIR}/systemd-extra/files.tsv"
+        else
+            printf '%s\t%s\t0\n' "${path}" "${backup_name}" >>"${TRANSACTION_BACKUP_DIR}/systemd-extra/files.tsv"
+        fi
+    done <<EOF
+${SYSTEMD_RUNNER_SERVICE_PATH}	linux-agent-runner.service
+${SYSTEMD_RUNNER_SOCKET_PATH}	linux-agent-runner.socket
+${SYSTEMD_HOST_SERVICE_PATH}	linux-agent-host-ops.service
+${SYSTEMD_HOST_SOCKET_PATH}	linux-agent-host-ops.socket
+${SYSTEMD_POLICY_SERVICE_PATH}	linux-agent-policy-writer.service
+${SYSTEMD_POLICY_SOCKET_PATH}	linux-agent-policy-writer.socket
+EOF
+    : >"${TRANSACTION_BACKUP_DIR}/systemd-extra/runtime.tsv"
+    for unit in linux-agent-runner.socket linux-agent-host-ops.socket linux-agent-policy-writer.socket; do
+        enabled=0
+        active=0
+        systemctl is-enabled --quiet "${unit}" >/dev/null 2>&1 && enabled=1
+        systemctl is-active --quiet "${unit}" >/dev/null 2>&1 && active=1
+        printf '%s\t%s\t%s\n' "${unit}" "${enabled}" "${active}" >>"${TRANSACTION_BACKUP_DIR}/systemd-extra/runtime.tsv"
+    done
     if systemctl is-enabled --quiet linux-agent-web.service >/dev/null 2>&1; then
         SYSTEMD_WAS_ENABLED=1
     fi
@@ -512,20 +698,70 @@ EOF
     SYSTEMD_STATE_CAPTURED=1
 }
 
-restore_persistent_config() {
-    local name backup target temp
-    [[ "${CONFIG_STATE_CAPTURED}" -eq 1 ]] || return 0
-    mkdir -p "${PREFIX}/data/config"
-    for name in config.json config.example.json ai-providers.json; do
-        backup="${TRANSACTION_BACKUP_DIR}/config/${name}"
-        target="${PREFIX}/data/config/${name}"
-        if [[ -f "${backup}" ]]; then
-            temp="${target}.rollback.$$"
-            cp -p -- "${backup}" "${temp}" && mv -f -- "${temp}" "${target}"
-        else
-            rm -f -- "${target}"
+stop_transaction_services() {
+    local unit
+    [[ "${NO_SYSTEMD}" -eq 0 ]] || return 0
+    for unit in \
+        linux-agent-web.service \
+        linux-agent-observer-helper.service linux-agent-observer-helper.socket \
+        linux-agent-runner.service linux-agent-runner.socket \
+        linux-agent-host-ops.service linux-agent-host-ops.socket \
+        linux-agent-policy-writer.service linux-agent-policy-writer.socket; do
+        if systemctl is-active --quiet "${unit}" >/dev/null 2>&1; then
+            systemctl stop "${unit}" || fail "升级事务无法停止正在运行的 unit: ${unit}"
         fi
     done
+}
+
+restore_persistent_config() {
+    local name backup target config_root
+    [[ "${CONFIG_STATE_CAPTURED}" -eq 1 ]] || return 0
+    config_root="${PREFIX}/data/config"
+    assert_plain_directory "${PREFIX}/data" || return 1
+    assert_plain_directory "${config_root}" || return 1
+    mkdir -p "${config_root}"
+    for name in config.json config.example.json ai-providers.json; do
+        backup="${TRANSACTION_BACKUP_DIR}/config/${name}"
+        target="${config_root}/${name}"
+        assert_plain_file "${target}" || return 1
+        if [[ -f "${backup}" ]]; then
+            atomic_copy_regular_file "${backup}" "${target}" "$(stat -c '%a' "${backup}")" || return 1
+        else
+            rm -f -- "${target}" || return 1
+        fi
+    done
+}
+
+restore_persistent_data() {
+    local name existed backup target marker marker_backup marker_existed
+    [[ "${PERSISTENT_DATA_STATE_CAPTURED}" -eq 1 ]] || return 0
+    while IFS=$'\t' read -r name existed; do
+        case "${name}" in
+            skills | policies | migration-reports | migration-conflicts) ;;
+            *)
+                warn "忽略未知持久数据回滚项: ${name}"
+                continue
+                ;;
+        esac
+        backup="${TRANSACTION_BACKUP_DIR}/persistent/${name}"
+        target="${PREFIX}/data/${name}"
+        if [[ -L "${target}" || (-e "${target}" && ! -d "${target}") ]]; then
+            return 1
+        fi
+        rm -rf -- "${target}" || return 1
+        if [[ "${existed}" -eq 1 ]]; then
+            cp -a -- "${backup}" "${target}" || return 1
+        fi
+    done <"${TRANSACTION_BACKUP_DIR}/persistent/directories.tsv"
+
+    marker="${PREFIX}/data/.overlay-layout-v1.json"
+    marker_backup="${TRANSACTION_BACKUP_DIR}/persistent/overlay-layout-v1.json"
+    marker_existed="$(<"${TRANSACTION_BACKUP_DIR}/persistent/marker-existed")"
+    if [[ "${marker_existed}" -eq 1 ]]; then
+        cp -p -- "${marker_backup}" "${marker}" || return 1
+    else
+        rm -f -- "${marker}"
+    fi
 }
 
 restore_install_state() {
@@ -540,6 +776,7 @@ restore_install_state() {
 }
 
 restore_systemd_state() {
+    local path backup_name existed unit enabled active
     [[ "${NO_SYSTEMD}" -eq 0 && "${SYSTEMD_STATE_CAPTURED}" -eq 1 ]] || return 0
     if [[ "${SYSTEMD_UNIT_EXISTED}" -eq 1 ]]; then
         cp -p -- "${TRANSACTION_BACKUP_DIR}/linux-agent-web.service" "${SYSTEMD_UNIT_PATH}"
@@ -563,6 +800,16 @@ restore_systemd_state() {
         rm -f -- "${SYSTEMD_EGRESS_DROPIN_PATH}"
         rmdir -- "$(dirname -- "${SYSTEMD_EGRESS_DROPIN_PATH}")" 2>/dev/null || true
     fi
+    if [[ -f "${TRANSACTION_BACKUP_DIR}/systemd-extra/files.tsv" ]]; then
+        while IFS=$'\t' read -r path backup_name existed; do
+            [[ -n "${path}" ]] || continue
+            if [[ "${existed}" -eq 1 ]]; then
+                cp -p -- "${TRANSACTION_BACKUP_DIR}/systemd-extra/${backup_name}" "${path}"
+            else
+                rm -f -- "${path}"
+            fi
+        done <"${TRANSACTION_BACKUP_DIR}/systemd-extra/files.tsv"
+    fi
     systemctl daemon-reload >/dev/null 2>&1 || warn '回滚后 systemd daemon-reload 失败'
     if [[ "${SYSTEMD_HELPER_SOCKET_WAS_ENABLED}" -eq 1 ]]; then
         systemctl enable linux-agent-observer-helper.socket >/dev/null 2>&1 || warn '无法恢复 observer helper socket enabled 状态'
@@ -573,6 +820,21 @@ restore_systemd_state() {
         systemctl start linux-agent-observer-helper.socket >/dev/null 2>&1 || warn '无法恢复 observer helper socket active 状态'
     else
         systemctl stop linux-agent-observer-helper.socket >/dev/null 2>&1 || true
+    fi
+    if [[ -f "${TRANSACTION_BACKUP_DIR}/systemd-extra/runtime.tsv" ]]; then
+        while IFS=$'\t' read -r unit enabled active; do
+            [[ -n "${unit}" ]] || continue
+            if [[ "${enabled}" -eq 1 ]]; then
+                systemctl enable "${unit}" >/dev/null 2>&1 || warn "无法恢复 ${unit} enabled 状态"
+            else
+                systemctl disable "${unit}" >/dev/null 2>&1 || true
+            fi
+            if [[ "${active}" -eq 1 ]]; then
+                systemctl start "${unit}" >/dev/null 2>&1 || warn "无法恢复 ${unit} active 状态"
+            else
+                systemctl stop "${unit}" >/dev/null 2>&1 || true
+            fi
+        done <"${TRANSACTION_BACKUP_DIR}/systemd-extra/runtime.tsv"
     fi
     if [[ "${SYSTEMD_WAS_ENABLED}" -eq 1 ]]; then
         systemctl enable linux-agent-web.service >/dev/null 2>&1 || warn '无法恢复 systemd enabled 状态'
@@ -596,8 +858,10 @@ rollback_transaction() {
     if [[ "${NO_SYSTEMD}" -eq 0 && "${SYSTEMD_STATE_CAPTURED}" -eq 1 &&
         "${current_target}" == "releases/${TRANSACTION_TARGET_VERSION}" ]]; then
         systemctl stop linux-agent-web.service >/dev/null 2>&1 || true
-        systemctl stop linux-agent-observer-helper.socket >/dev/null 2>&1 || true
+        systemctl stop linux-agent-observer-helper.socket linux-agent-runner.socket \
+            linux-agent-host-ops.socket linux-agent-policy-writer.socket >/dev/null 2>&1 || true
     fi
+    acquire_runtime_transaction_lock
 
     if [[ "${current_target}" == "releases/${TRANSACTION_TARGET_VERSION}" ]]; then
         if [[ "${TRANSACTION_MODE}" == "install" ]]; then
@@ -616,11 +880,21 @@ rollback_transaction() {
     fi
 
     restore_persistent_config || warn '无法完整恢复持久配置'
+    restore_persistent_data || warn '无法完整恢复 Skill/策略 overlay'
     restore_install_state || warn '无法完整恢复安装状态'
     restore_observer_helper_state || warn '无法恢复 observer helper capability 状态'
     restore_systemd_state || warn '无法完整恢复 systemd unit 状态'
 
-    if [[ "${TRANSACTION_MODE}" == "install" && "${SERVICE_USER_CREATED_THIS_RUN}" -eq 1 &&
+    if [[ "${RUNNER_USER_CREATED_THIS_RUN}" -eq 1 &&
+        "${NO_SYSTEMD}" -eq 0 && "${RUNNER_USER}" != "root" ]]; then
+        if command -v userdel >/dev/null 2>&1 && id "${RUNNER_USER}" >/dev/null 2>&1; then
+            userdel "${RUNNER_USER}" >/dev/null 2>&1 ||
+                warn "安装失败后无法删除本次创建的 Runner 用户: ${RUNNER_USER}"
+        fi
+    fi
+    RUNNER_USER_CREATED_THIS_RUN=0
+
+    if [[ "${SERVICE_USER_CREATED_THIS_RUN}" -eq 1 &&
         "${NO_SYSTEMD}" -eq 0 && "${SERVICE_USER}" != "root" ]]; then
         if command -v userdel >/dev/null 2>&1 && id "${SERVICE_USER}" >/dev/null 2>&1; then
             userdel "${SERVICE_USER}" >/dev/null 2>&1 ||
@@ -638,6 +912,7 @@ rollback_transaction() {
             rm -rf -- "${PREPARED_RELEASE_DIR}"
         fi
     fi
+    release_runtime_transaction_lock
 }
 
 commit_transaction() {
@@ -647,6 +922,7 @@ commit_transaction() {
         rm -rf -- "${TRANSACTION_BACKUP_DIR}"
     fi
     TRANSACTION_BACKUP_DIR=""
+    release_runtime_transaction_lock
 }
 
 current_version() {
@@ -684,9 +960,13 @@ append_history() {
 set_config_version() {
     local version="$1"
     local config_path="${PREFIX}/data/config/config.json"
-    local config_tmp="${config_path}.tmp.$$"
-    local expected_uid expected_gid
+    local config_dir config_tmp expected_uid expected_gid
+    config_dir="$(dirname -- "${config_path}")"
+    assert_plain_directory "${PREFIX}/data" || fail '持久数据目录类型非法'
+    assert_plain_directory "${config_dir}" || fail '持久配置目录类型非法'
     [[ -f "${config_path}" && ! -L "${config_path}" ]] || fail '持久配置文件缺失或类型非法'
+    config_tmp="$(mktemp "${config_dir}/.${config_path##*/}.XXXXXX")" ||
+        fail '无法创建持久配置 staging 文件'
     if ! jq --arg version "${version}" '
         .remote = ((.remote // {}) + {
             enabled:true,
@@ -703,7 +983,17 @@ set_config_version() {
         SERVICE_GROUP="$(id -gn "${SERVICE_USER}")" || fail "无法确定服务用户主组: ${SERVICE_USER}"
         chown "${SERVICE_USER}:${SERVICE_GROUP}" "${config_tmp}"
     fi
+    fsync_file_and_directory "${config_tmp}" "${config_dir}" || {
+        rm -f -- "${config_tmp}"
+        fail '无法持久化 release 版本 staging 文件'
+    }
+    [[ -f "${config_path}" && ! -L "${config_path}" ]] || {
+        rm -f -- "${config_tmp}"
+        fail '持久配置文件在更新期间发生类型变化'
+    }
     mv -f -- "${config_tmp}" "${config_path}"
+    fsync_file_and_directory "${config_path}" "${config_dir}" ||
+        fail '持久配置 release 版本落盘失败'
     if [[ "${NO_SYSTEMD}" -eq 0 ]]; then
         expected_uid="$(id -u "${SERVICE_USER}")"
         expected_gid="$(id -g "${SERVICE_USER}")"
@@ -754,14 +1044,27 @@ validate_manifest() {
         and ([.skills | to_entries[] | . as $skill | select(
             ($skill.key | test("^[a-z0-9][a-z0-9-]*$") | not)
             or (($skill.value | type) != "object")
+            or (($skill.value.description | type) != "string" or ($skill.value.description | length) == 0)
+            or ($skill.value.risk | IN("low", "medium", "high", "critical") | not)
             or ($skill.value.asset | valid_asset | not)
             or (($skill.value.refs | type) != "array" or ($skill.value.refs | length) == 0)
             or ([$skill.value.refs[] | select(
                 ((.ref | type) != "string")
                 or (.ref | startswith($skill.key + "/") | not)
+                or (.ref | test("^[a-z0-9][a-z0-9-]*/[a-z0-9][a-z0-9-]*$") | not)
                 or ((.description | type) != "string" or (.description | length) == 0)
                 or (.risk | IN("low", "medium", "high", "critical") | not)
+                or ((.execution_class | type) != "string")
+                or ((.capability | type) != "string")
+                or (if .ref == "network-ops-tools/firewall" then
+                        .execution_class != "host_helper" or .capability != "firewall.apply"
+                    elif .ref == "network-ops-tools/hosts-file-editor" then
+                        .execution_class != "host_helper" or .capability != "hosts.apply"
+                    else
+                        .execution_class != "runner" or .capability != ""
+                    end)
             )] | length > 0)
+            or (($skill.value.refs | map(.ref) | length) != ($skill.value.refs | map(.ref) | unique | length))
         )] | length == 0)
         and ([.assets[].name, .skills[].asset.name] as $names
             | ($names | length) == ($names | unique | length))
@@ -952,6 +1255,8 @@ PY
 prepare_release() {
     local release_dir="${PREFIX}/releases/${VERSION}"
     local manifest base_url core_archive web_archive skill_name skill_archive selector
+    assert_plain_directory "${PREFIX}/releases" ||
+        fail "发布目录类型非法: ${PREFIX}/releases"
     [[ ! -e "${release_dir}" && ! -L "${release_dir}" ]] || fail "版本已经安装: ${VERSION}"
     mkdir -p -- "${PREFIX}/releases"
     WORK_DIR="$(mktemp -d "${PREFIX}/.install-staging.XXXXXX")"
@@ -988,7 +1293,13 @@ prepare_release() {
     [[ -f "${WORK_DIR}/release/config/config.example.json" &&
         -f "${WORK_DIR}/release/packaging/linux-agent-web.service" &&
         -f "${WORK_DIR}/release/packaging/linux-agent-observer-helper.service" &&
-        -f "${WORK_DIR}/release/packaging/linux-agent-observer-helper.socket" ]] ||
+        -f "${WORK_DIR}/release/packaging/linux-agent-observer-helper.socket" &&
+        -f "${WORK_DIR}/release/packaging/linux-agent-runner.service" &&
+        -f "${WORK_DIR}/release/packaging/linux-agent-runner.socket" &&
+        -f "${WORK_DIR}/release/packaging/linux-agent-host-ops.service" &&
+        -f "${WORK_DIR}/release/packaging/linux-agent-host-ops.socket" &&
+        -f "${WORK_DIR}/release/packaging/linux-agent-policy-writer.service" &&
+        -f "${WORK_DIR}/release/packaging/linux-agent-policy-writer.socket" ]] ||
         fail '发布物缺少配置或 systemd unit'
 
     # Validate the bundled registry against the bundled configuration. The
@@ -1003,16 +1314,11 @@ prepare_release() {
     rm -f -- "${WORK_DIR}/release/config/config.json"
     rm -rf -- "${WORK_DIR}/release/logs" "${WORK_DIR}/release/tmp"
 
-    mkdir -p "${PREFIX}/data/config" "${PREFIX}/data/logs" "${PREFIX}/data/tmp"
-    cp -- "${WORK_DIR}/release/config/config.example.json" "${PREFIX}/data/config/config.example.json"
-    cp -- "${WORK_DIR}/release/config/ai-providers.json" "${PREFIX}/data/config/ai-providers.json"
-    if [[ ! -e "${PREFIX}/data/config/config.json" ]]; then
-        cp -- "${WORK_DIR}/release/config/config.example.json" "${PREFIX}/data/config/config.json"
-    fi
-    [[ -f "${PREFIX}/data/config/config.json" && ! -L "${PREFIX}/data/config/config.json" ]] ||
-        fail 'config.json 必须是普通文件'
-    chmod 0600 "${PREFIX}/data/config/config.json"
-    chmod 0700 "${PREFIX}/data" "${PREFIX}/data/config" "${PREFIX}/data/logs" "${PREFIX}/data/tmp"
+    mkdir -p "${WORK_DIR}/persistent-config"
+    cp -- "${WORK_DIR}/release/config/config.example.json" \
+        "${WORK_DIR}/persistent-config/config.example.json"
+    cp -- "${WORK_DIR}/release/config/ai-providers.json" \
+        "${WORK_DIR}/persistent-config/ai-providers.json"
 
     rm -rf -- "${WORK_DIR}/release/config"
     ln -s ../../data/config "${WORK_DIR}/release/config"
@@ -1022,6 +1328,101 @@ prepare_release() {
     find "${WORK_DIR}/release" -type d -exec chmod 0755 -- {} +
     mv -- "${WORK_DIR}/release" "${release_dir}"
     PREPARED_RELEASE_DIR="${release_dir}"
+}
+
+prepare_persistent_layout() {
+    local config_source="${WORK_DIR}/persistent-config"
+    local path name target
+    [[ -f "${config_source}/config.example.json" &&
+        ! -L "${config_source}/config.example.json" &&
+        -f "${config_source}/ai-providers.json" &&
+        ! -L "${config_source}/ai-providers.json" ]] ||
+        fail '安装 staging 缺少持久配置模板'
+    for path in data data/config data/logs data/tmp data/skills data/policies data/runner-tmp; do
+        assert_plain_directory "${PREFIX}/${path}" ||
+            fail "持久数据路径必须是普通目录且不能是符号链接: ${PREFIX}/${path}"
+    done
+    mkdir -p "${PREFIX}/data/config" "${PREFIX}/data/logs" "${PREFIX}/data/tmp" \
+        "${PREFIX}/data/skills" "${PREFIX}/data/policies" "${PREFIX}/data/runner-tmp"
+    target="${PREFIX}/data/.runtime.lock"
+    assert_plain_file "${target}" || fail "runtime 事务锁必须是普通文件且不能是符号链接: ${target}"
+    if [[ ! -e "${target}" ]]; then
+        (umask 077 && : >"${target}") || fail '无法创建 runtime 事务锁'
+    fi
+    for name in config.example.json ai-providers.json; do
+        target="${PREFIX}/data/config/${name}"
+        assert_plain_file "${target}" ||
+            fail "持久配置模板必须是普通文件且不能是符号链接: ${target}"
+        atomic_copy_regular_file "${config_source}/${name}" "${target}" 0644 ||
+            fail "无法原子更新持久配置模板: ${name}"
+    done
+    [[ ! -L "${PREFIX}/data/config/config.json" ]] ||
+        fail 'config.json 不能是符号链接'
+    if [[ ! -e "${PREFIX}/data/config/config.json" ]]; then
+        atomic_copy_regular_file "${config_source}/config.example.json" \
+            "${PREFIX}/data/config/config.json" 0600 ||
+            fail '无法原子创建 config.json'
+    fi
+    [[ -f "${PREFIX}/data/config/config.json" && ! -L "${PREFIX}/data/config/config.json" ]] ||
+        fail 'config.json 必须是普通文件'
+    chmod 0600 "${PREFIX}/data/config/config.json"
+    if [[ "${NO_SYSTEMD}" -eq 1 ]]; then
+        chmod 0700 "${PREFIX}/data" "${PREFIX}/data/config" "${PREFIX}/data/logs" \
+            "${PREFIX}/data/tmp" "${PREFIX}/data/skills" "${PREFIX}/data/policies" \
+            "${PREFIX}/data/runner-tmp"
+        chmod 0600 "${PREFIX}/data/.runtime.lock"
+    fi
+}
+
+migrate_managed_layout() {
+    local old_version="${1:-}" legacy_root="" migration_tool migration_result
+    local release_root="${2:-${PREPARED_RELEASE_DIR:-${PREFIX}/current}}"
+    migration_tool="${3:-${PREPARED_RELEASE_DIR:-${PREFIX}/current}/lib/layout_migration.py}"
+    [[ -f "${migration_tool}" && ! -L "${migration_tool}" ]] ||
+        fail '当前版本缺少受管 overlay 迁移器'
+    if [[ -n "${old_version}" ]]; then
+        legacy_root="${PREFIX}/releases/${old_version}"
+        [[ -d "${legacy_root}" && ! -L "${legacy_root}" ]] ||
+            fail "旧 release 不存在或类型非法: ${legacy_root}"
+    fi
+    if ! migration_result="$(python3 "${migration_tool}" \
+        --legacy-root "${legacy_root}" \
+        --release-root "${release_root}" \
+        --data-root "${PREFIX}/data" \
+        --version "${TRANSACTION_TARGET_VERSION}")"; then
+        printf '%s\n' "${migration_result}" >&2
+        fail '受管 Skill/策略 overlay 迁移失败'
+    fi
+    jq -e '.ok == true and (.status == "migrated" or .status == "reconciled" or .status == "already_migrated")' \
+        <<<"${migration_result}" >/dev/null || fail 'overlay 迁移器返回了无效结果'
+    case "$(jq -r '.status' <<<"${migration_result}")" in
+        migrated)
+            info "首次 overlay 迁移完成: $(jq -r '.report // "report unavailable"' <<<"${migration_result}")"
+            ;;
+        reconciled)
+            info "overlay 升级校验完成: $(jq -r '.report // "report unavailable"' <<<"${migration_result}")"
+            ;;
+    esac
+}
+
+validate_persistent_overlays() {
+    local release_root="${1:-${PREPARED_RELEASE_DIR:-${PREFIX}/current}}"
+    local validation policy_name payload
+    if ! validation="$(LINUX_AGENT_RUNTIME_PARENT_LOCK_FD="${RUNTIME_LOCK_FD}" bash "${release_root}/bin/agent" api skills validate '{}')" ||
+        ! jq -e '.ok == true and .validation.ok == true' <<<"${validation}" >/dev/null; then
+        printf '%s\n' "${validation:-Skill validation produced no result}" >&2
+        fail '迁移后的 Skill overlay 校验失败'
+    fi
+    while IFS= read -r policy_name; do
+        [[ -f "${PREFIX}/data/policies/${policy_name}" &&
+            ! -L "${PREFIX}/data/policies/${policy_name}" ]] || continue
+        payload="$(jq -cn --arg path "${policy_name}" '{path:$path}')"
+        if ! validation="$(LINUX_AGENT_RUNTIME_PARENT_LOCK_FD="${RUNTIME_LOCK_FD}" bash "${release_root}/bin/agent" api policy validate "${payload}")" ||
+            ! jq -e '.ok == true and .validation.ok == true' <<<"${validation}" >/dev/null; then
+            printf '%s\n' "${validation:-Policy validation produced no result}" >&2
+            fail "迁移后的策略校验失败: ${policy_name}"
+        fi
+    done < <(find "${release_root}/policies" -maxdepth 1 -type f -name '*.json' -printf '%f\n' | sort)
 }
 
 ensure_service_identity() {
@@ -1054,8 +1455,82 @@ ensure_service_identity() {
         fail 'systemd 服务用户不能映射到 UID 0'
     SERVICE_GROUP="$(id -gn "${SERVICE_USER}")"
     [[ -n "${SERVICE_GROUP}" ]] || fail "无法确定服务用户主组: ${SERVICE_USER}"
-    chown -R "${SERVICE_USER}:${SERVICE_GROUP}" "${PREFIX}/data"
+    ensure_runner_identity
+    configure_managed_data_permissions
     chown -R root:root "${PREFIX}/releases"
+}
+
+ensure_runner_identity() {
+    local uid service_uid service_gid runner_group_id runner_groups
+    [[ "${NO_SYSTEMD}" -eq 0 ]] || return 0
+    if id "${RUNNER_USER}" >/dev/null 2>&1; then
+        uid="$(id -u "${RUNNER_USER}")"
+        [[ "${uid}" != "0" || "${LINUX_AGENT_ALLOW_ROOT_SERVICE_USER_FOR_TESTS:-0}" == "1" ]] ||
+            fail 'Runner 用户不能映射到 UID 0'
+        RUNNER_GROUP="$(id -gn "${RUNNER_USER}")"
+    else
+        command -v useradd >/dev/null 2>&1 || fail '缺少 useradd，无法创建 Runner 用户'
+        if command -v getent >/dev/null 2>&1 && getent group "${RUNNER_GROUP}" >/dev/null 2>&1; then
+            useradd --system --home-dir /var/lib/linux-agent-runner --shell /usr/sbin/nologin \
+                --gid "${RUNNER_GROUP}" "${RUNNER_USER}"
+        elif [[ "${RUNNER_GROUP}" == "${RUNNER_USER}" ]]; then
+            useradd --system --home-dir /var/lib/linux-agent-runner --shell /usr/sbin/nologin \
+                --user-group "${RUNNER_USER}"
+        else
+            fail "自定义 Runner 组不存在: ${RUNNER_GROUP}"
+        fi
+        RUNNER_USER_CREATED=1
+        RUNNER_USER_CREATED_THIS_RUN=1
+        uid="$(id -u "${RUNNER_USER}")"
+    fi
+    service_uid="$(id -u "${SERVICE_USER}")"
+    if [[ "${uid}" == "${service_uid}" && "${LINUX_AGENT_ALLOW_ROOT_SERVICE_USER_FOR_TESTS:-0}" != "1" ]]; then
+        fail 'Runner 与 Web 服务用户必须使用不同 UID'
+    fi
+    if [[ "${LINUX_AGENT_ALLOW_ROOT_SERVICE_USER_FOR_TESTS:-0}" != "1" ]]; then
+        service_gid="$(id -g "${SERVICE_USER}")"
+        runner_group_id="$(id -g "${RUNNER_USER}")"
+        [[ -n "${runner_group_id}" ]] || fail "无法确定 Runner 用户组 GID: ${RUNNER_GROUP}"
+        [[ "${runner_group_id}" != "${service_gid}" ]] ||
+            fail 'Runner 用户组不能与 Web 服务用户主组相同'
+        runner_groups=" $(id -G "${RUNNER_USER}") "
+        [[ "${runner_groups}" != *" ${service_gid} "* ]] ||
+            fail 'Runner 用户不能加入 Web 服务组，否则可访问特权 helper socket'
+    fi
+}
+
+configure_managed_data_permissions() {
+    [[ "${NO_SYSTEMD}" -eq 0 ]] || return 0
+    mkdir -p -- "${PREFIX}/data/config" "${PREFIX}/data/logs" "${PREFIX}/data/tmp" \
+        "${PREFIX}/data/skills" "${PREFIX}/data/policies" "${PREFIX}/data/runner-tmp" \
+        "${PREFIX}/data/migration-reports" "${PREFIX}/data/migration-conflicts"
+    chown root:root "${PREFIX}/data"
+    chmod 0755 "${PREFIX}/data"
+    chown -R "${SERVICE_USER}:${SERVICE_GROUP}" \
+        "${PREFIX}/data/config" "${PREFIX}/data/logs" "${PREFIX}/data/tmp"
+    chmod 0700 "${PREFIX}/data/config" "${PREFIX}/data/logs" "${PREFIX}/data/tmp"
+    chown -R "${SERVICE_USER}:${RUNNER_GROUP}" \
+        "${PREFIX}/data/skills" "${PREFIX}/data/runner-tmp"
+    chown "${SERVICE_USER}:${RUNNER_GROUP}" "${PREFIX}/data/.runtime.lock"
+    chmod 0640 "${PREFIX}/data/.runtime.lock"
+    find "${PREFIX}/data/skills" "${PREFIX}/data/runner-tmp" -type d -exec chmod 2750 -- {} +
+    find "${PREFIX}/data/skills" -type f -exec chmod 0640 -- {} +
+    chown -R "root:${SERVICE_GROUP}" "${PREFIX}/data/policies"
+    find "${PREFIX}/data/policies" -type d -exec chmod 0750 -- {} +
+    find "${PREFIX}/data/policies" -type f -exec chmod 0640 -- {} +
+    chown -R "root:${SERVICE_GROUP}" "${PREFIX}/data/migration-reports"
+    find "${PREFIX}/data/migration-reports" -type d -exec chmod 0750 -- {} +
+    find "${PREFIX}/data/migration-reports" -type f -exec chmod 0640 -- {} +
+    chown -R root:root "${PREFIX}/data/migration-conflicts"
+    chmod 0700 "${PREFIX}/data/migration-conflicts"
+    find "${PREFIX}/data/migration-conflicts" -mindepth 1 -type d -exec chmod 0700 -- {} +
+    find "${PREFIX}/data/migration-conflicts" -type f -exec chmod 0600 -- {} +
+    if [[ -f "${PREFIX}/data/.overlay-layout-v1.json" &&
+        ! -L "${PREFIX}/data/.overlay-layout-v1.json" ]]; then
+        chown root:root "${PREFIX}/data/.overlay-layout-v1.json"
+        chmod 0644 "${PREFIX}/data/.overlay-layout-v1.json"
+    fi
+    chmod 0600 "${PREFIX}/data/config/config.json"
 }
 
 finalize_no_systemd_ownership() {
@@ -1088,7 +1563,8 @@ finalize_no_systemd_ownership() {
     expected_uid="$(id -u "${SERVICE_USER}")"
     expected_gid="$(id -g "${SERVICE_USER}")"
     for path in "${PREFIX}" "${PREFIX}/data" "${PREFIX}/data/config" \
-        "${PREFIX}/data/logs" "${PREFIX}/data/tmp" "$(install_state_path)"; do
+        "${PREFIX}/data/logs" "${PREFIX}/data/tmp" "${PREFIX}/data/skills" \
+        "${PREFIX}/data/policies" "${PREFIX}/data/runner-tmp" "$(install_state_path)"; do
         [[ -e "${path}" && ! -L "${path}" ]] || fail "无 systemd 运行路径缺失或类型非法: ${path}"
         [[ "$(stat -c '%u' "${path}")" == "${expected_uid}" &&
         "$(stat -c '%g' "${path}")" == "${expected_gid}" ]] ||
@@ -1195,7 +1671,90 @@ PY
         fail "Web 服务用户 ${SERVICE_USER} 无法读取配置或写入 data/{config,logs,tmp}"
 }
 
+verify_runner_runtime_access() {
+    local probe="${PREFIX}/data/runner-tmp/.runner-permission-probe.$$"
+    local -a command=(python3 - "${probe}" "${PREFIX}/data/skills"
+        "${PREFIX}/data/config/config.json" "${PREFIX}/data/logs"
+        "${PREFIX}/data/policies")
+    [[ "${NO_SYSTEMD}" -eq 0 ]] || return 0
+    printf 'runner-permission-probe\n' >"${probe}"
+    chown "${SERVICE_USER}:${RUNNER_GROUP}" "${probe}"
+    chmod 0640 "${probe}"
+    if [[ "${EUID}" -eq 0 && "${RUNNER_USER}" != "root" ]]; then
+        command -v runuser >/dev/null 2>&1 ||
+            fail '缺少 runuser，无法验证 Runner 数据权限'
+        command=(runuser -u "${RUNNER_USER}" -- "${command[@]}")
+    fi
+    if ! LINUX_AGENT_TEST_RUNNER_IS_ROOT="$([[ "${RUNNER_USER}" == "root" ]] && printf 1 || printf 0)" \
+        "${command[@]}" <<'PY'; then
+import os
+import sys
+from pathlib import Path
+
+probe, skills, config, logs, policies = map(Path, sys.argv[1:])
+if probe.read_text(encoding="utf-8") != "runner-permission-probe\n":
+    raise SystemExit("runner cannot read shared execution staging")
+if not skills.is_dir() or not os.access(skills, os.R_OK | os.X_OK):
+    raise SystemExit("runner cannot read the user Skill overlay")
+if os.environ.get("LINUX_AGENT_TEST_RUNNER_IS_ROOT") != "1":
+    try:
+        config.read_bytes()
+    except PermissionError:
+        pass
+    else:
+        raise SystemExit("runner can read the protected Agent configuration")
+    for protected in (config.parent, logs, policies):
+        if os.access(protected, os.R_OK | os.X_OK):
+            raise SystemExit(f"runner can traverse protected Agent data: {protected}")
+PY
+        rm -f -- "${probe}"
+        fail "Runner 用户 ${RUNNER_USER} 的隔离权限检查失败"
+    fi
+    rm -f -- "${probe}"
+}
+
 verify_systemd_unit_files() {
+    local output_file
+    [[ "${NO_SYSTEMD}" -eq 0 ]] || return 0
+    command -v systemd-analyze >/dev/null 2>&1 ||
+        fail '缺少 systemd-analyze，无法验证 systemd unit 兼容性'
+    output_file="$(mktemp)"
+    if ! LC_ALL=C systemd-analyze verify \
+        "${SYSTEMD_UNIT_PATH}" "${SYSTEMD_HELPER_SERVICE_PATH}" \
+        "${SYSTEMD_HELPER_SOCKET_PATH}" \
+        "${SYSTEMD_RUNNER_SERVICE_PATH}" "${SYSTEMD_RUNNER_SOCKET_PATH}" \
+        "${SYSTEMD_HOST_SERVICE_PATH}" "${SYSTEMD_HOST_SOCKET_PATH}" \
+        "${SYSTEMD_POLICY_SERVICE_PATH}" "${SYSTEMD_POLICY_SOCKET_PATH}" \
+        >"${output_file}" 2>&1; then
+        sed -n '1,80p' "${output_file}" >&2
+        rm -f -- "${output_file}"
+        fail '当前 systemd 不支持安装包中的 unit 配置'
+    fi
+    rm -f -- "${output_file}"
+    grep -Fxq "User=${RUNNER_USER}" "${SYSTEMD_RUNNER_SERVICE_PATH}" &&
+        grep -Fxq "Group=${RUNNER_GROUP}" "${SYSTEMD_RUNNER_SERVICE_PATH}" &&
+        grep -Fq "/run/linux-agent/runner.sock" "${SYSTEMD_RUNNER_SERVICE_PATH}" &&
+        grep -Fxq "SocketUser=${SERVICE_USER}" "${SYSTEMD_RUNNER_SOCKET_PATH}" &&
+        grep -Fxq "SocketGroup=${SERVICE_GROUP}" "${SYSTEMD_RUNNER_SOCKET_PATH}" &&
+        grep -Fxq 'SocketMode=0600' "${SYSTEMD_RUNNER_SOCKET_PATH}" ||
+        fail 'Runner unit 未落实独立 UID 或仅 Web 可连接的 socket 边界'
+    for output_file in "${SYSTEMD_HELPER_SOCKET_PATH}" "${SYSTEMD_HOST_SOCKET_PATH}" \
+        "${SYSTEMD_POLICY_SOCKET_PATH}"; do
+        grep -Fxq 'SocketUser=root' "${output_file}" &&
+            grep -Fxq "SocketGroup=${SERVICE_GROUP}" "${output_file}" &&
+            grep -Fxq 'SocketMode=0660' "${output_file}" ||
+            fail "特权 helper socket 权限边界无效: ${output_file}"
+    done
+    for output_file in "${SYSTEMD_HELPER_SERVICE_PATH}" "${SYSTEMD_RUNNER_SERVICE_PATH}" \
+        "${SYSTEMD_HOST_SERVICE_PATH}" "${SYSTEMD_POLICY_SERVICE_PATH}"; do
+        grep -Fxq "Environment=LINUX_AGENT_SERVICE_USER=${SERVICE_USER}" "${output_file}" ||
+            fail "helper/Runner unit 未绑定实际 Web 服务用户: ${output_file}"
+    done
+}
+
+verify_source_observer_systemd_unit_files() {
+    local socket_dropin_path="$1"
+    local service_dropin_path="$2"
     local output_file
     [[ "${NO_SYSTEMD}" -eq 0 ]] || return 0
     command -v systemd-analyze >/dev/null 2>&1 ||
@@ -1206,69 +1765,70 @@ verify_systemd_unit_files() {
         "${SYSTEMD_HELPER_SOCKET_PATH}" >"${output_file}" 2>&1; then
         sed -n '1,80p' "${output_file}" >&2
         rm -f -- "${output_file}"
-        fail '当前 systemd 不支持安装包中的 unit 配置'
+        fail '当前 systemd 不支持源码 observer helper unit 配置'
     fi
     rm -f -- "${output_file}"
+    grep -Fxq 'SocketUser=root' "${SYSTEMD_HELPER_SOCKET_PATH}" &&
+        grep -Fxq 'SocketMode=0660' "${SYSTEMD_HELPER_SOCKET_PATH}" &&
+        grep -Fxq "SocketGroup=${SERVICE_GROUP}" "${socket_dropin_path}" ||
+        fail '源码 observer helper socket 权限边界无效'
+    grep -Fxq "Environment=LINUX_AGENT_SERVICE_USER=${SERVICE_USER}" \
+        "${service_dropin_path}" &&
+        grep -Fq 'ExecStart=/usr/bin/python3 ' "${service_dropin_path}" ||
+        fail '源码 observer helper service 未绑定实际 Web 服务用户或隔离 runtime'
 }
 
 install_systemd_unit() {
-    local source="${PREFIX}/current/packaging/linux-agent-web.service"
-    local helper_source="${PREFIX}/current/packaging/linux-agent-observer-helper.service"
-    local socket_source="${PREFIX}/current/packaging/linux-agent-observer-helper.socket"
     local render_root="${WORK_DIR:-${TRANSACTION_BACKUP_DIR:-${PREFIX}}}"
-    local rendered="${render_root}/.linux-agent-web.service.$$"
-    local helper_rendered="${render_root}/.linux-agent-observer-helper.service.$$"
-    local socket_rendered="${render_root}/.linux-agent-observer-helper.socket.$$"
+    local template target rendered
+    local -a installed_units=()
     [[ "${NO_SYSTEMD}" -eq 0 ]] || return 0
     command -v systemctl >/dev/null 2>&1 || fail '缺少 systemctl'
-    [[ -f "${source}" && -f "${helper_source}" && -f "${socket_source}" ]] ||
-        fail '当前版本缺少 systemd unit'
-    python3 - "${source}" "${rendered}" "${helper_source}" "${helper_rendered}" \
-        "${socket_source}" "${socket_rendered}" "/opt/linux-agent" "${PREFIX}" \
-        "linux-agent" "${SERVICE_USER}" "${SERVICE_GROUP}" <<'PY'
+    mkdir -p -- "${SYSTEMD_UNIT_DIR}"
+    while IFS=$'\t' read -r template target; do
+        [[ -f "${template}" && ! -L "${template}" ]] ||
+            fail "当前版本缺少 systemd unit: ${template}"
+        rendered="${render_root}/.${target##*/}.$$"
+        python3 - "${template}" "${rendered}" "${PREFIX}" \
+            "${SERVICE_USER}" "${SERVICE_GROUP}" "${RUNNER_USER}" "${RUNNER_GROUP}" <<'PY'
 import sys
 from pathlib import Path
 
-(
-    source,
-    output,
-    helper_source,
-    helper_output,
-    socket_source,
-    socket_output,
-    old_prefix,
-    prefix,
-    old_user,
-    user,
-    group,
-) = sys.argv[1:]
-
-web = Path(source).read_text(encoding="utf-8")
-web = web.replace(old_prefix, prefix)
-web = web.replace(f"User={old_user}", f"User={user}")
-web = web.replace(f"Group={old_user}", f"Group={group}")
-Path(output).write_text(web, encoding="utf-8")
-
-helper = Path(helper_source).read_text(encoding="utf-8").replace(old_prefix, prefix)
-Path(helper_output).write_text(helper, encoding="utf-8")
-
-socket = Path(socket_source).read_text(encoding="utf-8")
-socket = socket.replace(f"SocketGroup={old_user}", f"SocketGroup={group}")
-Path(socket_output).write_text(socket, encoding="utf-8")
+source, output, prefix, web_user, web_group, runner_user, runner_group = sys.argv[1:]
+text = Path(source).read_text(encoding="utf-8").replace("/opt/linux-agent", prefix)
+replacements = {
+    "User=linux-agent-runner": f"User={runner_user}",
+    "Group=linux-agent-runner": f"Group={runner_group}",
+    "SocketGroup=linux-agent-runner": f"SocketGroup={runner_group}",
+    "User=linux-agent": f"User={web_user}",
+    "Group=linux-agent": f"Group={web_group}",
+    "SocketUser=linux-agent": f"SocketUser={web_user}",
+    "SocketGroup=linux-agent": f"SocketGroup={web_group}",
+    "Environment=LINUX_AGENT_SERVICE_USER=linux-agent": (
+        f"Environment=LINUX_AGENT_SERVICE_USER={web_user}"
+    ),
+}
+text = "".join(replacements.get(line.rstrip("\n"), line.rstrip("\n")) + "\n" for line in text.splitlines())
+Path(output).write_text(text, encoding="utf-8")
 PY
-    mkdir -p -- \
-        "$(dirname -- "${SYSTEMD_UNIT_PATH}")" \
-        "$(dirname -- "${SYSTEMD_HELPER_SERVICE_PATH}")" \
-        "$(dirname -- "${SYSTEMD_HELPER_SOCKET_PATH}")"
-    cp -- "${rendered}" "${SYSTEMD_UNIT_PATH}"
-    cp -- "${helper_rendered}" "${SYSTEMD_HELPER_SERVICE_PATH}"
-    cp -- "${socket_rendered}" "${SYSTEMD_HELPER_SOCKET_PATH}"
-    chmod 0644 "${SYSTEMD_UNIT_PATH}" "${SYSTEMD_HELPER_SERVICE_PATH}" "${SYSTEMD_HELPER_SOCKET_PATH}"
+        cp -- "${rendered}" "${target}"
+        chmod 0644 "${target}"
+        installed_units+=("${target}")
+    done <<EOF
+${PREFIX}/current/packaging/linux-agent-web.service	${SYSTEMD_UNIT_PATH}
+${PREFIX}/current/packaging/linux-agent-observer-helper.service	${SYSTEMD_HELPER_SERVICE_PATH}
+${PREFIX}/current/packaging/linux-agent-observer-helper.socket	${SYSTEMD_HELPER_SOCKET_PATH}
+${PREFIX}/current/packaging/linux-agent-runner.service	${SYSTEMD_RUNNER_SERVICE_PATH}
+${PREFIX}/current/packaging/linux-agent-runner.socket	${SYSTEMD_RUNNER_SOCKET_PATH}
+${PREFIX}/current/packaging/linux-agent-host-ops.service	${SYSTEMD_HOST_SERVICE_PATH}
+${PREFIX}/current/packaging/linux-agent-host-ops.socket	${SYSTEMD_HOST_SOCKET_PATH}
+${PREFIX}/current/packaging/linux-agent-policy-writer.service	${SYSTEMD_POLICY_SERVICE_PATH}
+${PREFIX}/current/packaging/linux-agent-policy-writer.socket	${SYSTEMD_POLICY_SOCKET_PATH}
+EOF
     install_provider_egress_policy
-    restore_selinux_paths "${PREFIX}" "${SYSTEMD_UNIT_PATH}" \
-        "${SYSTEMD_HELPER_SERVICE_PATH}" "${SYSTEMD_HELPER_SOCKET_PATH}" \
-        "${SYSTEMD_EGRESS_DROPIN_PATH}"
+    restore_selinux_paths "${PREFIX}" "${installed_units[@]}" "${SYSTEMD_EGRESS_DROPIN_PATH}"
     verify_service_runtime_access
+    verify_runner_runtime_access
     verify_systemd_unit_files
     systemctl daemon-reload
 }
@@ -1334,7 +1894,47 @@ health_request() {
         return 0
     fi
     observer_helper_health_request || return 1
-    jq -c '. + {observer_helper:{ok:true,status:"ready"}}' <<<"${output}"
+    runner_health_request || return 1
+    host_helper_health_request || return 1
+    policy_helper_health_request || return 1
+    jq -c '. + {observer_helper:{ok:true,status:"ready"}, execution_helpers:{runner:"ready",host_ops:"ready",policy_writer:"ready"}}' <<<"${output}"
+}
+
+runner_health_request() {
+    local client="${PREFIX}/current/lib/runner.py"
+    local socket_path="${LINUX_AGENT_RUNNER_SOCKET:-/run/linux-agent/runner.sock}"
+    [[ -f "${client}" && ! -L "${client}" ]] || return 1
+    if [[ "${EUID}" -eq 0 && "${SERVICE_USER}" != "root" ]]; then
+        runuser -u "${SERVICE_USER}" -- python3 "${client}" ping --socket "${socket_path}"
+    else
+        python3 "${client}" ping --socket "${socket_path}"
+    fi
+}
+
+host_helper_health_request() {
+    local client="${PREFIX}/current/lib/host_ops_helper.py"
+    local socket_path="${LINUX_AGENT_HOST_HELPER_SOCKET:-/run/linux-agent/host-ops.sock}"
+    [[ -f "${client}" && ! -L "${client}" ]] || return 1
+    if [[ "${EUID}" -eq 0 && "${SERVICE_USER}" != "root" ]]; then
+        runuser -u "${SERVICE_USER}" -- python3 "${client}" request \
+            --socket "${socket_path}" ping --params '{}' --summary 'Check host helper readiness'
+    else
+        python3 "${client}" request --socket "${socket_path}" ping \
+            --params '{}' --summary 'Check host helper readiness'
+    fi
+}
+
+policy_helper_health_request() {
+    local client="${PREFIX}/current/lib/policy_helper.py"
+    local socket_path="${LINUX_AGENT_POLICY_HELPER_SOCKET:-/run/linux-agent/policy-writer.sock}"
+    [[ -f "${client}" && ! -L "${client}" ]] || return 1
+    if [[ "${EUID}" -eq 0 && "${SERVICE_USER}" != "root" ]]; then
+        runuser -u "${SERVICE_USER}" -- python3 "${client}" request \
+            --socket "${socket_path}" ping --params '{}' --summary 'Check policy helper readiness'
+    else
+        python3 "${client}" request --socket "${socket_path}" ping \
+            --params '{}' --summary 'Check policy helper readiness'
+    fi
 }
 
 wait_for_health() {
@@ -1360,7 +1960,9 @@ wait_for_health() {
 
 restart_and_check() {
     [[ "${NO_SYSTEMD}" -eq 0 ]] || return 0
-    systemctl restart linux-agent-observer-helper.socket linux-agent-web.service || return 1
+    systemctl restart linux-agent-observer-helper.socket linux-agent-runner.socket \
+        linux-agent-host-ops.socket linux-agent-policy-writer.socket \
+        linux-agent-web.service || return 1
     wait_for_health >/dev/null || return 1
 }
 
@@ -1370,6 +1972,12 @@ run_install_health_check() {
         linux-agent-web.service
         linux-agent-observer-helper.service
         linux-agent-observer-helper.socket
+        linux-agent-runner.service
+        linux-agent-runner.socket
+        linux-agent-host-ops.service
+        linux-agent-host-ops.socket
+        linux-agent-policy-writer.service
+        linux-agent-policy-writer.socket
     )
 
     health_started_at="$(date --iso-8601=seconds)"
@@ -1383,7 +1991,9 @@ run_install_health_check() {
         warn '无法停止安装前已存在的服务进程'
         report_install_health_failure "${health_started_at}"
     elif
-        systemctl start linux-agent-observer-helper.socket linux-agent-web.service
+        systemctl start linux-agent-observer-helper.socket linux-agent-runner.socket \
+            linux-agent-host-ops.socket linux-agent-policy-writer.socket \
+            linux-agent-web.service
     then
         startup_ok=1
         if wait_for_health >/dev/null; then
@@ -1415,6 +2025,12 @@ report_install_health_failure() {
         linux-agent-web.service
         linux-agent-observer-helper.service
         linux-agent-observer-helper.socket
+        linux-agent-runner.service
+        linux-agent-runner.socket
+        linux-agent-host-ops.service
+        linux-agent-host-ops.socket
+        linux-agent-policy-writer.service
+        linux-agent-policy-writer.socket
     )
 
     warn '以下为安装健康检查失败时的 systemd 状态：'
@@ -1424,7 +2040,9 @@ report_install_health_failure() {
         journalctl --no-pager --since "${health_started_at}" -n 80 \
             -u linux-agent-web.service \
             -u linux-agent-observer-helper.service \
-            -u linux-agent-observer-helper.socket >&2 || true
+            -u linux-agent-observer-helper.socket \
+            -u linux-agent-runner.service -u linux-agent-host-ops.service \
+            -u linux-agent-policy-writer.service >&2 || true
     fi
 }
 
@@ -1480,12 +2098,20 @@ do_install() {
     begin_transaction install "" "${VERSION}"
     prepare_release
     release_dir="${PREPARED_RELEASE_DIR}"
-    ensure_service_identity
     capture_systemd_state
+    stop_transaction_services
+    capture_persistent_data_state
+    prepare_persistent_layout
+    acquire_runtime_transaction_lock
+    ensure_service_identity
+    migrate_managed_layout ""
+    configure_managed_data_permissions
     set_config_version "${VERSION}"
+    validate_persistent_overlays
     atomic_switch "${VERSION}"
     if [[ "${NO_SYSTEMD}" -eq 0 ]]; then
         install_systemd_unit
+        release_runtime_transaction_lock
         run_install_health_check || install_health_status=$?
         case "${install_health_status}" in
             0) ;;
@@ -1500,7 +2126,7 @@ do_install() {
     commit_transaction
     info "已安装 ${VERSION}: ${release_dir}"
     if [[ "${NO_SYSTEMD}" -eq 0 ]]; then
-        info '安装后健康检查已通过，临时服务已停止；安装器未修改原有开机启用状态，需要长期运行时请显式执行 systemctl enable --now linux-agent-observer-helper.socket linux-agent-web.service'
+        info '安装后健康检查已通过，临时服务已停止；安装器未修改原有开机启用状态，需要长期运行时请显式执行 systemctl enable --now linux-agent-observer-helper.socket linux-agent-runner.socket linux-agent-host-ops.socket linux-agent-policy-writer.socket linux-agent-web.service'
     fi
 }
 
@@ -1514,11 +2140,19 @@ do_upgrade() {
     begin_transaction upgrade "${old_version}" "${VERSION}"
     prepare_release
     release_dir="${PREPARED_RELEASE_DIR}"
-    ensure_service_identity
     capture_systemd_state
+    stop_transaction_services
+    acquire_runtime_transaction_lock
+    capture_persistent_data_state
+    prepare_persistent_layout
+    ensure_service_identity
+    migrate_managed_layout "${old_version}"
+    configure_managed_data_permissions
     set_config_version "${VERSION}"
+    validate_persistent_overlays
     atomic_switch "${VERSION}"
     install_systemd_unit
+    release_runtime_transaction_lock
     if ! restart_and_check; then
         warn "${VERSION} 健康检查失败，正在自动回滚到 ${old_version}"
         fail '升级失败，已恢复旧版本'
@@ -1532,18 +2166,29 @@ do_upgrade() {
 }
 
 do_rollback() {
-    local old_version target
+    local old_version target target_release migration_tool
     ensure_prefix
     load_existing_service_identity
     validate_service_identity
     old_version="$(current_version)" || fail '未检测到现有安装'
     target="$(rollback_target)" || fail '没有可回滚的历史版本'
     begin_transaction rollback "${old_version}" "${target}"
-    ensure_service_identity
     capture_systemd_state
+    stop_transaction_services
+    acquire_runtime_transaction_lock
+    capture_persistent_data_state
+    ensure_service_identity
+    target_release="${PREFIX}/releases/${target}"
+    migration_tool="${PREFIX}/current/lib/layout_migration.py"
+    [[ -d "${target_release}" && ! -L "${target_release}" ]] || fail '回滚目标 release 不可用'
+    [[ -f "${migration_tool}" && ! -L "${migration_tool}" ]] || fail '当前版本缺少可逆 overlay 迁移器'
+    migrate_managed_layout "${old_version}" "${target_release}" "${migration_tool}"
+    configure_managed_data_permissions
+    validate_persistent_overlays "${target_release}"
     set_config_version "${target}"
     atomic_switch "${target}"
     install_systemd_unit
+    release_runtime_transaction_lock
     if ! restart_and_check; then
         fail '回滚目标健康检查失败，已恢复原版本'
     fi
@@ -1614,14 +2259,17 @@ write_source_observer_socket_dropin() {
 
 install_source_observer_helper_runtime() {
     local source_prefix="$1" install_root="$2" digest runtime_dir staging_dir=""
-    local resolved_root owner mode path helper_sha env_sha runtime_helper_sha runtime_env_sha
+    local resolved_root owner mode path helper_sha env_sha protocol_sha runtime_helper_sha runtime_env_sha runtime_protocol_sha
     local helper_source="${source_prefix}/lib/observer_helper.py"
     local env_source="${source_prefix}/lib/subprocess_env.py"
+    local protocol_source="${source_prefix}/lib/helper_protocol.py"
     [[ -f "${helper_source}" && ! -L "${helper_source}" &&
-        -f "${env_source}" && ! -L "${env_source}" ]] || return 1
+        -f "${env_source}" && ! -L "${env_source}" &&
+        -f "${protocol_source}" && ! -L "${protocol_source}" ]] || return 1
     helper_sha="$(sha256sum "${helper_source}" | awk '{print $1}')" || return 1
     env_sha="$(sha256sum "${env_source}" | awk '{print $1}')" || return 1
-    digest="$(printf '%s\n%s\n' "${helper_sha}" "${env_sha}" | sha256sum | awk '{print $1}')" ||
+    protocol_sha="$(sha256sum "${protocol_source}" | awk '{print $1}')" || return 1
+    digest="$(printf '%s\n%s\n%s\n' "${helper_sha}" "${env_sha}" "${protocol_sha}" | sha256sum | awk '{print $1}')" ||
         return 1
     [[ "${digest}" =~ ^[0-9a-f]{64}$ ]] || return 1
     if [[ -L "${install_root}" || (-e "${install_root}" && ! -d "${install_root}") ]]; then
@@ -1639,13 +2287,16 @@ install_source_observer_helper_runtime() {
     runtime_dir="${install_root}/${digest}"
     if [[ -d "${runtime_dir}" && ! -L "${runtime_dir}" ]]; then
         [[ -f "${runtime_dir}/observer_helper.py" && ! -L "${runtime_dir}/observer_helper.py" &&
-            -f "${runtime_dir}/subprocess_env.py" && ! -L "${runtime_dir}/subprocess_env.py" ]] || return 1
+            -f "${runtime_dir}/subprocess_env.py" && ! -L "${runtime_dir}/subprocess_env.py" &&
+            -f "${runtime_dir}/helper_protocol.py" && ! -L "${runtime_dir}/helper_protocol.py" ]] || return 1
         runtime_helper_sha="$(sha256sum "${runtime_dir}/observer_helper.py" | awk '{print $1}')" || return 1
         runtime_env_sha="$(sha256sum "${runtime_dir}/subprocess_env.py" | awk '{print $1}')" || return 1
-        [[ "${runtime_helper_sha}" == "${helper_sha}" && "${runtime_env_sha}" == "${env_sha}" ]] ||
+        runtime_protocol_sha="$(sha256sum "${runtime_dir}/helper_protocol.py" | awk '{print $1}')" || return 1
+        [[ "${runtime_helper_sha}" == "${helper_sha}" && "${runtime_env_sha}" == "${env_sha}" &&
+            "${runtime_protocol_sha}" == "${protocol_sha}" ]] ||
             return 1
         for path in "${runtime_dir}" "${runtime_dir}/observer_helper.py" \
-            "${runtime_dir}/subprocess_env.py"; do
+            "${runtime_dir}/subprocess_env.py" "${runtime_dir}/helper_protocol.py"; do
             [[ "$(stat -c '%u:%g' "${path}")" == "0:0" ]] || return 1
             mode="$(stat -c '%a' "${path}")" || return 1
             (((8#${mode} & 0022) == 0)) || return 1
@@ -1657,8 +2308,9 @@ install_source_observer_helper_runtime() {
     staging_dir="$(mktemp -d "${install_root}/.staging.XXXXXX")" || return 1
     if ! cp -- "${helper_source}" "${staging_dir}/observer_helper.py" ||
         ! cp -- "${env_source}" "${staging_dir}/subprocess_env.py" ||
+        ! cp -- "${protocol_source}" "${staging_dir}/helper_protocol.py" ||
         ! chmod 0755 "${staging_dir}" "${staging_dir}/observer_helper.py" ||
-        ! chmod 0644 "${staging_dir}/subprocess_env.py" ||
+        ! chmod 0644 "${staging_dir}/subprocess_env.py" "${staging_dir}/helper_protocol.py" ||
         ! chown -R root:root "${staging_dir}"; then
         rm -rf -- "${staging_dir}"
         return 1
@@ -1671,7 +2323,12 @@ install_source_observer_helper_runtime() {
         rm -rf -- "${staging_dir}"
         return 1
     }
-    if [[ "${runtime_helper_sha}" != "${helper_sha}" || "${runtime_env_sha}" != "${env_sha}" ]] ||
+    runtime_protocol_sha="$(sha256sum "${staging_dir}/helper_protocol.py" | awk '{print $1}')" || {
+        rm -rf -- "${staging_dir}"
+        return 1
+    }
+    if [[ "${runtime_helper_sha}" != "${helper_sha}" || "${runtime_env_sha}" != "${env_sha}" ||
+        "${runtime_protocol_sha}" != "${protocol_sha}" ]] ||
         ! mv -- "${staging_dir}" "${runtime_dir}"; then
         rm -rf -- "${staging_dir}"
         return 1
@@ -1680,13 +2337,16 @@ install_source_observer_helper_runtime() {
 }
 
 write_source_observer_service_dropin() {
-    local dropin_dir="$1" dropin_path="$2" runtime_dir="$3" work_dir="$4" target_tmp=""
+    local dropin_dir="$1" dropin_path="$2" runtime_dir="$3" service_user="$4" work_dir="$5" data_dir="$6" target_tmp=""
     [[ "${runtime_dir}" =~ ^/[a-zA-Z0-9_./-]+$ ]] || return 1
+    [[ "${data_dir}" =~ ^/[a-zA-Z0-9_./-]+$ ]] || return 1
     mkdir -p -- "${dropin_dir}" || return 1
-    printf '%s\n%s\n%s\n%s\n' \
+    printf '%s\n%s\n%s\n%s\n%s\n%s\n' \
         '# Managed by linux-agent-install.sh repair-observer for a source checkout.' \
         '[Service]' 'ExecStart=' \
         "ExecStart=/usr/bin/python3 ${runtime_dir}/observer_helper.py serve" \
+        "Environment=LINUX_AGENT_SERVICE_USER=${service_user}" \
+        "Environment=LINUX_AGENT_DATA_DIR=${data_dir}" \
         >"${work_dir}/source-helper-service.conf" || return 1
     target_tmp="$(mktemp "${dropin_dir}/.10-source-runtime.conf.XXXXXX")" || return 1
     if ! cp -- "${work_dir}/source-helper-service.conf" "${target_tmp}" ||
@@ -1940,7 +2600,7 @@ do_repair_observer() {
     source_runtime_dir="$(install_source_observer_helper_runtime "${PREFIX}" "${source_runtime_root}")" ||
         fail '无法安装源码 observer helper runtime'
     if ! write_source_observer_service_dropin \
-        "${service_dropin_dir}" "${service_dropin_path}" "${source_runtime_dir}" "${WORK_DIR}"; then
+        "${service_dropin_dir}" "${service_dropin_path}" "${source_runtime_dir}" "${SERVICE_USER}" "${WORK_DIR}" "${PREFIX}/data"; then
         rollback_source_observer_repair \
             "${socket_dropin_dir}" "${socket_dropin_path}" \
             "${WORK_DIR}/original-socket-group.conf" "${source_dropin_existed}" \
@@ -1951,7 +2611,8 @@ do_repair_observer() {
     fi
     restore_selinux_paths "${source_runtime_root}" "${socket_dropin_path}" \
         "${service_dropin_path}" "$(dirname -- "${socket_path}")"
-    verify_systemd_unit_files
+    verify_source_observer_systemd_unit_files \
+        "${socket_dropin_path}" "${service_dropin_path}"
     if ! systemctl daemon-reload ||
         ! systemctl stop linux-agent-observer-helper.service linux-agent-observer-helper.socket; then
         rollback_source_observer_repair \
@@ -2080,6 +2741,10 @@ validate_uninstall_target() {
             SERVICE_USER="${INSTALL_STATE_SERVICE_USER}"
             SERVICE_USER_CREATED="${INSTALL_STATE_SERVICE_USER_CREATED}"
         fi
+        if [[ -n "${INSTALL_STATE_RUNNER_USER}" ]]; then
+            RUNNER_USER="${INSTALL_STATE_RUNNER_USER}"
+            RUNNER_USER_CREATED="${INSTALL_STATE_RUNNER_USER_CREATED}"
+        fi
         [[ "${INSTALL_STATE_NO_SYSTEMD}" -eq "${NO_SYSTEMD}" ]] ||
             fail '当前安装的 systemd 模式与本次参数不一致'
         state_installed="$(jq -r '.installed' "${state_path}")"
@@ -2099,7 +2764,16 @@ do_uninstall() {
         stop_and_disable_unit linux-agent-web.service
         stop_and_disable_unit linux-agent-observer-helper.socket
         stop_and_disable_unit linux-agent-observer-helper.service
+        stop_and_disable_unit linux-agent-runner.socket
+        stop_and_disable_unit linux-agent-runner.service
+        stop_and_disable_unit linux-agent-host-ops.socket
+        stop_and_disable_unit linux-agent-host-ops.service
+        stop_and_disable_unit linux-agent-policy-writer.socket
+        stop_and_disable_unit linux-agent-policy-writer.service
         rm -f -- "${SYSTEMD_UNIT_PATH}" "${SYSTEMD_HELPER_SERVICE_PATH}" "${SYSTEMD_HELPER_SOCKET_PATH}" \
+            "${SYSTEMD_RUNNER_SERVICE_PATH}" "${SYSTEMD_RUNNER_SOCKET_PATH}" \
+            "${SYSTEMD_HOST_SERVICE_PATH}" "${SYSTEMD_HOST_SOCKET_PATH}" \
+            "${SYSTEMD_POLICY_SERVICE_PATH}" "${SYSTEMD_POLICY_SOCKET_PATH}" \
             "${SYSTEMD_EGRESS_DROPIN_PATH}"
         rmdir -- "$(dirname -- "${SYSTEMD_EGRESS_DROPIN_PATH}")" 2>/dev/null || true
         systemctl daemon-reload
@@ -2113,6 +2787,11 @@ do_uninstall() {
             -n "${SERVICE_USER}" ]] && id "${SERVICE_USER}" >/dev/null 2>&1; then
             command -v userdel >/dev/null 2>&1 || fail '缺少 userdel，无法删除安装器创建的服务用户'
             userdel "${SERVICE_USER}" || fail "无法删除安装器创建的服务用户: ${SERVICE_USER}"
+        fi
+        if [[ "${RUNNER_USER_CREATED}" -eq 1 && "${RUNNER_USER}" != "root" &&
+            -n "${RUNNER_USER}" ]] && id "${RUNNER_USER}" >/dev/null 2>&1; then
+            command -v userdel >/dev/null 2>&1 || fail '缺少 userdel，无法删除安装器创建的 Runner 用户'
+            userdel "${RUNNER_USER}" || fail "无法删除安装器创建的 Runner 用户: ${RUNNER_USER}"
         fi
     else
         if [[ "${NO_SYSTEMD}" -eq 1 ]]; then

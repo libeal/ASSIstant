@@ -18,7 +18,7 @@ source "${ROOT_DIR}/lib/protocol.sh"
 # shellcheck source=../lib/api.sh
 source "${ROOT_DIR}/lib/api.sh"
 
-jq -e '.web.token == "0123"' "${ROOT_DIR}/config/config.example.json" >/dev/null
+jq -e '.web.token == "" and .web.sensitive_edits_enabled == true' "${ROOT_DIR}/config/config.example.json" >/dev/null
 linux_agent_init_env "${ROOT_DIR}"
 
 linux_agent_config_validate_web_metrics '{}'
@@ -28,6 +28,19 @@ if linux_agent_config_validate_web_metrics '{"web":{"metrics_enabled":"false"}}'
     printf 'web.metrics_enabled string unexpectedly passed strict validation\n' >&2
     exit 1
 fi
+linux_agent_config_validate_web_sensitive_edits '{}'
+linux_agent_config_validate_web_sensitive_edits '{"web":{}}'
+linux_agent_config_validate_web_sensitive_edits '{"web":{"sensitive_edits_enabled":true}}'
+linux_agent_config_validate_web_sensitive_edits '{"web":{"sensitive_edits_enabled":false}}'
+for invalid_sensitive_config in \
+    '{"web":null}' \
+    '{"web":"malformed"}' \
+    '{"web":{"sensitive_edits_enabled":"true"}}'; do
+    if linux_agent_config_validate_web_sensitive_edits "${invalid_sensitive_config}"; then
+        printf 'invalid web.sensitive_edits_enabled configuration unexpectedly passed strict validation\n' >&2
+        exit 1
+    fi
+done
 linux_agent_config_validate_provider_resilience '{}'
 linux_agent_config_validate_provider_resilience '{"provider_resilience":{"enabled":true,"max_attempts":3,"backoff_initial_ms":1,"backoff_max_ms":2,"circuit_failure_threshold":2,"circuit_open_sec":30,"failover":[]}}'
 linux_agent_config_validate_provider_resilience '{"provider_resilience":{"failover":[{"provider":"openai_compatible","api_key_env":"LINUX_AGENT_FAILOVER_API_KEY"}]}}'
@@ -48,6 +61,15 @@ fi
 jq -e '
     . as $schema
     | .schema_version == 1
+    and .protocol_version == "1.2.0"
+    and (.execution_isolation | sort) == ([
+        "runner_uid",
+        "degraded_same_uid",
+        "host_helper",
+        "unavailable"
+    ] | sort)
+    and (.helper_status | sort) == (["ready", "unavailable"] | sort)
+    and (.result_status | index("degraded") != null)
     and (.provider_normalization.aliases | type == "object")
     and (.provider_normalization.prefix_rules | type == "array")
     and (.job_status | type == "array" and length > 0)
@@ -60,6 +82,23 @@ jq -e '
         "audit_write_blocked",
         "audit_integrity_broken",
         "audit_export_failed",
+        "readonly_config_field",
+        "sensitive_edits_disabled",
+        "invalid_skill_output",
+        "skill_reported_failure",
+        "skill_exit_failed",
+        "runner_unavailable",
+        "runner_rejected",
+        "helper_unavailable",
+        "helper_failed",
+        "helper_rejected",
+        "observer_helper_unavailable",
+        "restore_failed",
+        "restore_requires_admin",
+        "restore_unavailable",
+        "restore_busy",
+        "restore_conflict",
+        "invalid_backup",
         "metrics_disabled",
         "sudo_required",
         "auditctl_not_found",
@@ -299,7 +338,7 @@ linux_agent_api_dispatch_raw() {
     printf '%s\n' '{"ok":true,"status":"ok"}'
 }
 linux_agent_api_dispatch >"${dispatch_output}"
-jq -e '.ok == true and .status == "ok" and .schema_version == 1 and .protocol_version == "1.0.0"' \
+jq -e '.ok == true and .status == "ok" and .schema_version == 1 and .protocol_version == "1.2.0"' \
     "${dispatch_output}" >/dev/null
 [[ "${LINUX_AGENT_LAST_BUSINESS_STATUS}" == "blocked" ]]
 jq -e 'length == 1 and .[0].purpose == "system_prompt"' <<<"${LINUX_AGENT_AI_FILE_MANIFEST}" >/dev/null
@@ -365,6 +404,11 @@ cp "${project}/config/config.example.json" "${project}/config/config.json"
 
 tools_json="$(cd "${project}" && LINUX_AGENT_API_MODE=1 bash bin/agent api tools list '{}')"
 jq -e 'has("ok") and (.ok | type == "boolean")' <<<"${tools_json}" >/dev/null
+unknown_terminal_json="$(cd "${project}" && LINUX_AGENT_API_MODE=1 bash bin/agent api terminal run \
+    '{"command":"vendor-diagnostic --status","approve":true}')"
+jq -e '.ok == false and .status == "blocked" and .code == "forbidden"
+    and ([.timeline[].output_blocks[]?.json.findings[]? | select(.code == "AST_UNKNOWN_COMMAND")] | length) == 1' \
+    <<<"${unknown_terminal_json}" >/dev/null
 
 # 7) Frontend provider normalization must match schema/domain.json.
 if command -v node >/dev/null 2>&1; then

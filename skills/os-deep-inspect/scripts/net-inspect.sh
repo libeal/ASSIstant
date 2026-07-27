@@ -41,10 +41,21 @@ case "${protocol}" in
 esac
 
 run_text() {
+    local command="${1:-}"
+    [[ -n "${command}" ]] || return 127
+    shift
     if command -v timeout >/dev/null 2>&1; then
-        timeout 8s "$@" 2>&1 || true
+        case "${command}" in
+            ss) timeout 8s ss "$@" 2>&1 || true ;;
+            netstat) timeout 8s netstat "$@" 2>&1 || true ;;
+            *) return 127 ;;
+        esac
     else
-        "$@" 2>&1 || true
+        case "${command}" in
+            ss) ss "$@" 2>&1 || true ;;
+            netstat) netstat "$@" 2>&1 || true ;;
+            *) return 127 ;;
+        esac
     fi
 }
 

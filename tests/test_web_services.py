@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 
+import io
 import json
 import os
 import sys
 import tempfile
+import urllib.error
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -25,6 +27,7 @@ from provider_security import (  # noqa: E402
 )
 import policy as policy_module  # noqa: E402
 import provider as provider_module  # noqa: E402
+import pinned_http  # noqa: E402
 from policy import PolicyService  # noqa: E402
 from skills import SkillService  # noqa: E402
 
@@ -124,6 +127,80 @@ class SkillServiceTests(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "does not match"):
             self.service.list_files()
+
+    @staticmethod
+    def _write_manifest_package(root, name, script, execution_class, capability):
+        package = root / name
+        scripts = package / "scripts"
+        scripts.mkdir(parents=True)
+        (package / "SKILL.md").write_text(
+            f"---\nname: {name}\ndescription: Test package\n---\n",
+            encoding="utf-8",
+        )
+        (scripts / script).write_text("#!/usr/bin/env bash\n", encoding="utf-8")
+        (package / "manifest.json").write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "name": name,
+                    "description": "Test package",
+                    "scripts": [
+                        {
+                            "name": script,
+                            "risk": "high",
+                            "execution_class": execution_class,
+                            "capability": capability,
+                        }
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+
+    def test_user_overlay_cannot_override_builtin_package(self):
+        user_root = Path(self.temp.name) / "user-skills"
+        self._write_manifest_package(self.root, "ops-basic", "inspect.sh", "runner", "")
+        self._write_manifest_package(user_root, "ops-basic", "inspect.sh", "runner", "")
+        service = SkillService(self.root, user_skills_root=user_root, require_manifest_file=True)
+
+        with self.assertRaisesRegex(ValueError, "conflicts with built-in"):
+            service.list_files()
+
+    def test_user_overlay_root_symlink_is_rejected_before_enumeration(self):
+        outside = Path(self.temp.name) / "outside-skills"
+        outside.mkdir()
+        linked_root = Path(self.temp.name) / "linked-skills"
+        os.symlink(outside, linked_root)
+
+        with self.assertRaisesRegex(ValueError, "Skill root"):
+            SkillService(self.root, user_skills_root=linked_root)
+
+    def test_user_overlay_cannot_forge_host_helper_capability(self):
+        user_root = Path(self.temp.name) / "user-skills"
+        self._write_manifest_package(
+            user_root,
+            "custom-network",
+            "firewall.sh",
+            "host_helper",
+            "firewall.apply",
+        )
+        service = SkillService(self.root, user_skills_root=user_root, require_manifest_file=True)
+
+        with self.assertRaisesRegex(ValueError, "only use runner"):
+            service.list_files()
+
+    def test_builtin_host_helper_allowlist_uses_exact_package_and_ref(self):
+        self._write_manifest_package(
+            self.root,
+            "custom-network",
+            "firewall.sh",
+            "host_helper",
+            "firewall.apply",
+        )
+        service = SkillService(self.root, require_manifest_file=True)
+
+        with self.assertRaisesRegex(ValueError, "not allowlisted"):
+            service.list_files()
 
 
 class ProviderServiceTests(unittest.TestCase):
@@ -243,6 +320,90 @@ class ProviderServiceTests(unittest.TestCase):
         self.assertEqual(self.fetches[0][2], 60)
         self.assertEqual(self.fetches[0][1]["User-Agent"], "LinuxAgentWeb/1.0")
 
+    def test_default_fetcher_revalidates_each_redirect_hop(self):
+        requests = []
+
+        class Response:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def read(self, _limit=-1):
+                return b'{"data":[{"id":"redirected-model"}]}'
+
+        class Opener:
+            def __init__(self, redirect):
+                self.redirect = redirect
+
+            def open(self, request, timeout):
+                requests.append((request.full_url, dict(request.header_items()), timeout))
+                if self.redirect:
+                    raise urllib.error.HTTPError(
+                        request.full_url,
+                        302,
+                        "redirect",
+                        {"Location": "https://api.example/v1/redirected-models"},
+                        io.BytesIO(),
+                    )
+                return Response()
+
+        with mock.patch.object(
+            pinned_http,
+            "build_pinned_opener",
+            side_effect=[Opener(True), Opener(False)],
+        ) as build_opener:
+            result = self.service(fetch_json=None).list_models(
+                {"provider": "openai_compatible"}
+            )
+
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(result["models"], [{"id": "redirected-model"}])
+        self.assertEqual(build_opener.call_count, 2)
+        self.assertEqual(len(self.inspected), 3)
+        self.assertEqual(
+            [item[0] for item in self.inspected],
+            [
+                "https://api.example/v1/models",
+                "https://api.example/v1/models",
+                "https://api.example/v1/redirected-models",
+            ],
+        )
+        self.assertEqual(len(requests), 2)
+        self.assertEqual(requests[1][0], "https://api.example/v1/redirected-models")
+        self.assertEqual(requests[1][1]["Authorization"], "Bearer configured-secret")
+
+    def test_credentialed_redirect_to_untrusted_host_is_rejected_before_second_connection(self):
+        requests = []
+
+        class Opener:
+            def open(self, request, timeout):
+                requests.append((request.full_url, dict(request.header_items()), timeout))
+                raise urllib.error.HTTPError(
+                    request.full_url,
+                    302,
+                    "redirect",
+                    {"Location": "https://attacker.example/collect"},
+                    io.BytesIO(),
+                )
+
+        with mock.patch.object(
+            pinned_http,
+            "build_pinned_opener",
+            return_value=Opener(),
+        ) as build_opener:
+            result = self.service(fetch_json=None).list_models(
+                {"provider": "openai_compatible"}
+            )
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["status"], "provider_host_not_allowed")
+        self.assertEqual(build_opener.call_count, 1)
+        self.assertEqual(len(requests), 1)
+        self.assertIn("attacker.example", self.inspected[-1][0])
+        self.assertNotIn("configured-secret", json.dumps(result))
+
     def test_pinned_https_handler_uses_context_without_legacy_hostname_argument(self):
         handler = provider_module._PinnedHTTPSHandler(["203.0.113.10"])
         response = mock.sentinel.response
@@ -340,7 +501,16 @@ class PolicyServiceTests(unittest.TestCase):
     def tearDown(self):
         self.temp.cleanup()
 
-    def service(self, audit=None):
+    def service(
+        self,
+        audit=None,
+        config_updater=None,
+        overlay_root=None,
+        effective_uid=0,
+        root=None,
+        privileged_writer=None,
+        managed_execution=None,
+    ):
         def write_config(config):
             self.config = dict(config)
             self.config_writes.append(dict(config))
@@ -354,15 +524,26 @@ class PolicyServiceTests(unittest.TestCase):
         audit_writer = audit or (
             lambda stage, payload: self.audit_events.append((stage, payload))
         )
+        options = {
+            "config_reader": lambda: self.config,
+            "config_writer": write_config,
+            "agent_api": agent_api,
+            "audit": audit_writer,
+            "config_public_state": lambda: {"ok": True, "config": self.config},
+            "config_updater": config_updater,
+            "effective_uid": lambda: effective_uid,
+            "process_runner": lambda *_args, **_kwargs: self.fail(
+                "root tests must not run sudo"
+            ),
+            "privileged_writer": privileged_writer,
+        }
+        if managed_execution is not None:
+            options["managed_execution"] = managed_execution
+        if overlay_root is not None:
+            options["overlay_root"] = overlay_root
         return PolicyService(
-            self.root,
-            config_reader=lambda: self.config,
-            config_writer=write_config,
-            agent_api=agent_api,
-            audit=audit_writer,
-            config_public_state=lambda: {"ok": True, "config": self.config},
-            effective_uid=lambda: 0,
-            process_runner=lambda *_args, **_kwargs: self.fail("root tests must not run sudo"),
+            self.root if root is None else root,
+            **options,
         )
 
     def test_policy_paths_reject_escape_hidden_suffix_and_symlink(self):
@@ -448,6 +629,107 @@ class PolicyServiceTests(unittest.TestCase):
         self.assertEqual(1, len(operation_ids))
         self.assertEqual(self.audit_events[-1][1]["path"], "example.json")
 
+    def test_policy_write_rechecks_gate_immediately_before_replace(self):
+        before = self.policy_path.read_bytes()
+        original_fsync = policy_module._fsync_file
+
+        def disable_after_staged_file_is_synced(path):
+            original_fsync(path)
+            self.config["web"] = {"sensitive_edits_enabled": False}
+
+        with mock.patch.object(
+            policy_module,
+            "_fsync_file",
+            side_effect=disable_after_staged_file_is_synced,
+        ), mock.patch.object(policy_module.os, "replace", wraps=os.replace) as replace:
+            result = self.service().write_file("example.json", '{"enabled":true}')
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["status"], "sensitive_edits_disabled")
+        self.assertEqual(before, self.policy_path.read_bytes())
+        replace.assert_not_called()
+        self.assertEqual(
+            list((self.root / "tmp" / "web" / "policy-edits").glob("*.tmp")),
+            [],
+        )
+
+    def test_source_write_creates_missing_policy_overlay(self):
+        overlay = self.root / "data" / "policies"
+
+        result = self.service(overlay_root=overlay, effective_uid=1000).write_file(
+            "example.json", '{"enabled":true}'
+        )
+
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(result["method"], "direct")
+        self.assertEqual(
+            json.loads((overlay / "example.json").read_text(encoding="utf-8")),
+            {"enabled": True},
+        )
+        self.assertEqual(
+            json.loads(self.policy_path.read_text(encoding="utf-8")),
+            {"enabled": False},
+        )
+
+    def test_managed_policy_and_guard_propagate_helper_cleanup_warning(self):
+        managed_root = Path(self.temp.name) / "releases" / "current"
+        (managed_root / "policies").mkdir(parents=True)
+        (managed_root / "policies" / "example.json").write_text(
+            '{"enabled":false}\n', encoding="utf-8"
+        )
+        overlay = Path(self.temp.name) / "data" / "policies"
+
+        def privileged_writer(operation, params):
+            if operation == "policy.write":
+                return {
+                    "ok": True,
+                    "status": "saved",
+                    "warning": "policy_cleanup_pending",
+                }
+            self.config["command_guard"] = {"enabled": params["enabled"]}
+            return {
+                "ok": True,
+                "status": "updated",
+                "warning": "policy_cleanup_pending",
+            }
+
+        service = self.service(
+            root=managed_root,
+            overlay_root=overlay,
+            privileged_writer=privileged_writer,
+        )
+        policy_result = service.write_file("example.json", '{"enabled":true}')
+        guard_result = service.update_command_guard(True)
+
+        self.assertEqual(policy_result["warning"], "policy_cleanup_pending")
+        self.assertEqual(guard_result["warning"], "policy_cleanup_pending")
+
+    def test_no_systemd_release_layout_writes_policy_without_helper(self):
+        release_root = Path(self.temp.name) / "releases" / "v1"
+        (release_root / "policies").mkdir(parents=True)
+        (release_root / "policies" / "example.json").write_text(
+            '{"enabled":false}\n', encoding="utf-8"
+        )
+        overlay = Path(self.temp.name) / "data" / "policies"
+        service = self.service(
+            root=release_root,
+            overlay_root=overlay,
+            effective_uid=1000,
+            managed_execution=False,
+            privileged_writer=lambda *_args: self.fail(
+                "no-systemd policy write must not call the helper"
+            ),
+        )
+
+        result = service.write_file("example.json", '{"enabled":true}')
+
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(result["method"], "direct")
+        self.assertEqual(
+            json.loads((overlay / "example.json").read_text(encoding="utf-8")),
+            {"enabled": True},
+        )
+
     def test_audit_intent_failure_prevents_policy_write(self):
         before = self.policy_path.read_bytes()
 
@@ -508,6 +790,45 @@ class PolicyServiceTests(unittest.TestCase):
             self.audit_events[-2][1]["operation_id"],
             self.audit_events[-1][1]["operation_id"],
         )
+
+    def test_sensitive_edit_switch_blocks_only_mutations(self):
+        self.config["web"] = {"sensitive_edits_enabled": False}
+        before = self.policy_path.read_bytes()
+
+        read = self.service().read_file("example.json")
+        validation = self.service().validate("example.json", '{"enabled":true}')
+        write = self.service().write_file("example.json", '{"enabled":true}')
+        guard = self.service().update_command_guard(True)
+
+        self.assertTrue(read["ok"])
+        self.assertTrue(validation["ok"])
+        self.assertEqual(write["status"], "sensitive_edits_disabled")
+        self.assertEqual(guard["status"], "sensitive_edits_disabled")
+        self.assertEqual(before, self.policy_path.read_bytes())
+        self.assertFalse(self.config["command_guard"]["enabled"])
+        self.assertEqual([], self.audit_events)
+
+    def test_command_guard_rechecks_gate_inside_config_transaction(self):
+        def update_after_admin_disables(mutator):
+            self.config["web"] = {"sensitive_edits_enabled": False}
+            mutator(self.config)
+            self.config_writes.append(dict(self.config))
+
+        result = self.service(
+            config_updater=update_after_admin_disables
+        ).update_command_guard(True)
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["status"], "sensitive_edits_disabled")
+        self.assertFalse(self.config["command_guard"]["enabled"])
+        self.assertEqual(self.config_writes, [])
+
+    def test_legacy_sudo_endpoint_never_invokes_process_runner(self):
+        result = self.service().sudo_check("must-not-be-used")
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["status"], "authorization_not_required")
+        self.assertEqual(result["method"], "web_bearer")
 
     def test_audit_intent_failure_prevents_command_guard_update(self):
         def fail_audit(_stage, _payload):

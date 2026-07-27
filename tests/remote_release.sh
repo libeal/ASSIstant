@@ -77,7 +77,12 @@ jq -e '
     | .spdxVersion == "SPDX-2.3"
     and .SPDXID == "SPDXRef-DOCUMENT"
     and .creationInfo.created == "1970-01-01T00:00:00Z"
-    and ([.packages[].name] | sort == ["bash", "curl", "jq", "linux-agent", "python3"])
+    and ([.packages[].name] | sort == ["bash", "curl", "jq", "linux-agent", "python3", "util-linux"])
+    and ([.relationships[] | select(
+        .spdxElementId == "SPDXRef-Package-linux-agent"
+        and .relationshipType == "DEPENDS_ON"
+        and .relatedSpdxElement == "SPDXRef-Package-util-linux"
+    )] | length == 1)
     and ([.files[].checksums[] | select(.algorithm == "SHA256")] | length == ($document.files | length))
 ' "${first}/sbom.spdx.json" >/dev/null
 sbom_files="$(jq -r '.files[].fileName' "${first}/sbom.spdx.json" | sort)"

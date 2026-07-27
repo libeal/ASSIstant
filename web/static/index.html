@@ -47,6 +47,7 @@
           </div>
           <div class="status">
             <span class="pill" id="connectionState">offline</span>
+            <span class="pill risk high" id="executionIsolation">execution: unavailable</span>
             <button class="pill status-action" id="observerAuditBtn" type="button">observer: <span id="observerState">pending</span></button>
             <span class="pill">audit: <span id="activeBoundary">safe_summary</span></span>
             <span class="pill">thinking_summary: optional</span>
@@ -344,20 +345,14 @@
             <div class="stack">
               <div class="panel">
                 <div class="panel-header">
-                  <div><h2>策略</h2><p>集中呈现正则审查表与 audit 边界策略；编辑能力默认锁定，核对服务器密码后才开放。</p></div>
-                  <span class="pill risk medium" id="policyLockPill">locked</span>
+                  <div><h2>策略</h2><p>集中呈现正则审查表与 audit 边界策略；保存权限由服务器敏感编辑配置控制。</p></div>
+                  <span class="pill risk medium" id="policyLockPill">loading</span>
                 </div>
                 <div class="split">
                   <div class="locked-note">
-                    <strong class="white">服务器密码核对</strong>
-                    <p class="small">密码只用于当前编辑授权，不在前端持久保存；未解锁时只能查看策略。</p>
-                    <div class="form-grid action-gap">
-                      <input class="field" id="policyPassword" type="password" autocomplete="current-password" placeholder="输入服务器密码以解锁编辑">
-                      <div class="toolbar">
-                        <button class="btn" id="policyUnlockBtn" type="button">核对并允许编辑</button>
-                        <button class="btn secondary" id="policyLockBtn" type="button">锁定</button>
-                      </div>
-                    </div>
+                    <strong class="white">授权边界</strong>
+                    <p class="small">已认证的 Web Bearer Token 授权受限写入；服务器不会收集或传递 sudo 密码。</p>
+                    <div class="kv"><div class="k">control</div><div class="v mono">web.sensitive_edits_enabled</div></div>
                   </div>
                   <div class="locked-note">
                     <strong class="white">编辑状态</strong>
@@ -393,7 +388,7 @@
 
               <div class="split-wide">
                 <div class="panel">
-                  <div class="panel-header"><div><h3>正则审查表</h3><p>阻断规则、警告规则和原因一屏可查；解锁后可编辑。</p></div><button class="btn secondary policy-edit" id="policyAddRuleBtn" type="button" disabled>新增规则</button></div>
+                  <div class="panel-header"><div><h3>正则审查表</h3><p>阻断规则、警告规则和原因一屏可查；最终保存受服务器敏感编辑开关控制。</p></div><button class="btn secondary policy-edit" id="policyAddRuleBtn" type="button" disabled>新增规则</button></div>
                   <div class="table-scroll" role="region" aria-label="正则审查规则列表，可左右滑动查看完整信息" tabindex="0">
                     <table class="table">
                     <thead><tr><th>级别</th><th>正则 / 关键词</th><th>动作</th><th>原因</th></tr></thead>
@@ -420,7 +415,7 @@
                   </div>
                   <div class="divider"></div>
                   <div id="policyBoundaryOptions" hidden>
-                    <div class="panel-header"><div><h3>可选检测边界</h3><p>服务器密码核对后才展示可选观察范围。</p></div></div>
+                    <div class="panel-header"><div><h3>可选检测边界</h3><p>可查看、编辑和校验草稿；最终保存受服务器敏感编辑开关控制。</p></div></div>
                     <div class="list" id="policyBoundaryOptionsList"></div>
                     <div class="divider"></div>
                   </div>
@@ -509,12 +504,12 @@
         <div class="panel-header">
           <div>
             <h2 id="observerAuditTitle">启用内核审计</h2>
-            <p>Web 进程没有终端交互权限，需要在浏览器中核对一次服务器密码来启用 auditd observer。</p>
+            <p id="observerAuditDescription">正在检查当前部署可用的内核审计授权方式。</p>
           </div>
           <span class="pill risk medium" id="observerAuditStatus">pending</span>
         </div>
-        <label class="small" for="observerAuditPassword">服务器密码
-          <input class="field" id="observerAuditPassword" type="password" autocomplete="current-password" placeholder="输入服务器密码">
+        <label class="small" id="observerAuditPasswordField" for="observerAuditPassword" hidden>服务器 sudo 密码
+          <input class="field" id="observerAuditPassword" type="password" autocomplete="current-password" placeholder="仅发送给本机 sudo 标准输入">
         </label>
         <pre class="code observer-dialog-output" id="observerAuditOutput">等待授权。</pre>
         <div class="approval-actions">
@@ -534,7 +529,7 @@
           <button class="btn secondary" id="policyFileDialogClose" type="button">关闭</button>
         </div>
         <pre class="policy-file-preview" id="policyFilePreview">暂无文件内容。</pre>
-        <textarea class="textarea policy-file-editor policy-edit mono" id="policyEditor" disabled hidden aria-label="编辑策略文件"></textarea>
+        <textarea class="textarea policy-file-editor policy-edit mono" id="policyEditor" aria-label="编辑策略文件"></textarea>
         <div class="toolbar policy-file-dialog-actions">
           <button class="btn secondary" id="policyDialogValidateBtn" type="button">校验当前文件</button>
           <button class="btn policy-edit" id="policySaveBtn" type="button" disabled>保存当前文件</button>

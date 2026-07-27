@@ -11,7 +11,7 @@ Linux 运维 Agent 是一个以 Bash CLI 为核心的本机运维助手。它把
 | 模式 | 命令 | 功能 |
 | --- | --- | --- |
 | Work | `bash bin/agent work "<需求>"` | 让模型返回 `answer` 或 `work_plan`，执行计划步骤，并按配置进行反思续写。 |
-| Edit | `bash bin/agent edit "<需求>"` | 生成或修改 skill，打开 `$EDITOR` 或 `vi` 让用户确认脚本内容，再写入 `skills/`。 |
+| Edit | `bash bin/agent edit "<需求>"` | 生成或修改用户 skill，打开 `$EDITOR` 或 `vi` 让用户确认脚本内容，再写入当前形态的用户 overlay。 |
 | Script | `bash bin/agent script <skill>/<script> [json]` | 执行已登记 skill 脚本，执行前校验登记、参数和策略。 |
 | Terminal | `bash bin/agent terminal "<命令>"` | 对本机 shell 命令做策略审查；低风险命令是否自动执行由 `approvals.auto.shell_readonly` 控制，高风险或提权命令请求确认。 |
 | Doctor | `bash bin/agent doctor` | 检查依赖、配置 JSON、skill 目录和基础运行环境。 |
@@ -22,6 +22,7 @@ Linux 运维 Agent 是一个以 Bash CLI 为核心的本机运维助手。它把
 | Policy | `bash bin/agent policy validate [file]` | 校验 `policies/` 下策略 JSON、正则和审计边界。 |
 | Audit | `bash bin/agent audit <session-id>` / `bash bin/agent audit verify <session-id>` / `bash bin/agent audit export <session-id>\|--all [--output <目录>]` | 读取历史 JSONL 审计会话、校验跨轮转 SHA-256 hash chain，或导出带完整性证明的离线证据包。 |
 | Backup | `bash bin/agent backup <output.tar.gz>` | 导出脱敏配置、运行日志和用户 skill，用于诊断或迁移。 |
+| Restore | `bash bin/agent restore <backup.tar.gz>` | 校验并恢复运行时快照；支持 source checkout、`--no-systemd` 和 managed 安装（managed 仅允许本机 root），Remote 明确不支持。 |
 | API | `bash bin/agent api <resource> <action> [json]` | 给 Web 后端调用的机器可读 JSON 接口。 |
 
 交互式 REPL 支持 `/work`、`/edit`、`/script`、`/terminal`、`/mode`、`/help`、`/exit`。输入 `/` 或 `/前缀` 后回车会打开命令菜单。
@@ -35,7 +36,7 @@ Web 视图包括：
 - Work 工作台：自然语言任务、terminal 命令、执行时间线、审批抽屉、环境主题刷新。
 - Skill 库：script 运行、script 审查、edit 生成、edit 审查、保存、skill 树、Markdown 预览、`skills validate`。
 - MCP：读取 `mcp/<id>/mcp.json` 外部 MCP server manifest，校验 stdio、legacy SSE 和 Streamable HTTP 三种传输配置，并在 work/edit 上下文暴露可用 tools。
-- Policy：以运维视角查看命令安全检查、校验和编辑 `policies/` 下的 JSON 策略文件（含风险规则、审计边界和文件保险箱）；策略文件通过“查阅文件”弹窗查看，解锁后可编辑保存；命令安全检查默认开启，只有 sudo 核对后才能从 Web 切换。
+- Policy：以运维视角查看命令安全检查、校验和编辑已登记的 JSON 策略文件（含风险规则、审计边界和文件保险箱）；关闭 `web.sensitive_edits_enabled` 时仍可读取、编辑草稿和校验，但保存与 command guard 切换由后端拒绝。Web 不收集 sudo 密码。
 - Audit：查看 JSONL 审计 session、完整性结果、事件筛选、指标统计和报告导出。新会话可从持久化的权威 protocol turns 恢复工作台；没有 turns 的旧会话只显示只读事件，不再从审计事件推导业务状态。
 - Config：读取和保存白名单配置项，运行 Doctor，展示运行时配置快照。
 
@@ -88,6 +89,8 @@ curl -fsSL https://github.com/libeal/ASSIstant/releases/latest/download/linux-ag
 
 两条命令都只从同一个 GitHub Release 获取 manifest 和已登记资产。Bootstrap 不保存到本机；core、Web 和按需加载的完整 skill 包优先物化到 `$XDG_RUNTIME_DIR` 或 `/dev/shm`，必要时回退权限为 `0700` 的 `/tmp` 子目录，并在退出或收到信号时清理。
 
+Remote 主机必须预先提供 `flock`（通常由 `util-linux` 包提供）；bootstrap 会在任何下载前检查，缺失时直接给出安装提示，不自动修改系统包。
+
 `curl | bash` 只适合临时诊断：管道中的首段脚本尚未取得签名信任，不能靠脚本内部的验证证明自身。生产或敏感主机必须先在非特权目录验证签名 manifest 和入口脚本，再执行：
 
 ```bash
@@ -112,13 +115,13 @@ test "$(sha256sum "${verify_dir}/${asset}" | awk '{print $1}')" = "${expected_sh
 LINUX_AGENT_VERSION="${version}" LINUX_AGENT_REQUIRE_SIGNATURE=1 bash "${verify_dir}/${asset}"
 ```
 
-Remote CLI 会从 `/dev/tty` 读取审批和可选 API key，密钥不写入配置文件。Remote Web 强制监听 `127.0.0.1`，从其他机器访问时使用启动日志打印的 SSH 转发命令。默认模板固定使用 Web token `0123`；生产部署必须在 `config.json` 中替换。将 `web.token` 显式留空时，才会生成本次运行的临时 token，并写入权限 `0600` 的 `tmp/web/auth-token`（不在终端回显）。Remote 部署会自动把 `providers_security.require_https` 置为 `true`（仅允许 HTTPS Provider）。
+Remote CLI 会从 `/dev/tty` 读取审批和可选 API key，密钥不写入配置文件。Remote Web 强制监听 `127.0.0.1`，从其他机器访问时使用启动日志打印的 SSH 转发命令。示例模板的 `web.token` 为空；启动时用系统 CSPRNG 生成本次运行的临时 token，并写入权限 `0600` 的 `tmp/web/auth-token`（不在终端回显）。Remote 部署会自动把 `providers_security.require_https` 置为 `true`（仅允许 HTTPS Provider）。
 
-Remote 模式默认禁止向 AI Provider 传输 API key。CLI 会在需要 AI 时询问；Web 需在配置中心开启“允许远程传输 API Key”。Terminal、Doctor、Audit 和不需要模型的 Skill 不受此开关影响。运行日志、脱敏配置和用户生成的 skill 可通过 `agent backup <output.tar.gz>` 或 Web“下载运行时备份”按钮显式保存。
+Remote 模式默认禁止向 AI Provider 传输 API key。CLI 会在需要 AI 时询问；Web 需在配置中心开启“允许远程传输 API Key”。Terminal、Doctor、Audit 和不需要模型的 Skill 不受此开关影响。验证并按需物化的内置 Skill 固定在 `skills/`，Remote Web/CLI 创建的用户 Skill 固定在 `data/skills/`，远程 manifest 登记的名称属于不可覆盖的内置命名空间。运行日志、脱敏配置、用户 Skill overlay 和有效策略可通过 `agent backup <output.tar.gz>` 或 Web“下载运行时备份”按钮显式导出；Remote 退出即清理，`agent restore` 始终返回 `restore_unavailable`，归档须在 source checkout、`--no-systemd` 或 managed 安装中恢复。
 
 ### 生产部署（systemd）
 
-生产环境必须先验证固定版本的 manifest，再按其中登记的摘要验证安装器，最后才允许授予 root 权限。安装器还会再次校验自身和下游资产。版本化代码放到 `/opt/linux-agent/releases/`，通过原子 `current` 符号链接切换版本；配置、日志和临时状态持久化在 `/opt/linux-agent/data/`。
+生产环境必须先验证固定版本的 manifest，再按其中登记的摘要验证安装器，最后才允许授予 root 权限。安装器还会再次校验自身和下游资产。版本化代码放到 `/opt/linux-agent/releases/`，通过原子 `current` 符号链接切换版本；配置、日志、Runner staging、用户 Skill 和策略持久化在 `/opt/linux-agent/data/`，release 目录保持只读。
 
 ```bash
 version=vX.Y.Z
@@ -139,7 +142,8 @@ test "$(sha256sum linux-agent-install.sh | awk '{print $1}')" = "${expected_sha}
 sudo bash linux-agent-install.sh install --version "${version}" --require-signature \
   --provider-cidr 203.0.113.0/24 --provider-cidr 2001:db8:1234::/48
 # 安装健康检查会临时启动后自动停止；配置完成后再显式长期启动
-sudo systemctl enable --now linux-agent-observer-helper.socket linux-agent-web.service
+sudo systemctl enable --now linux-agent-observer-helper.socket linux-agent-runner.socket \
+  linux-agent-host-ops.socket linux-agent-policy-writer.socket linux-agent-web.service
 sudo bash linux-agent-install.sh upgrade --version vX.Y.NEW --require-signature
 sudo bash linux-agent-install.sh rollback
 sudo bash linux-agent-install.sh health
@@ -149,13 +153,13 @@ sudo bash linux-agent-install.sh status
 
 如果 Web 控制台报告 `observer_helper_failed` 且错误是 observer socket 权限不足，运行 `repair-observer` 会重新应用当前服务用户对应的 `SocketGroup`，重建 socket inode，并以 Web 服务用户执行 helper 健康检查；它不会切换版本或修改持久配置。
 
-Git 源码目录直接运行时，密码不会用于已存在的 helper socket；必须让 socket 权限匹配实际运行 `bin/agent-web` 的系统用户。若主机已经安装 `linux-agent-observer-helper.socket`，在源码目录执行：
+Git 源码目录直接运行时会优先使用已存在的 observer helper；若没有 helper，则保留本机兼容路径：root 直接调用 auditd，非 root 可在仅监听 loopback 的 Web 页面中验证一次 sudo。密码只写入本机 `sudo -S` 的标准输入，不进入 argv、环境、配置或审计日志。若希望源码版也采用生产 helper 边界，且主机已经安装 `linux-agent-observer-helper.socket`，可在源码目录执行：
 
 ```bash
 sudo bash scripts/install.sh repair-observer --prefix "$PWD" --service-user "$USER"
 ```
 
-该源码模式会同时更新 socket 的 `SocketGroup` drop-in，并把当前 `observer_helper.py` 及其依赖复制到 root 管理的 `/usr/local/libexec/linux-agent-observer-helper/<digest>/`，再用 service drop-in 覆盖 `ExecStart`。这样 helper 不会继续执行 `/opt/linux-agent/current` 或被 `ProtectHome=yes` 隐藏的源码路径。修复会在停止 helper 后重置可能损坏的 capability 状态；健康检查失败时恢复 drop-in、状态文件和原有 active 状态。若 Web 由其他用户运行，请将 `$USER` 替换为该用户；源码快速运行本身未安装 helper unit 时，命令会明确拒绝并提示。
+该源码模式会同时更新 socket 的 `SocketGroup` drop-in，并把当前 `observer_helper.py` 及其依赖复制到 root 管理的 `/usr/local/libexec/linux-agent-observer-helper/<digest>/`，再用 service drop-in 覆盖 `ExecStart`。这样 helper 不会继续执行 `/opt/linux-agent/current` 或被 `ProtectHome=yes` 隐藏的源码路径。修复会在停止 helper 后重置可能损坏的 capability 状态；健康检查失败时恢复 drop-in、状态文件和原有 active 状态。若 Web 由其他用户运行，请将 `$USER` 替换为该用户；源码快速运行本身未安装 helper unit 时，修复命令会明确拒绝，但直接兼容运行不受影响。
 
 ### Prometheus 指标
 
@@ -179,7 +183,7 @@ scrape_configs:
       - targets: ["127.0.0.1:8765"]
 ```
 
-首次 `install` 会写入代码、配置模板和 systemd unit，先停止可能残留的旧实例，再临时启动新版本完成认证健康检查；检查结束后自动停止 Web、observer socket 和 helper。安装器不修改原有开机启用状态，全新安装默认未启用。管理员完成 Provider/API key 配置后，再显式执行上面的 `systemctl enable --now`。`upgrade` 切换后会重启已经部署的 observer helper socket 与 Web 服务，并轮询认证后的 `/api/health`，失败时自动恢复旧版本。生产安装同时部署 root auditd helper 的 service/socket；主 Web 进程仍以专用非 root 用户运行，helper 只接受固定 JSON 协议和 syscall allowlist，不接受命令文本。默认保留最近两个版本，可用 `--keep` 调整；`uninstall` 默认保留 `data/`，只有 `uninstall --purge-data` 会删除持久数据。systemd 模式的自定义 `--prefix` 应位于 `/opt`、`/srv` 等系统服务目录，安装器会拒绝被 `ProtectHome` 或 `PrivateTmp` 隐藏的 `/home`、`/root`、`/run/user`、`/tmp` 和 `/var/tmp`。容器和测试环境可使用 `--no-systemd --prefix <目录>`，本地发布演练可增加 `--from-dist <目录>`。
+首次 `install` 会写入代码、配置模板和 Web/Runner/host-ops/policy-writer/observer systemd unit，先停止可能残留的旧实例，再临时启动新版本完成认证健康检查；检查结束后自动停止这些服务。安装器不修改原有开机启用状态，全新安装默认未启用。管理员完成 Provider/API key 配置后，再显式执行上面的 `systemctl enable --now`。`upgrade` 切换后会重启已部署的 socket 与 Web 服务，并轮询认证后的 `/api/health`，失败时自动恢复旧版本。主 Web 进程仍以专用非 root 用户运行，普通步骤进入独立 Runner UID；root helper 只接受固定 JSON 操作和结构化参数，不接受命令文本、任意路径或 argv。默认保留最近两个版本，可用 `--keep` 调整；`uninstall` 默认保留 `data/`，只有 `uninstall --purge-data` 会删除持久数据。systemd 模式的自定义 `--prefix` 应位于 `/opt`、`/srv` 等系统服务目录，安装器会拒绝被 `ProtectHome` 或 `PrivateTmp` 隐藏的 `/home`、`/root`、`/run/user`、`/tmp` 和 `/var/tmp`。容器和测试环境可使用 `--no-systemd --prefix <目录>`，本地发布演练可增加 `--from-dist <目录>`。
 
 首次 systemd 安装必须明确网络出口策略。重复传入 `--provider-cidr` 后，安装器会事务化生成 `IPAddressDeny=any`、放行 localhost 和所列 IPv4/IPv6 CIDR 的 drop-in；升级和回滚默认保留该策略，失败回滚也会恢复旧文件。CIDR 应覆盖主 Provider、所有 failover Provider，以及未使用本机 DNS stub 时的 DNS 服务地址；地址变化后重新运行 upgrade 并传入新列表。确实无法固定出口网段时必须显式使用 `--allow-unrestricted-provider-egress`，安装器会给出警告，不能以“未配置”静默获得无限制出口。
 
@@ -210,7 +214,7 @@ cd linux-agent-vX.Y.Z-debian
 sudo bash install.sh --provider-cidr 203.0.113.0/24
 ```
 
-Fedora/RHEL/麒麟 V11 使用 `linux-agent-vX.Y.Z-fedora.tar.gz`。RPM 必需清单已包含 `audit`、`policycoreutils` 和 `util-linux`。安装器会检查 Python 3.10+、GNU 工具特性、Web 用户的 data 实际读写权限、SELinux label 和 systemd unit 兼容性。首次 systemd 安装必须显式提供 `--provider-cidr`；配置完成后执行 `sudo systemctl enable --now linux-agent-observer-helper.socket linux-agent-web.service`。
+Fedora/RHEL/麒麟 V11 使用 `linux-agent-vX.Y.Z-fedora.tar.gz`。RPM 必需清单已包含 `audit`、`policycoreutils` 和 `util-linux`。安装器会检查 Python 3.10+、GNU 工具特性、Web/Runner 数据权限、SELinux label 和全部 systemd unit 兼容性。首次 systemd 安装必须显式提供 `--provider-cidr`；配置完成后执行上一节列出的五个 socket/service。
 
 ### 本地运行
 
@@ -242,10 +246,21 @@ bash bin/agent policy validate file-vault.json
 bash bin/agent-web
 ```
 
-默认访问 `http://127.0.0.1:8765/`。静态页面不需要认证，业务 `/api/` 请求都需要 `Authorization: Bearer <token>`（认证使用常量时间比较，不再支持 `X-Agent-Token` 备用头）；仅启动器使用的一次性 `/api/auth/bootstrap` 凭据例外。示例配置固定为 `web.token="0123"`，仅适合受控环境，生产必须替换。如果 `web.token` 留空，启动时会用系统 CSPRNG 生成本次运行的临时 token，并写入权限 `0600` 的 `tmp/web/auth-token` 文件（不在终端回显），退出时清理；配置文件 `config/config.json` 写入时也会强制 `0600`。
+默认访问 `http://127.0.0.1:8765/`。静态页面不需要认证，业务 `/api/` 请求都需要 `Authorization: Bearer <token>`（认证使用常量时间比较，不再支持 `X-Agent-Token` 备用头）；仅启动器使用的一次性 `/api/auth/bootstrap` 凭据例外。示例配置的 `web.token` 为空，启动时会用系统 CSPRNG 生成本次运行的临时 token，并写入权限 `0600` 的 `tmp/web/auth-token` 文件（不在终端回显），退出时清理；配置文件 `config/config.json` 写入时也会强制 `0600`。
 
 在本机桌面会话中，`agent-web` 会自动打开前端外壳：启动器把一次性 bootstrap 凭据放在 URL fragment，前端换取 token 后立即清理地址栏并连接，真实 token 不会进入 URL、HTTP 日志或静态 HTML。无图形桌面、Remote 模式或不希望自动打开浏览器时，可设置 `LINUX_AGENT_WEB_AUTO_OPEN=0`，仍可在右上角手动输入 token；显式设为 `1` 可在受控桌面环境强制打开。
-systemd 生产部署会通过 `/run/linux-agent/observer.sock` 自动使用独立 auditd helper，不向浏览器索取 sudo 密码；socket 存在但 helper 失败时不会降级回 sudo。本地手工启动且没有 helper 时，Web 才沿用一次性 sudo bootstrap。跳过或启用失败都会写入 Web 审计日志。默认 `observer.require=false` 时按降级模式继续；强合规环境设置为 `true` 后，observer 不可用或规则失效会拒绝真实执行。`observer.privilege=none` 会同时禁用 helper 与 sudo。
+部署形态决定执行和写入边界：
+
+| 形态 | 持久数据/身份 | 执行与恢复边界 |
+| --- | --- | --- |
+| source checkout | 项目 `data/`，当前 UID 直接写 overlay | same-UID；每个 CLI/REPL/Web 业务生命周期持 runtime 共享锁，restore 由当前 UID 独占切换 |
+| remote runtime | 验证后的临时 release；内置 Skill 在 `skills/`、当前 UID 用户 overlay 在 `data/skills/`，Web 仅 loopback | `degraded_same_uid`；共享 runtime 锁，不获得受管 helper 权限；只支持导出 backup，不支持就地 restore |
+| `--no-systemd` | release/data 持久布局归安装用户 | 无 Runner/helper socket，`degraded_same_uid`；升级、回滚、restore 与业务请求共用 runtime 锁 |
+| managed systemd | Web、Runner 和 root helpers 分离；`data/` 按最小权限分配 | Web/Runner/helper 只取共享锁；仅本机 root 可独占执行 restore/安装切换，helper 缺失时 fail-closed |
+
+非托管形态启用 observer 时优先使用 helper；没有 helper 则 root 直接预检 auditd，非 root 使用已有的 `sudo -n` 授权。只有 loopback Web 才显示一次性 sudo 输入框，密码只进入本机 sudo 标准输入，不保存、不记录；非 loopback 监听拒绝交互式密码回退。
+
+默认 `observer.require=false` 时 observer 缺失只记录降级，强合规环境设置为 `true` 后会拒绝真实执行；`observer.privilege=none` 会禁用 observer。
 
 常用命令：
 
@@ -268,7 +283,7 @@ bash bin/agent audit export --all --output /secure/evidence
 
 审计 hash chain 是强制不变量，不能通过配置或 CLI 关闭；每个事件始终包含 `seq`、`prev_hash` 和 `hash`。升级配置如果仍含旧的 `audit.integrity_chain` 字段，CLI/Web 会要求删除该字段后再启动。追加只校验最后一个非空事件及其自身 hash，写入成本不随历史事件数增长。跨分段全链检查是显式职责：取证、导出或合规检查前运行 `audit verify`；中间事件或旧归档损坏会由该命令报告，但不会阻止后续追加。
 
-`agent backup` 面向诊断和迁移，导出脱敏配置、运行日志与用户 skill；`agent audit export` 只导出审计 session、全部轮转段、逐 session 完整性报告、文件摘要 manifest 和 `SHA256SUMS`，适合交给 SIEM、对象存储或合规采集流程。导出先取得加锁快照，因此不会把写入中的不同链尾混入同一证据包。
+`agent backup` 面向诊断和迁移，导出脱敏配置、运行日志与用户 skill；Remote 归档只携带 `data/skills/` 用户包，并以 `materialized.json` 记录已验证的内置物化包，不复制内置代码。manifest 在一次排序扫描中分块计算摘要，复杂度为 `O(total_bytes + n log n)`。source checkout、`--no-systemd` 和 managed 的 `agent restore` 在锁外校验归档，再核对 release/config/Skill/policy 指纹并非阻塞申请独占切换：有活动请求返回 `restore_busy`，准备期间数据已变更返回 `restore_conflict`，不覆盖并发提交；Remote 在读取归档前返回 `restore_unavailable`。`agent audit export` 只导出审计 session、全部轮转段、逐 session 完整性报告、文件摘要 manifest 和 `SHA256SUMS`，适合交给 SIEM、对象存储或合规采集流程。
 
 机器可读 API 示例：
 
@@ -306,7 +321,8 @@ Linux 运维 Agent
 │  │  ├─ config.sh           配置读取和默认值
 │  │  ├─ audit.sh            JSONL 审计和审计报告
 │  │  ├─ audit_chain.py      hash chain、fsync、轮转、磁盘策略与校验器
-│  │  ├─ backup.sh            运行时脱敏备份
+│  │  ├─ backup.sh            用户 overlay、有效策略与完整审计链的脱敏备份/恢复
+│  │  ├─ runtime_archive.py   备份归档校验与原子恢复事务
 │  │  └─ context.sh          会话历史和模型上下文
 │  ├─ 感知与校验
 │  │  ├─ sense.sh            环境采集
@@ -326,6 +342,12 @@ Linux 运维 Agent
 │  │  ├─ api.sh              机器可读 API
 │  │  ├─ mcp_client.py       MCP stdio/SSE/Streamable HTTP 客户端
 │  │  ├─ provider_security.py Provider URL 校验、SSRF 防护与地址解析
+│  │  ├─ pinned_http.py       固定解析 IP、保持 Host/SNI 的 HTTPS 客户端
+│  │  ├─ runner.py            独立 UID 普通执行 Unix socket 服务
+│  │  ├─ host_ops_helper.py   firewall/hosts 固定特权操作
+│  │  ├─ policy_helper.py     策略与 command guard 固定写入操作
+│  │  ├─ helper_protocol.py   Runner/helper 版本化 JSON socket 协议
+│  │  ├─ layout_migration.py  受管 data overlay 复制迁移与冲突隔离
 │  │  ├─ workflow.sh         CLI/API 共用的 Work 准备与执行选择
 │  │  └─ interactive.sh      REPL 菜单和模式选择
 ├─ Web 外壳层 web/
@@ -338,8 +360,8 @@ Linux 运维 Agent
 │  ├─ domain.py              schema/domain.json 运行时契约校验
 │  ├─ timeline.py            只消费持久化 protocol turns 的时间线视图
 │  ├─ provider.py            Provider 配置与模型服务
-│  ├─ policy.py              Policy 文件与 sudo 写入服务
-│  ├─ skills.py              Skill 文件树服务
+│  ├─ policy.py              Policy overlay 校验与窄 helper 写入服务
+│  ├─ skills.py              内置 Skill + 用户 overlay 文件树服务
 │  └─ static/
 │     ├─ index.html          Web 页面结构
 │     ├─ app.js              前端工作台入口
@@ -372,7 +394,7 @@ Linux 运维 Agent
 │  ├─ fake_ai_server.py      测试用 Chat Completions 兼容服务
 │  ├─ helpers.sh             测试辅助函数
 │  ├─ *.sh                   CLI、Web、策略、安全、observer、交互、安装和发布测试
-│  ├─ test_web_*.py          Web 服务与领域模块单元测试
+│  ├─ test_*.py              Python 单元测试，统一由 unittest discovery 执行
 │  └─ web_*.mjs              无 npm 依赖的前端模块和协议测试
 ├─ 发布与部署 packaging/、remote/、scripts/
 │  ├─ packaging/             systemd 单元和权限边界说明
@@ -398,7 +420,7 @@ Linux 运维 Agent
 
 ### Skill Registry 边界
 
-skill registry 同时支持本地目录和 Remote Release manifest；`skills/INDEX.md`、`skills/<name>/SKILL.md`、包内脚本与 manifest refs 必须互相一致。调用方应通过 `lib/skills.sh` 提供的函数列出、检查、物化、读取和执行 skill，而不是绕过 registry 直接拼路径。
+skill registry 同时支持本地目录和 Remote Release manifest；内置包使用 `skills/` 信任根，用户包使用解析后的用户 overlay（Remote 固定为 `data/skills/`）。`INDEX.md`、包内 `SKILL.md`、脚本与 manifest refs 必须互相一致，远程 manifest 中登记的名称即使尚未物化也保留给内置包。调用方应通过 `lib/skills.sh` 提供的函数列出、检查、物化、读取和执行 skill，而不是绕过 registry 直接拼路径。
 
 Remote runtime 首次只加载索引与 Release manifest 元数据，执行前按一级 skill 整包 materialize，校验来源、大小、摘要、归档边界、INDEX/包内脚本集合和 policy 后，再交给现有 approval、observer 与 audit 流程。
 
@@ -539,7 +561,7 @@ GitHub Actions 会构建确定性资产与 SPDX 2.3 SBOM，使用 GitHub OIDC �
 | `provider_resilience.circuit_failure_threshold` / `circuit_open_sec` | 开启熔断前的连续故障阈值，以及进入半开探测前的秒数。 |
 | `provider_resilience.failover` | 有序备用 Provider 数组；每项使用 `api_key_env` 或显式 `reuse_primary_api_key:true`，禁止内联密钥。仅在可重试故障或熔断时切换。 |
 | `context_turns` | 会话历史窗口大小。 |
-| `command_guard.enabled` | 是否启用 Python AST/Token 命令守卫；默认开启，关闭或重新开启需通过 Web Policy 页面完成 sudo 核对。 |
+| `command_guard.enabled` | 是否启用 Python AST/Token 命令守卫；默认开启，Web 切换受 `web.sensitive_edits_enabled` 控制并由 policy-writer helper 原子更新。 |
 | `agent_loop.enabled_for_work` | 是否启用 work 反思续写循环。 |
 | `agent_loop.observation_text_limit` | observation 文本摘要上限。 |
 | `agent_loop.thinking_trace_enabled` | 是否保存并展示简短 `thinking_summary`。 |
@@ -559,7 +581,7 @@ GitHub Actions 会构建确定性资产与 SPDX 2.3 SBOM，使用 GitHub OIDC �
 | `audit.min_free_bytes` | 审计目录最小可用空间阈值；`0` 禁用检查。 |
 | `audit.on_full` | 空间不足时 `degrade`（写最小事件）或 `block`（拒绝操作）。 |
 | `observer.enabled` | observer 开关，默认 `auto`。 |
-| `observer.privilege` | auditd observer 的 sudo 策略。 |
+| `observer.privilege` | auditd observer 的兼容权限策略；受管安装只用 observer helper，源码/Remote/no-systemd 的 loopback Web 可一次性验证本机 sudo。 |
 | `observer.max_events` | observer 汇总事件上限。 |
 | `observer.require` | 强合规开关；为 `true` 时 observer 未完整生效即拒绝真实执行。 |
 | `execution.min_privilege_proxy` | root 运行时是否尽量降权执行普通命令。 |
@@ -578,13 +600,14 @@ GitHub Actions 会构建确定性资产与 SPDX 2.3 SBOM，使用 GitHub OIDC �
 | `web.enabled` | 是否允许启动 Web。 |
 | `web.host` | Web 监听地址。 |
 | `web.port` | Web 监听端口。 |
-| `web.token` | Web Bearer token；示例默认 `0123`，生产必须替换；空值则启动时生成临时 token。 |
+| `web.token` | Web Bearer token；示例为空，空值则启动时用 CSPRNG 生成临时 token；固定值只能由本机管理员直接维护。 |
 | `web.job_retention_hours` | SQLite Job 历史保留小时数。 |
 | `web.max_active_jobs` | 同时处于 queued/running 的 Job 上限。 |
 | `web.job_timeout_sec` | 后台 Job 硬超时。 |
 | `web.max_job_attempts` | Job 重试次数上限。 |
 | `web.cancel_grace_sec` | 取消时从 SIGTERM 升级到 SIGKILL 的等待秒数。 |
 | `web.metrics_enabled` | 是否开启带 Bearer token 保护的 `/api/metrics` Prometheus 文本端点，默认 `true`。 |
+| `web.sensitive_edits_enabled` | 敏感只读开关，默认/缺失为 `true`。`true` 允许 Web 提交用户 Skill、安装用户 Skill、保存策略和切换 command guard；`false` 仍允许读取、草稿、diff、review 和 validate，但所有最终写入返回 403。只能由本机管理员直接修改。 |
 
 备用 Provider 只保存密钥来源，不在配置中保存备用密钥值：
 
@@ -615,7 +638,10 @@ GitHub Actions 会构建确定性资产与 SPDX 2.3 SBOM，使用 GitHub OIDC �
 | `LINUX_AGENT_REQUIRE_SIGNATURE=1` | 要求 Remote bootstrap 验证 release manifest 的 cosign/Sigstore 签名。 |
 | `LINUX_AGENT_SIGNATURE_PUBKEY` | 私有部署的 cosign 公钥路径；使用离线 key 签名验证。 |
 | `LINUX_AGENT_SIGNATURE_IDENTITY` / `LINUX_AGENT_SIGNATURE_ISSUER` | 收窄 keyless release 签名的证书身份和 OIDC issuer。 |
-| `LINUX_AGENT_OBSERVER_HELPER_SOCKET` | 覆盖 observer helper Unix socket；默认 `/run/linux-agent/observer.sock`，主要用于受控测试或自定义打包。 |
+| `LINUX_AGENT_OBSERVER_HELPER_SOCKET` | 覆盖 observer helper Unix socket；默认 `/run/linux-agent/observer.sock`。 |
+| `LINUX_AGENT_RUNNER_SOCKET` | 覆盖 Runner Unix socket；默认 `/run/linux-agent/runner.sock`。 |
+| `LINUX_AGENT_HOST_HELPER_SOCKET` | 覆盖 host-ops helper Unix socket；默认 `/run/linux-agent/host-ops.sock`。 |
+| `LINUX_AGENT_POLICY_HELPER_SOCKET` | 覆盖 policy-writer helper Unix socket；默认 `/run/linux-agent/policy-writer.sock`。 |
 
 内部变量如 `LINUX_AGENT_TMP_DIR`、`LINUX_AGENT_SESSION_ID`、`LINUX_AGENT_AUDIT_LOG`、`LINUX_AGENT_FILE_VAULT_POLICY_PATH` 由程序设置，不建议外部手工使用。
 
@@ -632,10 +658,11 @@ GitHub Actions 会构建确定性资产与 SPDX 2.3 SBOM，使用 GitHub OIDC �
 - Remote script 只能 HTTPS 下载后审查，不允许流式管道执行。
 - Web `/api/` 全部需要 Bearer token。
 - `/api/metrics` 默认开启但同样需要 Bearer token；指标只使用低基数 route/status 标签，不记录 token、API key 或 Job ID。
-- systemd Web 通过独立、socket 激活的 privileged helper 操作 auditd；helper 只允许固定操作、当前请求用户和 syscall allowlist，失败不回退 sudo。仅本地无 helper 模式会请求一次 sudo bootstrap；`observer.require=true` 时未观察到真实执行即阻断。
-- Web、Terminal、Skill 与 MCP 子进程从空环境按白名单构造，不继承父进程中的云凭据、访问令牌或凭据代理；API key 只进入 AI 编排路径，执行步骤会再次清空环境。
-- Bash 与 Web 执行层都在读取期间限制 stdout/stderr，达到 `execution.max_output_bytes` 时终止整个进程组，不依赖展示阶段截断；若命令退出后仍有脱离进程组的后代持有输出管道，limiter 在有界排空窗口后会以 `invalid_output` 失败关闭，不会无限等待或把不完整输出当成成功。
-- Web 策略编辑只允许 `policies/` 下 JSON 文件，保存前做策略校验，写入前做 sudo 校验。
+- systemd Web 通过四类独立 socket 激活的 helper/Runner 隔离执行；host-ops 只允许 `firewall.apply`/`hosts.apply`，policy-writer 只允许 `policy.write`/`command_guard.set`，Runner 不可读取配置、API key 或特权 socket。helper 失败不回退 sudo；`observer.require=true` 时未观察到真实执行即阻断。
+- Web、Runner、Terminal、Skill 与 MCP 子进程从空环境按白名单构造，不继承父进程中的云凭据、访问令牌或凭据代理；API key 只进入 AI Provider 路径，执行步骤会再次清空环境。
+- Bash 与 Web 执行层都在读取期间限制 stdout/stderr。Runner `1.2.0` 将最大 64 KiB 原始块编码为按序 NDJSON 帧，客户端断开、Web 取消或父进程死亡会终止并 reap 整个进程组后才释放 slot。超限固定返回 exit 125/`output_limit_exceeded` 和准确截断计数；丢帧、乱序或缺 final 帧返回 `invalid_output`/`output_integrity_unknown`，不会静默成功。
+- Web 策略编辑只允许当前 release 登记的 JSON 策略，保存前做现有 validator 校验，再由 policy-writer helper 原子写入 `data/policies/`；`web.sensitive_edits_enabled=false` 时只允许草稿、diff、review 和 validate。
+- 用户 Skill 写入 `data/skills/`，同名内置 Skill 冲突即拒绝；每个脚本 manifest 必须声明 `risk`、`execution_class` 和 `capability`，用户 Skill 强制为 `runner` 且 capability 为空。
 - 审计文本和上下文会脱敏并截断。
 - Remote bootstrap 和 installer 先校验 release manifest、资产大小与 SHA-256；存在 cosign bundle 时验证签名，`LINUX_AGENT_REQUIRE_SIGNATURE=1` 或 `--require-signature` 时缺失签名会拒绝运行。
 - systemd 生产安装使用专用非 root 用户、只读版本目录、独立持久数据目录和沙箱单元；升级健康检查失败会自动回滚，卸载默认保留 `data/`。
@@ -660,7 +687,6 @@ bash tests/workflow.sh
 bash tests/policy.sh
 bash tests/tools.sh
 bash tests/observer.sh
-bash tests/mcp.sh
 bash tests/interactive.sh
 bash tests/web_api.sh
 bash tests/web_server.sh
@@ -676,11 +702,11 @@ bash tests/web_frontend.sh
 
 ```bash
 for test in policy tools context security workflow workflow_unit observer audit_integrity \
-            smoke mcp contract web_api web_server interactive remote_release remote_runtime \
+            smoke contract web_api web_server interactive remote_release remote_runtime \
             remote_web_security backup install; do
   bash "tests/$test.sh"
 done
-python3 -m unittest discover -s tests -p 'test_web_*.py' -v
+python3 -m unittest discover -s tests -p 'test_*.py' -v
 bash tests/web_frontend.sh
 bash scripts/lint.sh
 ```
@@ -736,6 +762,10 @@ bash scripts/lint.sh
 | `lib/protocol.sh` | 为 API/CLI 构造 `timeline`、`approval_card`、`output_blocks` 工作台协议。 |
 | `lib/observer.sh` | auditd observer 预检、规则安装和清理、`ausearch` 解析、执行过程 marker 和降级记录。 |
 | `lib/observer_helper.py` | systemd socket 激活的最小 auditd privileged helper，执行固定协议、peer uid 校验、输出/超时限制和工具所有权校验。 |
+| `lib/runner.py` / `lib/helper_protocol.py` | 普通执行 Runner 及版本化 Unix socket JSON 协议；受管模式由独立 UID 运行。 |
+| `lib/host_ops_helper.py` / `lib/policy_helper.py` | firewall/hosts 与策略/command guard 的固定 root 操作 helper；拒绝任意命令、路径和 argv。 |
+| `lib/pinned_http.py` | Provider 与 file-download 共用的固定解析 IP HTTPS 客户端，逐跳校验地址并保持原 hostname 的 Host/SNI。 |
+| `lib/layout_migration.py` / `lib/runtime_archive.py` | 受管 overlay 复制迁移、冲突报告，以及运行时归档校验/原子恢复。 |
 | `lib/output_limiter.py` / `lib/subprocess_env.py` | Bash 流式输出硬上限，以及 Web/MCP 不可信子进程的显式环境白名单。 |
 | `lib/executor.sh` | Work 计划执行状态机，包含 API 审批输入队列、自动审批、人工审批、跳过/修改/终止、远程脚本下载审查、步骤执行、失败修复建议和输出渲染。 |
 | `lib/editor.sh` | Edit 模式实现，生成 `SKILL.md`，打开编辑器，记录人工修改 diff，staging 校验并提交 skill。 |
@@ -755,8 +785,8 @@ bash scripts/lint.sh
 | `web/execution.py` | Agent 子进程环境隔离、并发管道读取、超时、取消和进程组回收。 |
 | `web/audit.py` / `web/domain.py` / `web/timeline.py` | Web 审计适配、领域契约校验和持久化时间线读取。 |
 | `web/metrics.py` | 仅使用 Python 标准库的线程安全 Prometheus counter/gauge 注册和文本渲染。 |
-| `web/observer.py` | observer helper/sudo 预检和 Web bootstrap 状态机；helper 失败时 fail closed。 |
-| `web/provider.py` / `web/policy.py` / `web/skills.py` | Provider、Policy 和 Skill 文件服务。 |
+| `web/observer.py` | observer helper 预检和 Web bootstrap 状态机；受管执行 fail-closed，非托管 loopback Web 可通过 sudo 标准输入完成一次性本机预检。 |
+| `web/provider.py` / `web/policy.py` / `web/skills.py` | Provider、Policy 和 Skill 文件服务；策略/Skill 使用 release defaults 与 data overlay。 |
 | `web/static/index.html` | Web 控制台 HTML 页面，包含 Workbench、Skill、MCP、Policy、Audit、Config 六个主视图。 |
 | `web/static/app.js` | Web 前端入口，组合无构建 ES modules 并驱动工作台交互。 |
 | `web/static/modules/` | 前端 API、状态、布局、Job 客户端、输出渲染、turn 处理及 Workbench/Skill/Policy/Audit/Config 视图模块；模块由 `tests/web_frontend.sh` 直接用 Node 检查。 |
@@ -791,7 +821,10 @@ bash scripts/lint.sh
 | 文件 | 功能 |
 | --- | --- |
 | `packaging/linux-agent-web.service` | 生产 Web systemd 单元，包含非 root 身份、只读代码、可写数据目录和资源沙箱。 |
-| `packaging/linux-agent-observer-helper.service` / `.socket` | 仅持有 audit capability 的 root helper 与 `0660` Unix socket。 |
+| `packaging/linux-agent-observer-helper.service` / `.socket` | 仅持有 audit capability 的 root observer helper 与 Web 组可访问的 `0660` Unix socket。 |
+| `packaging/linux-agent-runner.service` / `.socket` | 独立 Runner UID 的普通执行服务；socket 为 `0600`，只允许 Web 服务用户连接。 |
+| `packaging/linux-agent-host-ops.service` / `.socket` | 仅允许 firewall/hosts 固定操作的 root helper 与 Web 组可访问的 `0660` Unix socket。 |
+| `packaging/linux-agent-policy-writer.service` / `.socket` | 仅允许策略/command guard 固定操作的 root helper 与 Web 组可访问的 `0660` Unix socket。 |
 | `packaging/dropins/10-provider-egress.conf.example` | 默认拒绝网络出口、按 Provider CIDR 显式放行的 systemd drop-in 模板。 |
 | `packaging/install-package.sh` / `INSTALL_PACKAGE.md` | Debian 与 Fedora/RPM（含麒麟 V11）归档内的依赖安装入口与使用说明。 |
 | `packaging/权限边界.md` | Terminal、Skill、MCP、远程脚本、文件编辑和 AI 调用的权限与密钥边界。 |
@@ -878,7 +911,7 @@ bash scripts/lint.sh
 | `tests/install.sh` | 无 root 覆盖发布物校验、安装、升级、回滚、持久数据、版本保留和健康检查。 |
 | `tests/workflow_unit.sh` | 覆盖 CLI/API 共享 Work 工作流边界。 |
 | `tests/contract.sh` | 覆盖 API/domain schema、状态和错误码契约。 |
-| `tests/test_web_*.py` | 覆盖 JobStore、Session 事务、Execution、Domain 与拆分后的 Web 服务。 |
+| `tests/test_*.py` | 统一覆盖 MCP、网络工具、JobStore、Session 事务、Execution、Domain 与拆分后的 Web 服务。 |
 | `tests/interactive.sh` | 覆盖 REPL 菜单、模式切换、terminal 模式和 edit 模式。 |
 | `tests/web_api.sh` | 覆盖机器可读 API 的 work、script、terminal、edit、audit 等路径。 |
 | `tests/web_server.sh` | 覆盖 Web token 拦截、health、静态页面、config、skill、policy、job、shutdown、metrics 和新增 Web 入口。 |
@@ -902,4 +935,4 @@ bash scripts/lint.sh
 - Web 端口被占用：停止旧进程或修改 `web.port`。
 - Web 认证失败：确认页面右上角 token 与 `agent-web` 启动日志一致。
 - `skills validate` 失败：检查 `skills/INDEX.md`、对应 `SKILL.md` 和 `scripts/*.sh` 是否一致。
-- observer 不可用：生产部署先检查 `linux-agent-observer-helper.socket/service`、socket 组权限和 journal；本地模式再检查 auditd/sudo。helper socket 存在但调用失败时不会回退 sudo。`observer.require=false` 时记录降级事件并继续，`true` 时修复 observer 后才能执行。
+- observer 不可用：生产部署先检查 `linux-agent-observer-helper.socket/service`、socket 组权限、auditd 和 journal；受管 Web 不回退 sudo。源码、临时 Remote 或 `--no-systemd` 安装先确认 Web 监听在 loopback、系统存在 `auditctl`/`ausearch`/`sudo`，再从页面完成本机预检。`observer.require=false` 时记录降级事件并继续，`true` 时修复 observer 后才能执行。

@@ -92,6 +92,11 @@ asset_json() {
 
 core_stage="${tmp_root}/core"
 mkdir -p "${core_stage}/bin" "${core_stage}/lib" "${core_stage}/config" "${core_stage}/skills" "${core_stage}/schema" "${core_stage}/packaging/dropins"
+jq -e '.web.token == "" and (.web.sensitive_edits_enabled == true)' \
+    "${ROOT_DIR}/config/config.example.json" >/dev/null || {
+    printf 'release config template must use an empty Web token and enable sensitive edits by default\n' >&2
+    exit 1
+}
 cp -a "${ROOT_DIR}/bin/agent" "${core_stage}/bin/agent"
 cp -a "${ROOT_DIR}/lib/"*.sh "${ROOT_DIR}/lib/"*.py "${core_stage}/lib/"
 cp -a "${ROOT_DIR}/config/config.example.json" "${ROOT_DIR}/config/ai-providers.json" "${core_stage}/config/"
@@ -100,6 +105,12 @@ cp -a \
     "${ROOT_DIR}/packaging/linux-agent-web.service" \
     "${ROOT_DIR}/packaging/linux-agent-observer-helper.service" \
     "${ROOT_DIR}/packaging/linux-agent-observer-helper.socket" \
+    "${ROOT_DIR}/packaging/linux-agent-runner.service" \
+    "${ROOT_DIR}/packaging/linux-agent-runner.socket" \
+    "${ROOT_DIR}/packaging/linux-agent-host-ops.service" \
+    "${ROOT_DIR}/packaging/linux-agent-host-ops.socket" \
+    "${ROOT_DIR}/packaging/linux-agent-policy-writer.service" \
+    "${ROOT_DIR}/packaging/linux-agent-policy-writer.socket" \
     "${ROOT_DIR}/packaging/权限边界.md" \
     "${core_stage}/packaging/"
 cp -a "${ROOT_DIR}/packaging/dropins/10-provider-egress.conf.example" "${core_stage}/packaging/dropins/"
@@ -122,6 +133,26 @@ while IFS= read -r skill_dir; do
         printf 'invalid skill directory name: %s\n' "${skill_name}" >&2
         exit 1
     }
+    skill_manifest="${skill_dir}/manifest.json"
+    jq -e --arg skill "${skill_name}" '
+        .schema_version == 1 and .name == $skill
+        and (.scripts | type == "array" and length > 0)
+        and all(.scripts[]; . as $script
+            | ($script.name | type == "string" and test("^[a-z0-9][a-z0-9-]*\\.sh$"))
+            and (["low","medium","high","critical"] | index($script.risk)) != null
+            and (["runner","host_helper"] | index($script.execution_class)) != null
+            and ($script.capability | type == "string")
+            and (if $skill == "network-ops-tools" and $script.name == "firewall.sh" then
+                    $script.execution_class == "host_helper" and $script.capability == "firewall.apply"
+                 elif $skill == "network-ops-tools" and $script.name == "hosts-file-editor.sh" then
+                    $script.execution_class == "host_helper" and $script.capability == "hosts.apply"
+                 else
+                    $script.execution_class == "runner" and $script.capability == ""
+                 end))
+    ' "${skill_manifest}" >/dev/null || {
+        printf 'invalid skill manifest.json: %s\n' "${skill_name}" >&2
+        exit 1
+    }
     skill_stage="${tmp_root}/skill-${skill_name}"
     mkdir -p "${skill_stage}/skills"
     copy_tree_without_cache "${skill_dir}" "${skill_stage}/skills/${skill_name}"
@@ -135,16 +166,23 @@ while IFS= read -r skill_dir; do
         ref="${ref%.sh}"
         description="$(sed -n 's/^- `[^`]*`: \(.*\)$/\1/p' <<<"${index_line}")"
         script_name="${ref#*/}.sh"
-        manifest_line="$(grep -E "scripts/${script_name}(\`|[[:space:]):,-])" "${skill_dir}/SKILL.md" 2>/dev/null | head -n 1 || true)"
-        risk="$(sed -nE 's/.*risk:[[:space:]]*`?(low|medium|high|critical)`?.*/\1/p' <<<"${manifest_line}" | head -n 1)"
-        case "${risk}" in low | medium | high | critical) ;; *) risk=low ;; esac
-        refs="$(jq -cn --argjson prior "${refs}" --arg ref "${ref}" --arg description "${description}" --arg risk "${risk}" '$prior + [{ref:$ref, description:$description, risk:$risk}]')"
+        script_contract="$(jq -c --arg script "${script_name}" '[.scripts[] | select(.name == $script)][0] // empty' "${skill_manifest}")"
+        [[ -n "${script_contract}" ]] || {
+            printf 'skill index ref is missing from manifest.json: %s\n' "${ref}" >&2
+            exit 1
+        }
+        risk="$(jq -r '.risk' <<<"${script_contract}")"
+        execution_class="$(jq -r '.execution_class' <<<"${script_contract}")"
+        capability="$(jq -r '.capability' <<<"${script_contract}")"
+        refs="$(jq -cn --argjson prior "${refs}" --arg ref "${ref}" --arg description "${description}" \
+            --arg risk "${risk}" --arg execution_class "${execution_class}" --arg capability "${capability}" \
+            '$prior + [{ref:$ref, description:$description, risk:$risk, execution_class:$execution_class, capability:$capability}]')"
     done <"${ROOT_DIR}/skills/INDEX.md"
     [[ "$(jq 'length' <<<"${refs}")" -gt 0 ]] || {
         printf 'skill has no INDEX.md references: %s\n' "${skill_name}" >&2
         exit 1
     }
-    skill_description="$(sed -n 's/^description:[[:space:]]*//p' "${skill_dir}/SKILL.md" | head -n 1)"
+    skill_description="$(jq -r '.description // empty' "${skill_manifest}")"
     [[ -n "${skill_description}" ]] || {
         printf 'skill has no description frontmatter: %s\n' "${skill_name}" >&2
         exit 1
@@ -190,7 +228,8 @@ sbom_relationships='[
     {"spdxElementId":"SPDXRef-Package-linux-agent","relationshipType":"DEPENDS_ON","relatedSpdxElement":"SPDXRef-Package-bash"},
     {"spdxElementId":"SPDXRef-Package-linux-agent","relationshipType":"DEPENDS_ON","relatedSpdxElement":"SPDXRef-Package-curl"},
     {"spdxElementId":"SPDXRef-Package-linux-agent","relationshipType":"DEPENDS_ON","relatedSpdxElement":"SPDXRef-Package-jq"},
-    {"spdxElementId":"SPDXRef-Package-linux-agent","relationshipType":"DEPENDS_ON","relatedSpdxElement":"SPDXRef-Package-python3"}
+    {"spdxElementId":"SPDXRef-Package-linux-agent","relationshipType":"DEPENDS_ON","relatedSpdxElement":"SPDXRef-Package-python3"},
+    {"spdxElementId":"SPDXRef-Package-linux-agent","relationshipType":"DEPENDS_ON","relatedSpdxElement":"SPDXRef-Package-util-linux"}
 ]'
 while IFS= read -r name; do
     file_sha="$(sha256sum "${OUTPUT_DIR}/${name}" | awk '{print $1}')"
@@ -225,7 +264,8 @@ jq -S -n \
             {name:"bash", SPDXID:"SPDXRef-Package-bash", downloadLocation:"NOASSERTION", filesAnalyzed:false, licenseConcluded:"NOASSERTION", licenseDeclared:"NOASSERTION", copyrightText:"NOASSERTION", comment:"系统运行时依赖"},
             {name:"curl", SPDXID:"SPDXRef-Package-curl", downloadLocation:"NOASSERTION", filesAnalyzed:false, licenseConcluded:"NOASSERTION", licenseDeclared:"NOASSERTION", copyrightText:"NOASSERTION", comment:"系统运行时依赖"},
             {name:"jq", SPDXID:"SPDXRef-Package-jq", downloadLocation:"NOASSERTION", filesAnalyzed:false, licenseConcluded:"NOASSERTION", licenseDeclared:"NOASSERTION", copyrightText:"NOASSERTION", comment:"系统运行时依赖"},
-            {name:"python3", SPDXID:"SPDXRef-Package-python3", downloadLocation:"NOASSERTION", filesAnalyzed:false, licenseConcluded:"NOASSERTION", licenseDeclared:"NOASSERTION", copyrightText:"NOASSERTION", comment:"系统运行时依赖"}
+            {name:"python3", SPDXID:"SPDXRef-Package-python3", downloadLocation:"NOASSERTION", filesAnalyzed:false, licenseConcluded:"NOASSERTION", licenseDeclared:"NOASSERTION", copyrightText:"NOASSERTION", comment:"系统运行时依赖"},
+            {name:"util-linux", SPDXID:"SPDXRef-Package-util-linux", downloadLocation:"NOASSERTION", filesAnalyzed:false, licenseConcluded:"NOASSERTION", licenseDeclared:"NOASSERTION", copyrightText:"NOASSERTION", comment:"提供 flock 的系统运行时依赖"}
         ],
         files:$files,
         relationships:$relationships

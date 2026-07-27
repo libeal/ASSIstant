@@ -7,11 +7,11 @@ linux_agent_protocol_metadata() {
     if [[ -f "${schema_file}" ]]; then
         jq -c '{
             schema_version:(.schema_version // 1),
-            protocol_version:(.protocol_version // "1.0.0")
+            protocol_version:(.protocol_version // "1.2.0")
         }' "${schema_file}"
         return 0
     fi
-    printf '%s\n' '{"schema_version":1,"protocol_version":"1.0.0"}'
+    printf '%s\n' '{"schema_version":1,"protocol_version":"1.2.0"}'
 }
 
 linux_agent_protocol_step_statuses() {
@@ -461,9 +461,9 @@ linux_agent_protocol_envelope_for_single_execution() {
             protocol_version:$protocol.protocol_version,
             ok:($result.ok // false),
             status:(
-                if (["succeeded", "success", "completed", "ok"] | index($raw_status)) != null then "executed"
+                if ($result.ok // false) then "executed"
+                elif (["succeeded", "success", "completed", "ok"] | index($raw_status)) != null then "executed"
                 elif $raw_status != "" then $raw_status
-                elif ($result.ok // false) then "executed"
                 else "failed" end
             ),
             timeline:$protocol.timeline,

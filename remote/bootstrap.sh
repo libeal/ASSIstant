@@ -12,6 +12,7 @@ fail() {
     exit 1
 }
 
+command -v flock >/dev/null 2>&1 || fail '缺少依赖命令: flock（请安装 util-linux）'
 for command_name in bash curl python3 jq tar sha256sum stat mktemp; do
     command -v "${command_name}" >/dev/null 2>&1 || fail "缺少依赖命令: ${command_name}"
 done

@@ -6,11 +6,49 @@ LINUX_AGENT_CONFIG_JSON=""
 LINUX_AGENT_API_KEY_SOURCE=""
 LINUX_AGENT_JSON_SAFE_INTEGER_MAX=9007199254740991
 
+linux_agent_config_validate_json_strict() {
+    local config_json="${1:-${LINUX_AGENT_CONFIG_JSON:-}}"
+
+    python3 -c '
+import json
+import sys
+
+
+def reject_constant(value):
+    raise ValueError(f"non-finite JSON number is not allowed: {value}")
+
+
+def reject_duplicates(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f"duplicate JSON key is not allowed: {key}")
+        result[key] = value
+    return result
+
+
+try:
+    value = json.load(
+        sys.stdin,
+        object_pairs_hook=reject_duplicates,
+        parse_constant=reject_constant,
+    )
+except (json.JSONDecodeError, UnicodeDecodeError, ValueError):
+    raise SystemExit(1)
+if not isinstance(value, dict):
+    raise SystemExit(1)
+' <<<"${config_json}"
+}
+
 linux_agent_load_config() {
     local config_json
 
     linux_agent_require_command jq
 
+    if [[ -L "${LINUX_AGENT_CONFIG_FILE}" ]]; then
+        linux_agent_print_error "config/config.json 不能是符号链接。"
+        return 1
+    fi
     if [[ ! -f "${LINUX_AGENT_CONFIG_FILE}" ]]; then
         cp "${LINUX_AGENT_ROOT}/config/config.example.json" "${LINUX_AGENT_CONFIG_FILE}"
         linux_agent_print_warn "未找到 config/config.json，已根据示例生成，请补充真实配置。"
@@ -24,6 +62,10 @@ linux_agent_load_config() {
         linux_agent_print_error "无法读取 config/config.json；请检查当前用户与文件所有权。"
         return 1
     fi
+    if ! linux_agent_config_validate_json_strict "${config_json}"; then
+        linux_agent_print_error "config/config.json 必须是无重复键、无非有限数值的合法 JSON 对象。"
+        return 1
+    fi
     if ! jq -e 'type == "object"' >/dev/null 2>&1 <<<"${config_json}"; then
         linux_agent_print_error "config/config.json 必须是合法的 JSON 对象。"
         return 1
@@ -34,6 +76,10 @@ linux_agent_load_config() {
     fi
     if ! linux_agent_config_validate_web_metrics "${config_json}"; then
         linux_agent_print_error "web.metrics_enabled 必须是 JSON boolean（true 或 false）。"
+        return 1
+    fi
+    if ! linux_agent_config_validate_web_sensitive_edits "${config_json}"; then
+        linux_agent_print_error "web.sensitive_edits_enabled 必须是 JSON boolean（true 或 false）。"
         return 1
     fi
     if ! linux_agent_config_validate_execution "${config_json}"; then
@@ -69,6 +115,54 @@ linux_agent_config_validate_web_metrics() {
             end
         )
     ' >/dev/null 2>&1 <<<"${config_json}"
+}
+
+linux_agent_config_validate_web_sensitive_edits() {
+    local config_json="${1:-${LINUX_AGENT_CONFIG_JSON:-}}"
+
+    jq -e '
+        type == "object"
+        and (
+            if (has("web") | not) then true
+            elif (.web | type) != "object" then false
+            elif (.web | has("sensitive_edits_enabled") | not) then true
+            else (.web.sensitive_edits_enabled | type) == "boolean"
+            end
+        )
+    ' >/dev/null 2>&1 <<<"${config_json}"
+}
+
+linux_agent_web_sensitive_edits_enabled() {
+    local config_json
+
+    [[ "${LINUX_AGENT_WEB:-0}" == "1" ]] || return 0
+    [[ -f "${LINUX_AGENT_CONFIG_FILE}" ]] || return 1
+    config_json="$(cat "${LINUX_AGENT_CONFIG_FILE}" 2>/dev/null)" || return 1
+    linux_agent_config_validate_json_strict "${config_json}" || return 1
+    [[ "$(jq -r '
+        if type != "object" then
+            "false"
+        elif (has("web") | not) then
+            "true"
+        elif (.web | type) != "object" then
+            "false"
+        elif (.web | has("sensitive_edits_enabled") | not) then
+            "true"
+        elif (.web | type) == "object" and (.web.sensitive_edits_enabled | type) == "boolean" then
+            (.web.sensitive_edits_enabled | tostring)
+        else
+            "false"
+        end
+    ' <<<"${config_json}" 2>/dev/null || printf 'false')" == "true" ]]
+}
+
+linux_agent_sensitive_edits_disabled_result() {
+    jq -cn '{
+        ok:false,
+        status:"sensitive_edits_disabled",
+        code:"sensitive_edits_disabled",
+        error:"Sensitive Web edits are disabled by server configuration."
+    }'
 }
 
 linux_agent_config_validate_execution() {
@@ -234,7 +328,11 @@ linux_agent_config_bool_default() {
     local default_value="${2:-false}"
     local value
 
-    value="$(linux_agent_config_get_default "${key}" "${default_value}")"
+    # 不能用 `key // default`：jq 的 `//` 会把显式 false 当成缺失，
+    # 导致默认 true 的开关无法被用户显式关闭。先绑定再判 null。
+    value="$(jq -r --arg default_value "${default_value}" \
+        "(${key}) as \$v | if \$v == null then \$default_value else (\$v | tostring) end" \
+        <<<"${LINUX_AGENT_CONFIG_JSON}")"
     case "${value,,}" in
         true | 1 | yes | on)
             printf 'true\n'

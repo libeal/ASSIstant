@@ -1,0 +1,8 @@
+{
+    "schema_version": 1,
+    "name": "session-history",
+    "description": "读取本项目审计 session 中上一轮或指定轮次的输出预览。",
+    "scripts": [
+        {"name": "last-command-output.sh", "risk": "low", "execution_class": "runner", "capability": ""}
+    ]
+}

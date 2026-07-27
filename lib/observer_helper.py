@@ -12,7 +12,6 @@ import re
 import signal
 import socket
 import stat
-import struct
 import subprocess
 import sys
 import threading
@@ -20,9 +19,21 @@ import time
 from pathlib import Path
 
 from subprocess_env import build_subprocess_env
+from helper_protocol import (
+    PROTOCOL_VERSION,
+    ProtocolError,
+    allowed_peer_uid,
+    build_request as build_protocol_request,
+    client_request as protocol_client_request,
+    peer_credentials,
+    receive_json,
+    runtime_shared_lock,
+    send_json,
+    systemd_listener,
+    validate_request,
+)
 
 
-MAX_REQUEST_BYTES = 8192
 MAX_STREAM_BYTES = 1_048_576
 MAX_CAPABILITY_STATE_BYTES = 1_048_576
 COMMAND_TIMEOUT_SEC = 15.0
@@ -70,7 +81,7 @@ _SESSION_CAPABILITIES: dict[str, dict[str, object]] = {}
 _CAPABILITY_STATE_PATH: Path | None = None
 
 
-class HelperRequestError(ValueError):
+class HelperRequestError(ProtocolError):
     """Raised when a client request is outside the helper allowlist."""
 
 
@@ -140,10 +151,27 @@ def _write_all(descriptor: int, payload: bytes) -> None:
         offset += written
 
 
+def _assert_no_symlink_components(path: Path) -> None:
+    """Reject state paths that could redirect persistence outside the runtime."""
+
+    current = Path(path.anchor or "/")
+    for component in path.parts[1:] if path.is_absolute() else path.parts:
+        current /= component
+        try:
+            metadata = current.lstat()
+        except FileNotFoundError:
+            continue
+        if stat.S_ISLNK(metadata.st_mode):
+            raise RuntimeError(f"observer capability state path contains a symbolic link: {current}")
+        if not stat.S_ISDIR(metadata.st_mode):
+            raise RuntimeError(f"observer capability state path component is not a directory: {current}")
+
+
 def _persist_capability_state_locked() -> None:
     path = _CAPABILITY_STATE_PATH
     if path is None:
         return
+    _assert_no_symlink_components(path.parent)
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o755)
     temporary = path.with_name(f".{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
     payload = (
@@ -183,20 +211,30 @@ def _persist_capability_state_locked() -> None:
 
 
 def _load_capability_records(path: Path) -> dict[str, dict[str, object]]:
+    _assert_no_symlink_components(path.parent)
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
     try:
-        metadata = path.stat()
+        descriptor = os.open(path, flags)
     except FileNotFoundError:
         return {}
-    if not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != os.geteuid():
-        raise RuntimeError("observer capability state has an untrusted owner or type")
-    if stat.S_IMODE(metadata.st_mode) & 0o077:
-        raise RuntimeError("observer capability state must be owner-only")
-    if metadata.st_size > MAX_CAPABILITY_STATE_BYTES:
-        raise RuntimeError("observer capability state exceeds its size limit")
+    except OSError as exc:
+        raise RuntimeError("observer capability state cannot be opened safely") from exc
     try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != os.geteuid():
+            raise RuntimeError("observer capability state has an untrusted owner or type")
+        if stat.S_IMODE(metadata.st_mode) & 0o077:
+            raise RuntimeError("observer capability state must be owner-only")
+        if metadata.st_size > MAX_CAPABILITY_STATE_BYTES:
+            raise RuntimeError("observer capability state exceeds its size limit")
+        with os.fdopen(descriptor, "r", encoding="utf-8") as handle:
+            descriptor = -1
+            payload = json.load(handle)
     except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise RuntimeError("observer capability state is invalid") from exc
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
     if not isinstance(payload, dict) or payload.get("version") != CAPABILITY_STATE_VERSION:
         raise RuntimeError("observer capability state version is unsupported")
     sessions = payload.get("sessions")
@@ -554,43 +592,41 @@ def run_command(command: list[str]) -> dict[str, object]:
 
 
 def _peer_credentials(connection: socket.socket) -> tuple[int, int, int]:
-    if not hasattr(socket, "SO_PEERCRED"):
-        raise RuntimeError("SO_PEERCRED is required")
-    raw = connection.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12)
-    return struct.unpack("3i", raw)
+    """Keep a patchable local seam while using the shared SO_PEERCRED check."""
+
+    return peer_credentials(connection)
 
 
-def _receive_request(connection: socket.socket) -> object:
-    payload = bytearray()
-    while True:
-        chunk = connection.recv(4096)
-        if not chunk:
-            break
-        payload.extend(chunk)
-        if len(payload) > MAX_REQUEST_BYTES:
-            raise HelperRequestError("request exceeds 8192 bytes")
-        if b"\n" in chunk:
-            break
-    try:
-        return json.loads(bytes(payload).decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise HelperRequestError("request is not valid UTF-8 JSON") from exc
+def _validate_operation_params(operation: str, params: dict[str, object]) -> dict[str, object]:
+    expected_fields = {
+        "ping": set(),
+        "status": set(),
+        "list_rules": {"key", "capability"},
+        "search_key": {"key", "capability"},
+        "add_rule": {"audit_uid", "key", "syscall", "capability"},
+        "remove_rule": {"audit_uid", "key", "syscall", "capability"},
+        "release_key": {"key", "capability"},
+    }
+    if operation not in expected_fields:
+        raise HelperRequestError("unsupported helper operation")
+    if set(params) != expected_fields[operation]:
+        raise HelperRequestError(f"{operation} params do not match the fixed schema")
+    return {"operation": operation, **params}
 
 
-def handle_connection(connection: socket.socket) -> None:
+def handle_connection(connection: socket.socket, expected_uid: int | None = None) -> None:
     peer_pid = peer_uid = peer_gid = -1
     operation = ""
     request = None
     authorization = None
+    request_id = ""
     try:
         peer_pid, peer_uid, peer_gid = _peer_credentials(connection)
-        request = _receive_request(connection)
-        operation = str(request.get("operation") or "") if isinstance(request, dict) else ""
-        authorization = authorize_request(
-            request,
-            peer_pid=peer_pid,
-            peer_uid=peer_uid,
-        )
+        if expected_uid is not None and peer_uid != expected_uid:
+            raise HelperRequestError("requesting process uid is not authorized")
+        envelope = receive_json(connection)
+        operation, params, _summary, request_id = validate_request(envelope)
+        request = _validate_operation_params(operation, params)
         if operation == "ping":
             response = {
                 "ok": True,
@@ -599,24 +635,32 @@ def handle_connection(connection: socket.socket) -> None:
                 "stdout": "",
                 "stderr": "",
             }
-        elif operation == "release_key":
-            response = {
-                "ok": True,
-                "status": "released",
-                "exit_code": 0,
-                "stdout": "",
-                "stderr": "",
-            }
         else:
-            response = run_command(
-                build_command(request, peer_pid=peer_pid, peer_uid=peer_uid)
-            )
-        finish_authorized_request(request, authorization, response)
-    except HelperRequestError as exc:
+            with runtime_shared_lock():
+                authorization = authorize_request(
+                    request,
+                    peer_pid=peer_pid,
+                    peer_uid=peer_uid,
+                )
+                if operation == "release_key":
+                    response = {
+                        "ok": True,
+                        "status": "released",
+                        "exit_code": 0,
+                        "stdout": "",
+                        "stderr": "",
+                    }
+                else:
+                    response = run_command(
+                        build_command(request, peer_pid=peer_pid, peer_uid=peer_uid)
+                    )
+                finish_authorized_request(request, authorization, response)
+    except ProtocolError as exc:
         rollback_new_authorization(authorization, request)
         response = {
             "ok": False,
-            "status": "invalid_request",
+            "status": "helper_rejected",
+            "code": "helper_rejected",
             "exit_code": 126,
             "stdout": "",
             "stderr": str(exc),
@@ -626,13 +670,19 @@ def handle_connection(connection: socket.socket) -> None:
         response = {
             "ok": False,
             "status": "helper_failed",
+            "code": "helper_failed",
             "exit_code": 125,
             "stdout": "",
             "stderr": str(exc),
         }
+    response.update(
+        {
+            "protocol_version": PROTOCOL_VERSION,
+            "request_id": request_id,
+        }
+    )
     try:
-        encoded = json.dumps(response, ensure_ascii=True, separators=(",", ":")).encode()
-        connection.sendall(encoded + b"\n")
+        send_json(connection, response)
     except OSError as exc:
         print(
             json.dumps(
@@ -667,14 +717,6 @@ def handle_connection(connection: socket.socket) -> None:
     )
 
 
-def systemd_listener() -> socket.socket:
-    if int(os.environ.get("LISTEN_PID", "0") or "0") != os.getpid():
-        raise RuntimeError("helper requires systemd socket activation")
-    if int(os.environ.get("LISTEN_FDS", "0") or "0") != 1:
-        raise RuntimeError("helper requires exactly one systemd socket")
-    return socket.socket(fileno=os.dup(3))
-
-
 def serve() -> int:
     if os.geteuid() != 0:
         raise RuntimeError("observer helper service must run as root")
@@ -685,12 +727,13 @@ def serve() -> int:
         )
     )
     listener = systemd_listener()
+    expected_uid = allowed_peer_uid("linux-agent")
     while True:
         connection, _ = listener.accept()
         with connection:
             connection.settimeout(5.0)
             try:
-                handle_connection(connection)
+                handle_connection(connection, expected_uid)
             except Exception as exc:  # Isolate one malformed peer from the daemon.
                 print(
                     json.dumps(
@@ -706,34 +749,23 @@ def serve() -> int:
 
 
 def client_request(socket_path: str, request: dict[str, object]) -> int:
-    encoded = json.dumps(request, separators=(",", ":")).encode() + b"\n"
-    if len(encoded) > MAX_REQUEST_BYTES:
-        raise HelperRequestError("request exceeds 8192 bytes")
-    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
-        connection.settimeout(20.0)
-        connection.connect(socket_path)
-        connection.sendall(encoded)
-        connection.shutdown(socket.SHUT_WR)
-        response_bytes = bytearray()
-        while True:
-            chunk = connection.recv(65_536)
-            if not chunk:
-                break
-            response_bytes.extend(chunk)
-            if len(response_bytes) > 2 * MAX_STREAM_BYTES + MAX_REQUEST_BYTES:
-                raise RuntimeError("helper response exceeds the client limit")
-    if not response_bytes:
-        raise HelperRequestError("helper returned an empty response")
+    if not isinstance(request, dict):
+        raise HelperRequestError("request must be a JSON object")
+    operation = str(request.get("operation") or "")
+    params = {key: value for key, value in request.items() if key != "operation"}
+    _validate_operation_params(operation, params)
+    summary = f"Observer helper operation {operation}"
+    envelope = build_protocol_request(operation, params, summary=summary)
     try:
-        response = json.loads(response_bytes.decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise HelperRequestError("helper returned invalid UTF-8 JSON") from exc
-    if not isinstance(response, dict):
-        raise HelperRequestError("helper response must be a JSON object")
-    stdout = response.get("stdout") or ""
-    stderr = response.get("stderr") or ""
+        response = protocol_client_request(socket_path, envelope, timeout=20.0)
+    except ProtocolError as exc:
+        raise HelperRequestError(str(exc)) from exc
+    stdout = response.get("stdout", "")
+    stderr = response.get("stderr", "")
     if not isinstance(stdout, str) or not isinstance(stderr, str):
         raise HelperRequestError("helper response streams must be strings")
+    if len(stdout.encode("utf-8")) > MAX_STREAM_BYTES or len(stderr.encode("utf-8")) > MAX_STREAM_BYTES:
+        raise HelperRequestError("helper response streams exceed the client limit")
     sys.stdout.write(stdout)
     sys.stderr.write(stderr)
     exit_code = response.get("exit_code", 125)

@@ -2,12 +2,14 @@
 
 import json
 import os
-import subprocess
+import stat
 import tempfile
 import uuid
 from pathlib import Path
 
-from subprocess_env import build_subprocess_env
+
+class SensitiveEditsDisabled(RuntimeError):
+    pass
 
 
 def _reject_json_constant(value):
@@ -43,11 +45,111 @@ def _fsync_directory(path):
 
 
 def _fsync_file(path):
-    descriptor = os.open(str(path), os.O_RDONLY)
+    descriptor = os.open(str(path), os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
     try:
         os.fsync(descriptor)
     finally:
         os.close(descriptor)
+
+
+def _assert_no_symlink_components(path):
+    """Reject existing symbolic-link components before a Web-originated write."""
+
+    path = Path(os.path.abspath(os.fspath(path)))
+    current = Path(path.root)
+    for component in path.parts[1:]:
+        current /= component
+        try:
+            metadata = current.lstat()
+        except FileNotFoundError:
+            break
+        if stat.S_ISLNK(metadata.st_mode):
+            raise ValueError(f"policy path component must not be a symlink: {current}")
+        if current != path and not stat.S_ISDIR(metadata.st_mode):
+            raise ValueError(f"policy path component is not a directory: {current}")
+
+
+def _copy_snapshot(source, directory):
+    source = Path(source)
+    directory = Path(directory)
+    source_descriptor = os.open(
+        str(source), os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    )
+    snapshot_descriptor = -1
+    snapshot = None
+    try:
+        metadata = os.fstat(source_descriptor)
+        if not stat.S_ISREG(metadata.st_mode):
+            raise OSError("policy target must be a regular file")
+        snapshot_descriptor, raw_path = tempfile.mkstemp(
+            prefix=f".{source.name}.previous.", suffix=".tmp", dir=str(directory)
+        )
+        snapshot = Path(raw_path)
+        os.fchmod(snapshot_descriptor, stat.S_IMODE(metadata.st_mode))
+        while True:
+            chunk = os.read(source_descriptor, 65536)
+            if not chunk:
+                break
+            _write_all(snapshot_descriptor, chunk)
+        os.fsync(snapshot_descriptor)
+        os.close(snapshot_descriptor)
+        snapshot_descriptor = -1
+        current = os.stat(source, follow_symlinks=False)
+        identity = (metadata.st_dev, metadata.st_ino, metadata.st_size, metadata.st_mtime_ns)
+        current_identity = (
+            current.st_dev,
+            current.st_ino,
+            current.st_size,
+            current.st_mtime_ns,
+        )
+        if identity != current_identity:
+            raise OSError("policy target changed while preparing replacement")
+        return snapshot
+    except Exception:
+        if snapshot_descriptor >= 0:
+            os.close(snapshot_descriptor)
+        if snapshot is not None:
+            snapshot.unlink(missing_ok=True)
+        raise
+    finally:
+        os.close(source_descriptor)
+
+
+def _restore_snapshot(snapshot, target, directory):
+    snapshot = Path(snapshot)
+    target = Path(target)
+    directory = Path(directory)
+    source_descriptor = os.open(
+        str(snapshot), os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    )
+    rollback_descriptor = -1
+    rollback = None
+    try:
+        metadata = os.fstat(source_descriptor)
+        rollback_descriptor, raw_path = tempfile.mkstemp(
+            prefix=f".{target.name}.rollback.", suffix=".tmp", dir=str(directory)
+        )
+        rollback = Path(raw_path)
+        os.fchmod(rollback_descriptor, stat.S_IMODE(metadata.st_mode))
+        while True:
+            chunk = os.read(source_descriptor, 65536)
+            if not chunk:
+                break
+            _write_all(rollback_descriptor, chunk)
+        os.fsync(rollback_descriptor)
+        os.close(rollback_descriptor)
+        rollback_descriptor = -1
+        os.replace(rollback, target)
+        rollback = None
+        os.chmod(target, stat.S_IMODE(metadata.st_mode))
+        _fsync_file(target)
+        _fsync_directory(directory)
+    finally:
+        if rollback_descriptor >= 0:
+            os.close(rollback_descriptor)
+        if rollback is not None:
+            rollback.unlink(missing_ok=True)
+        os.close(source_descriptor)
 
 
 class PolicyService:
@@ -57,6 +159,7 @@ class PolicyService:
         self,
         root,
         *,
+        overlay_root=None,
         config_reader,
         config_writer,
         agent_api,
@@ -64,8 +167,12 @@ class PolicyService:
         config_public_state,
         config_updater=None,
         effective_uid=os.geteuid,
-        process_runner=subprocess.run,
-        env_builder=build_subprocess_env,
+        privileged_writer=None,
+        managed_execution=None,
+        # Kept as accepted compatibility parameters for third-party adapters;
+        # policy editing no longer invokes sudo or a password-bearing runner.
+        process_runner=None,
+        env_builder=None,
     ):
         dependencies = {
             "config_reader": config_reader,
@@ -73,8 +180,6 @@ class PolicyService:
             "agent_api": agent_api,
             "audit": audit,
             "config_public_state": config_public_state,
-            "process_runner": process_runner,
-            "env_builder": env_builder,
         }
         for name, dependency in dependencies.items():
             if not callable(dependency):
@@ -83,9 +188,26 @@ class PolicyService:
             raise TypeError("config_updater must be callable")
         if not callable(effective_uid) and not isinstance(effective_uid, int):
             raise TypeError("effective_uid must be an integer or callable")
+        if privileged_writer is not None and not callable(privileged_writer):
+            raise TypeError("privileged_writer must be callable")
+        if managed_execution is not None and not isinstance(managed_execution, bool):
+            raise TypeError("managed_execution must be a boolean or None")
 
         self.root = Path(root).resolve()
         self.policies_root = self.root / "policies"
+        # Adapters that do not provide an explicit overlay retain the historic
+        # in-tree behavior; the production Web adapter always injects the
+        # managed ``data/policies`` root explicitly.
+        self.overlay_root = (
+            Path(os.path.abspath(os.fspath(overlay_root)))
+            if overlay_root is not None
+            else self.policies_root
+        )
+        self.managed = (
+            self.root.parent.name == "releases"
+            if managed_execution is None
+            else managed_execution
+        )
         self.temp_root = self.root / "tmp" / "web" / "policy-edits"
         self._config_reader = config_reader
         self._config_writer = config_writer
@@ -94,8 +216,7 @@ class PolicyService:
         self._audit = audit
         self._config_public_state = config_public_state
         self._effective_uid = effective_uid
-        self._process_runner = process_runner
-        self._env_builder = env_builder
+        self._privileged_writer = privileged_writer
 
     def _begin_audited_mutation(self, stage, payload):
         audit_payload = dict(payload)
@@ -117,6 +238,47 @@ class PolicyService:
         value = self._effective_uid() if callable(self._effective_uid) else self._effective_uid
         return int(value)
 
+    @staticmethod
+    def _has_writable_ancestor(path):
+        """Return whether a missing target can be created by this process."""
+
+        current = Path(path).parent
+        while not current.exists():
+            parent = current.parent
+            if parent == current:
+                return False
+            current = parent
+        return current.is_dir() and os.access(current, os.W_OK | os.X_OK)
+
+    @staticmethod
+    def _config_allows_mutation(config):
+        if not isinstance(config, dict):
+            return False
+        if "web" not in config:
+            return True
+        web = config.get("web")
+        if not isinstance(web, dict):
+            return False
+        if "sensitive_edits_enabled" not in web:
+            return True
+        value = web.get("sensitive_edits_enabled")
+        return value if isinstance(value, bool) else False
+
+    def _mutation_allowed(self):
+        return self._config_allows_mutation(self._config_reader())
+
+    def _mutation_blocked_result(self):
+        return {
+            "ok": False,
+            "status": "sensitive_edits_disabled",
+            "code": "sensitive_edits_disabled",
+            "error": "Sensitive Web edits are disabled by server configuration.",
+        }
+
+    def _require_mutation_allowed(self):
+        if not self._mutation_allowed():
+            raise SensitiveEditsDisabled
+
     def _assert_policies_root(self):
         if self.policies_root.is_symlink():
             raise ValueError("policies root must not be a symbolic link")
@@ -126,36 +288,56 @@ class PolicyService:
         except ValueError as exc:
             raise ValueError("policies root must stay below the project root") from exc
 
-    def safe_path(self, relative_path):
-        self._assert_policies_root()
+    def _assert_overlay_root(self):
+        _assert_no_symlink_components(self.overlay_root)
+        if self.overlay_root.is_symlink():
+            raise ValueError("policy overlay root must not be a symbolic link")
+        if self.overlay_root.exists() and not self.overlay_root.is_dir():
+            raise ValueError("policy overlay root must be a directory")
+
+    @staticmethod
+    def _validate_relative_path(relative_path):
         if not isinstance(relative_path, str) or not relative_path or "\x00" in relative_path:
             raise ValueError("policy path is required")
         candidate = Path(relative_path)
         if candidate.is_absolute() or ".." in candidate.parts:
             raise ValueError("policy path must be relative to policies/")
-        if any(part.startswith(".") for part in candidate.parts):
-            raise ValueError("hidden policy paths are not editable from the web console")
+        if len(candidate.parts) != 1 or candidate.name.startswith("."):
+            raise ValueError("only registered top-level policy files are editable")
         if candidate.suffix != ".json":
             raise ValueError("only JSON policy files are editable from the web console")
+        return candidate
 
-        current = self.policies_root
-        for part in candidate.parts:
-            current = current / part
-            if current.is_symlink():
-                raise ValueError("symbolic links are not editable from the web console")
-        target = (self.policies_root / candidate).resolve()
-        try:
-            target.relative_to(self.policies_root)
-        except ValueError as exc:
-            raise ValueError("policy path must be relative to policies/") from exc
+    def _registered_default(self, relative_path):
+        self._assert_policies_root()
+        candidate = self._validate_relative_path(relative_path)
+        target = self.policies_root / candidate
+        if target.is_symlink() or not target.is_file():
+            raise ValueError("policy is not registered by the current release")
         return target
+
+    def _overlay_target(self, relative_path):
+        self._registered_default(relative_path)
+        self._assert_overlay_root()
+        candidate = self._validate_relative_path(relative_path)
+        target = self.overlay_root / candidate
+        if target.is_symlink():
+            raise ValueError("symbolic links are not editable from the web console")
+        return target
+
+    def safe_path(self, relative_path):
+        default = self._registered_default(relative_path)
+        overlay = self._overlay_target(relative_path)
+        if overlay.exists():
+            if not overlay.is_file():
+                raise ValueError("policy overlay must be a regular file")
+            return overlay
+        return default
 
     def list_files(self):
         self._assert_policies_root()
-        try:
-            paths = sorted(self.policies_root.iterdir(), key=lambda item: item.name)
-        except FileNotFoundError:
-            return []
+        self._assert_overlay_root()
+        paths = sorted(self.policies_root.iterdir(), key=lambda item: item.name)
         files = []
         for path in paths:
             if path.name.startswith(".") or path.is_symlink():
@@ -166,14 +348,32 @@ class PolicyService:
                 metadata = path.stat()
             except FileNotFoundError:
                 continue
+            overlay = self.overlay_root / path.name
+            effective = overlay if overlay.exists() else path
+            if overlay.is_symlink() or (overlay.exists() and not overlay.is_file()):
+                raise ValueError(f"policy overlay is invalid: {path.name}")
+            metadata = effective.stat()
             files.append(
                 {
-                    "path": path.relative_to(self.policies_root).as_posix(),
+                    "path": path.name,
                     "size_bytes": metadata.st_size,
                     "mtime": int(metadata.st_mtime),
+                    "source": "overlay" if effective == overlay else "default",
                 }
             )
         return files
+
+    def orphaned_files(self):
+        self._assert_overlay_root()
+        if not self.overlay_root.exists():
+            return []
+        orphans = []
+        for path in sorted(self.overlay_root.iterdir(), key=lambda item: item.name):
+            if path.name.startswith(".") or path.is_symlink() or not path.is_file():
+                continue
+            if path.suffix == ".json" and not (self.policies_root / path.name).is_file():
+                orphans.append(path.name)
+        return orphans
 
     def read_file(self, relative_path):
         target = self.safe_path(relative_path)
@@ -191,7 +391,8 @@ class PolicyService:
         return {
             "ok": True,
             "status": "read",
-            "path": target.relative_to(self.policies_root).as_posix(),
+            "path": Path(relative_path).as_posix(),
+            "source": "overlay" if target.parent == self.overlay_root else "default",
             "content": content,
             "json": parsed,
         }
@@ -208,43 +409,14 @@ class PolicyService:
             timeout=60,
         )
 
-    def sudo_check(self, password):
-        if self._euid() == 0:
-            return {"ok": True, "status": "sudo_ok", "method": "root"}
-        if not password:
-            return {
-                "ok": False,
-                "status": "sudo_required",
-                "error": "sudo password is required.",
-            }
-        try:
-            process = self._process_runner(
-                ["sudo", "-S", "-p", "", "-v"],
-                input=f"{password}\n",
-                text=True,
-                capture_output=True,
-                env=self._env_builder(include_api_key=False),
-                timeout=10,
-                check=False,
-            )
-        except FileNotFoundError:
-            return {
-                "ok": False,
-                "status": "sudo_not_found",
-                "error": "sudo is not installed.",
-            }
-        except subprocess.TimeoutExpired:
-            return {
-                "ok": False,
-                "status": "sudo_timeout",
-                "error": "sudo validation timed out.",
-            }
-        if process.returncode == 0:
-            return {"ok": True, "status": "sudo_ok", "method": "sudo"}
+    def sudo_check(self, _password=None):
+        """Compatibility endpoint: Bearer authentication is the authorization."""
+
         return {
-            "ok": False,
-            "status": "sudo_denied",
-            "error": (process.stderr or "sudo validation failed").strip()[:400],
+            "ok": True,
+            "status": "authorization_not_required",
+            "method": "web_bearer",
+            "deprecated": True,
         }
 
     @staticmethod
@@ -303,43 +475,60 @@ class PolicyService:
         os.close(descriptor)
         return temp_path
 
-    def _root_replace(self, temp_path, target):
+    def _root_replace(self, temp_path, target, pre_replace=None):
+        _assert_no_symlink_components(target.parent)
         target.parent.mkdir(parents=True, exist_ok=True)
+        if target.parent.is_symlink() or target.is_symlink():
+            raise OSError("policy target must not be a symbolic link")
         os.chmod(temp_path, 0o644)
         _fsync_file(temp_path)
-        os.replace(temp_path, target)
-        _fsync_file(target)
-        _fsync_directory(target.parent)
-        if self.temp_root != target.parent:
-            _fsync_directory(self.temp_root)
-
-    def _sudo_install(self, temp_path, target, password):
+        snapshot = None
+        replaced = False
+        retain_snapshot = False
+        target_existed = target.exists()
+        if target_existed:
+            snapshot = _copy_snapshot(target, target.parent)
+            _fsync_directory(target.parent)
+        elif target.is_symlink():
+            raise OSError("policy target appeared as a symbolic link")
+        if pre_replace is not None:
+            try:
+                pre_replace()
+            except Exception:
+                if snapshot is not None:
+                    snapshot.unlink(missing_ok=True)
+                raise
         try:
-            return self._process_runner(
-                [
-                    "sudo",
-                    "-S",
-                    "-p",
-                    "",
-                    "install",
-                    "-m",
-                    "0644",
-                    "--",
-                    str(temp_path),
-                    str(target),
-                ],
-                input=f"{password}\n",
-                text=True,
-                capture_output=True,
-                env=self._env_builder(include_api_key=False),
-                timeout=10,
-                check=False,
-            )
-        except subprocess.TimeoutExpired:
-            return None
+            os.replace(temp_path, target)
+            replaced = True
+            _fsync_file(target)
+            _fsync_directory(target.parent)
+            if self.temp_root != target.parent:
+                _fsync_directory(self.temp_root)
+        except Exception as exc:
+            if replaced:
+                try:
+                    if snapshot is not None:
+                        _restore_snapshot(snapshot, target, target.parent)
+                    else:
+                        target.unlink(missing_ok=True)
+                        _fsync_directory(target.parent)
+                except Exception as rollback_exc:
+                    retain_snapshot = snapshot is not None
+                    recovery = f"; recovery backup: {snapshot}" if snapshot else ""
+                    raise OSError(
+                        f"policy replacement failed and rollback failed{recovery}: {rollback_exc}"
+                    ) from exc
+            raise
+        finally:
+            if snapshot is not None and not retain_snapshot:
+                try:
+                    snapshot.unlink(missing_ok=True)
+                except OSError:
+                    pass
 
-    def write_file(self, relative_path, content, password=""):
-        target = self.safe_path(relative_path)
+    def write_file(self, relative_path, content, _password=""):
+        target = self._overlay_target(relative_path)
         normalized_content, parse_error = self._parse_content(content)
         if parse_error:
             return parse_error
@@ -355,54 +544,72 @@ class PolicyService:
                 else {"ok": False, "status": "invalid_validation_response"},
             }
 
-        method = "root"
-        if self._euid() != 0:
-            check = self.sudo_check(password)
-            if not check.get("ok"):
-                return check
-            method = str(check.get("method") or "sudo")
+        if not self._mutation_allowed():
+            return self._mutation_blocked_result()
 
-        relative = target.relative_to(self.policies_root).as_posix()
+        direct_write = not self.managed and (
+            self._euid() == 0 or self._has_writable_ancestor(target)
+        )
+        method = ("root" if self._euid() == 0 else "direct") if direct_write else "policy_helper"
+        if not direct_write and self._privileged_writer is None:
+            return {
+                "ok": False,
+                "status": "helper_unavailable",
+                "code": "helper_unavailable",
+                "error": "Policy writer helper is required for this installation.",
+            }
+
+        relative = Path(relative_path).name
         audit_payload = self._begin_audited_mutation(
             "policy_update",
             {"path": relative, "method": method},
         )
-        temp_path = self._create_temp_file(target, normalized_content)
-        try:
-            if method == "root":
-                self._root_replace(temp_path, target)
-            else:
-                process = self._sudo_install(temp_path, target, password)
-                if process is None:
-                    return {
-                        "ok": False,
-                        "status": "sudo_timeout",
-                        "error": "sudo install timed out.",
-                    }
-                if process.returncode != 0:
-                    return {
-                        "ok": False,
-                        "status": "sudo_write_failed",
-                        "error": (process.stderr or "sudo install failed").strip()[:400],
-                    }
-                _fsync_file(target)
-                _fsync_directory(target.parent)
-        finally:
+        helper_warning = None
+        if direct_write:
+            temp_path = self._create_temp_file(target, normalized_content)
             try:
-                temp_path.unlink()
-            except FileNotFoundError:
-                pass
+                try:
+                    self._root_replace(
+                        temp_path,
+                        target,
+                        pre_replace=self._require_mutation_allowed,
+                    )
+                except SensitiveEditsDisabled:
+                    return self._mutation_blocked_result()
+            finally:
+                try:
+                    temp_path.unlink()
+                except FileNotFoundError:
+                    pass
+        else:
+            if not self._mutation_allowed():
+                return self._mutation_blocked_result()
+            helper_result = self._privileged_writer(
+                "policy.write",
+                {"path": relative, "content": normalized_content},
+            )
+            if not isinstance(helper_result, dict) or not helper_result.get("ok"):
+                return helper_result if isinstance(helper_result, dict) else {
+                    "ok": False,
+                    "status": "helper_failed",
+                    "code": "helper_failed",
+                    "error": "Policy writer helper returned an invalid response.",
+                }
+            helper_warning = helper_result.get("warning")
 
         audit_result = self._finish_audited_mutation("policy_updated", audit_payload)
-        return {
+        result = {
             "ok": True,
             "status": "saved",
             "path": relative,
             "method": method,
             **audit_result,
         }
+        if isinstance(helper_warning, str) and helper_warning:
+            result["warning"] = helper_warning
+        return result
 
-    def update_command_guard(self, enabled, password=""):
+    def update_command_guard(self, enabled, _password=""):
         if not isinstance(enabled, bool):
             return {
                 "ok": False,
@@ -410,34 +617,59 @@ class PolicyService:
                 "error": "command_guard.enabled must be boolean.",
             }
 
-        if self._euid() == 0:
-            method = "root"
-        else:
-            check = self.sudo_check(password)
-            if not check.get("ok"):
-                return check
-            method = str(check.get("method") or "sudo")
+        if not self._mutation_allowed():
+            return self._mutation_blocked_result()
+
+        direct_write = not self.managed
+        method = ("root" if self._euid() == 0 else "direct") if direct_write else "policy_helper"
+        if not direct_write and self._privileged_writer is None:
+            return {
+                "ok": False,
+                "status": "helper_unavailable",
+                "code": "helper_unavailable",
+                "error": "Policy writer helper is required for this installation.",
+            }
 
         audit_payload = self._begin_audited_mutation(
             "command_guard_update",
             {"enabled": enabled, "method": method},
         )
         command_guard = {"enabled": enabled}
+        helper_warning = None
 
         def mutate_config(config):
+            if not self._config_allows_mutation(config):
+                raise SensitiveEditsDisabled
             existing_guard = config.get("command_guard")
             updated_guard = dict(existing_guard) if isinstance(existing_guard, dict) else {}
             updated_guard["enabled"] = enabled
             config["command_guard"] = updated_guard
 
         try:
-            if self._config_updater is not None:
+            if not self._mutation_allowed():
+                return self._mutation_blocked_result()
+            if not direct_write:
+                helper_result = self._privileged_writer(
+                    "command_guard.set",
+                    {"enabled": enabled},
+                )
+                if not isinstance(helper_result, dict) or not helper_result.get("ok"):
+                    return helper_result if isinstance(helper_result, dict) else {
+                        "ok": False,
+                        "status": "helper_failed",
+                        "code": "helper_failed",
+                        "error": "Policy writer helper returned an invalid response.",
+                    }
+                helper_warning = helper_result.get("warning")
+            elif self._config_updater is not None:
                 self._config_updater(mutate_config)
             else:
                 current = self._config_reader()
                 config = dict(current) if isinstance(current, dict) else {}
                 mutate_config(config)
                 self._config_writer(config)
+        except SensitiveEditsDisabled:
+            return self._mutation_blocked_result()
         except (OSError, ValueError) as exc:
             return {
                 "ok": False,
@@ -451,6 +683,8 @@ class PolicyService:
         result["status"] = "updated"
         result["method"] = method
         result["command_guard"] = public_config.get("command_guard", command_guard)
+        if isinstance(helper_warning, str) and helper_warning:
+            result["warning"] = helper_warning
         result.update(
             self._finish_audited_mutation(
                 "command_guard_updated",

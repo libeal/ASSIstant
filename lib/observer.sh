@@ -39,6 +39,11 @@ linux_agent_observer_helper_available() {
         command -v python3 >/dev/null 2>&1
 }
 
+linux_agent_observer_helper_required() {
+    declare -F linux_agent_managed_execution_enabled >/dev/null 2>&1 &&
+        linux_agent_managed_execution_enabled
+}
+
 linux_agent_observer_helper_request() {
     local operation="$1"
     shift
@@ -46,10 +51,12 @@ linux_agent_observer_helper_request() {
     local socket_path
     socket_path="$(linux_agent_observer_helper_socket)"
     linux_agent_observer_helper_available || return 127
-    if [[ "${operation}" != "status" ]]; then
-        [[ "${LINUX_AGENT_OBSERVER_HELPER_CAPABILITY:-}" =~ ^[0-9a-f]{64}$ ]] || return 126
-        capability_args=(--capability "${LINUX_AGENT_OBSERVER_HELPER_CAPABILITY}")
-    fi
+    case "${operation}" in
+        list_rules | search_key | add_rule | remove_rule | release_key)
+            [[ "${LINUX_AGENT_OBSERVER_HELPER_CAPABILITY:-}" =~ ^[0-9a-f]{64}$ ]] || return 126
+            capability_args=(--capability "${LINUX_AGENT_OBSERVER_HELPER_CAPABILITY}")
+            ;;
+    esac
     python3 "${LINUX_AGENT_ROOT}/lib/observer_helper.py" request \
         --socket "${socket_path}" "${operation}" "$@" "${capability_args[@]}"
 }
@@ -254,6 +261,10 @@ linux_agent_observer_auditctl() {
         esac
         return
     fi
+    if linux_agent_observer_helper_required; then
+        printf 'observer helper is required in managed execution mode\n' >&2
+        return 126
+    fi
     if [[ "$(id -u)" -eq 0 ]]; then
         auditctl "$@"
     else
@@ -268,6 +279,10 @@ linux_agent_observer_ausearch() {
             return
         fi
         printf 'observer helper rejected an unstructured ausearch request\n' >&2
+        return 126
+    fi
+    if linux_agent_observer_helper_required; then
+        printf 'observer helper is required in managed execution mode\n' >&2
         return 126
     fi
     if [[ "$(id -u)" -eq 0 ]]; then
@@ -310,6 +325,10 @@ linux_agent_observer_preflight() {
             jq -cn --arg reason "${reason}" --argjson auditctl_exit_code "${auditctl_exit_code}" \
                 '{status:"unavailable", backend:"auditd", available:false, privilege:"helper", sudo_available:null, sudo_authenticated:null, auditctl_exit_code:$auditctl_exit_code, reason_code:"observer_helper_failed", reason:$reason, diagnostic:"The privileged observer helper socket exists but its auditd preflight failed; execution will not fall back to sudo."}'
         fi
+        return 0
+    fi
+    if linux_agent_observer_helper_required; then
+        jq -cn '{status:"unavailable", backend:"auditd", available:false, privilege:"helper", sudo_available:null, sudo_authenticated:null, reason_code:"observer_helper_unavailable", reason:"observer helper is unavailable", diagnostic:"Managed execution requires the privileged observer helper; sudo fallback is disabled."}'
         return 0
     fi
 
@@ -589,6 +608,7 @@ linux_agent_observer_install_syscall_rule() {
             --audit-uid "${audit_uid}" --key "${key}" --syscall "${syscall}" >/dev/null 2>&1
         return
     fi
+    linux_agent_observer_helper_required && return 126
     linux_agent_observer_auditctl -a always,exit -F arch=b64 -S "${syscall}" -F "auid=${audit_uid}" -k "${key}" >/dev/null 2>&1
 }
 
@@ -601,6 +621,7 @@ linux_agent_observer_remove_syscall_rule() {
             --audit-uid "${audit_uid}" --key "${key}" --syscall "${syscall}" >/dev/null 2>&1
         return
     fi
+    linux_agent_observer_helper_required && return 126
     linux_agent_observer_auditctl -d always,exit -F arch=b64 -S "${syscall}" -F "auid=${audit_uid}" -k "${key}" >/dev/null 2>&1
 }
 
@@ -813,7 +834,12 @@ linux_agent_observer_parse_ausearch() {
 linux_agent_observer_log_file_vault_observations() {
     local parsed="$1"
     local scope="${2:-session}"
-    local policy_path="${LINUX_AGENT_FILE_VAULT_POLICY_PATH:-${LINUX_AGENT_ROOT}/policies/file-vault.json}"
+    local policy_path
+    if [[ -n "${LINUX_AGENT_FILE_VAULT_POLICY_PATH:-}" ]]; then
+        policy_path="${LINUX_AGENT_FILE_VAULT_POLICY_PATH}"
+    else
+        policy_path="$(linux_agent_policy_path file-vault.json)"
+    fi
     local paths observed
 
     [[ -f "${policy_path}" ]] || return 0
@@ -1057,7 +1083,7 @@ linux_agent_run_observed_process() {
             '{exit_code:($blocked_result.exit_code // 125), root_pid:null, timed_out:false, observer:{status:"audit_blocked", backend:"auditd", lifecycle:"execution"}, blocked_result:$blocked_result}'
         return 0
     fi
-    local max_output_bytes output_capped output_integrity_unknown
+    local max_output_bytes output_capped output_integrity_unknown runner_cancelled runner_metadata
     local stdout_truncated_bytes stderr_truncated_bytes
     local stdout_pipe stderr_pipe stdout_marker stderr_marker stdout_limiter_pid stderr_limiter_pid
     local stdout_limiter_status stderr_limiter_status
@@ -1065,6 +1091,7 @@ linux_agent_run_observed_process() {
     [[ "${max_output_bytes}" =~ ^[0-9]+$ ]] || max_output_bytes=1048576
     output_capped=false
     output_integrity_unknown=false
+    runner_cancelled=false
     stdout_truncated_bytes=0
     stderr_truncated_bytes=0
     stdout_pipe="${stdout_file}.pipe.$$"
@@ -1130,6 +1157,37 @@ linux_agent_run_observed_process() {
         printf 'execution descendant retained an output stream; output integrity is unknown\n' >"${stderr_file}"
     fi
     rm -f -- "${stdout_marker}" "${stderr_marker}"
+
+    # In managed mode the outer process is a bounded streaming Runner client.
+    # Its private sidecar carries the real process status without mixing
+    # control metadata into stdout/stderr. Outer limiter failures always win.
+    runner_metadata=""
+    if declare -F linux_agent_runner_result_metadata >/dev/null 2>&1; then
+        runner_metadata="$(linux_agent_runner_result_metadata 2>/dev/null || true)"
+    fi
+    if [[ -n "${LINUX_AGENT_RUNNER_RESULT_FILE:-}" && -z "${runner_metadata}" &&
+        "${output_integrity_unknown}" != "true" && "${output_capped}" != "true" &&
+        "${timed_out}" != "true" ]]; then
+        output_integrity_unknown=true
+        exit_code=125
+    elif [[ -n "${runner_metadata}" && "${output_integrity_unknown}" != "true" &&
+        "${output_capped}" != "true" && "${timed_out}" != "true" ]]; then
+        if [[ "$(jq -r '.output_integrity_unknown // false' <<<"${runner_metadata}")" == "true" ]]; then
+            output_integrity_unknown=true
+            exit_code=125
+        elif [[ "$(jq -r '.output_capped // false' <<<"${runner_metadata}")" == "true" ]]; then
+            output_capped=true
+            stdout_truncated_bytes="$(jq -r '.stdout_truncated_bytes // 0' <<<"${runner_metadata}")"
+            stderr_truncated_bytes="$(jq -r '.stderr_truncated_bytes // 0' <<<"${runner_metadata}")"
+            exit_code=125
+        elif [[ "$(jq -r '.timed_out // false' <<<"${runner_metadata}")" == "true" ]]; then
+            timed_out=true
+            exit_code=124
+        elif [[ "$(jq -r '.cancelled // false' <<<"${runner_metadata}")" == "true" ]]; then
+            runner_cancelled=true
+            exit_code=125
+        fi
+    fi
     if [[ "${output_integrity_unknown}" == "true" ]]; then
         output_capped=false
         observer_status="guard_unavailable"
@@ -1140,6 +1198,8 @@ linux_agent_run_observed_process() {
     elif [[ "${exit_code}" -eq 124 ]]; then
         timed_out=true
         observer_status="timed_out"
+    elif [[ "${runner_cancelled}" == "true" ]]; then
+        observer_status="cancelled"
     fi
     end_time="$(linux_agent_now_iso)"
     observer_marker="$(jq -cn \

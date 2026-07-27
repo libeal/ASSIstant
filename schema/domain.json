@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "protocol_version": "1.0.0",
+  "protocol_version": "1.2.0",
   "description": "Cross-language domain contract (single source of truth). Bash reads it via jq, Python via json, the web front-end via GET /api/schema. Keep provider normalization, status enums, and error codes here — do not fork per language.",
   "provider_normalization": {
     "note": "Normalize input: lowercase, then collapse runs of '-', whitespace, or '/' into a single '_'. Then apply prefix_rules (startswith) first, then exact aliases, then identity.",
@@ -51,6 +51,25 @@
     "medium",
     "high",
     "critical"
+  ],
+  "skill_execution_class": [
+    "runner",
+    "host_helper"
+  ],
+  "skill_capability": [
+    "",
+    "firewall.apply",
+    "hosts.apply"
+  ],
+  "execution_isolation": [
+    "runner_uid",
+    "degraded_same_uid",
+    "host_helper",
+    "unavailable"
+  ],
+  "helper_status": [
+    "ready",
+    "unavailable"
   ],
   "executor_type": [
     "skill_script",
@@ -109,6 +128,7 @@
     "updated",
     "saved",
     "ok",
+    "degraded",
     "completed",
     "succeeded",
     "running",
@@ -125,7 +145,11 @@
     "invalid_agent_output",
     "invalid_skill_manifest",
     "output_limit_exceeded",
-    "skill_materialized"
+    "skill_materialized",
+    "invalid_skill_output",
+    "skill_reported_failure",
+    "skill_exit_failed",
+    "sensitive_edits_disabled"
   ],
   "status_presentation": {
     "low": [
@@ -147,7 +171,8 @@
       "skipped_user",
       "skipped_unexecuted",
       "revision_requested",
-      "review"
+      "review",
+      "degraded"
     ],
     "high": [
       "failed",
@@ -251,6 +276,7 @@
     },
     "skill_manifest": {
       "required": [
+        "schema_version",
         "name",
         "description",
         "scripts"
@@ -269,6 +295,50 @@
     "forbidden": {
       "retryable": false,
       "http": 403
+    },
+    "readonly_config_field": {
+      "retryable": false,
+      "http": 403
+    },
+    "sensitive_edits_disabled": {
+      "retryable": false,
+      "http": 403
+    },
+    "invalid_skill_output": {
+      "retryable": false,
+      "http": 502
+    },
+    "skill_reported_failure": {
+      "retryable": false,
+      "http": 502
+    },
+    "skill_exit_failed": {
+      "retryable": false,
+      "http": 502
+    },
+    "runner_unavailable": {
+      "retryable": false,
+      "http": 503
+    },
+    "runner_rejected": {
+      "retryable": false,
+      "http": 403
+    },
+    "helper_unavailable": {
+      "retryable": false,
+      "http": 503
+    },
+    "helper_failed": {
+      "retryable": true,
+      "http": 500
+    },
+    "helper_rejected": {
+      "retryable": false,
+      "http": 403
+    },
+    "skill_conflict": {
+      "retryable": false,
+      "http": 409
     },
     "invalid_path": {
       "retryable": false,
@@ -478,6 +548,10 @@
       "retryable": true,
       "http": 503
     },
+    "observer_helper_unavailable": {
+      "retryable": false,
+      "http": 503
+    },
     "auditctl_not_found": {
       "retryable": false,
       "http": 503
@@ -667,6 +741,30 @@
       "http": 409
     },
     "backup_unsafe_skill": {
+      "retryable": false,
+      "http": 400
+    },
+    "restore_failed": {
+      "retryable": true,
+      "http": 500
+    },
+    "restore_requires_admin": {
+      "retryable": false,
+      "http": 403
+    },
+    "restore_unavailable": {
+      "retryable": false,
+      "http": 503
+    },
+    "restore_busy": {
+      "retryable": true,
+      "http": 409
+    },
+    "restore_conflict": {
+      "retryable": true,
+      "http": 409
+    },
+    "invalid_backup": {
       "retryable": false,
       "http": 400
     },

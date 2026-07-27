@@ -10,10 +10,12 @@ import signal
 import shutil
 import socket
 import sqlite3
+import stat
 import sys
 import threading
 import time
 import uuid
+from functools import wraps
 from http import HTTPStatus
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -33,6 +35,12 @@ from provider_security import (  # noqa: E402
     trusted_provider_hosts,
     validate_provider_url,
 )
+from helper_protocol import (  # noqa: E402
+    ProtocolError as HelperProtocolError,
+    build_request as build_helper_request,
+    client_request as helper_client_request,
+    runtime_shared_lock,
+)
 from subprocess_env import build_subprocess_env  # noqa: E402
 WEB_ROOT = ROOT / "web"
 if str(WEB_ROOT) not in sys.path:
@@ -44,10 +52,12 @@ from jobs import (  # noqa: E402
     JobVersionConflict,
 )
 from configuration import (  # noqa: E402
+    CONFIG_READONLY_FIELDS,
     CONFIG_SECRET_FIELDS,
     ConfigStore,
     normalize_config_value,
     provider_failover_api_key_envs,
+    sensitive_edits_enabled,
     validate_config_relationships,
     write_nested_config_value,
 )
@@ -83,8 +93,56 @@ LOG_ROOT = (ROOT / "logs").resolve()
 JOBS_DB = ROOT / "tmp" / "web" / "jobs.db"
 POLICIES_ROOT = ROOT / "policies"
 SKILLS_ROOT = ROOT / "skills"
-CONFIG_PATH = ROOT / "config" / "config.json"
-PROVIDERS_PATH = ROOT / "config" / "ai-providers.json"
+_ROOT_RESOLVED = ROOT.resolve()
+MANAGED_LAYOUT = _ROOT_RESOLVED.parent.name == "releases"
+
+
+def managed_execution_enabled():
+    """Distinguish systemd/helper installs from no-systemd release layouts."""
+
+    if not MANAGED_LAYOUT:
+        return False
+    prefix = _ROOT_RESOLVED.parent.parent
+    state_path = prefix / ".install-state.json"
+    try:
+        metadata = state_path.lstat()
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_size > 65536:
+            return True
+        with state_path.open("r", encoding="utf-8") as handle:
+            state = json.load(handle)
+    except (OSError, json.JSONDecodeError):
+        return True
+    no_systemd_install = (
+        isinstance(state, dict)
+        and state.get("schema_version") == 1
+        and state.get("prefix") == str(prefix)
+        and state.get("installed") is True
+        and state.get("no_systemd") is True
+    )
+    return not no_systemd_install
+
+
+MANAGED_EXECUTION = managed_execution_enabled()
+if MANAGED_LAYOUT:
+    DATA_ROOT = _ROOT_RESOLVED.parent.parent / "data"
+else:
+    DATA_ROOT = ROOT / "data"
+USER_SKILLS_ROOT = DATA_ROOT / "skills"
+USER_POLICIES_ROOT = DATA_ROOT / "policies"
+POLICY_HELPER_SOCKET = os.environ.get(
+    "LINUX_AGENT_POLICY_HELPER_SOCKET",
+    "/run/linux-agent/policy-writer.sock",
+)
+# In a managed installation the release's ``config`` entry is a compatibility
+# symlink into ``data``.  ConfigStore deliberately rejects symlink components,
+# so Web persistence must address the trusted data tree directly.  Source and
+# temporary remote layouts retain their in-tree paths.
+if MANAGED_LAYOUT:
+    CONFIG_PATH = DATA_ROOT / "config" / "config.json"
+    PROVIDERS_PATH = DATA_ROOT / "config" / "ai-providers.json"
+else:
+    CONFIG_PATH = ROOT / "config" / "config.json"
+    PROVIDERS_PATH = ROOT / "config" / "ai-providers.json"
 AGENT = ROOT / "bin" / "agent"
 HOST = os.environ.get("LINUX_AGENT_WEB_HOST", "127.0.0.1")
 PORT = int(os.environ.get("LINUX_AGENT_WEB_PORT", "8765"))
@@ -109,6 +167,16 @@ CANCEL_GRACE_SEC = int(os.environ.get("LINUX_AGENT_WEB_CANCEL_GRACE_SEC", "2") o
 REQUEST_ID_MAX_LENGTH = 128
 
 
+def web_host_is_loopback(value):
+    normalized = str(value or "").strip().strip("[]")
+    if normalized.lower() == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(normalized).is_loopback
+    except ValueError:
+        return False
+
+
 class RequestBodyTooLarge(ValueError):
     """Raised when an inbound request body exceeds MAX_REQUEST_BODY_BYTES."""
 
@@ -120,13 +188,17 @@ METRICS = create_default_registry(process_start_time=PROCESS_START_TIME)
 METRICS.set_gauge("linux_agent_process_start_time_seconds", PROCESS_START_TIME)
 
 API_KEY_PLACEHOLDER = "please-set-your-api-key"
-EPHEMERAL_TOKEN_FILE = ROOT / "tmp" / "web" / "auth-token"
+EPHEMERAL_TOKEN_FILE = (
+    DATA_ROOT / "tmp" / "web" / "auth-token"
+    if MANAGED_LAYOUT
+    else ROOT / "tmp" / "web" / "auth-token"
+)
 WEB_AUDIT_SESSION_ID = f"web_{SERVER_RUN_ID[:16]}"
 WEB_AUDIT_LOG = LOG_ROOT / f"{WEB_AUDIT_SESSION_ID}.jsonl"
 REMOTE_MODE = os.environ.get("LINUX_AGENT_REMOTE_MODE", "0") == "1"
 RUNTIME_SECRET_LOCK = threading.RLock()
 RUNTIME_API_KEY = ""
-CONFIG_STORE = ConfigStore(CONFIG_PATH)
+CONFIG_STORE = ConfigStore(CONFIG_PATH, DATA_ROOT / ".runtime.lock")
 
 
 def read_config():
@@ -148,7 +220,7 @@ DOMAIN_SCHEMA = load_domain_schema()
 DOMAIN_CONTRACT = DomainContract(DOMAIN_SCHEMA)
 
 AGENT_API_RESPONSE_PROFILES = {
-    "health": {"required_fields": {"root": str, "web": dict}},
+    "health": {"required_fields": {"root": str, "web": dict, "execution": dict}},
     "config_web": {"required_fields": {"web": dict}},
     "doctor": {"required_fields": {"doctor": dict}},
     "tools": {"required_fields": {"scripts": list}},
@@ -373,6 +445,7 @@ def config_public_state():
                 "host": web.get("host", HOST),
                 "port": safe_int(web.get("port", PORT) or PORT, PORT),
                 "token_configured": bool(web.get("token") or TOKEN),
+                "sensitive_edits_enabled": sensitive_edits_enabled(config),
                 "job_retention_hours": safe_int(web.get("job_retention_hours", JOB_RETENTION_HOURS) or JOB_RETENTION_HOURS, JOB_RETENTION_HOURS),
                 "max_active_jobs": safe_int(web.get("max_active_jobs", MAX_ACTIVE_JOBS) or MAX_ACTIVE_JOBS, MAX_ACTIVE_JOBS),
                 "job_timeout_sec": safe_int(web.get("job_timeout_sec", JOB_TIMEOUT_SEC) or JOB_TIMEOUT_SEC, JOB_TIMEOUT_SEC),
@@ -382,6 +455,13 @@ def config_public_state():
             },
         },
     }
+
+
+def sensitive_edit_disabled_error():
+    return domain_error(
+        "sensitive_edits_disabled",
+        "Sensitive Web edits are disabled by server configuration.",
+    )
 
 
 def update_config_values(changes):
@@ -398,6 +478,13 @@ def update_config_values(changes):
         if not isinstance(raw_key, str) or not raw_key:
             return {"ok": False, "status": "invalid_config_value", "error": "Configuration keys must be non-empty strings."}
         key = raw_key
+        if key in CONFIG_READONLY_FIELDS:
+            return {
+                "ok": False,
+                "status": "readonly_config_field",
+                "code": "readonly_config_field",
+                "error": f"{key} is read-only in the Web console.",
+            }
         if REMOTE_MODE and key == "providers_security.require_https" and value is not True:
             return {
                 "ok": False,
@@ -439,9 +526,16 @@ def update_config_values(changes):
 
     try:
         if file_changes:
-            CONFIG_STORE.update(apply_changes)
+            _updated_config, cleanup_warning = CONFIG_STORE.update_with_warning(apply_changes)
+        else:
+            cleanup_warning = None
     except ValueError as exc:
         return {"ok": False, "status": "invalid_config_value", "error": str(exc)}
+    except OSError as exc:
+        return domain_error(
+            "config_write_failed",
+            f"Could not persist configuration: {exc}",
+        )
 
     if REMOTE_MODE and "api_key" in normalized_changes:
         with RUNTIME_SECRET_LOCK:
@@ -453,6 +547,8 @@ def update_config_values(changes):
         key: ("configured" if value else "cleared") if key in CONFIG_SECRET_FIELDS else value
         for key, value in normalized_changes.items()
     }
+    if isinstance(cleanup_warning, str) and cleanup_warning:
+        result["warning"] = cleanup_warning
     return result
 
 
@@ -505,10 +601,59 @@ def agent_subprocess_env(include_api_key=False):
     return env
 
 
+def _prepare_private_directory(root, *relative_parts):
+    """Create a private directory without following symbolic-link components."""
+
+    root_path = Path(os.path.abspath(os.fspath(root)))
+    directory = root_path.joinpath(*relative_parts)
+
+    def assert_plain_directory_components(path):
+        current = Path(path.anchor)
+        for component in path.parts[1:]:
+            current /= component
+            try:
+                metadata = current.lstat()
+            except FileNotFoundError:
+                continue
+            if stat.S_ISLNK(metadata.st_mode):
+                raise OSError(f"directory path contains a symbolic link: {current}")
+            if not stat.S_ISDIR(metadata.st_mode):
+                raise OSError(f"directory path contains a non-directory: {current}")
+
+    assert_plain_directory_components(root_path)
+    if not root_path.is_dir():
+        raise OSError(f"managed data root is not a directory: {root_path}")
+    assert_plain_directory_components(directory)
+    directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+    assert_plain_directory_components(directory)
+    try:
+        directory.resolve(strict=True).relative_to(root_path.resolve(strict=True))
+    except ValueError as exc:
+        raise OSError("managed private directory escaped the data root") from exc
+    os.chmod(directory, 0o700)
+    return directory
+
+
 def create_runtime_backup():
-    if not REMOTE_MODE:
-        return {"ok": False, "status": "backup_unavailable", "error": "Runtime backup is only available in remote mode."}
-    output_path = ROOT.parent / f"linux-agent-runtime-backup-{uuid.uuid4().hex}.tar.gz"
+    if not REMOTE_MODE and not MANAGED_LAYOUT:
+        return {
+            "ok": False,
+            "status": "backup_unavailable",
+            "error": "Runtime backup is only available in a managed or remote runtime.",
+        }
+    # Managed releases are immutable.  Keep the temporary archive in the
+    # persistent data tree that the Web unit is explicitly allowed to write;
+    # source/remote runtimes retain the historical sibling-of-root location
+    # because backup.sh intentionally rejects paths inside the runtime root.
+    managed_layout = MANAGED_LAYOUT
+    if managed_layout:
+        try:
+            backup_dir = _prepare_private_directory(DATA_ROOT, "tmp", "web-backups")
+        except OSError as exc:
+            return {"ok": False, "status": "backup_unavailable", "error": str(exc)}
+        output_path = backup_dir / f"linux-agent-runtime-backup-{uuid.uuid4().hex}.tar.gz"
+    else:
+        output_path = ROOT.parent / f"linux-agent-runtime-backup-{uuid.uuid4().hex}.tar.gz"
     backup_env = agent_subprocess_env()
     try:
         outcome = execution_service().run_external_sync(
@@ -885,11 +1030,38 @@ def recover_interrupted_jobs():
 _POLICY_SERVICE = None
 
 
+def write_with_policy_helper(operation, params):
+    """Invoke the narrow policy helper without forwarding Web credentials."""
+
+    if operation == "policy.write":
+        summary = f"Update registered policy {params.get('path', '')}"
+    elif operation == "command_guard.set":
+        summary = "Update command guard state"
+    else:
+        return {
+            "ok": False,
+            "status": "helper_rejected",
+            "code": "helper_rejected",
+            "error": "Unsupported policy helper operation.",
+        }
+    try:
+        request = build_helper_request(operation, params, summary=summary)
+        return helper_client_request(POLICY_HELPER_SOCKET, request, timeout=65)
+    except (OSError, HelperProtocolError) as exc:
+        return {
+            "ok": False,
+            "status": "helper_unavailable",
+            "code": "helper_unavailable",
+            "error": f"Policy writer helper is unavailable: {exc}",
+        }
+
+
 def policy_service():
     global _POLICY_SERVICE
     if _POLICY_SERVICE is None:
         _POLICY_SERVICE = PolicyService(
             ROOT,
+            overlay_root=USER_POLICIES_ROOT,
             config_reader=read_config,
             config_writer=write_config,
             config_updater=CONFIG_STORE.update,
@@ -897,6 +1069,8 @@ def policy_service():
             audit=record_web_audit_event,
             config_public_state=config_public_state,
             env_builder=agent_subprocess_env,
+            privileged_writer=write_with_policy_helper,
+            managed_execution=MANAGED_EXECUTION,
         )
     return _POLICY_SERVICE
 
@@ -909,15 +1083,19 @@ def list_policy_files():
     return policy_service().list_files()
 
 
+def list_orphaned_policy_files():
+    return policy_service().orphaned_files()
+
+
 def read_policy_file(relative_path):
     return policy_service().read_file(relative_path)
 
 
-def sudo_check(password):
-    return policy_service().sudo_check(password)
+def policy_sudo_check(_password=None):
+    return policy_service().sudo_check()
 
 
-def update_command_guard(enabled, password):
+def update_command_guard(enabled, password=""):
     return policy_service().update_command_guard(enabled, password)
 
 
@@ -962,10 +1140,13 @@ def record_web_audit_event(stage, payload=None):
 OBSERVER_SERVICE = ObserverService(
     config_reader=read_config,
     audit=record_web_audit_event,
-    sudo_check=sudo_check,
     env_builder=agent_subprocess_env,
     lib_root=LIB_ROOT,
     server_started_at=SERVER_STARTED_AT,
+    managed_execution=MANAGED_EXECUTION,
+    allow_sudo_password=(
+        not MANAGED_EXECUTION and web_host_is_loopback(HOST)
+    ),
     now_iso=now_iso,
 )
 
@@ -1085,7 +1266,7 @@ def observer_bootstrap_skip():
     return OBSERVER_SERVICE.skip()
 
 
-def observer_bootstrap_enable(password):
+def observer_bootstrap_enable(password=""):
     return OBSERVER_SERVICE.enable(password)
 
 
@@ -1093,13 +1274,15 @@ def validate_policy_content(relative_path, content):
     return policy_service().validate(relative_path, content)
 
 
-def write_policy_file(relative_path, content, password):
+def write_policy_file(relative_path, content, password=""):
     return policy_service().write_file(relative_path, content, password)
 
 
 SKILL_SERVICE = SkillService(
     SKILLS_ROOT,
     manifest_validator=DOMAIN_CONTRACT.validate_skill_manifest,
+    user_skills_root=USER_SKILLS_ROOT,
+    require_manifest_file=True,
 )
 
 
@@ -1252,6 +1435,18 @@ def terminal_job_status(result):
     return "failed"
 
 
+def hold_runtime_shared(function):
+    """Keep one Web request or background Job on a complete runtime generation."""
+
+    @wraps(function)
+    def locked(*args, **kwargs):
+        with runtime_shared_lock(DATA_ROOT):
+            return function(*args, **kwargs)
+
+    return locked
+
+
+@hold_runtime_shared
 def run_job(job_id, job, resource, action, payload, job_context):
     del job  # The durable store is authoritative after admission.
     result = None
@@ -1497,6 +1692,11 @@ def retry_job(job_id, request_id=None, idempotency_key=None, expected_version=No
     parent = read_job(job_id)
     if parent is None:
         return domain_error("not_found", "Job not found.")
+    if (
+        (parent.get("resource"), parent.get("action")) == ("edit", "apply")
+        and not sensitive_edits_enabled(read_config())
+    ):
+        return sensitive_edit_disabled_error()
     if expected_version is not None and int(parent.get("version", 0)) != int(expected_version):
         raise JobVersionConflict(job_id, expected_version, int(parent.get("version", 0)))
     if parent.get("status") not in ("failed", "cancelled"):
@@ -1700,6 +1900,7 @@ class Handler(SimpleHTTPRequestHandler):
         )
         return False
 
+    @hold_runtime_shared
     def do_GET(self):
         self.begin_request()
         parsed = urlparse(self.path)
@@ -1710,6 +1911,7 @@ class Handler(SimpleHTTPRequestHandler):
             return
         self.serve_static(parsed.path)
 
+    @hold_runtime_shared
     def do_POST(self):
         self.begin_request()
         parsed = urlparse(self.path)
@@ -1849,7 +2051,17 @@ class Handler(SimpleHTTPRequestHandler):
             send_runtime_backup(self)
             return
         if path == "/api/policies":
-            json_response(self, HTTPStatus.OK, {"ok": True, "status": "listed", "files": list_policy_files(), "requires_sudo_to_edit": True})
+            json_response(
+                self,
+                HTTPStatus.OK,
+                {
+                    "ok": True,
+                    "status": "listed",
+                    "files": list_policy_files(),
+                    "orphaned": list_orphaned_policy_files(),
+                    "authorization": "web_bearer",
+                },
+            )
             return
         if path == "/api/config":
             json_response(self, HTTPStatus.OK, config_public_state())
@@ -1928,6 +2140,9 @@ class Handler(SimpleHTTPRequestHandler):
             "/api/edit/review": ("edit", "review", "edit_review"),
             "/api/skills/materialize": ("skills", "materialize", "skill_materialize"),
         }
+        if path == "/api/skills/materialize" and not sensitive_edits_enabled(read_config()):
+            json_response(self, HTTPStatus.FORBIDDEN, sensitive_edit_disabled_error())
+            return
         if path == "/api/policies/read":
             try:
                 result = read_policy_file(str(body.get("path") or ""))
@@ -1936,12 +2151,17 @@ class Handler(SimpleHTTPRequestHandler):
             json_response(self, HTTPStatus.OK, result)
             return
         if path == "/api/policies/sudo-check":
-            result = sudo_check(str(body.get("password") or ""))
+            result = policy_sudo_check()
             json_response(self, HTTPStatus.OK, result)
             return
         if path == "/api/policies/command-guard":
-            result = update_command_guard(body.get("enabled"), str(body.get("password") or ""))
-            json_response(self, HTTPStatus.OK, result)
+            result = update_command_guard(body.get("enabled"))
+            status = (
+                HTTPStatus.FORBIDDEN
+                if result.get("code") == "sensitive_edits_disabled"
+                else HTTPStatus.OK
+            )
+            json_response(self, status, result)
             return
         if path == "/api/policies/validate":
             try:
@@ -1954,15 +2174,24 @@ class Handler(SimpleHTTPRequestHandler):
             json_response(self, HTTPStatus.OK, result)
             return
         if path == "/api/policies/write":
+            # Gate the Web mutation before parsing or validating user input so
+            # a disabled sensitive-edit switch has one stable 403 contract.
+            if not sensitive_edits_enabled(read_config()):
+                json_response(self, HTTPStatus.FORBIDDEN, sensitive_edit_disabled_error())
+                return
             try:
                 result = write_policy_file(
                     str(body.get("path") or ""),
                     str(body.get("content") or ""),
-                    str(body.get("password") or ""),
                 )
             except ValueError as exc:
                 result = {"ok": False, "status": "invalid_path", "error": str(exc)}
-            json_response(self, HTTPStatus.OK, result)
+            status = (
+                HTTPStatus.FORBIDDEN
+                if result.get("code") == "sensitive_edits_disabled"
+                else HTTPStatus.OK
+            )
+            json_response(self, status, result)
             return
         if path == "/api/audit/read":
             result = run_agent_api(
@@ -2031,7 +2260,12 @@ class Handler(SimpleHTTPRequestHandler):
                 result = update_config_values(body["changes"])
             else:
                 result = update_config_value(str(body.get("key") or ""), body.get("value"))
-            json_response(self, HTTPStatus.OK, result)
+            status = (
+                HTTPStatus.FORBIDDEN
+                if result.get("code") == "readonly_config_field"
+                else HTTPStatus.OK
+            )
+            json_response(self, status, result)
             return
         if path == "/api/config/models":
             result = list_provider_models(body)
@@ -2042,7 +2276,15 @@ class Handler(SimpleHTTPRequestHandler):
             if action == "skip":
                 result = observer_bootstrap_skip()
             elif action == "enable":
-                result = observer_bootstrap_enable(str(body.get("password") or ""))
+                password = body.get("password", "")
+                if not isinstance(password, str):
+                    result = {
+                        "ok": False,
+                        "status": "invalid_password",
+                        "error": "password must be a string.",
+                    }
+                else:
+                    result = observer_bootstrap_enable(password)
             else:
                 result = {"ok": False, "status": "invalid_action", "error": "action must be enable or skip."}
             json_response(self, HTTPStatus.OK, result)
@@ -2171,6 +2413,9 @@ class Handler(SimpleHTTPRequestHandler):
             resource = str(body.get("resource") or "")
             action = str(body.get("action") or "")
             payload = body.get("payload") if isinstance(body.get("payload"), dict) else {}
+            if (resource, action) == ("edit", "apply") and not sensitive_edits_enabled(read_config()):
+                json_response(self, HTTPStatus.FORBIDDEN, sensitive_edit_disabled_error())
+                return
             allowed = {
                 ("work", "run"),
                 ("script", "run"),
@@ -2269,7 +2514,14 @@ class Handler(SimpleHTTPRequestHandler):
                 default=HTTPStatus.BAD_GATEWAY,
             )
             return
-        json_response(self, HTTPStatus.OK, result)
+        result_status = (
+            HTTPStatus.FORBIDDEN
+            if path == "/api/skills/materialize"
+            and isinstance(result, dict)
+            and result.get("code") == "sensitive_edits_disabled"
+            else HTTPStatus.OK
+        )
+        json_response(self, result_status, result)
 
 
 def main():

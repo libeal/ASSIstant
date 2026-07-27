@@ -18,20 +18,20 @@ class ObserverService:
         *,
         config_reader,
         audit,
-        sudo_check,
         env_builder,
         lib_root,
         server_started_at,
         process_runner=subprocess.run,
         effective_uid=os.geteuid,
         which=shutil.which,
+        managed_execution=False,
+        allow_sudo_password=True,
         helper_socket_checker=None,
         now_iso=None,
     ):
         for name, callback in (
             ("config_reader", config_reader),
             ("audit", audit),
-            ("sudo_check", sudo_check),
             ("env_builder", env_builder),
             ("process_runner", process_runner),
             ("effective_uid", effective_uid),
@@ -39,15 +39,20 @@ class ObserverService:
         ):
             if not callable(callback):
                 raise TypeError(f"{name} must be callable")
+        if not isinstance(managed_execution, bool):
+            raise TypeError("managed_execution must be a boolean")
+        if not isinstance(allow_sudo_password, bool):
+            raise TypeError("allow_sudo_password must be a boolean")
         self.config_reader = config_reader
         self.audit = audit
-        self.sudo_check = sudo_check
         self.env_builder = env_builder
         self.lib_root = Path(lib_root)
         self.server_started_at = str(server_started_at)
         self.process_runner = process_runner
         self.effective_uid = effective_uid
         self.which = which
+        self.managed_execution = bool(managed_execution)
+        self.allow_sudo_password = bool(allow_sudo_password)
         self.helper_socket_checker = helper_socket_checker or (lambda path: path.is_socket())
         self.now_iso = now_iso or (
             lambda: time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
@@ -116,6 +121,33 @@ class ObserverService:
             and not self.helper_available()
         )
 
+    def password_allowed(self, observer=None):
+        observer = observer or self.runtime_config()
+        return (
+            not self.managed_execution
+            and self.allow_sudo_password
+            and not self.helper_available()
+            and self.effective_uid() != 0
+            and observer.get("enabled") != "disabled"
+            and observer.get("privilege") == "sudo_interactive"
+        )
+
+    def authorization_mode(self, observer=None):
+        observer = observer or self.runtime_config()
+        if observer.get("enabled") == "disabled":
+            return "disabled"
+        if observer.get("privilege") == "none":
+            return "disabled"
+        if self.helper_available() or self.managed_execution:
+            return "helper"
+        if self.effective_uid() == 0:
+            return "root"
+        if observer.get("privilege") == "passwordless":
+            return "sudo_noninteractive"
+        if self.password_allowed(observer):
+            return "sudo_interactive"
+        return "unavailable"
+
     def public_state(self, force_ok=None, extra=None):
         observer = self.runtime_config()
         state = dict(self.state)
@@ -138,6 +170,9 @@ class ObserverService:
             "diagnostic": state.get("diagnostic", ""),
             "updated_at": state.get("updated_at", self.server_started_at),
             "requires_permission": self.requires_permission(observer),
+            "managed_execution": self.managed_execution,
+            "authorization_mode": self.authorization_mode(observer),
+            "password_allowed": self.password_allowed(observer),
             "observer": observer,
         }
 
@@ -169,17 +204,19 @@ class ObserverService:
         result["logged"] = True
         return result
 
-    def _run(self, command, *, timeout, env=None):
+    def _run(self, command, *, timeout, env=None, input_text=None):
         if env is None:
             env = self.env_builder(include_api_key=False)
-        return self.process_runner(
-            command,
-            env=env,
-            text=True,
-            capture_output=True,
-            timeout=timeout,
-            check=False,
-        )
+        options = {
+            "env": env,
+            "text": True,
+            "capture_output": True,
+            "timeout": timeout,
+            "check": False,
+        }
+        if input_text is not None:
+            options["input"] = input_text
+        return self.process_runner(command, **options)
 
     def helper_preflight(self):
         if not self.helper_available():
@@ -206,9 +243,31 @@ class ObserverService:
             return False
         try:
             process = self._run(["sudo", "-n", "true"], timeout=5)
-        except (FileNotFoundError, subprocess.TimeoutExpired):
+        except (OSError, subprocess.TimeoutExpired):
             return False
         return process.returncode == 0
+
+    def validate_sudo(self, password):
+        if (
+            not isinstance(password, str)
+            or not password
+            or len(password) > 4096
+            or any(character in password for character in ("\x00", "\n", "\r"))
+        ):
+            return {"ok": False, "status": "invalid_password"}
+        try:
+            process = self._run(
+                ["sudo", "-S", "-p", "", "-v"],
+                timeout=15,
+                input_text=f"{password}\n",
+            )
+        except FileNotFoundError:
+            return {"ok": False, "status": "sudo_not_found"}
+        except subprocess.TimeoutExpired:
+            return {"ok": False, "status": "sudo_timeout"}
+        if process.returncode == 0:
+            return {"ok": True, "status": "sudo_validated"}
+        return {"ok": False, "status": "sudo_denied"}
 
     def _failed(self, status, method, error, diagnostic):
         return self._record(
@@ -240,6 +299,13 @@ class ObserverService:
             )
 
         helper = self.helper_preflight()
+        if helper is None and self.managed_execution:
+            return self._failed(
+                "observer_helper_unavailable",
+                "helper",
+                "The privileged observer helper is unavailable.",
+                "Install or repair linux-agent-observer-helper.socket locally; managed Web never accepts sudo credentials.",
+            )
         if helper is not None:
             if hasattr(helper, "returncode") and helper.returncode == 0:
                 return self._record(
@@ -277,24 +343,49 @@ class ObserverService:
                 "Install auditd/ausearch or disable observer.",
             )
 
-        if self.effective_uid() != 0 and not self.sudo_cached():
-            if not password:
+        effective_uid = self.effective_uid()
+        if effective_uid != 0:
+            if not self.which("sudo"):
                 return self._failed(
-                    "sudo_required",
+                    "sudo_not_found",
                     "sudo",
-                    "sudo password is required.",
-                    "Web has no TTY, so sudo credentials must be validated from the browser once per sudo timeout window.",
+                    "sudo is not installed.",
+                    "Install sudo, run Web as root, or use a managed installation with the observer helper.",
                 )
-            check = self.sudo_check(password)
-            if not check.get("ok"):
-                return self._failed(
-                    str(check.get("status") or "sudo_denied"),
-                    str(check.get("method") or "sudo"),
-                    str(check.get("error") or check.get("status") or "sudo validation failed"),
-                    "sudo credential validation failed; auditd observer was not enabled for Web Jobs.",
-                )
+            if not self.sudo_cached():
+                if observer.get("privilege") != "sudo_interactive":
+                    return self._failed(
+                        "sudo_required",
+                        "sudo",
+                        "Passwordless sudo is not available.",
+                        "observer.privilege=passwordless only uses an existing sudo -n authorization.",
+                    )
+                if not self.allow_sudo_password:
+                    return self._failed(
+                        "sudo_transport_disabled",
+                        "sudo",
+                        "Interactive sudo is restricted to a loopback Web listener.",
+                        "Bind Web to 127.0.0.1/localhost or use the managed observer helper; the password was not used.",
+                    )
+                if not password:
+                    return self._failed(
+                        "sudo_required",
+                        "sudo",
+                        "sudo password is required.",
+                        "The local Web adapter validates the password once through sudo stdin and does not store or log it.",
+                    )
+                check = self.validate_sudo(password)
+                password = ""
+                if not check.get("ok"):
+                    status = str(check.get("status") or "sudo_denied")
+                    return self._failed(
+                        status,
+                        "sudo",
+                        "sudo credential validation failed.",
+                        "The credential was not stored or logged; auditd observer was not enabled for Web Jobs.",
+                    )
 
-        if self.effective_uid() == 0:
+        if effective_uid == 0:
             command, method = ["auditctl", "-s"], "root"
         else:
             command, method = ["sudo", "-n", "auditctl", "-s"], "sudo"

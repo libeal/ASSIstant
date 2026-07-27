@@ -2,6 +2,7 @@ config/config.json
 config/*.secret
 logs/
 tmp/
+data/
 __pycache__/
 *.pyc
 AGENTS.md
