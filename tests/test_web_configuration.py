@@ -267,6 +267,19 @@ class ConfigStoreTests(unittest.TestCase):
         write_nested_config_value(config, "web.max_active_jobs", value)
         self.assertEqual({"web": {"max_active_jobs": 8}}, config)
 
+        self.assertEqual(
+            (True, ""),
+            normalize_config_value("approvals.auto.package_scope", True),
+        )
+        self.assertIn(
+            "must be boolean",
+            normalize_config_value("approvals.auto.package_scope", "true")[1],
+        )
+        self.assertIn(
+            "Unsupported",
+            normalize_config_value("approvals.auto.invalid-scope", True)[1],
+        )
+
         attempts, error = normalize_config_value("provider_resilience.max_attempts", 5)
         self.assertEqual((5, ""), (attempts, error))
         self.assertIsNotNone(normalize_config_value("provider_resilience.max_attempts", 6)[1])

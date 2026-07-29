@@ -18,6 +18,10 @@ RUNNER_USER="${LINUX_AGENT_RUNNER_USER:-linux-agent-runner}"
 RUNNER_GROUP="${LINUX_AGENT_RUNNER_GROUP:-linux-agent-runner}"
 RUNNER_USER_CREATED=0
 RUNNER_USER_CREATED_THIS_RUN=0
+CREDENTIAL_USER="${LINUX_AGENT_CREDENTIAL_USER:-linux-agent-credential}"
+CREDENTIAL_GROUP="${LINUX_AGENT_CREDENTIAL_GROUP:-linux-agent-credential}"
+CREDENTIAL_USER_CREATED=0
+CREDENTIAL_USER_CREATED_THIS_RUN=0
 REQUIRE_SIGNATURE=0
 NO_SYSTEMD=0
 KEEP=2
@@ -26,6 +30,8 @@ EGRESS_MODE="preserve"
 declare -a PROVIDER_CIDRS=()
 WORK_DIR=""
 PREPARED_RELEASE_DIR=""
+PREPARED_SKILLS_DIR=""
+PREPARED_SKILLS_MANIFEST=""
 SYSTEMD_UNIT_PATH="${LINUX_AGENT_SYSTEMD_UNIT_PATH:-/etc/systemd/system/linux-agent-web.service}"
 SYSTEMD_UNIT_DIR="${SYSTEMD_UNIT_PATH%/*}"
 SYSTEMD_HELPER_SERVICE_PATH="${LINUX_AGENT_SYSTEMD_HELPER_SERVICE_PATH:-${SYSTEMD_UNIT_DIR}/linux-agent-observer-helper.service}"
@@ -37,6 +43,7 @@ SYSTEMD_HOST_SOCKET_PATH="${LINUX_AGENT_SYSTEMD_HOST_SOCKET_PATH:-${SYSTEMD_UNIT
 SYSTEMD_POLICY_SERVICE_PATH="${LINUX_AGENT_SYSTEMD_POLICY_SERVICE_PATH:-${SYSTEMD_UNIT_DIR}/linux-agent-policy-writer.service}"
 SYSTEMD_POLICY_SOCKET_PATH="${LINUX_AGENT_SYSTEMD_POLICY_SOCKET_PATH:-${SYSTEMD_UNIT_DIR}/linux-agent-policy-writer.socket}"
 SYSTEMD_EGRESS_DROPIN_PATH="${LINUX_AGENT_SYSTEMD_EGRESS_DROPIN_PATH:-${SYSTEMD_UNIT_DIR}/linux-agent-web.service.d/10-provider-egress.conf}"
+HOST_OPS_POLICY_PATH="${LINUX_AGENT_HOST_OPS_POLICY_PATH:-/etc/linux-agent/host-ops-policy.json}"
 TRANSACTION_MODE=""
 TRANSACTION_OLD_VERSION=""
 TRANSACTION_TARGET_VERSION=""
@@ -59,11 +66,17 @@ INSTALL_STATE_SERVICE_USER=""
 INSTALL_STATE_SERVICE_USER_CREATED=0
 INSTALL_STATE_RUNNER_USER=""
 INSTALL_STATE_RUNNER_USER_CREATED=0
+INSTALL_STATE_CREDENTIAL_USER=""
+INSTALL_STATE_CREDENTIAL_USER_CREATED=0
 INSTALL_STATE_NO_SYSTEMD=0
 OBSERVER_STATE_CAPTURED=0
 OBSERVER_STATE_EXISTED=0
 OBSERVER_STATE_PATH=""
 OBSERVER_STATE_BACKUP_PATH=""
+BUILTIN_SKILLS_STATE_CAPTURED=0
+BUILTIN_SKILLS_EXISTED=0
+BUILTIN_SKILL_RELEASES_EXISTED=0
+RELEASE_MANIFEST_EXISTED=0
 RUNTIME_LOCK_FD=""
 
 fail() {
@@ -231,9 +244,13 @@ esac
 if [[ "${LINUX_AGENT_ALLOW_ROOT_SERVICE_USER_FOR_TESTS:-0}" == "1" && "${SERVICE_USER}" == "root" ]]; then
     RUNNER_USER="root"
     RUNNER_GROUP="root"
+    CREDENTIAL_USER="root"
+    CREDENTIAL_GROUP="root"
 fi
 [[ "${RUNNER_USER}" =~ ^[a-z_][a-z0-9_-]*[$]?$ ]] || fail 'Runner 用户格式非法'
 [[ "${RUNNER_GROUP}" =~ ^[a-z_][a-z0-9_-]*[$]?$ ]] || fail 'Runner 用户组格式非法'
+[[ "${CREDENTIAL_USER}" =~ ^[a-z_][a-z0-9_-]*[$]?$ ]] || fail 'Credential helper 用户格式非法'
+[[ "${CREDENTIAL_GROUP}" =~ ^[a-z_][a-z0-9_-]*[$]?$ ]] || fail 'Credential helper 用户组格式非法'
 [[ "${KEEP}" =~ ^[0-9]+$ && "${KEEP}" -ge 1 && "${KEEP}" -le 100 ]] ||
     fail '--keep 必须是 1-100 的整数'
 
@@ -439,11 +456,15 @@ read_install_state() {
         and (.service_user == "" or (.service_user | test("^[a-z_][a-z0-9_-]*[$]?$")))
         and ((has("runner_user") | not) or (.runner_user | type == "string" and (. == "" or test("^[a-z_][a-z0-9_-]*[$]?$"))))
         and ((has("runner_user_created") | not) or (.runner_user_created | type == "boolean"))
+        and (.credential_user | type == "string" and (. == "" or test("^[a-z_][a-z0-9_-]*[$]?$")))
+        and (.credential_user_created | type == "boolean")
     ' "${state_path}" >/dev/null || fail '安装状态文件契约无效'
     INSTALL_STATE_SERVICE_USER="$(jq -er '.service_user' "${state_path}")"
     INSTALL_STATE_SERVICE_USER_CREATED="$(jq -er 'if .service_user_created then 1 else 0 end' "${state_path}")"
     INSTALL_STATE_RUNNER_USER="$(jq -r '.runner_user // ""' "${state_path}")"
     INSTALL_STATE_RUNNER_USER_CREATED="$(jq -r 'if .runner_user_created // false then 1 else 0 end' "${state_path}")"
+    INSTALL_STATE_CREDENTIAL_USER="$(jq -r '.credential_user' "${state_path}")"
+    INSTALL_STATE_CREDENTIAL_USER_CREATED="$(jq -r 'if .credential_user_created then 1 else 0 end' "${state_path}")"
     INSTALL_STATE_NO_SYSTEMD="$(jq -er 'if .no_systemd then 1 else 0 end' "${state_path}")"
     return 0
 }
@@ -494,6 +515,13 @@ load_existing_service_identity() {
                 RUNNER_GROUP="$(id -gn "${RUNNER_USER}")"
             fi
         fi
+        if [[ -n "${INSTALL_STATE_CREDENTIAL_USER}" ]]; then
+            CREDENTIAL_USER="${INSTALL_STATE_CREDENTIAL_USER}"
+            CREDENTIAL_USER_CREATED="${INSTALL_STATE_CREDENTIAL_USER_CREATED}"
+            if id "${CREDENTIAL_USER}" >/dev/null 2>&1; then
+                CREDENTIAL_GROUP="$(id -gn "${CREDENTIAL_USER}")"
+            fi
+        fi
         return 0
     fi
     [[ "${NO_SYSTEMD}" -eq 0 ]] || return 0
@@ -518,11 +546,13 @@ write_install_state() {
         --arg prefix "${PREFIX}" \
         --arg service_user "${service_user}" \
         --arg runner_user "$([[ "${NO_SYSTEMD}" -eq 0 ]] && printf '%s' "${RUNNER_USER}" || printf '')" \
+        --arg credential_user "$([[ "${NO_SYSTEMD}" -eq 0 ]] && printf '%s' "${CREDENTIAL_USER}" || printf '')" \
         --argjson installed "${installed}" \
         --argjson no_systemd "$([[ "${NO_SYSTEMD}" -eq 1 ]] && printf true || printf false)" \
         --argjson service_user_created "$([[ "${NO_SYSTEMD}" -eq 0 && "${SERVICE_USER_CREATED}" -eq 1 ]] && printf true || printf false)" \
         --argjson runner_user_created "$([[ "${NO_SYSTEMD}" -eq 0 && "${RUNNER_USER_CREATED}" -eq 1 ]] && printf true || printf false)" \
-        '{schema_version:1,prefix:$prefix,installed:$installed,no_systemd:$no_systemd,service_user:$service_user,service_user_created:$service_user_created,runner_user:$runner_user,runner_user_created:$runner_user_created}' \
+        --argjson credential_user_created "$([[ "${NO_SYSTEMD}" -eq 0 && "${CREDENTIAL_USER_CREATED}" -eq 1 ]] && printf true || printf false)" \
+        '{schema_version:1,prefix:$prefix,installed:$installed,no_systemd:$no_systemd,service_user:$service_user,service_user_created:$service_user_created,runner_user:$runner_user,runner_user_created:$runner_user_created,credential_user:$credential_user,credential_user_created:$credential_user_created}' \
         >"${state_tmp}" || {
         rm -f -- "${state_tmp}"
         fail '无法写入安装状态文件'
@@ -564,8 +594,13 @@ begin_transaction() {
     OBSERVER_STATE_EXISTED=0
     OBSERVER_STATE_PATH=""
     OBSERVER_STATE_BACKUP_PATH=""
+    BUILTIN_SKILLS_STATE_CAPTURED=0
+    BUILTIN_SKILLS_EXISTED=0
+    BUILTIN_SKILL_RELEASES_EXISTED=0
+    RELEASE_MANIFEST_EXISTED=0
     SERVICE_USER_CREATED_THIS_RUN=0
     RUNNER_USER_CREATED_THIS_RUN=0
+    CREDENTIAL_USER_CREATED_THIS_RUN=0
     TRANSACTION_BACKUP_DIR="$(mktemp -d "${PREFIX}/.install-rollback.XXXXXX")"
     chmod 0700 "${TRANSACTION_BACKUP_DIR}"
     mkdir -p "${TRANSACTION_BACKUP_DIR}/config"
@@ -581,7 +616,7 @@ begin_transaction() {
 }
 
 capture_persistent_data_state() {
-    local name source backup unsafe marker marker_backup
+    local name source backup unsafe marker marker_backup ledger ledger_backup
     mkdir -p "${TRANSACTION_BACKUP_DIR}/config" "${TRANSACTION_BACKUP_DIR}/persistent"
 
     assert_plain_directory "${PREFIX}/data" ||
@@ -629,11 +664,157 @@ capture_persistent_data_state() {
     else
         printf '0\n' >"${TRANSACTION_BACKUP_DIR}/persistent/marker-existed"
     fi
+    ledger="${PREFIX}/data/skill-components.json"
+    ledger_backup="${TRANSACTION_BACKUP_DIR}/persistent/skill-components.json"
+    if [[ -L "${ledger}" || (-e "${ledger}" && ! -f "${ledger}") ]]; then
+        fail "Skill component ownership ledger 类型非法: ${ledger}"
+    fi
+    if [[ -f "${ledger}" ]]; then
+        cp -p -- "${ledger}" "${ledger_backup}"
+        printf '1\n' >"${TRANSACTION_BACKUP_DIR}/persistent/skill-components-existed"
+    else
+        printf '0\n' >"${TRANSACTION_BACKUP_DIR}/persistent/skill-components-existed"
+    fi
     PERSISTENT_DATA_STATE_CAPTURED=1
 }
 
+capture_builtin_skills_state() {
+    local skills_root="${PREFIX}/skills"
+    local skill_releases_root="${PREFIX}/skill-releases"
+    local release_manifest="${PREFIX}/release-manifest.json"
+    local unsafe
+    [[ "${BUILTIN_SKILLS_STATE_CAPTURED}" -eq 0 ]] || return 0
+    if [[ -L "${skills_root}" || (-e "${skills_root}" && ! -d "${skills_root}") ]]; then
+        fail "内置 Skill 根目录类型非法: ${skills_root}"
+    fi
+    if [[ -d "${skills_root}" ]]; then
+        unsafe="$(find "${skills_root}" -mindepth 1 \( -type l -o -type b -o -type c -o -type p -o -type s \) -print -quit)"
+        [[ -z "${unsafe}" ]] || fail "内置 Skill 根目录包含不安全文件类型: ${unsafe}"
+        cp -a -- "${skills_root}" "${TRANSACTION_BACKUP_DIR}/builtin-skills"
+        BUILTIN_SKILLS_EXISTED=1
+    fi
+    if [[ -L "${skill_releases_root}" ||
+        (-e "${skill_releases_root}" && ! -d "${skill_releases_root}") ]]; then
+        fail "内置 Skill 版本快照根目录类型非法: ${skill_releases_root}"
+    fi
+    if [[ -d "${skill_releases_root}" ]]; then
+        unsafe="$(find "${skill_releases_root}" -mindepth 1 \( -type l -o -type b -o -type c -o -type p -o -type s \) -print -quit)"
+        [[ -z "${unsafe}" ]] || fail "内置 Skill 版本快照包含不安全文件类型: ${unsafe}"
+        cp -a -- "${skill_releases_root}" \
+            "${TRANSACTION_BACKUP_DIR}/builtin-skill-releases"
+        BUILTIN_SKILL_RELEASES_EXISTED=1
+    fi
+    if [[ -L "${release_manifest}" || (-e "${release_manifest}" && ! -f "${release_manifest}") ]]; then
+        fail "release manifest 类型非法: ${release_manifest}"
+    fi
+    if [[ -f "${release_manifest}" ]]; then
+        cp -p -- "${release_manifest}" "${TRANSACTION_BACKUP_DIR}/release-manifest.json"
+        RELEASE_MANIFEST_EXISTED=1
+    fi
+    BUILTIN_SKILLS_STATE_CAPTURED=1
+}
+
+restore_builtin_skills_state() {
+    local skills_root="${PREFIX}/skills"
+    local skill_releases_root="${PREFIX}/skill-releases"
+    local release_manifest="${PREFIX}/release-manifest.json"
+    [[ "${BUILTIN_SKILLS_STATE_CAPTURED}" -eq 1 ]] || return 0
+    if [[ -L "${skills_root}" || (-e "${skills_root}" && ! -d "${skills_root}") ]]; then
+        return 1
+    fi
+    rm -rf -- "${skills_root}" || return 1
+    if [[ "${BUILTIN_SKILLS_EXISTED}" -eq 1 ]]; then
+        cp -a -- "${TRANSACTION_BACKUP_DIR}/builtin-skills" "${skills_root}" || return 1
+    fi
+    if [[ -L "${skill_releases_root}" ||
+        (-e "${skill_releases_root}" && ! -d "${skill_releases_root}") ]]; then
+        return 1
+    fi
+    rm -rf -- "${skill_releases_root}" || return 1
+    if [[ "${BUILTIN_SKILL_RELEASES_EXISTED}" -eq 1 ]]; then
+        cp -a -- "${TRANSACTION_BACKUP_DIR}/builtin-skill-releases" \
+            "${skill_releases_root}" || return 1
+    fi
+    if [[ "${RELEASE_MANIFEST_EXISTED}" -eq 1 ]]; then
+        cp -p -- "${TRANSACTION_BACKUP_DIR}/release-manifest.json" "${release_manifest}" || return 1
+    else
+        rm -f -- "${release_manifest}" || return 1
+    fi
+}
+
+install_prepared_builtin_skills() {
+    local target="${PREFIX}/skills"
+    local staging="${PREFIX}/.skills.install.$$"
+    local previous="${PREFIX}/.skills.previous.$$"
+    local manifest="${PREPARED_SKILLS_MANIFEST:-${WORK_DIR}/release-manifest.json}"
+    local history_root="${PREFIX}/skill-releases"
+    local history_target="" history_staging=""
+    [[ -n "${PREPARED_SKILLS_DIR}" && -d "${PREPARED_SKILLS_DIR}" &&
+        ! -L "${PREPARED_SKILLS_DIR}" ]] || fail '内置 Skill staging 不可用'
+    [[ -f "${PREPARED_SKILLS_DIR}/INDEX.md" && ! -L "${PREPARED_SKILLS_DIR}/INDEX.md" ]] ||
+        fail '内置 Skill staging 缺少 INDEX.md'
+    [[ -f "${manifest}" && ! -L "${manifest}" ]] ||
+        fail '内置 Skill staging 缺少对应的签名 release manifest'
+    [[ ! -e "${staging}" && ! -L "${staging}" &&
+        ! -e "${previous}" && ! -L "${previous}" ]] ||
+        fail '内置 Skill 原子安装路径已被占用'
+    cp -a -- "${PREPARED_SKILLS_DIR}" "${staging}"
+    find "${staging}" -type d -exec chmod 0755 -- {} +
+    find "${staging}" -type f -exec chmod 0644 -- {} +
+    if [[ "${NO_SYSTEMD}" -eq 0 ]]; then
+        chown -R root:root "${staging}"
+    fi
+    if [[ -n "${TRANSACTION_OLD_VERSION}" && -d "${target}" && ! -L "${target}" ]]; then
+        [[ "${TRANSACTION_OLD_VERSION}" =~ ^v[0-9A-Za-z][0-9A-Za-z._-]*$ ]] ||
+            fail '内置 Skill 快照版本非法'
+        [[ ! -L "${history_root}" &&
+            (! -e "${history_root}" || -d "${history_root}") ]] ||
+            fail '内置 Skill 版本快照根目录类型非法'
+        mkdir -p -- "${history_root}"
+        history_target="${history_root}/${TRANSACTION_OLD_VERSION}"
+        history_staging="${history_root}/.${TRANSACTION_OLD_VERSION}.$$"
+        [[ ! -e "${history_staging}" && ! -L "${history_staging}" ]] ||
+            fail '内置 Skill 版本快照 staging 已被占用'
+        mkdir -- "${history_staging}"
+        cp -a -- "${target}" "${history_staging}/skills"
+        if [[ -f "${PREFIX}/release-manifest.json" &&
+            ! -L "${PREFIX}/release-manifest.json" ]]; then
+            cp -p -- "${PREFIX}/release-manifest.json" \
+                "${history_staging}/release-manifest.json"
+        else
+            fail '当前内置 Skill 缺少对应的 release manifest'
+        fi
+        if [[ -e "${history_target}" || -L "${history_target}" ]]; then
+            [[ -d "${history_target}" && ! -L "${history_target}" ]] ||
+                fail '现有内置 Skill 版本快照类型非法'
+            rm -rf -- "${history_target}"
+        fi
+        mv -- "${history_staging}" "${history_target}"
+        python3 -c 'import os,sys; fd=os.open(sys.argv[1], os.O_RDONLY | os.O_DIRECTORY); os.fsync(fd); os.close(fd)' "${history_root}" ||
+            fail '内置 Skill 版本快照 fsync 失败'
+    fi
+    if [[ -d "${target}" && ! -L "${target}" ]]; then
+        mv -- "${target}" "${previous}"
+    elif [[ -e "${target}" || -L "${target}" ]]; then
+        fail "内置 Skill 根目录类型非法: ${target}"
+    fi
+    if ! mv -- "${staging}" "${target}"; then
+        [[ ! -d "${previous}" ]] || mv -- "${previous}" "${target}"
+        fail '内置 Skill 原子提交失败'
+    fi
+    python3 -c 'import os,sys; fd=os.open(sys.argv[1], os.O_RDONLY | os.O_DIRECTORY); os.fsync(fd); os.close(fd)' "${PREFIX}" ||
+        fail '内置 Skill 根目录 fsync 失败'
+    rm -rf -- "${previous}"
+    atomic_copy_regular_file "${manifest}" "${PREFIX}/release-manifest.json" 0644 ||
+        fail '无法持久化签名 release manifest'
+    if [[ "${NO_SYSTEMD}" -eq 0 ]]; then
+        chown root:root "${PREFIX}/release-manifest.json"
+    fi
+}
+
 capture_systemd_state() {
-    local path backup_name existed_var egress_dir unit enabled active
+    local path backup_name existed_var egress_dir unit enabled active _package component
+    local _client _socket_env _socket_path _service_asset socket_asset _egress_dropin
     [[ "${NO_SYSTEMD}" -eq 0 ]] || return 0
     command -v systemctl >/dev/null 2>&1 || fail '缺少 systemctl'
     egress_dir="$(dirname -- "${SYSTEMD_EGRESS_DROPIN_PATH}")"
@@ -674,7 +855,27 @@ ${SYSTEMD_HOST_SERVICE_PATH}	linux-agent-host-ops.service
 ${SYSTEMD_HOST_SOCKET_PATH}	linux-agent-host-ops.socket
 ${SYSTEMD_POLICY_SERVICE_PATH}	linux-agent-policy-writer.service
 ${SYSTEMD_POLICY_SOCKET_PATH}	linux-agent-policy-writer.socket
+${HOST_OPS_POLICY_PATH}	host-ops-policy.json
 EOF
+    : >"${TRANSACTION_BACKUP_DIR}/systemd-extra/credential-files.tsv"
+    while IFS=$'\t' read -r path backup_name; do
+        [[ -n "${path}" ]] || continue
+        if [[ -L "${path}" || (-e "${path}" && ! -f "${path}") ]]; then
+            fail "现有 Skill credential component 文件类型非法: ${path}"
+        fi
+        if [[ -f "${path}" ]]; then
+            cp -p -- "${path}" "${TRANSACTION_BACKUP_DIR}/systemd-extra/${backup_name}"
+            printf '%s\t%s\t1\n' "${path}" "${backup_name}" \
+                >>"${TRANSACTION_BACKUP_DIR}/systemd-extra/files.tsv"
+            printf '%s\n' "${path}" \
+                >>"${TRANSACTION_BACKUP_DIR}/systemd-extra/credential-files.tsv"
+        else
+            printf '%s\t%s\t0\n' "${path}" "${backup_name}" \
+                >>"${TRANSACTION_BACKUP_DIR}/systemd-extra/files.tsv"
+            printf '%s\n' "${path}" \
+                >>"${TRANSACTION_BACKUP_DIR}/systemd-extra/credential-files.tsv"
+        fi
+    done < <(transaction_credential_file_rows)
     : >"${TRANSACTION_BACKUP_DIR}/systemd-extra/runtime.tsv"
     for unit in linux-agent-runner.socket linux-agent-host-ops.socket linux-agent-policy-writer.socket; do
         enabled=0
@@ -683,6 +884,18 @@ EOF
         systemctl is-active --quiet "${unit}" >/dev/null 2>&1 && active=1
         printf '%s\t%s\t%s\n' "${unit}" "${enabled}" "${active}" >>"${TRANSACTION_BACKUP_DIR}/systemd-extra/runtime.tsv"
     done
+    while IFS=$'\t' read -r _package component _client _socket_env _socket_path \
+        _service_asset socket_asset _egress_dropin; do
+        [[ -n "${component}" ]] || continue
+        unit="$(basename -- "${socket_asset}")"
+        grep -Fq "${unit}"$'\t' "${TRANSACTION_BACKUP_DIR}/systemd-extra/runtime.tsv" && continue
+        enabled=0
+        active=0
+        systemctl is-enabled --quiet "${unit}" >/dev/null 2>&1 && enabled=1
+        systemctl is-active --quiet "${unit}" >/dev/null 2>&1 && active=1
+        printf '%s\t%s\t%s\n' "${unit}" "${enabled}" "${active}" \
+            >>"${TRANSACTION_BACKUP_DIR}/systemd-extra/runtime.tsv"
+    done < <(transaction_credential_component_rows | sort -u)
     if systemctl is-enabled --quiet linux-agent-web.service >/dev/null 2>&1; then
         SYSTEMD_WAS_ENABLED=1
     fi
@@ -699,7 +912,8 @@ EOF
 }
 
 stop_transaction_services() {
-    local unit
+    local unit _package _component _client _socket_env _socket_path service_asset socket_asset
+    local _egress_dropin
     [[ "${NO_SYSTEMD}" -eq 0 ]] || return 0
     for unit in \
         linux-agent-web.service \
@@ -711,6 +925,15 @@ stop_transaction_services() {
             systemctl stop "${unit}" || fail "升级事务无法停止正在运行的 unit: ${unit}"
         fi
     done
+    while IFS=$'\t' read -r _package _component _client _socket_env _socket_path \
+        service_asset socket_asset _egress_dropin; do
+        for unit in "$(basename -- "${service_asset}")" "$(basename -- "${socket_asset}")"; do
+            if systemctl is-active --quiet "${unit}" >/dev/null 2>&1; then
+                systemctl stop "${unit}" ||
+                    fail "升级事务无法停止 Skill credential component unit: ${unit}"
+            fi
+        done
+    done < <(transaction_credential_component_rows | sort -u)
 }
 
 restore_persistent_config() {
@@ -734,6 +957,7 @@ restore_persistent_config() {
 
 restore_persistent_data() {
     local name existed backup target marker marker_backup marker_existed
+    local ledger ledger_backup ledger_existed
     [[ "${PERSISTENT_DATA_STATE_CAPTURED}" -eq 1 ]] || return 0
     while IFS=$'\t' read -r name existed; do
         case "${name}" in
@@ -761,6 +985,14 @@ restore_persistent_data() {
         cp -p -- "${marker_backup}" "${marker}" || return 1
     else
         rm -f -- "${marker}"
+    fi
+    ledger="${PREFIX}/data/skill-components.json"
+    ledger_backup="${TRANSACTION_BACKUP_DIR}/persistent/skill-components.json"
+    ledger_existed="$(<"${TRANSACTION_BACKUP_DIR}/persistent/skill-components-existed")"
+    if [[ "${ledger_existed}" -eq 1 ]]; then
+        cp -p -- "${ledger_backup}" "${ledger}" || return 1
+    else
+        rm -f -- "${ledger}" || return 1
     fi
 }
 
@@ -849,7 +1081,8 @@ restore_systemd_state() {
 }
 
 rollback_transaction() {
-    local current_target="" link_tmp
+    local current_target="" link_tmp unit _package _component _client _socket_env
+    local _socket_path _service_asset socket_asset _egress_dropin
 
     [[ -n "${TRANSACTION_MODE}" && "${TRANSACTION_COMMITTED}" -eq 0 ]] || return 0
     TRANSACTION_COMMITTED=1
@@ -860,6 +1093,11 @@ rollback_transaction() {
         systemctl stop linux-agent-web.service >/dev/null 2>&1 || true
         systemctl stop linux-agent-observer-helper.socket linux-agent-runner.socket \
             linux-agent-host-ops.socket linux-agent-policy-writer.socket >/dev/null 2>&1 || true
+        while IFS=$'\t' read -r _package _component _client _socket_env _socket_path \
+            _service_asset socket_asset _egress_dropin; do
+            unit="$(basename -- "${socket_asset}")"
+            systemctl stop "${unit}" >/dev/null 2>&1 || true
+        done < <(transaction_credential_component_rows | sort -u)
     fi
     acquire_runtime_transaction_lock
 
@@ -881,6 +1119,7 @@ rollback_transaction() {
 
     restore_persistent_config || warn '无法完整恢复持久配置'
     restore_persistent_data || warn '无法完整恢复 Skill/策略 overlay'
+    restore_builtin_skills_state || warn '无法完整恢复内置 Skill 安装集合'
     restore_install_state || warn '无法完整恢复安装状态'
     restore_observer_helper_state || warn '无法恢复 observer helper capability 状态'
     restore_systemd_state || warn '无法完整恢复 systemd unit 状态'
@@ -893,6 +1132,14 @@ rollback_transaction() {
         fi
     fi
     RUNNER_USER_CREATED_THIS_RUN=0
+    if [[ "${CREDENTIAL_USER_CREATED_THIS_RUN}" -eq 1 &&
+        "${NO_SYSTEMD}" -eq 0 && "${CREDENTIAL_USER}" != "root" ]]; then
+        if command -v userdel >/dev/null 2>&1 && id "${CREDENTIAL_USER}" >/dev/null 2>&1; then
+            userdel "${CREDENTIAL_USER}" >/dev/null 2>&1 ||
+                warn "安装失败后无法删除本次创建的 credential helper 用户: ${CREDENTIAL_USER}"
+        fi
+    fi
+    CREDENTIAL_USER_CREATED_THIS_RUN=0
 
     if [[ "${SERVICE_USER_CREATED_THIS_RUN}" -eq 1 &&
         "${NO_SYSTEMD}" -eq 0 && "${SERVICE_USER}" != "root" ]]; then
@@ -1021,6 +1268,9 @@ copy_local_asset() {
 
 validate_manifest() {
     local manifest="$1"
+    local manifest_schema
+    manifest_schema="$(jq -r '.schema_version // empty' "${manifest}" 2>/dev/null || true)"
+    [[ "${manifest_schema}" != "1" ]] || fail 'release manifest schema v1 已不受支持；请使用 schema v2 发布物'
     jq -e --arg repository "${REPOSITORY}" --arg version "${VERSION}" '
         def valid_asset:
             type == "object"
@@ -1030,8 +1280,9 @@ validate_manifest() {
             and (.max_size_bytes | type == "number" and floor == . and . >= 1)
             and (.size_bytes <= .max_size_bytes)
             and (.max_size_bytes <= 52428800);
-        type == "object"
-        and .schema_version == 1
+        . as $release
+        | type == "object"
+        and .schema_version == 2
         and .repository == $repository
         and .version == $version
         and (.assets | type == "object")
@@ -1040,14 +1291,19 @@ validate_manifest() {
         and (.assets.installer | valid_asset)
         and ([.assets[] | valid_asset] | all)
         and (.assets.installer.name == "linux-agent-install.sh")
-        and ((.skills | type) == "object" and (.skills | length) > 0)
+        and .core_contents == {builtin_skill_index:true,builtin_skill_packages:false}
+        and (.skills | type == "object")
         and ([.skills | to_entries[] | . as $skill | select(
             ($skill.key | test("^[a-z0-9][a-z0-9-]*$") | not)
             or (($skill.value | type) != "object")
             or (($skill.value.description | type) != "string" or ($skill.value.description | length) == 0)
+            or (($skill.value.category | type) != "string" or ($skill.value.category | test("^[a-z0-9][a-z0-9-]{0,63}$") | not))
             or ($skill.value.risk | IN("low", "medium", "high", "critical") | not)
             or ($skill.value.asset | valid_asset | not)
-            or (($skill.value.refs | type) != "array" or ($skill.value.refs | length) == 0)
+            or (($skill.value.contract_digest | type) != "string" or ($skill.value.contract_digest | test("^[0-9a-f]{64}$") | not))
+            or (($skill.value.index_section_digest | type) != "string" or ($skill.value.index_section_digest | test("^[0-9a-f]{64}$") | not))
+            or (($skill.value.refs | type) != "array")
+            or (($skill.value.components | type) != "object")
             or ([$skill.value.refs[] | select(
                 ((.ref | type) != "string")
                 or (.ref | startswith($skill.key + "/") | not)
@@ -1056,20 +1312,14 @@ validate_manifest() {
                 or (.risk | IN("low", "medium", "high", "critical") | not)
                 or ((.execution_class | type) != "string")
                 or ((.capability | type) != "string")
-                or (if .ref == "network-ops-tools/firewall" then
-                        .execution_class != "host_helper" or .capability != "firewall.apply"
-                    elif .ref == "network-ops-tools/hosts-file-editor" then
-                        .execution_class != "host_helper" or .capability != "hosts.apply"
-                    else
-                        .execution_class != "runner" or .capability != ""
-                    end)
+                or (.execution_class | IN("runner", "host_helper", "credential_helper") | not)
             )] | length > 0)
             or (($skill.value.refs | map(.ref) | length) != ($skill.value.refs | map(.ref) | unique | length))
         )] | length == 0)
         and ([.assets[].name, .skills[].asset.name] as $names
             | ($names | length) == ($names | unique | length))
     ' "${manifest}" >/dev/null ||
-        fail 'release manifest 契约无效；旧发布物可能不包含 installer 资产'
+        fail 'release manifest schema v2 契约无效'
 }
 
 obtain_signature_bundle() {
@@ -1255,6 +1505,9 @@ PY
 prepare_release() {
     local release_dir="${PREFIX}/releases/${VERSION}"
     local manifest base_url core_archive web_archive skill_name skill_archive selector
+    local expected_contract actual_contract expected_index actual_index index_json validation
+    local expected_components actual_components
+    local -a skill_names=()
     assert_plain_directory "${PREFIX}/releases" ||
         fail "发布目录类型非法: ${PREFIX}/releases"
     [[ ! -e "${release_dir}" && ! -L "${release_dir}" ]] || fail "版本已经安装: ${VERSION}"
@@ -1280,14 +1533,69 @@ prepare_release() {
     mkdir -p "${WORK_DIR}/release"
     extract_archive_safely "${core_archive}" "${WORK_DIR}/release" || fail 'core archive 安全解包失败'
     extract_archive_safely "${web_archive}" "${WORK_DIR}/release" || fail 'web archive 安全解包失败'
-    while IFS= read -r skill_name; do
+    [[ -f "${WORK_DIR}/release/skills/INDEX.md" &&
+        ! -L "${WORK_DIR}/release/skills/INDEX.md" ]] ||
+        fail 'core archive 缺少 skills/INDEX.md'
+    mkdir -p "${WORK_DIR}/builtin-root/skills"
+    cp -- "${WORK_DIR}/release/skills/INDEX.md" "${WORK_DIR}/builtin-root/skills/INDEX.md"
+    if [[ "${TRANSACTION_MODE}" == "install" || ! -d "${PREFIX}/skills" ]]; then
+        mapfile -t skill_names < <(jq -r '.skills | keys[]' "${manifest}")
+    else
+        [[ ! -L "${PREFIX}/skills" &&
+            -f "${PREFIX}/skills/INDEX.md" && ! -L "${PREFIX}/skills/INDEX.md" ]] ||
+            fail '现有内置 Skill 根目录或 INDEX 类型非法'
+        mapfile -t skill_names < <(
+            find "${PREFIX}/skills" -mindepth 1 -maxdepth 1 -type d \
+                ! -name '.*' -printf '%f\n' | LC_ALL=C sort
+        )
+        for skill_name in "${skill_names[@]}"; do
+            [[ "${skill_name}" =~ ^[a-z0-9][a-z0-9-]*$ ]] ||
+                fail "现有内置 Skill 名称非法: ${skill_name}"
+            jq -e --arg skill "${skill_name}" '.skills[$skill] | type == "object"' \
+                "${manifest}" >/dev/null ||
+                fail "新 release catalog 缺少已安装 Skill: ${skill_name}"
+        done
+    fi
+    index_json="$(python3 "${WORK_DIR}/release/lib/skill_package.py" index \
+        "${WORK_DIR}/release/skills/INDEX.md")" ||
+        fail 'core archive 的 skills/INDEX.md 无效'
+    for skill_name in "${skill_names[@]}"; do
         [[ "${skill_name}" =~ ^[a-z0-9][a-z0-9-]*$ ]] ||
             fail "Skill 名称非法: ${skill_name}"
         selector=".skills[\"${skill_name}\"].asset"
         skill_archive="$(obtain_asset "${manifest}" "${selector}" "${base_url}")"
-        extract_archive_safely "${skill_archive}" "${WORK_DIR}/release" ||
+        extract_archive_safely "${skill_archive}" "${WORK_DIR}/builtin-root" ||
             fail "Skill archive 安全解包失败: ${skill_name}"
-    done < <(jq -r '.skills | keys[]' "${manifest}")
+        [[ -d "${WORK_DIR}/builtin-root/skills/${skill_name}" &&
+            ! -L "${WORK_DIR}/builtin-root/skills/${skill_name}" ]] ||
+            fail "Skill archive 未生成预期包目录: ${skill_name}"
+        expected_contract="$(jq -r --arg skill "${skill_name}" \
+            '.skills[$skill].contract_digest' "${manifest}")"
+        actual_contract="$(python3 "${WORK_DIR}/release/lib/skill_package.py" digest \
+            "${WORK_DIR}/builtin-root/skills/${skill_name}" --origin builtin |
+            jq -r '.contract_digest // empty')"
+        [[ -n "${actual_contract}" && "${actual_contract}" == "${expected_contract}" ]] ||
+            fail "Skill contract digest 不匹配: ${skill_name}"
+        expected_components="$(jq -Sc --arg skill "${skill_name}" \
+            '.skills[$skill].components // {}' "${manifest}")"
+        actual_components="$(python3 "${WORK_DIR}/release/lib/skill_package.py" inspect \
+            "${WORK_DIR}/builtin-root/skills/${skill_name}" --origin builtin |
+            jq -Sc '.components // {}')"
+        [[ "${actual_components}" == "${expected_components}" ]] ||
+            fail "Skill components 与签名 manifest 不匹配: ${skill_name}"
+        expected_index="$(jq -r --arg skill "${skill_name}" \
+            '.skills[$skill].index_section_digest' "${manifest}")"
+        actual_index="$(jq -r --arg skill "${skill_name}" \
+            '.skills[] | select(.name == $skill) | .section_digest' <<<"${index_json}")"
+        [[ -n "${actual_index}" && "${actual_index}" == "${expected_index}" ]] ||
+            fail "Skill INDEX section digest 不匹配: ${skill_name}"
+    done
+    PREPARED_SKILLS_DIR="${WORK_DIR}/builtin-root/skills"
+    PREPARED_SKILLS_MANIFEST="${manifest}"
+    validation="$(python3 "${WORK_DIR}/release/lib/skill_package.py" validate-root \
+        "${PREPARED_SKILLS_DIR}")" || fail '内置 Skill staging 校验失败'
+    jq -e '.ok == true and all(.findings[]?; .code == "SKILL_PACKAGE_UNAVAILABLE")' \
+        <<<"${validation}" >/dev/null || fail '内置 Skill staging 与 INDEX 不一致'
     [[ -x "${WORK_DIR}/release/bin/agent" && -x "${WORK_DIR}/release/bin/agent-web" ]] ||
         fail '发布物缺少可执行入口'
     [[ -f "${WORK_DIR}/release/config/config.example.json" &&
@@ -1301,17 +1609,6 @@ prepare_release() {
         -f "${WORK_DIR}/release/packaging/linux-agent-policy-writer.service" &&
         -f "${WORK_DIR}/release/packaging/linux-agent-policy-writer.socket" ]] ||
         fail '发布物缺少配置或 systemd unit'
-
-    # Validate the bundled registry against the bundled configuration. The
-    # operator's persistent config may be invalid or point at an external
-    # skills_dir; neither should change the release-integrity verdict.
-    cp -- "${WORK_DIR}/release/config/config.example.json" "${WORK_DIR}/release/config/config.json"
-    chmod 0600 "${WORK_DIR}/release/config/config.json"
-    if ! bash "${WORK_DIR}/release/bin/agent" api skills validate '{}' |
-        jq -e '.ok == true' >/dev/null; then
-        fail '安装包内的 Skill registry 校验失败'
-    fi
-    rm -f -- "${WORK_DIR}/release/config/config.json"
     rm -rf -- "${WORK_DIR}/release/logs" "${WORK_DIR}/release/tmp"
 
     mkdir -p "${WORK_DIR}/persistent-config"
@@ -1456,8 +1753,40 @@ ensure_service_identity() {
     SERVICE_GROUP="$(id -gn "${SERVICE_USER}")"
     [[ -n "${SERVICE_GROUP}" ]] || fail "无法确定服务用户主组: ${SERVICE_USER}"
     ensure_runner_identity
+    ensure_credential_identity
     configure_managed_data_permissions
     chown -R root:root "${PREFIX}/releases"
+}
+
+ensure_credential_identity() {
+    local uid web_uid runner_uid
+    [[ "${NO_SYSTEMD}" -eq 0 ]] || return 0
+    if id "${CREDENTIAL_USER}" >/dev/null 2>&1; then
+        uid="$(id -u "${CREDENTIAL_USER}")"
+        [[ "${uid}" != "0" || "${LINUX_AGENT_ALLOW_ROOT_SERVICE_USER_FOR_TESTS:-0}" == "1" ]] ||
+            fail 'Credential helper 用户不能映射到 UID 0'
+        CREDENTIAL_GROUP="$(id -gn "${CREDENTIAL_USER}")"
+    else
+        command -v useradd >/dev/null 2>&1 || fail '缺少 useradd，无法创建 credential helper 用户'
+        if command -v getent >/dev/null 2>&1 && getent group "${CREDENTIAL_GROUP}" >/dev/null 2>&1; then
+            useradd --system --home-dir /var/lib/linux-agent-credential --shell /usr/sbin/nologin \
+                --gid "${CREDENTIAL_GROUP}" "${CREDENTIAL_USER}"
+        elif [[ "${CREDENTIAL_GROUP}" == "${CREDENTIAL_USER}" ]]; then
+            useradd --system --home-dir /var/lib/linux-agent-credential --shell /usr/sbin/nologin \
+                --user-group "${CREDENTIAL_USER}"
+        else
+            fail "自定义 credential helper 组不存在: ${CREDENTIAL_GROUP}"
+        fi
+        CREDENTIAL_USER_CREATED=1
+        CREDENTIAL_USER_CREATED_THIS_RUN=1
+        uid="$(id -u "${CREDENTIAL_USER}")"
+    fi
+    if [[ "${LINUX_AGENT_ALLOW_ROOT_SERVICE_USER_FOR_TESTS:-0}" != "1" ]]; then
+        web_uid="$(id -u "${SERVICE_USER}")"
+        runner_uid="$(id -u "${RUNNER_USER}")"
+        [[ "${uid}" != "${web_uid}" && "${uid}" != "${runner_uid}" ]] ||
+            fail 'Credential helper 必须使用独立 UID'
+    fi
 }
 
 ensure_runner_identity() {
@@ -1714,18 +2043,23 @@ PY
 }
 
 verify_systemd_unit_files() {
-    local output_file
+    local output_file _package _component _client _socket_env _socket_path
+    local service_asset socket_asset service_path socket_path _egress_dropin
+    local -a verify_paths=(
+        "${SYSTEMD_UNIT_PATH}" "${SYSTEMD_HELPER_SERVICE_PATH}"
+        "${SYSTEMD_HELPER_SOCKET_PATH}"
+        "${SYSTEMD_RUNNER_SERVICE_PATH}" "${SYSTEMD_RUNNER_SOCKET_PATH}"
+        "${SYSTEMD_HOST_SERVICE_PATH}" "${SYSTEMD_HOST_SOCKET_PATH}"
+        "${SYSTEMD_POLICY_SERVICE_PATH}" "${SYSTEMD_POLICY_SOCKET_PATH}"
+    )
     [[ "${NO_SYSTEMD}" -eq 0 ]] || return 0
     command -v systemd-analyze >/dev/null 2>&1 ||
         fail '缺少 systemd-analyze，无法验证 systemd unit 兼容性'
+    while IFS= read -r output_file; do
+        [[ -n "${output_file}" ]] && verify_paths+=("${output_file}")
+    done < <(installed_credential_file_paths | grep -E '[.](service|socket)$' || true)
     output_file="$(mktemp)"
-    if ! LC_ALL=C systemd-analyze verify \
-        "${SYSTEMD_UNIT_PATH}" "${SYSTEMD_HELPER_SERVICE_PATH}" \
-        "${SYSTEMD_HELPER_SOCKET_PATH}" \
-        "${SYSTEMD_RUNNER_SERVICE_PATH}" "${SYSTEMD_RUNNER_SOCKET_PATH}" \
-        "${SYSTEMD_HOST_SERVICE_PATH}" "${SYSTEMD_HOST_SOCKET_PATH}" \
-        "${SYSTEMD_POLICY_SERVICE_PATH}" "${SYSTEMD_POLICY_SOCKET_PATH}" \
-        >"${output_file}" 2>&1; then
+    if ! LC_ALL=C systemd-analyze verify "${verify_paths[@]}" >"${output_file}" 2>&1; then
         sed -n '1,80p' "${output_file}" >&2
         rm -f -- "${output_file}"
         fail '当前 systemd 不支持安装包中的 unit 配置'
@@ -1750,6 +2084,19 @@ verify_systemd_unit_files() {
         grep -Fxq "Environment=LINUX_AGENT_SERVICE_USER=${SERVICE_USER}" "${output_file}" ||
             fail "helper/Runner unit 未绑定实际 Web 服务用户: ${output_file}"
     done
+    while IFS=$'\t' read -r _package _component _client _socket_env _socket_path \
+        service_asset socket_asset _egress_dropin; do
+        service_path="${SYSTEMD_UNIT_DIR}/$(basename -- "${service_asset}")"
+        socket_path="${SYSTEMD_UNIT_DIR}/$(basename -- "${socket_asset}")"
+        grep -Fxq 'SocketUser=root' "${socket_path}" &&
+            grep -Fxq "SocketGroup=${SERVICE_GROUP}" "${socket_path}" &&
+            grep -Fxq 'SocketMode=0660' "${socket_path}" ||
+            fail "Credential helper socket 权限边界无效: ${socket_path}"
+        grep -Fxq "Environment=LINUX_AGENT_SERVICE_USER=${SERVICE_USER}" "${service_path}" &&
+            grep -Fxq "User=${CREDENTIAL_USER}" "${service_path}" &&
+            grep -Fxq "Group=${CREDENTIAL_GROUP}" "${service_path}" ||
+            fail "Credential helper unit 未落实服务用户与独立 UID/GID: ${service_path}"
+    done < <(credential_component_rows)
 }
 
 verify_source_observer_systemd_unit_files() {
@@ -1778,28 +2125,267 @@ verify_source_observer_systemd_unit_files() {
         fail '源码 observer helper service 未绑定实际 Web 服务用户或隔离 runtime'
 }
 
-install_systemd_unit() {
-    local render_root="${WORK_DIR:-${TRANSACTION_BACKUP_DIR:-${PREFIX}}}"
-    local template target rendered
-    local -a installed_units=()
-    [[ "${NO_SYSTEMD}" -eq 0 ]] || return 0
-    command -v systemctl >/dev/null 2>&1 || fail '缺少 systemctl'
-    mkdir -p -- "${SYSTEMD_UNIT_DIR}"
-    while IFS=$'\t' read -r template target; do
-        [[ -f "${template}" && ! -L "${template}" ]] ||
-            fail "当前版本缺少 systemd unit: ${template}"
-        rendered="${render_root}/.${target##*/}.$$"
-        python3 - "${template}" "${rendered}" "${PREFIX}" \
-            "${SERVICE_USER}" "${SERVICE_GROUP}" "${RUNNER_USER}" "${RUNNER_GROUP}" <<'PY'
+skill_component_registry_at() {
+    local skills_root="$1"
+    local parser="$2"
+    local registry
+    if [[ ! -d "${skills_root}" || -L "${skills_root}" ]]; then
+        jq -cn '{ok:true,status:"unavailable",skills:[],findings:[]}'
+        return 0
+    fi
+    [[ -f "${parser}" && ! -L "${parser}" ]] ||
+        fail '当前版本缺少 Skill 包契约解析器'
+    registry="$(python3 "${parser}" validate-root "${skills_root}")" ||
+        fail '无法读取已安装 Skill 组件注册表'
+    jq -e '.ok == true and (.skills | type == "array")' <<<"${registry}" >/dev/null ||
+        fail '已安装 Skill 组件注册表无效'
+    printf '%s\n' "${registry}"
+}
+
+skill_component_registry() {
+    skill_component_registry_at "${PREFIX}/skills" "${PREFIX}/current/lib/skill_package.py"
+}
+
+credential_component_rows_at() {
+    local skills_root="$1" parser="$2"
+    skill_component_registry_at "${skills_root}" "${parser}" | jq -er '
+        .skills[]
+        | select(.state == "installed" and (.components.credential_helper | type) == "object")
+        | .name as $package
+        | .components.credential_helper
+        | select(has("service_asset") and has("socket_asset"))
+        | [
+            $package,
+            .name,
+            .client,
+            .socket_env,
+            .default_socket,
+            .service_asset,
+            .socket_asset,
+            (.egress_dropin // "")
+        ]
+        | @tsv
+    '
+}
+
+credential_component_rows() {
+    credential_component_rows_at "${PREFIX}/skills" "${PREFIX}/current/lib/skill_package.py"
+}
+
+transaction_credential_component_rows() {
+    local current_parser="${PREFIX}/current/lib/skill_package.py"
+    local prepared_parser="${PREPARED_RELEASE_DIR:-}/lib/skill_package.py"
+    credential_component_rows_at "${PREFIX}/skills" "${current_parser}"
+    if [[ -n "${PREPARED_SKILLS_DIR}" && -n "${WORK_DIR}" ]]; then
+        credential_component_rows_at "${PREPARED_SKILLS_DIR}" "${prepared_parser}"
+    fi
+}
+
+transaction_credential_file_rows() {
+    local _package component _client _socket_env _socket_path service_asset socket_asset
+    local egress_dropin path key
+    local -A seen=()
+    while IFS=$'\t' read -r _package component _client _socket_env _socket_path \
+        service_asset socket_asset egress_dropin; do
+        [[ -n "${component}" ]] || continue
+        for path in \
+            "${SYSTEMD_UNIT_DIR}/$(basename -- "${service_asset}")" \
+            "${SYSTEMD_UNIT_DIR}/$(basename -- "${socket_asset}")"; do
+            key="${path}"
+            [[ -z "${seen["${key}"]:-}" ]] || continue
+            seen["${key}"]=1
+            printf '%s\tcredential-%s-%s\n' "${path}" "${component}" "$(basename -- "${path}")"
+        done
+        if [[ -n "${egress_dropin}" ]]; then
+            path="${SYSTEMD_UNIT_DIR}/linux-agent-${component}.service.d/${egress_dropin}"
+            key="${path}"
+            if [[ -z "${seen["${key}"]:-}" ]]; then
+                seen["${key}"]=1
+                printf '%s\tcredential-%s-%s\n' "${path}" "${component}" "${egress_dropin}"
+            fi
+        fi
+    done < <(transaction_credential_component_rows | sort -u)
+}
+
+installed_credential_unit_names() {
+    local _package _component _client _socket_env _socket_path service_asset socket_asset
+    local _egress_dropin
+    while IFS=$'\t' read -r _package _component _client _socket_env _socket_path \
+        service_asset socket_asset _egress_dropin; do
+        [[ -n "${_package}" ]] || continue
+        basename -- "${socket_asset}"
+        basename -- "${service_asset}"
+    done < <(credential_component_rows)
+}
+
+installed_credential_file_paths() {
+    local _package component _client _socket_env _socket_path service_asset socket_asset
+    local egress_dropin
+    while IFS=$'\t' read -r _package component _client _socket_env _socket_path \
+        service_asset socket_asset egress_dropin; do
+        [[ -n "${component}" ]] || continue
+        printf '%s\n' \
+            "${SYSTEMD_UNIT_DIR}/$(basename -- "${service_asset}")" \
+            "${SYSTEMD_UNIT_DIR}/$(basename -- "${socket_asset}")"
+        if [[ -n "${egress_dropin}" ]]; then
+            printf '%s\n' \
+                "${SYSTEMD_UNIT_DIR}/linux-agent-${component}.service.d/${egress_dropin}"
+        fi
+    done < <(credential_component_rows)
+}
+
+remove_stale_credential_systemd_files() {
+    local path current_files
+    [[ -f "${TRANSACTION_BACKUP_DIR}/systemd-extra/credential-files.tsv" ]] || return 0
+    current_files="$(installed_credential_file_paths | sort -u)"
+    while IFS= read -r path; do
+        [[ -n "${path}" ]] || continue
+        grep -Fxq -- "${path}" <<<"${current_files}" && continue
+        rm -f -- "${path}"
+        case "${path}" in
+            *.service.d/*.conf) rmdir -- "$(dirname -- "${path}")" 2>/dev/null || true ;;
+        esac
+    done <"${TRANSACTION_BACKUP_DIR}/systemd-extra/credential-files.tsv"
+}
+
+install_credential_component_state() {
+    local registry package component egress_dropin command_json entrypoint
+    local environment_name environment_value resolved_value
+    local -a arguments=() command=()
+    registry="$(skill_component_registry)"
+    while IFS=$'\t' read -r package component egress_dropin command_json; do
+        [[ -n "${package}" && -n "${command_json}" ]] || continue
+        entrypoint="$(jq -er '.entrypoint' <<<"${command_json}")" ||
+            fail "Skill ${package} 的 credential helper 安装命令无效"
+        mapfile -t arguments < <(jq -er '.arguments[]' <<<"${command_json}")
+        command=(env "PYTHONPATH=${PREFIX}/current/lib")
+        while IFS=$'\t' read -r environment_name environment_value; do
+            [[ -n "${environment_name}" ]] || continue
+            case "${environment_value}" in
+                credential_group) resolved_value="${CREDENTIAL_GROUP}" ;;
+                component_egress_dropin)
+                    [[ -n "${egress_dropin}" ]] ||
+                        fail "Skill ${package} 缺少 credential helper egress drop-in 声明"
+                    resolved_value="${SYSTEMD_UNIT_DIR}/linux-agent-${component}.service.d/${egress_dropin}"
+                    ;;
+                *) fail "Skill ${package} 声明了未知的 credential helper 安装环境" ;;
+            esac
+            command+=("${environment_name}=${resolved_value}")
+        done < <(jq -er '.environment | to_entries[] | [.key, .value] | @tsv' \
+            <<<"${command_json}")
+        command+=(python3 "${PREFIX}/skills/${package}/${entrypoint}" "${arguments[@]}")
+        "${command[@]}" >/dev/null ||
+            fail "Skill ${package} 的 credential helper 安装命令失败"
+    done < <(jq -er '
+        .skills[]
+        | select(.state == "installed")
+        | .name as $package
+        | .components.credential_helper as $component
+        | $component.install.commands[]?
+        | [$package, $component.name, ($component.egress_dropin // ""), tojson]
+        | @tsv
+    ' <<<"${registry}")
+}
+
+update_skill_component_ledger() {
+    local ledger="${PREFIX}/data/skill-components.json"
+    local registry package package_path contract_digest components credential host
+    local environment default_path resolved_path record result
+    local units='[]' unit_files='[]' host_policy_files='[]' owned_paths='[]'
+    local component service_asset socket_asset egress_dropin
+    [[ -d "${PREFIX}/data" && ! -L "${PREFIX}/data" ]] ||
+        fail 'Skill component ownership ledger 目录不可用'
+    [[ -f "${PREFIX}/current/lib/skill_component_ledger.py" &&
+        ! -L "${PREFIX}/current/lib/skill_component_ledger.py" ]] ||
+        fail '当前版本缺少 Skill component ownership ledger 实现'
+    registry="$(skill_component_registry)"
+    while IFS= read -r package; do
+        [[ -n "${package}" ]] || continue
+        package_path="${PREFIX}/skills/${package}"
+        contract_digest="$(python3 "${PREFIX}/current/lib/skill_package.py" digest \
+            "${package_path}" --origin builtin | jq -er '.contract_digest')" ||
+            fail "无法记录 Skill ${package} 的 contract digest"
+        components="$(jq -c --arg package "${package}" \
+            '.skills[] | select(.name == $package) | .components' <<<"${registry}")"
+        units='[]'
+        unit_files='[]'
+        host_policy_files='[]'
+        owned_paths='[]'
+        credential="$(jq -c '.credential_helper // {}' <<<"${components}")"
+        if [[ "${NO_SYSTEMD}" -eq 0 && "$(jq -r 'length' <<<"${credential}")" -gt 0 ]]; then
+            component="$(jq -er '.name' <<<"${credential}")"
+            service_asset="$(jq -er '.service_asset' <<<"${credential}")"
+            socket_asset="$(jq -er '.socket_asset' <<<"${credential}")"
+            egress_dropin="$(jq -r '.egress_dropin // empty' <<<"${credential}")"
+            units="$(jq -cn \
+                --arg service "$(basename -- "${service_asset}")" \
+                --arg socket "$(basename -- "${socket_asset}")" \
+                '[$socket,$service]')"
+            unit_files="$(jq -cn \
+                --arg service "${SYSTEMD_UNIT_DIR}/$(basename -- "${service_asset}")" \
+                --arg socket "${SYSTEMD_UNIT_DIR}/$(basename -- "${socket_asset}")" \
+                --arg dropin "$([[ -n "${egress_dropin}" ]] && printf '%s' "${SYSTEMD_UNIT_DIR}/linux-agent-${component}.service.d/${egress_dropin}")" \
+                '[$service,$socket] + (if $dropin == "" then [] else [$dropin] end)')"
+            while IFS=$'\t' read -r environment default_path; do
+                [[ -n "${environment}" ]] || continue
+                resolved_path="${!environment-}"
+                [[ -n "${resolved_path}" ]] || resolved_path="${default_path}"
+                owned_paths="$(jq -cn --argjson prior "${owned_paths}" \
+                    --arg path "${resolved_path}" --arg default "${default_path}" \
+                    '$prior + [{kind:"directory",path:$path,default:$default}]')"
+            done < <(jq -r '.owned_paths[]? | [.environment,.default] | @tsv' \
+                <<<"${credential}")
+        fi
+        host="$(jq -c '.host_helper // {}' <<<"${components}")"
+        if [[ "${NO_SYSTEMD}" -eq 0 && "$(jq -r 'has("policy_asset")' <<<"${host}")" == "true" ]]; then
+            host_policy_files="$(jq -cn --arg path "${HOST_OPS_POLICY_PATH}" '[$path]')"
+        fi
+        record="$(jq -cn \
+            --arg digest "${contract_digest}" \
+            --argjson units "${units}" \
+            --argjson unit_files "${unit_files}" \
+            --argjson host_policy_files "${host_policy_files}" \
+            --argjson owned_paths "${owned_paths}" \
+            '{installed:true,contract_digest:$digest,units:$units,unit_files:$unit_files,host_policy_files:$host_policy_files,owned_paths:$owned_paths}')"
+        result="$(python3 "${PREFIX}/current/lib/skill_component_ledger.py" upsert \
+            "${ledger}" "${package}" --record "${record}")" ||
+            fail "无法更新 Skill ${package} 的 component ownership ledger"
+        jq -e '.ok == true' <<<"${result}" >/dev/null ||
+            fail "Skill ${package} 的 component ownership ledger 返回无效结果"
+    done < <(jq -r '.skills[] | select(.state == "installed") | .name' <<<"${registry}")
+    if [[ "${NO_SYSTEMD}" -eq 0 ]]; then
+        chown root:root "${ledger}"
+        chmod 0600 "${ledger}"
+    fi
+}
+
+render_systemd_unit() {
+    local template="$1" rendered="$2"
+    python3 - "${template}" "${rendered}" "${PREFIX}" \
+        "${SERVICE_USER}" "${SERVICE_GROUP}" "${RUNNER_USER}" "${RUNNER_GROUP}" \
+        "${CREDENTIAL_USER}" "${CREDENTIAL_GROUP}" "${HOST_OPS_POLICY_PATH}" <<'PY'
 import sys
 from pathlib import Path
 
-source, output, prefix, web_user, web_group, runner_user, runner_group = sys.argv[1:]
+(
+    source,
+    output,
+    prefix,
+    web_user,
+    web_group,
+    runner_user,
+    runner_group,
+    credential_user,
+    credential_group,
+    host_ops_policy,
+) = sys.argv[1:]
 text = Path(source).read_text(encoding="utf-8").replace("/opt/linux-agent", prefix)
 replacements = {
     "User=linux-agent-runner": f"User={runner_user}",
     "Group=linux-agent-runner": f"Group={runner_group}",
     "SocketGroup=linux-agent-runner": f"SocketGroup={runner_group}",
+    "User=linux-agent-credential": f"User={credential_user}",
+    "Group=linux-agent-credential": f"Group={credential_group}",
     "User=linux-agent": f"User={web_user}",
     "Group=linux-agent": f"Group={web_group}",
     "SocketUser=linux-agent": f"SocketUser={web_user}",
@@ -1807,10 +2393,33 @@ replacements = {
     "Environment=LINUX_AGENT_SERVICE_USER=linux-agent": (
         f"Environment=LINUX_AGENT_SERVICE_USER={web_user}"
     ),
+    "Environment=LINUX_AGENT_HOST_OPS_POLICY_PATH=/etc/linux-agent/host-ops-policy.json": (
+        f"Environment=LINUX_AGENT_HOST_OPS_POLICY_PATH={host_ops_policy}"
+    ),
 }
-text = "".join(replacements.get(line.rstrip("\n"), line.rstrip("\n")) + "\n" for line in text.splitlines())
+text = "".join(
+    replacements.get(line.rstrip("\n"), line.rstrip("\n")) + "\n"
+    for line in text.splitlines()
+)
 Path(output).write_text(text, encoding="utf-8")
 PY
+}
+
+install_systemd_unit() {
+    local render_root="${WORK_DIR:-${TRANSACTION_BACKUP_DIR:-${PREFIX}}}"
+    local template target rendered package _component _client _socket_env _socket_path
+    local service_asset socket_asset _egress_dropin
+    local -a installed_units=()
+    [[ "${NO_SYSTEMD}" -eq 0 ]] || return 0
+    install_credential_component_state
+    install_host_ops_policy
+    command -v systemctl >/dev/null 2>&1 || fail '缺少 systemctl'
+    mkdir -p -- "${SYSTEMD_UNIT_DIR}"
+    while IFS=$'\t' read -r template target; do
+        [[ -f "${template}" && ! -L "${template}" ]] ||
+            fail "当前版本缺少 systemd unit: ${template}"
+        rendered="${render_root}/.${target##*/}.$$"
+        render_systemd_unit "${template}" "${rendered}"
         cp -- "${rendered}" "${target}"
         chmod 0644 "${target}"
         installed_units+=("${target}")
@@ -1825,12 +2434,142 @@ ${PREFIX}/current/packaging/linux-agent-host-ops.socket	${SYSTEMD_HOST_SOCKET_PA
 ${PREFIX}/current/packaging/linux-agent-policy-writer.service	${SYSTEMD_POLICY_SERVICE_PATH}
 ${PREFIX}/current/packaging/linux-agent-policy-writer.socket	${SYSTEMD_POLICY_SOCKET_PATH}
 EOF
+    while IFS=$'\t' read -r package _component _client _socket_env _socket_path \
+        service_asset socket_asset _egress_dropin; do
+        [[ -n "${package}" ]] || continue
+        for template in "${PREFIX}/skills/${package}/${service_asset}" \
+            "${PREFIX}/skills/${package}/${socket_asset}"; do
+            target="${SYSTEMD_UNIT_DIR}/$(basename -- "${template}")"
+            [[ -f "${template}" && ! -L "${template}" ]] ||
+                fail "Skill ${package} 缺少声明的 credential helper unit: ${template}"
+            rendered="${render_root}/.${target##*/}.$$"
+            render_systemd_unit "${template}" "${rendered}"
+            cp -- "${rendered}" "${target}"
+            chmod 0644 "${target}"
+            installed_units+=("${target}")
+        done
+    done < <(credential_component_rows)
+    remove_stale_credential_systemd_files
     install_provider_egress_policy
     restore_selinux_paths "${PREFIX}" "${installed_units[@]}" "${SYSTEMD_EGRESS_DROPIN_PATH}"
     verify_service_runtime_access
     verify_runner_runtime_access
     verify_systemd_unit_files
     systemctl daemon-reload
+}
+
+install_host_ops_policy() {
+    local registry template="" parent package asset
+    local -a templates=()
+    [[ "${NO_SYSTEMD}" -eq 0 ]] || return 0
+    registry="$(skill_component_registry)"
+    while IFS=$'\t' read -r package asset; do
+        [[ -n "${package}" && -n "${asset}" ]] || continue
+        templates+=("${PREFIX}/skills/${package}/${asset}")
+    done < <(jq -er '
+        .skills[]
+        | select(.state == "installed" and (.components.host_helper.policy_asset | type) == "string")
+        | [.name, .components.host_helper.policy_asset]
+        | @tsv
+    ' <<<"${registry}")
+    if [[ "${#templates[@]}" -eq 0 ]]; then
+        return 0
+    fi
+    [[ "${#templates[@]}" -eq 1 ]] ||
+        fail '多个 host helper Skill 声明了互斥的全局 policy 资产'
+    template="${templates[0]}"
+    [[ -f "${template}" && ! -L "${template}" ]] ||
+        fail 'Skill 组件注册表声明的 host operations policy 模板不可用'
+    parent="$(dirname -- "${HOST_OPS_POLICY_PATH}")"
+    if [[ -L "${parent}" || (-e "${parent}" && ! -d "${parent}") ]]; then
+        fail "host operations policy 父目录类型非法: ${parent}"
+    fi
+    mkdir -p -- "${parent}"
+    chown root:root "${parent}"
+    chmod 0755 "${parent}"
+    python3 - "${HOST_OPS_POLICY_PATH}" "${template}" <<'PY'
+import json
+import os
+import re
+import stat
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+template = Path(sys.argv[2])
+unit_pattern = re.compile(r"^[A-Za-z0-9][A-Za-z0-9:_.@-]{0,254}\.service$")
+
+
+def reject_duplicates(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f"duplicate key: {key}")
+        result[key] = value
+    return result
+
+
+def load(raw):
+    value = json.loads(
+        raw,
+        object_pairs_hook=reject_duplicates,
+        parse_constant=lambda item: (_ for _ in ()).throw(ValueError(item)),
+    )
+    if not isinstance(value, dict) or set(value) != {
+        "schema_version",
+        "service_restart_units",
+        "systemd_dropin_units",
+    } or value.get("schema_version") != 1:
+        raise ValueError("invalid policy schema")
+    for name in ("service_restart_units", "systemd_dropin_units"):
+        units = value.get(name)
+        if not isinstance(units, list) or len(units) > 256 or len(units) != len(set(units)):
+            raise ValueError(f"invalid {name}")
+        if any(
+            not isinstance(unit, str)
+            or unit_pattern.fullmatch(unit) is None
+            or unit == "systemd.service"
+            or unit.startswith("linux-agent-")
+            for unit in units
+        ):
+            raise ValueError(f"invalid {name} unit")
+    return value
+
+
+if path.exists() or path.is_symlink():
+    metadata = path.lstat()
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or stat.S_ISLNK(metadata.st_mode)
+        or metadata.st_uid != 0
+        or metadata.st_gid != 0
+        or stat.S_IMODE(metadata.st_mode) != 0o600
+        or metadata.st_size > 65_536
+    ):
+        raise SystemExit("existing host operations policy metadata is invalid")
+    load(path.read_text(encoding="utf-8"))
+    raise SystemExit(0)
+
+raw = template.read_text(encoding="utf-8")
+load(raw)
+flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+descriptor = os.open(path, flags, 0o600)
+try:
+    payload = raw.encode("utf-8")
+    offset = 0
+    while offset < len(payload):
+        offset += os.write(descriptor, payload[offset:])
+    os.fchmod(descriptor, 0o600)
+    os.fchown(descriptor, 0, 0)
+    os.fsync(descriptor)
+finally:
+    os.close(descriptor)
+directory = os.open(path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+try:
+    os.fsync(directory)
+finally:
+    os.close(directory)
+PY
 }
 
 web_health_request() {
@@ -1887,7 +2626,7 @@ observer_helper_audit_preflight_request() {
 }
 
 health_request() {
-    local output
+    local output credential_helpers
     output="$(web_health_request)" || return 1
     if [[ "${NO_SYSTEMD}" -eq 1 ]]; then
         printf '%s\n' "${output}"
@@ -1897,7 +2636,18 @@ health_request() {
     runner_health_request || return 1
     host_helper_health_request || return 1
     policy_helper_health_request || return 1
-    jq -c '. + {observer_helper:{ok:true,status:"ready"}, execution_helpers:{runner:"ready",host_ops:"ready",policy_writer:"ready"}}' <<<"${output}"
+    credential_helpers="$(credential_helpers_health_request)" || return 1
+    jq -c --argjson credential_helpers "${credential_helpers}" '
+        . + {
+            observer_helper:{ok:true,status:"ready"},
+            execution_helpers:{
+                runner:"ready",
+                host_ops:"ready",
+                policy_writer:"ready",
+                credential_helpers:$credential_helpers
+            }
+        }
+    ' <<<"${output}"
 }
 
 runner_health_request() {
@@ -1937,6 +2687,31 @@ policy_helper_health_request() {
     fi
 }
 
+credential_helpers_health_request() {
+    local package component client socket_env socket_path _service_asset _socket_asset
+    local _egress_dropin configured_socket status='{}'
+    while IFS=$'\t' read -r package component client socket_env socket_path \
+        _service_asset _socket_asset _egress_dropin; do
+        [[ -n "${package}" ]] || continue
+        client="${PREFIX}/skills/${package}/${client}"
+        [[ -f "${client}" && ! -L "${client}" ]] || return 1
+        configured_socket="${!socket_env:-${socket_path}}"
+        if [[ "${EUID}" -eq 0 && "${SERVICE_USER}" != "root" ]]; then
+            runuser -u "${SERVICE_USER}" -- env \
+                "PYTHONPATH=${PREFIX}/current/lib" python3 "${client}" request \
+                --socket "${configured_socket}" ping --params '{}' \
+                --summary "Check ${component} helper readiness" >/dev/null || return 1
+        else
+            PYTHONPATH="${PREFIX}/current/lib" python3 "${client}" request \
+                --socket "${configured_socket}" ping \
+                --params '{}' --summary "Check ${component} helper readiness" >/dev/null || return 1
+        fi
+        status="$(jq -c --arg name "${component}" '. + {($name):"ready"}' <<<"${status}")" ||
+            return 1
+    done < <(credential_component_rows)
+    printf '%s\n' "${status}"
+}
+
 wait_for_health() {
     local output error_file attempts="${LINUX_AGENT_INSTALL_HEALTH_ATTEMPTS:-60}"
     [[ "${attempts}" =~ ^[0-9]+$ && "${attempts}" -ge 1 && "${attempts}" -le 600 ]] || attempts=60
@@ -1959,10 +2734,15 @@ wait_for_health() {
 }
 
 restart_and_check() {
+    local -a credential_units=()
+    local -a units=(
+        linux-agent-observer-helper.socket linux-agent-runner.socket
+        linux-agent-host-ops.socket linux-agent-policy-writer.socket
+    )
     [[ "${NO_SYSTEMD}" -eq 0 ]] || return 0
-    systemctl restart linux-agent-observer-helper.socket linux-agent-runner.socket \
-        linux-agent-host-ops.socket linux-agent-policy-writer.socket \
-        linux-agent-web.service || return 1
+    mapfile -t credential_units < <(installed_credential_unit_names | grep '[.]socket$' || true)
+    units+=("${credential_units[@]}" linux-agent-web.service)
+    systemctl restart "${units[@]}" || return 1
     wait_for_health >/dev/null || return 1
 }
 
@@ -1979,6 +2759,13 @@ run_install_health_check() {
         linux-agent-policy-writer.service
         linux-agent-policy-writer.socket
     )
+    local -a credential_units=()
+    local -a start_units=(
+        linux-agent-observer-helper.socket linux-agent-runner.socket
+        linux-agent-host-ops.socket linux-agent-policy-writer.socket
+    )
+    mapfile -t credential_units < <(installed_credential_unit_names)
+    units+=("${credential_units[@]}")
 
     health_started_at="$(date --iso-8601=seconds)"
 
@@ -1990,21 +2777,21 @@ run_install_health_check() {
     if [[ "${cleanup_ok}" -ne 1 ]]; then
         warn '无法停止安装前已存在的服务进程'
         report_install_health_failure "${health_started_at}"
-    elif
-        systemctl start linux-agent-observer-helper.socket linux-agent-runner.socket \
-            linux-agent-host-ops.socket linux-agent-policy-writer.socket \
-            linux-agent-web.service
-    then
-        startup_ok=1
-        if wait_for_health >/dev/null; then
-            health_ok=1
+    else
+        mapfile -t credential_units < <(installed_credential_unit_names | grep '[.]socket$' || true)
+        start_units+=("${credential_units[@]}" linux-agent-web.service)
+        if systemctl start "${start_units[@]}"; then
+            startup_ok=1
+            if wait_for_health >/dev/null; then
+                health_ok=1
+            else
+                warn '新安装版本未在超时时间内通过认证健康检查'
+                report_install_health_failure "${health_started_at}"
+            fi
         else
-            warn '新安装版本未在超时时间内通过认证健康检查'
+            warn '无法启动新安装版本的临时健康检查服务'
             report_install_health_failure "${health_started_at}"
         fi
-    else
-        warn '无法启动新安装版本的临时健康检查服务'
-        report_install_health_failure "${health_started_at}"
     fi
     for unit in "${units[@]}"; do
         systemctl stop "${unit}" || cleanup_ok=0
@@ -2032,17 +2819,27 @@ report_install_health_failure() {
         linux-agent-policy-writer.service
         linux-agent-policy-writer.socket
     )
+    local -a credential_units=()
+    mapfile -t credential_units < <(installed_credential_unit_names)
+    units+=("${credential_units[@]}")
 
     warn '以下为安装健康检查失败时的 systemd 状态：'
     systemctl status --no-pager --full "${units[@]}" >&2 || true
     if command -v journalctl >/dev/null 2>&1; then
         warn '以下为本次安装健康检查期间的 journal：'
-        journalctl --no-pager --since "${health_started_at}" -n 80 \
-            -u linux-agent-web.service \
-            -u linux-agent-observer-helper.service \
-            -u linux-agent-observer-helper.socket \
-            -u linux-agent-runner.service -u linux-agent-host-ops.service \
-            -u linux-agent-policy-writer.service >&2 || true
+        local -a journal_arguments=(
+            --no-pager --since "${health_started_at}" -n 80
+            -u linux-agent-web.service
+            -u linux-agent-observer-helper.service
+            -u linux-agent-observer-helper.socket
+            -u linux-agent-runner.service
+            -u linux-agent-host-ops.service
+            -u linux-agent-policy-writer.service
+        )
+        while IFS= read -r unit; do
+            [[ "${unit}" == *.service ]] && journal_arguments+=(-u "${unit}")
+        done < <(installed_credential_unit_names)
+        journalctl "${journal_arguments[@]}" >&2 || true
     fi
 }
 
@@ -2064,6 +2861,7 @@ prune_releases() {
         version="${candidates[$i]}"
         [[ "${version}" =~ ^v[0-9A-Za-z][0-9A-Za-z._-]*$ ]] || continue
         rm -rf -- "${PREFIX}/releases/${version}"
+        rm -rf -- "${PREFIX}/skill-releases/${version}"
     done
 }
 
@@ -2086,6 +2884,11 @@ rollback_target() {
 
 do_install() {
     local release_dir install_health_status=0
+    local -a enable_units=(
+        linux-agent-observer-helper.socket linux-agent-runner.socket
+        linux-agent-host-ops.socket linux-agent-policy-writer.socket
+    )
+    local -a credential_sockets=()
     ensure_prefix
     load_existing_service_identity
     validate_service_identity
@@ -2103,14 +2906,17 @@ do_install() {
     capture_persistent_data_state
     prepare_persistent_layout
     acquire_runtime_transaction_lock
+    capture_builtin_skills_state
     ensure_service_identity
     migrate_managed_layout ""
     configure_managed_data_permissions
     set_config_version "${VERSION}"
     validate_persistent_overlays
+    install_prepared_builtin_skills
     atomic_switch "${VERSION}"
     if [[ "${NO_SYSTEMD}" -eq 0 ]]; then
         install_systemd_unit
+        update_skill_component_ledger
         release_runtime_transaction_lock
         run_install_health_check || install_health_status=$?
         case "${install_health_status}" in
@@ -2120,13 +2926,17 @@ do_install() {
             3) fail '安装后无法启动临时健康检查服务；临时单元已停止' ;;
             *) fail '安装后临时健康检查失败' ;;
         esac
+    else
+        update_skill_component_ledger
     fi
     write_install_state true
     finalize_no_systemd_ownership
     commit_transaction
     info "已安装 ${VERSION}: ${release_dir}"
     if [[ "${NO_SYSTEMD}" -eq 0 ]]; then
-        info '安装后健康检查已通过，临时服务已停止；安装器未修改原有开机启用状态，需要长期运行时请显式执行 systemctl enable --now linux-agent-observer-helper.socket linux-agent-runner.socket linux-agent-host-ops.socket linux-agent-policy-writer.socket linux-agent-web.service'
+        mapfile -t credential_sockets < <(installed_credential_unit_names | grep '[.]socket$' || true)
+        enable_units+=("${credential_sockets[@]}" linux-agent-web.service)
+        info "安装后健康检查已通过，临时服务已停止；安装器未修改原有开机启用状态，需要长期运行时请显式执行 systemctl enable --now ${enable_units[*]}"
     fi
 }
 
@@ -2143,6 +2953,7 @@ do_upgrade() {
     capture_systemd_state
     stop_transaction_services
     acquire_runtime_transaction_lock
+    capture_builtin_skills_state
     capture_persistent_data_state
     prepare_persistent_layout
     ensure_service_identity
@@ -2150,8 +2961,10 @@ do_upgrade() {
     configure_managed_data_permissions
     set_config_version "${VERSION}"
     validate_persistent_overlays
+    install_prepared_builtin_skills
     atomic_switch "${VERSION}"
     install_systemd_unit
+    update_skill_component_ledger
     release_runtime_transaction_lock
     if ! restart_and_check; then
         warn "${VERSION} 健康检查失败，正在自动回滚到 ${old_version}"
@@ -2179,15 +2992,23 @@ do_rollback() {
     capture_persistent_data_state
     ensure_service_identity
     target_release="${PREFIX}/releases/${target}"
+    PREPARED_SKILLS_DIR="${PREFIX}/skill-releases/${target}/skills"
+    PREPARED_SKILLS_MANIFEST="${PREFIX}/skill-releases/${target}/release-manifest.json"
     migration_tool="${PREFIX}/current/lib/layout_migration.py"
     [[ -d "${target_release}" && ! -L "${target_release}" ]] || fail '回滚目标 release 不可用'
+    [[ -d "${PREPARED_SKILLS_DIR}" && ! -L "${PREPARED_SKILLS_DIR}" &&
+        -f "${PREPARED_SKILLS_MANIFEST}" && ! -L "${PREPARED_SKILLS_MANIFEST}" ]] ||
+        fail '回滚目标缺少内置 Skill 版本快照'
+    capture_builtin_skills_state
     [[ -f "${migration_tool}" && ! -L "${migration_tool}" ]] || fail '当前版本缺少可逆 overlay 迁移器'
     migrate_managed_layout "${old_version}" "${target_release}" "${migration_tool}"
     configure_managed_data_permissions
     validate_persistent_overlays "${target_release}"
     set_config_version "${target}"
+    install_prepared_builtin_skills
     atomic_switch "${target}"
     install_systemd_unit
+    update_skill_component_ledger
     release_runtime_transaction_lock
     if ! restart_and_check; then
         fail '回滚目标健康检查失败，已恢复原版本'
@@ -2745,6 +3566,10 @@ validate_uninstall_target() {
             RUNNER_USER="${INSTALL_STATE_RUNNER_USER}"
             RUNNER_USER_CREATED="${INSTALL_STATE_RUNNER_USER_CREATED}"
         fi
+        if [[ -n "${INSTALL_STATE_CREDENTIAL_USER}" ]]; then
+            CREDENTIAL_USER="${INSTALL_STATE_CREDENTIAL_USER}"
+            CREDENTIAL_USER_CREATED="${INSTALL_STATE_CREDENTIAL_USER_CREATED}"
+        fi
         [[ "${INSTALL_STATE_NO_SYSTEMD}" -eq "${NO_SYSTEMD}" ]] ||
             fail '当前安装的 systemd 模式与本次参数不一致'
         state_installed="$(jq -r '.installed' "${state_path}")"
@@ -2758,9 +3583,22 @@ validate_uninstall_target() {
 }
 
 do_uninstall() {
+    local path unit skill result ledger="${PREFIX}/data/skill-components.json"
+    local -a credential_files=() credential_units=()
+    local -a ledger_skills=()
     validate_uninstall_target
+    if [[ -f "${ledger}" && ! -L "${ledger}" &&
+        -f "${PREFIX}/current/lib/skill_component_ledger.py" ]]; then
+        mapfile -t ledger_skills < <(python3 \
+            "${PREFIX}/current/lib/skill_component_ledger.py" list "${ledger}" |
+            jq -er '.result.skills | keys[]')
+    fi
     if [[ "${NO_SYSTEMD}" -eq 0 ]]; then
         command -v systemctl >/dev/null 2>&1 || fail '缺少 systemctl'
+        if [[ -d "${PREFIX}/skills" && -x "${PREFIX}/current/bin/agent" ]]; then
+            mapfile -t credential_units < <(installed_credential_unit_names)
+            mapfile -t credential_files < <(installed_credential_file_paths)
+        fi
         stop_and_disable_unit linux-agent-web.service
         stop_and_disable_unit linux-agent-observer-helper.socket
         stop_and_disable_unit linux-agent-observer-helper.service
@@ -2770,16 +3608,40 @@ do_uninstall() {
         stop_and_disable_unit linux-agent-host-ops.service
         stop_and_disable_unit linux-agent-policy-writer.socket
         stop_and_disable_unit linux-agent-policy-writer.service
+        for unit in "${credential_units[@]}"; do
+            stop_and_disable_unit "${unit}"
+        done
         rm -f -- "${SYSTEMD_UNIT_PATH}" "${SYSTEMD_HELPER_SERVICE_PATH}" "${SYSTEMD_HELPER_SOCKET_PATH}" \
             "${SYSTEMD_RUNNER_SERVICE_PATH}" "${SYSTEMD_RUNNER_SOCKET_PATH}" \
             "${SYSTEMD_HOST_SERVICE_PATH}" "${SYSTEMD_HOST_SOCKET_PATH}" \
             "${SYSTEMD_POLICY_SERVICE_PATH}" "${SYSTEMD_POLICY_SOCKET_PATH}" \
-            "${SYSTEMD_EGRESS_DROPIN_PATH}"
+            "${SYSTEMD_EGRESS_DROPIN_PATH}" "${HOST_OPS_POLICY_PATH}"
+        for path in "${credential_files[@]}"; do
+            rm -f -- "${path}"
+            case "${path}" in
+                *.service.d/*.conf) rmdir -- "$(dirname -- "${path}")" 2>/dev/null || true ;;
+            esac
+        done
         rmdir -- "$(dirname -- "${SYSTEMD_EGRESS_DROPIN_PATH}")" 2>/dev/null || true
+        rmdir -- "$(dirname -- "${HOST_OPS_POLICY_PATH}")" 2>/dev/null || true
         systemctl daemon-reload
     fi
+    for skill in "${ledger_skills[@]}"; do
+        if [[ "${PURGE_DATA}" -eq 1 ]]; then
+            result="$(python3 "${PREFIX}/current/lib/skill_component_ledger.py" uninstall \
+                "${ledger}" "${skill}" --purge --confirm PURGE_SKILL_DATA)" ||
+                fail "无法清理 Skill ${skill} 明确登记的持久数据"
+        else
+            result="$(python3 "${PREFIX}/current/lib/skill_component_ledger.py" uninstall \
+                "${ledger}" "${skill}")" ||
+                fail "无法更新 Skill ${skill} 的卸载状态"
+        fi
+        jq -e '.ok == true' <<<"${result}" >/dev/null ||
+            fail "Skill ${skill} ownership ledger 返回无效结果"
+    done
     rm -f -- "${PREFIX}/current"
-    rm -rf -- "${PREFIX}/releases"
+    rm -rf -- "${PREFIX}/releases" "${PREFIX}/skills" "${PREFIX}/skill-releases"
+    rm -f -- "${PREFIX}/release-manifest.json"
     if [[ "${PURGE_DATA}" -eq 1 ]]; then
         rm -rf -- "${PREFIX}/data"
         rm -f -- "$(install_state_path)"
@@ -2792,6 +3654,11 @@ do_uninstall() {
             -n "${RUNNER_USER}" ]] && id "${RUNNER_USER}" >/dev/null 2>&1; then
             command -v userdel >/dev/null 2>&1 || fail '缺少 userdel，无法删除安装器创建的 Runner 用户'
             userdel "${RUNNER_USER}" || fail "无法删除安装器创建的 Runner 用户: ${RUNNER_USER}"
+        fi
+        if [[ "${CREDENTIAL_USER_CREATED}" -eq 1 && "${CREDENTIAL_USER}" != "root" &&
+            -n "${CREDENTIAL_USER}" ]] && id "${CREDENTIAL_USER}" >/dev/null 2>&1; then
+            command -v userdel >/dev/null 2>&1 || fail '缺少 userdel，无法删除 credential helper 用户'
+            userdel "${CREDENTIAL_USER}" || fail "无法删除 credential helper 用户: ${CREDENTIAL_USER}"
         fi
     else
         if [[ "${NO_SYSTEMD}" -eq 1 ]]; then

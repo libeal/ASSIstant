@@ -127,7 +127,11 @@ work_run="$(
         bash bin/agent api work run '{"input":"查看cpu占用"}'
 )"
 jq -e '.ok == true and .status == "executed"
-    and ([.output_blocks[]? | select(.kind == "meta" and .title == "工作流摘要") | .json.auto_executed_count] | first) == 1
+    and ([.output_blocks[]? | select(.kind == "meta" and .title == "工作流摘要") | .json.auto_executed_count] | first) == 2
+    and any(.timeline[]?;
+        .kind == "execution"
+        and .original_step_id == "load-ops-basic"
+        and .result.status == "read")
     and ([.timeline[]? | select(.kind == "execution") | .output_blocks[]? | select(.kind == "meta" and .title == "执行代理") | .json.requested_privilege] | first) == "least"' <<<"${work_run}" >/dev/null
 jq -e '([.timeline[]? | select(.kind == "execution") | .output_blocks[]? | select(.kind == "json") | .json
     | select(.tool == "system.resource.inspect" and (.top_processes | length > 0))] | length) > 0' <<<"${work_run}" >/dev/null
@@ -138,17 +142,22 @@ continue_answer="$(
 )"
 jq -e '.ok == true and .status == "executed"
     and ([.output_blocks[]? | select(.kind == "markdown" and .title == "最终回答") | .text | contains("慢速实时检查已完成")] | any)
-    and ([.output_blocks[]? | select(.kind == "meta" and .title == "工作流摘要") | .json.iterations] | first) == 1
-    and ([.timeline[]? | select(.kind == "execution")] | length) == 1' <<<"${continue_answer}" >/dev/null
+    and ([.output_blocks[]? | select(.kind == "meta" and .title == "工作流摘要") | .json.iterations] | first) == 2
+    and ([.timeline[]? | select(.kind == "execution")] | length) == 2
+    and any(.timeline[]?;
+        .kind == "execution"
+        and .original_step_id == "load-ops-basic"
+        and .result.status == "read")' <<<"${continue_answer}" >/dev/null
 
 loop_run="$(
     linux_agent_test_capture "API iterative work" 150 "${project_work}" discard \
         bash bin/agent api work run '{"input":"查看cpu继续深入"}'
 )"
 jq -e '.ok == true and .status == "executed"
-    and ([.output_blocks[]? | select(.kind == "meta" and .title == "工作流摘要") | .json.iterations] | first) == 2
-    and ([.timeline[]? | select(.kind == "execution") | .iteration] | unique) == [1, 2]
-    and ([.timeline[]? | select(.kind == "execution")] | length) == 2' <<<"${loop_run}" >/dev/null
+    and ([.output_blocks[]? | select(.kind == "meta" and .title == "工作流摘要") | .json.iterations] | first) == 3
+    and ([.timeline[]? | select(.kind == "execution") | .iteration] | unique) == [1, 2, 3]
+    and ([.timeline[]? | select(.kind == "execution") | .original_step_id]
+        == ["load-ops-basic", "step-1", "reflect-1"])' <<<"${loop_run}" >/dev/null
 
 approval_first="$(
     linux_agent_test_capture "API approval request" 120 "${project_work}" discard \
@@ -173,7 +182,11 @@ approval_second="$(
         bash bin/agent api work run "${approval_payload}"
 )"
 jq -e '.ok == true and .status == "executed" and .response.response_type == "work_plan"
-    and ([.timeline[]? | select(.kind == "execution")] | length) == 2' <<<"${approval_second}" >/dev/null
+    and ([.timeline[]? | select(.kind == "execution")] | length) == 3
+    and any(.timeline[]?;
+        .kind == "execution"
+        and .original_step_id == "load-ops-basic"
+        and .result.status == "read")' <<<"${approval_second}" >/dev/null
 
 network_steps="$(jq -cn '[
     {id:"net-ip-scanner", title:"IP scanner", executor_type:"skill_script", skill_script:"network-ops-tools/ip-scanner", arguments:{cidr:"127.0.0.1/32", ports:[1], timeout_ms:200}, reason:"regression", expected_effect:"scan loopback IP", risk_level:"low", rollback_hint:"none"},
@@ -210,10 +223,32 @@ network_work="$(
     linux_agent_test_capture "API network tools workflow" 240 "${project_work}" discard \
         bash bin/agent api work run "${network_payload}"
 )"
-jq -e '.ok == true and .status == "executed"
-    and ([.timeline[]? | select(.kind == "execution")] | length) == 21
-    and ([.timeline[]? | select(.kind == "execution") | .output_blocks[]? | select(.kind == "json") | .json.tool] | unique | length) == 21
-    and ([.output_blocks[]? | select(.kind == "meta" and .title == "工作流摘要") | .json.auto_executed_count] | first) == 0' <<<"${network_work}" >/dev/null
+jq -e '.ok == false and .status == "blocked" and .code == "skill_not_loaded"
+    and (.error | contains("must be loaded through skill_load"))' \
+    <<<"${network_work}" >/dev/null
+
+network_tools='[]'
+while IFS= read -r network_step; do
+    network_ref="$(jq -r '.skill_script' <<<"${network_step}")"
+    network_script_payload="$(jq -cn \
+        --arg ref "${network_ref}" \
+        --argjson arguments "$(jq -c '.arguments' <<<"${network_step}")" \
+        '{ref:$ref,arguments:$arguments,approve:true}')"
+    network_script_result="$(
+        linux_agent_test_capture "API script ${network_ref}" 60 "${project_work}" discard \
+            bash bin/agent api script run "${network_script_payload}"
+    )"
+    jq -e '.ok == true and .status == "executed"
+        and any(.output_blocks[]?; .kind == "json" and (.json.tool | type) == "string")' \
+        <<<"${network_script_result}" >/dev/null
+    network_tool="$(jq -r \
+        '[.output_blocks[]? | select(.kind == "json") | .json.tool // empty] | first // empty' \
+        <<<"${network_script_result}")"
+    network_tools="$(jq -cn --argjson prior "${network_tools}" --arg tool "${network_tool}" \
+        '$prior + [$tool]')"
+done < <(jq -c '.[]' <<<"${network_steps}")
+jq -e 'length == 21 and (unique | length) == 21 and all(.[]; length > 0)' \
+    <<<"${network_tools}" >/dev/null
 
 project_missing="${tmp_root}/project-missing-ai"
 copy_project "${project_missing}"

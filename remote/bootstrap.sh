@@ -89,6 +89,8 @@ else
     curl -fsSL --proto '=https' --tlsv1.2 --max-time 60 --max-filesize 1048576 "${RELEASE_BASE}/release-manifest.json" -o "${manifest_path}" || fail 'release manifest 下载失败'
 fi
 [[ "$(stat -c '%s' "${manifest_path}")" -le 1048576 ]] || fail 'release manifest 超过 1MiB'
+manifest_schema="$(jq -r '.schema_version // empty' "${manifest_path}" 2>/dev/null || true)"
+[[ "${manifest_schema}" != "1" ]] || fail 'release manifest schema v1 已不受支持；请使用下一主版本 schema v2 发布物'
 jq -e --arg repository "${REPOSITORY}" '
     def valid_asset:
         type == "object"
@@ -104,13 +106,14 @@ jq -e --arg repository "${REPOSITORY}" '
         and (.description | type == "string" and length > 0)
         and (.risk | valid_risk);
     type == "object"
-    and .schema_version == 1
+    and .schema_version == 2
     and .repository == $repository
     and (.version | type == "string" and test("^v[0-9A-Za-z][0-9A-Za-z._-]*$"))
     and (.assets.bootstrap_cli | type == "object")
     and (.assets.bootstrap_web | type == "object")
     and (.assets.core | type == "object")
     and (.assets.web | type == "object")
+    and .core_contents == {builtin_skill_index:true,builtin_skill_packages:false}
     and (.skills | type == "object")
     and ([.assets[] | valid_asset] | all)
     and ([.skills | to_entries[] |
@@ -118,7 +121,10 @@ jq -e --arg repository "${REPOSITORY}" '
         and (.value.description | type == "string" and length > 0)
         and (.value.risk | valid_risk)
         and (.value.asset | valid_asset)
-        and (.value.refs | type == "array" and length > 0 and all(valid_ref))
+        and (.value.contract_digest | type == "string" and test("^[0-9a-f]{64}$"))
+        and (.value.index_section_digest | type == "string" and test("^[0-9a-f]{64}$"))
+        and (.value.refs | type == "array" and all(valid_ref))
+        and (.value.components | type == "object")
     ] | all)
 ' "${manifest_path}" >/dev/null || fail 'release manifest 校验失败'
 

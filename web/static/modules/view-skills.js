@@ -106,7 +106,10 @@ export function createSkillsView(app) {
 
   async function loadTools() {
     const data = await app.api("/api/tools");
-    state.tools = data.scripts || [];
+    state.tools = (data.scripts || []).slice().sort((left, right) => {
+      const category = String(left.category || "custom").localeCompare(String(right.category || "custom"));
+      return category || String(left.ref || "").localeCompare(String(right.ref || ""));
+    });
     const select = $("scriptSelect");
     select.innerHTML = "";
     for (const tool of state.tools) {
@@ -249,10 +252,12 @@ export function createSkillsView(app) {
     for (const tool of state.tools) {
       const parts = String(tool.ref || "").split("/");
       const name = parts[parts.length - 1] || tool.ref;
-      const group = parts.length > 1 ? parts.slice(0, -1).join(" / ") : "skills";
+      const packageName = parts.length > 1 ? parts.slice(0, -1).join(" / ") : "skills";
+      const category = String(tool.category || "custom");
+      const group = `${category} / ${packageName}`;
       const risk = tool.risk || "low";
       const row = document.createElement("tr");
-      const scriptPath = `${group.split(" / ").join("/")}/scripts/${name}.sh`;
+      const scriptPath = `${packageName.split(" / ").join("/")}/scripts/${name}.sh`;
       const materialization = tool.materialization || "local";
       const remoteCell = materialization === "local"
         ? '<span class="pill">local</span>'
@@ -309,6 +314,7 @@ export function createSkillsView(app) {
     }
     await loadTools();
     await loadSkillTree();
+    await app.loadSkillWebComponents();
     showToast(`${skill} 已完成整包校验与加载`);
   }
 

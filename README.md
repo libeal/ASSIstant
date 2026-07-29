@@ -47,6 +47,11 @@ Web 视图包括：
 - `controlled-tools`: 受控文件匹配、字面量补丁、安全下载和本地文本分析；自由 shell 文件修改会被审查拒绝，应使用这些脚本。
 - `session-history`: 只读回看审计 session 中上一轮或指定轮次的命令、计划步骤和输出预览。
 - `network-ops-tools`: 运维/网络工程工具箱，覆盖 IP Scanner、Port Scanner、Discovery Protocol、Wake on LAN、Network Interface、WiFi、Connections、Listeners、Neighbor Table、Ping Monitor、Traceroute、DNS Lookup、SNTP Lookup、Whois、IP Geolocation、Hosts File Editor、Lookup、SNMP、Firewall、Subnet Calculator、Bit Calculator，以及 TLS Inspect、HTTP Check、Public IP 和 Service Discovery；SNMP 支持 v1/v2c/v3-auth 与 walk/bulk，DNS 内置纯 Python 解析器覆盖全部常见记录类型；所有脚本声明为 `medium` 或 `high`，不能作为 low 风险自动执行。
+- `container-inspect`: 容器 runtime、容器、镜像和资源快照检查。
+- `ops-change`: 账户、软件包、计划任务和 systemd 的审查与受控变更能力。
+- `database-inspect`: 数据库 profile、凭据代理、健康检查和固定只读查询；其 Web、credential helper 与 systemd 资产都由包内 component 契约注册。
+
+重构前后的逐项能力闭合、主版本移除项和验收证据见 [`docs/SKILL_CAPABILITY_MATRIX.md`](docs/SKILL_CAPABILITY_MATRIX.md)。
 
 ## 快速开始
 
@@ -143,7 +148,8 @@ sudo bash linux-agent-install.sh install --version "${version}" --require-signat
   --provider-cidr 203.0.113.0/24 --provider-cidr 2001:db8:1234::/48
 # 安装健康检查会临时启动后自动停止；配置完成后再显式长期启动
 sudo systemctl enable --now linux-agent-observer-helper.socket linux-agent-runner.socket \
-  linux-agent-host-ops.socket linux-agent-policy-writer.socket linux-agent-web.service
+  linux-agent-host-ops.socket linux-agent-policy-writer.socket \
+  linux-agent-database-inspector.socket linux-agent-web.service
 sudo bash linux-agent-install.sh upgrade --version vX.Y.NEW --require-signature
 sudo bash linux-agent-install.sh rollback
 sudo bash linux-agent-install.sh health
@@ -270,7 +276,12 @@ bash bin/agent script ops-basic/process-inspect '{"pattern":"systemd"}'
 bash bin/agent terminal "printf hello"
 bash bin/agent sense disk
 bash bin/agent tools list
+bash bin/agent skills list
 bash bin/agent skills validate
+bash bin/agent skills read <skill-name> SKILL.md
+bash bin/agent skills read <skill-name> references/<file>
+bash bin/agent skills install --scope user <local-directory-or-tar.gz>
+bash bin/agent skills uninstall --scope user <skill-name>
 bash bin/agent mcp list
 bash bin/agent mcp validate
 bash bin/agent mcp tools
@@ -283,7 +294,7 @@ bash bin/agent audit export --all --output /secure/evidence
 
 审计 hash chain 是强制不变量，不能通过配置或 CLI 关闭；每个事件始终包含 `seq`、`prev_hash` 和 `hash`。升级配置如果仍含旧的 `audit.integrity_chain` 字段，CLI/Web 会要求删除该字段后再启动。追加只校验最后一个非空事件及其自身 hash，写入成本不随历史事件数增长。跨分段全链检查是显式职责：取证、导出或合规检查前运行 `audit verify`；中间事件或旧归档损坏会由该命令报告，但不会阻止后续追加。
 
-`agent backup` 面向诊断和迁移，导出脱敏配置、运行日志与用户 skill；Remote 归档只携带 `data/skills/` 用户包，并以 `materialized.json` 记录已验证的内置物化包，不复制内置代码。manifest 在一次排序扫描中分块计算摘要，复杂度为 `O(total_bytes + n log n)`。source checkout、`--no-systemd` 和 managed 的 `agent restore` 在锁外校验归档，再核对 release/config/Skill/policy 指纹并非阻塞申请独占切换：有活动请求返回 `restore_busy`，准备期间数据已变更返回 `restore_conflict`，不覆盖并发提交；Remote 在读取归档前返回 `restore_unavailable`。`agent audit export` 只导出审计 session、全部轮转段、逐 session 完整性报告、文件摘要 manifest 和 `SHA256SUMS`，适合交给 SIEM、对象存储或合规采集流程。
+`agent backup` 面向诊断和迁移，导出脱敏配置、运行日志与用户标准 Skill；归档以 `installation-state.json` 记录内置包安装状态和已验证摘要，不复制内置包代码，也不保存用户级 INDEX。manifest 在一次排序扫描中分块计算摘要，复杂度为 `O(total_bytes + n log n)`。source checkout、`--no-systemd` 和 Managed 的 `agent restore` 在锁外校验归档，再核对 release/config/Skill/policy 指纹并非阻塞申请独占切换：有活动请求返回 `restore_busy`，准备期间数据已变更返回 `restore_conflict`，不覆盖并发提交；Remote 在读取归档前返回 `restore_unavailable`。`agent audit export` 只导出审计 session、全部轮转段、逐 session 完整性报告、文件摘要 manifest 和 `SHA256SUMS`，适合交给 SIEM、对象存储或合规采集流程。
 
 机器可读 API 示例：
 
@@ -327,7 +338,9 @@ Linux 运维 Agent
 │  ├─ 感知与校验
 │  │  ├─ sense.sh            环境采集
 │  │  ├─ doctor.sh           本地健康检查
-│  │  ├─ skills.sh           skill 解析、登记和校验
+│  │  ├─ skills.sh           Skill resolver、生命周期、渐进披露和执行登记
+│  │  ├─ skill_package.py    SKILL.md frontmatter、linux-agent.json 与 INDEX 的统一安全解析器
+│  │  ├─ skill_lifecycle.py  用户/内置包 staging、原子安装、读取和卸载
 │  │  ├─ mcp.sh              MCP manifest 发现、脱敏和校验
 │  │  ├─ policy.sh           风险规则审查
 │  │  └─ file_vault.py       文件保险箱静态访问分类器（读取/修改/未知）
@@ -344,7 +357,7 @@ Linux 运维 Agent
 │  │  ├─ provider_security.py Provider URL 校验、SSRF 防护与地址解析
 │  │  ├─ pinned_http.py       固定解析 IP、保持 Host/SNI 的 HTTPS 客户端
 │  │  ├─ runner.py            独立 UID 普通执行 Unix socket 服务
-│  │  ├─ host_ops_helper.py   firewall/hosts 固定特权操作
+│  │  ├─ host_ops_helper.py   内置包声明 capability 的通用特权 dispatcher
 │  │  ├─ policy_helper.py     策略与 command guard 固定写入操作
 │  │  ├─ helper_protocol.py   Runner/helper 版本化 JSON socket 协议
 │  │  ├─ layout_migration.py  受管 data overlay 复制迁移与冲突隔离
@@ -376,12 +389,15 @@ Linux 运维 Agent
 │     ├─ audit-boundaries.json audit/observer 允许观察边界
 │     └─ file-vault.json     用户自定义的敏感文件保险箱路径，默认为空
 ├─ Skill 能力层 skills/
-│  ├─ INDEX.md               可执行 skill 白名单
+│  ├─ INDEX.md               项目级内置 Skill 目录与元数据
 │  ├─ ops-basic/             基础巡检、日志、备份和安全清理 skill
 │  ├─ os-deep-inspect/       深度系统、网络、FD 和 journal 检查 skill
 │  ├─ controlled-tools/      受控文件匹配、补丁、下载和本地文本分析 skill
 │  ├─ session-history/       只读审计 session 历史输出回看 skill
-│  └─ network-ops-tools/     运维/网络工程常用诊断、查询、扫描和计算 skill
+│  ├─ network-ops-tools/     运维/网络工程常用诊断、查询、扫描和计算 skill
+│  ├─ container-inspect/     容器 runtime、镜像与资源检查 skill
+│  ├─ ops-change/            主机配置审查与受控变更 skill
+│  └─ database-inspect/      数据库检查及动态 Web/credential component
 ├─ MCP 能力层 mcp/
 │  └─ <server-id>/mcp.json    外部 MCP server manifest，支持 stdio、sse、streamable_http
 ├─ 领域契约 schema/
@@ -420,7 +436,19 @@ Linux 运维 Agent
 
 ### Skill Registry 边界
 
-skill registry 同时支持本地目录和 Remote Release manifest；内置包使用 `skills/` 信任根，用户包使用解析后的用户 overlay（Remote 固定为 `data/skills/`）。`INDEX.md`、包内 `SKILL.md`、脚本与 manifest refs 必须互相一致，远程 manifest 中登记的名称即使尚未物化也保留给内置包。调用方应通过 `lib/skills.sh` 提供的函数列出、检查、物化、读取和执行 skill，而不是绕过 registry 直接拼路径。
+Skill registry 同时支持 source、Managed、Remote pending/materialized 和用户 overlay。每个包只要求标准 `SKILL.md`，可选 `scripts/`、`references/`、`assets/` 和项目扩展 `linux-agent.json`；`skills/INDEX.md` 只是项目级内置目录。INDEX、`SKILL.md`、扩展 tool refs 与签名 release manifest 必须互相一致，远程 manifest 中登记的名称即使尚未物化也保留给内置包。调用方应通过 `lib/skills.sh` 提供的函数列出、检查、物化、读取和执行 Skill，而不是绕过 resolver 直接拼路径。遗留 `manifest.json` 包和用户级 INDEX 会被明确拒绝，不会自动转换。
+
+公共生命周期命令为 `agent skills list|validate|read|install|uninstall`。用户安装只接受本地目录或 `.tar.gz`，原子写入 `data/skills/<name>/`，不生成用户 INDEX，也不能占用内置目录中的保留名称。Remote 中的 `install --scope builtin <name>` 按签名 manifest 只物化目标包；Managed 中该命令和 `uninstall --scope builtin <name>` 要求本机管理员权限。卸载默认保留包声明的配置、凭据和运行数据；只有显式追加 `--purge --confirm PURGE_SKILL_DATA` 才清理这些目录，清理残留会通过 `cleanup_pending` 报告。
+
+```bash
+bash bin/agent skills install --scope user ./my-skill
+bash bin/agent skills install --scope user ./my-skill.tar.gz
+bash bin/agent skills read my-skill SKILL.md
+bash bin/agent skills read my-skill references/operations.md
+bash bin/agent skills uninstall --scope user my-skill
+bash bin/agent skills uninstall --scope builtin database-inspect \
+    --purge --confirm PURGE_SKILL_DATA
+```
 
 Remote runtime 首次只加载索引与 Release manifest 元数据，执行前按一级 skill 整包 materialize，校验来源、大小、摘要、归档边界、INDEX/包内脚本集合和 policy 后，再交给现有 approval、observer 与 audit 流程。
 
@@ -442,7 +470,7 @@ Web MCP 页和 `agent api mcp list|validate|tools` 会隐藏 Authorization、tok
 2. 除 `agent audit` 和部分无需会话的 `api` 入口外，运行开始会创建 JSONL 审计 session。
 3. `lib/sense.sh` 按请求主题采集最小必要环境信息。
 4. `lib/context.sh` 构造模型请求上下文，并按 `context_turns` 带入会话历史窗口。
-5. `lib/ai.sh` 拼接 `prompts/system.txt`、`skills/INDEX.md`、动态上下文并调用 OpenAI-compatible Chat Completions 接口。
+5. `lib/ai.sh` 先向模型提供 INDEX/用户 Skill 候选元数据；模型只能用受控 `skill_load`/`skill_read` 按需取得 `SKILL.md` 和 UTF-8 reference，再调用 OpenAI-compatible Chat Completions 接口。
 6. `lib/orchestrator.sh` 根据模式调度 work、edit、script、terminal。
 7. `lib/policy.sh` 用 `policies/risk-rules.json` 做阻断、警告、保护路径和保护服务审查。
 8. `lib/executor.sh` 执行计划步骤，处理自动批准、人工审批、跳过、修改、终止、远程脚本下载审查和失败修复建议。
@@ -498,7 +526,7 @@ CLI 会话历史只在当前 `agent` 进程内有效，存放于该 session 的�
 3. 每个脚本写入临时文件并打开 `$EDITOR` 或 `vi`。
 4. 用户保存后，脚本再次经过策略审查。
 5. 生成 `SKILL.md` 和脚本文件，在临时 staging 目录中校验。
-6. 校验通过后替换正式 `skills/<name>/` 并更新 `skills/INDEX.md`。
+6. 校验通过后原子替换 `data/skills/<name>/`；用户 Skill 不创建或更新 INDEX。
 
 Web 版 edit 使用浏览器内联编辑器，但保存前仍调用同一套 `edit review/apply` API。
 
@@ -567,13 +595,7 @@ GitHub Actions 会构建确定性资产与 SPDX 2.3 SBOM，使用 GitHub OIDC �
 | `agent_loop.thinking_trace_enabled` | 是否保存并展示简短 `thinking_summary`。 |
 | `agent_loop.max_iterations` | Work 反思续写的硬上限，默认 12，范围 1–100；达到后停止而不是继续占用资源。 |
 | `agent_loop.checkpoint_turns` | 强制 checkpoint 轮次，`0` 表示使用默认窗口。 |
-| `approvals.auto.skill_readonly` | 是否自动执行低风险且策略干净的普通只读 skill。 |
-| `approvals.auto.shell_readonly` | 是否自动执行低风险且策略干净的 shell，默认关闭。 |
-| `approvals.auto.file_match` | 是否自动执行 `controlled-tools/file-match`。 |
-| `approvals.auto.file_patch` | 是否自动执行 `controlled-tools/file-patch`，默认关闭。 |
-| `approvals.auto.file_download` | 是否自动执行 `controlled-tools/file-download`，默认关闭。 |
-| `approvals.auto.local_analyze` | 是否自动执行 `controlled-tools/local-analyze`。 |
-| `approvals.auto.remote_script` | 是否自动执行远程脚本，默认关闭。 |
+| `approvals.auto.<scope>` | 按通用 approval scope 控制低风险、策略干净步骤的自动执行；Skill scope 来自 `linux-agent.json`，未配置的新 scope 默认关闭并由 Web 动态展示。 |
 | `audit_mode` | 审计写入模式。 |
 | `audit_text_limit` | 审计和输出预览文本截断长度。 |
 | `audit.fsync` | 是否在审计追加/轮转后执行 fsync。 |
@@ -648,7 +670,7 @@ GitHub Actions 会构建确定性资产与 SPDX 2.3 SBOM，使用 GitHub OIDC �
 ## 安全边界
 
 - AI 只能返回结构化 JSON，不能直接执行命令。
-- Skill 脚本必须同时登记在 `skills/INDEX.md` 和对应 `SKILL.md`。
+- 内置 Skill tool 必须在项目 INDEX 与包内 `linux-agent.json` 交叉登记；用户 tool 只来自其包内扩展，用户目录不使用 INDEX。
 - Work 和 Script 都经过 `policies/risk-rules.json`。
 - Terminal 也会执行策略审查，高风险命令需要确认。
 - 保护路径覆盖 `/`、`/etc`、`/boot`、`/usr`、`/var/lib`、`/root` 和用户 `.ssh`。
@@ -658,11 +680,11 @@ GitHub Actions 会构建确定性资产与 SPDX 2.3 SBOM，使用 GitHub OIDC �
 - Remote script 只能 HTTPS 下载后审查，不允许流式管道执行。
 - Web `/api/` 全部需要 Bearer token。
 - `/api/metrics` 默认开启但同样需要 Bearer token；指标只使用低基数 route/status 标签，不记录 token、API key 或 Job ID。
-- systemd Web 通过四类独立 socket 激活的 helper/Runner 隔离执行；host-ops 只允许 `firewall.apply`/`hosts.apply`，policy-writer 只允许 `policy.write`/`command_guard.set`，Runner 不可读取配置、API key 或特权 socket。helper 失败不回退 sudo；`observer.require=true` 时未观察到真实执行即阻断。
+- systemd Web 通过独立 socket 激活 Runner、observer、host、policy 与包声明的 credential helper；host-ops 只接受已安装签名包 adapter 产生的登记 capability，policy-writer 只允许 `policy.write`/`command_guard.set`，Runner 不可读取配置、API key 或特权 socket。helper 失败不回退 sudo；`observer.require=true` 时未观察到真实执行即阻断。
 - Web、Runner、Terminal、Skill 与 MCP 子进程从空环境按白名单构造，不继承父进程中的云凭据、访问令牌或凭据代理；API key 只进入 AI Provider 路径，执行步骤会再次清空环境。
 - Bash 与 Web 执行层都在读取期间限制 stdout/stderr。Runner `1.2.0` 将最大 64 KiB 原始块编码为按序 NDJSON 帧，客户端断开、Web 取消或父进程死亡会终止并 reap 整个进程组后才释放 slot。超限固定返回 exit 125/`output_limit_exceeded` 和准确截断计数；丢帧、乱序或缺 final 帧返回 `invalid_output`/`output_integrity_unknown`，不会静默成功。
 - Web 策略编辑只允许当前 release 登记的 JSON 策略，保存前做现有 validator 校验，再由 policy-writer helper 原子写入 `data/policies/`；`web.sensitive_edits_enabled=false` 时只允许草稿、diff、review 和 validate。
-- 用户 Skill 写入 `data/skills/`，同名内置 Skill 冲突即拒绝；每个脚本 manifest 必须声明 `risk`、`execution_class` 和 `capability`，用户 Skill 强制为 `runner` 且 capability 为空。
+- 用户 Skill 写入 `data/skills/`，同名内置 Skill 冲突即拒绝；唯一必需文件为标准 `SKILL.md`，可选 `linux-agent.json` tool 强制使用 `runner`、空 capability 和无 privileged/Web component。
 - 审计文本和上下文会脱敏并截断。
 - Remote bootstrap 和 installer 先校验 release manifest、资产大小与 SHA-256；存在 cosign bundle 时验证签名，`LINUX_AGENT_REQUIRE_SIGNATURE=1` 或 `--require-signature` 时缺失签名会拒绝运行。
 - systemd 生产安装使用专用非 root 用户、只读版本目录、独立持久数据目录和沙箱单元；升级健康检查失败会自动回滚，卸载默认保留 `data/`。
@@ -840,7 +862,7 @@ bash scripts/lint.sh
 
 | 文件 | 功能 |
 | --- | --- |
-| `skills/INDEX.md` | Skill 白名单索引，会进入模型 system prompt，也是 script 模式可执行入口的登记依据。 |
+| `skills/INDEX.md` | 项目级内置 Skill 目录与元数据，会进入模型 system prompt；可执行入口来自已校验包内的 `linux-agent.json`。 |
 | `skills/ops-basic/SKILL.md` | `ops-basic` skill 说明和脚本清单。 |
 | `skills/ops-basic/scripts/disk-hotspots.sh` | 采集指定路径磁盘使用、一级目录占用和大文件。 |
 | `skills/ops-basic/scripts/resource-inspect.sh` | 查看负载、CPU、内存和高占用进程。 |
@@ -911,6 +933,7 @@ bash scripts/lint.sh
 | `tests/install.sh` | 无 root 覆盖发布物校验、安装、升级、回滚、持久数据、版本保留和健康检查。 |
 | `tests/workflow_unit.sh` | 覆盖 CLI/API 共享 Work 工作流边界。 |
 | `tests/contract.sh` | 覆盖 API/domain schema、状态和错误码契约。 |
+| `tests/skill_lifecycle.sh` | 覆盖用户 Skill 的目录/归档安装、读取、卸载、内置名称保留、旧格式拒绝和无用户 INDEX 契约。 |
 | `tests/test_*.py` | 统一覆盖 MCP、网络工具、JobStore、Session 事务、Execution、Domain 与拆分后的 Web 服务。 |
 | `tests/interactive.sh` | 覆盖 REPL 菜单、模式切换、terminal 模式和 edit 模式。 |
 | `tests/web_api.sh` | 覆盖机器可读 API 的 work、script、terminal、edit、audit 等路径。 |

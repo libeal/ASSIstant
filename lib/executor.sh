@@ -164,17 +164,24 @@ linux_agent_runner_result_metadata() {
 linux_agent_prepare_session_history_snapshot() {
     local runner_kind="$1"
     shift
-    local script_path expected_path arguments session_id latest_log
+    local script_path builtin_root relative skill_name entrypoint metadata_path arguments session_id latest_log
     local private_stage snapshot_path segment line staged_file verify_report
 
     LINUX_AGENT_RUNNER_AUDIT_SNAPSHOT=""
     LINUX_AGENT_RUNNER_AUDIT_SNAPSHOT_SESSION=""
     [[ "${runner_kind}" == "skill" && $# -eq 3 && "${1:-}" == "bash" ]] || return 0
     script_path="$(readlink -f -- "${2:-}" 2>/dev/null || true)"
-    expected_path="$(readlink -f -- \
-        "${LINUX_AGENT_BUILTIN_SKILLS_DIR:-${LINUX_AGENT_ROOT}/skills}/session-history/scripts/last-command-output.sh" \
-        2>/dev/null || true)"
-    [[ -n "${script_path}" && "${script_path}" == "${expected_path}" ]] || return 0
+    builtin_root="$(readlink -f -- "${LINUX_AGENT_BUILTIN_SKILLS_DIR:-${LINUX_AGENT_ROOT}/skills}" 2>/dev/null || true)"
+    [[ -n "${script_path}" && -n "${builtin_root}" && "${script_path}" == "${builtin_root}/"* ]] || return 0
+    relative="${script_path#"${builtin_root}/"}"
+    skill_name="${relative%%/*}"
+    entrypoint="${relative#*/}"
+    [[ "${entrypoint}" == scripts/* ]] || return 0
+    metadata_path="${builtin_root}/${skill_name}/linux-agent.json"
+    [[ -f "${metadata_path}" && ! -L "${metadata_path}" ]] || return 0
+    jq -e --arg entrypoint "${entrypoint}" '
+        any(.tools[]?; .entrypoint == $entrypoint and (.runtime_inputs | index("audit_snapshot")) != null)
+    ' "${metadata_path}" >/dev/null 2>&1 || return 0
 
     arguments="${3:-}"
     jq -e 'type == "object"' <<<"${arguments}" >/dev/null 2>&1 || return 0
@@ -461,203 +468,148 @@ linux_agent_host_helper_result() {
         }'
 }
 
-linux_agent_host_helper_skill_params() {
-    local ref="$1" args="$2" capability origin action apply confirm expected_sha
-    capability="$(linux_agent_skill_capability "${ref}")"
-    origin="$(linux_agent_skill_package_origin "${ref%%/*}" 2>/dev/null || printf invalid)"
-    if [[ "${origin}" != "builtin" ]]; then
-        jq -cn --arg ref "${ref}" ' {
-            ok:false, status:"helper_rejected", code:"helper_rejected",
-            error_code:"helper_rejected", exit_code:126,
-            output:{ok:false, status:"helper_rejected", tool:$ref,
-                    error:"User Skills cannot request host-helper execution."},
-            execution_proxy:{isolation:"host_helper", helper:"host-ops", available:false}
-        }'
+linux_agent_skill_adapter_result() {
+    local ref="$1" args="$2" contract origin adapter tool_name response
+    local -a scrub_env
+    contract="$(linux_agent_skill_tool_contract_json "${ref}")"
+    origin="$(jq -r '.origin // empty' <<<"${contract}")"
+    adapter="$(linux_agent_skill_adapter_path "${ref}" 2>/dev/null || true)"
+    tool_name="$(jq -r '.tool.name // empty' <<<"${contract}")"
+    if [[ "${origin}" != "builtin" || -z "${adapter}" || -L "${adapter}" || ! -f "${adapter}" || -z "${tool_name}" ]]; then
+        jq -cn '{ok:false,status:"helper_rejected",error:"Signed builtin helper adapter is unavailable"}'
         return 0
     fi
-    [[ "$(linux_agent_skill_execution_class "${ref}")" == "host_helper" ]] || return 1
-    if [[ "${origin}" != "builtin" ]]; then
-        jq -cn '{handled:true, error:"User Skills cannot request host helper capabilities."}'
+    linux_agent_build_execution_environment scrub_env
+    response="$("${scrub_env[@]}" timeout 10s python3 "${adapter}" "${tool_name}" "${args}" 2>&1)" || true
+    if ! jq -e 'type == "object" and (.ok | type == "boolean")' <<<"${response}" >/dev/null 2>&1; then
+        jq -cn --arg error "${response}" '{ok:false,status:"helper_rejected",error:("Skill helper adapter returned invalid output: " + $error)}'
         return 0
     fi
-    action="$(jq -r '.action // "" | ascii_downcase' <<<"${args}")"
-    apply="$(jq -r '.apply // false' <<<"${args}")"
-    confirm="$(jq -r '.confirm // ""' <<<"${args}")"
-    case "${ref}:${capability}" in
-        network-ops-tools/firewall:firewall.apply)
-            jq -e '
-                (.action | type == "string" and ascii_downcase == "apply")
-                and (.apply | type == "boolean" and . == true)
-                and (.confirm | type == "string" and . == "APPLY_FIREWALL_CHANGE")
-            ' <<<"${args}" >/dev/null 2>&1 || return 1
-            if [[ "${confirm}" != "APPLY_FIREWALL_CHANGE" ]]; then
-                return 1
-            fi
-            jq -c '
-                (.rule // {}) as $rule
-                | {
-                    backend:(.backend // "ufw"),
-                    decision:($rule.decision // .decision // "allow"),
-                    protocol:($rule.protocol // .protocol // "tcp"),
-                    port:($rule.port // .port // 0),
-                    source:($rule.source // .source // "any")
-                }
-            ' <<<"${args}"
-            ;;
-        network-ops-tools/hosts-file-editor:hosts.apply)
-            jq -e '
-                (.action | type == "string" and ((ascii_downcase == "add") or (ascii_downcase == "remove")))
-                and (.apply | type == "boolean" and . == true)
-                and (.confirm | type == "string" and . == "APPLY_HOSTS_CHANGE")
-            ' <<<"${args}" >/dev/null 2>&1 || return 1
-            if [[ "${confirm}" != "APPLY_HOSTS_CHANGE" ]]; then
-                return 1
-            fi
-            if [[ "$(jq -r '.path // "/etc/hosts"' <<<"${args}")" != "/etc/hosts" ||
-            ! -f /etc/hosts || -L /etc/hosts ]]; then
-                jq -cn '{handled:true, error:"host helper only permits the regular /etc/hosts target."}'
-                return 0
-            fi
-            expected_sha="$(sha256sum /etc/hosts | awk '{print $1}')"
-            jq -c --arg expected_sha "${expected_sha}" '
-                {
-                    action:(.action | ascii_downcase),
-                    ip:(.ip // ""),
-                    hostnames:(
-                        if (.hostnames | type) == "array" then .hostnames
-                        elif (.hostname | type) == "string" and .hostname != "" then [.hostname]
-                        else [] end
-                    ),
-                    hostname:(.hostname // .query // ""),
-                    merge:(.merge // false),
-                    expected_sha256:$expected_sha
-                }
-            ' <<<"${args}"
-            ;;
-        *)
-            jq -cn '{handled:true, error:"Built-in Skill helper capability does not match the release allowlist."}'
-            ;;
-    esac
+    printf '%s\n' "${response}"
 }
 
 linux_agent_maybe_execute_host_helper_skill() {
     local scope="$1" subject_json="$2"
     shift 2
-    local ref args capability params error execution_class origin action apply_state
+    local ref args contract capability adapter_result dispatch operation params error
     [[ "${scope}" == "script" || "${scope}" == "step_skill_script" ]] || return 1
     [[ "${1:-}" == "bash" && $# -eq 3 ]] || return 1
     ref="$(jq -r '.ref // .step.skill_script // empty' <<<"${subject_json}")"
     [[ -n "${ref}" ]] || return 1
+    contract="$(linux_agent_skill_tool_contract_json "${ref}")"
+    [[ "$(jq -r '.tool.execution.class // empty' <<<"${contract}")" == "host_helper" ]] || return 1
     args="${3:-}"
-    execution_class="$(linux_agent_skill_execution_class "${ref}" 2>/dev/null || printf invalid)"
-    [[ "${execution_class}" == "host_helper" ]] || return 1
-
-    # A host-helper declaration is an execution boundary.  Only the explicitly
-    # read/plan forms may fall through to the ordinary runner; malformed or
-    # potentially mutating arguments must be consumed and rejected here so a
-    # source-runtime/root process can never execute the privileged script
-    # directly after helper routing fails.
-    if ! jq -e 'type == "object"' >/dev/null 2>&1 <<<"${args}"; then
-        jq -cn --arg ref "${ref}" ' {
-            ok:false, status:"helper_rejected", code:"helper_rejected",
-            error_code:"helper_rejected", exit_code:126,
-            output:{ok:false, status:"helper_rejected", tool:$ref,
-                    error:"Host-helper Skill arguments must be a JSON object."},
-            execution_proxy:{isolation:"host_helper", helper:"host-ops", available:false}
-        }'
-        return 0
-    fi
-    capability="$(linux_agent_skill_capability "${ref}")"
-    origin="$(linux_agent_skill_package_origin "${ref%%/*}" 2>/dev/null || printf invalid)"
-    action="$(jq -r '
-        if (has("action") | not) then ""
-        elif (.action | type) == "string" then (.action | ascii_downcase)
-        else "__invalid__" end
-    ' <<<"${args}")"
-    apply_state="$(jq -r '
-        if (has("apply") | not) then "missing"
-        elif (.apply | type) != "boolean" then "invalid"
-        elif .apply then "true" else "false" end
-    ' <<<"${args}")"
-
-    case "${ref}:${capability}" in
-        network-ops-tools/firewall:firewall.apply)
-            case "${action}:${apply_state}" in
-                :missing | :false | status:* | plan:*) return 1 ;;
-                apply:true)
-                    if ! linux_agent_managed_execution_enabled 2>/dev/null; then
-                        return 1
-                    fi
-                    ;;
-                *)
-                    jq -cn --arg ref "${ref}" ' {
-                        ok:false, status:"helper_rejected", code:"helper_rejected",
-                        error_code:"helper_rejected", exit_code:126,
-                        output:{ok:false, status:"helper_rejected", tool:$ref,
-                                error:"Firewall apply requires boolean apply=true and the fixed confirmation token."},
-                        execution_proxy:{isolation:"host_helper", helper:"host-ops", available:false}
-                    }'
-                    return 0
-                    ;;
-            esac
-            ;;
-        network-ops-tools/hosts-file-editor:hosts.apply)
-            case "${action}:${apply_state}" in
-                :missing | :false | add:missing | add:false | remove:missing | remove:false | read:* | search:* | plan-add:* | plan-remove:*) return 1 ;;
-                add:true | remove:true)
-                    if ! linux_agent_managed_execution_enabled 2>/dev/null; then
-                        return 1
-                    fi
-                    ;;
-                *)
-                    jq -cn --arg ref "${ref}" ' {
-                        ok:false, status:"helper_rejected", code:"helper_rejected",
-                        error_code:"helper_rejected", exit_code:126,
-                        output:{ok:false, status:"helper_rejected", tool:$ref,
-                                error:"Hosts apply requires boolean apply=true and the fixed confirmation token."},
-                        execution_proxy:{isolation:"host_helper", helper:"host-ops", available:false}
-                    }'
-                    return 0
-                    ;;
-            esac
-            ;;
-        *)
-            jq -cn --arg ref "${ref}" ' {
-                ok:false, status:"helper_rejected", code:"helper_rejected",
-                error_code:"helper_rejected", exit_code:126,
-                output:{ok:false, status:"helper_rejected", tool:$ref,
-                        error:"Built-in Skill helper capability is not allowlisted."},
-                execution_proxy:{isolation:"host_helper", helper:"host-ops", available:false}
-            }'
-            return 0
-            ;;
-    esac
-
-    if ! params="$(linux_agent_host_helper_skill_params "${ref}" "${args}")"; then
-        jq -cn --arg ref "${ref}" ' {
-            ok:false, status:"helper_rejected", code:"helper_rejected",
-            error_code:"helper_rejected", exit_code:126,
-            output:{ok:false, status:"helper_rejected", tool:$ref,
-                    error:"Host-helper Skill arguments failed the fixed schema."},
-            execution_proxy:{isolation:"host_helper", helper:"host-ops", available:false}
-        }'
-        return 0
-    fi
-    if [[ "$(jq -r '.handled // false' <<<"${params}")" == "true" ]]; then
-        error="$(jq -r '.error // "host helper request was rejected"' <<<"${params}")"
+    adapter_result="$(linux_agent_skill_adapter_result "${ref}" "${args}")"
+    if [[ "$(jq -r '.ok // false' <<<"${adapter_result}")" != "true" ]]; then
+        error="$(jq -r '.error // "host helper adapter rejected the request"' <<<"${adapter_result}")"
         jq -cn --arg ref "${ref}" --arg error "${error}" '{
-            ok:false,
-            status:"helper_rejected",
-            code:"helper_rejected",
-            error_code:"helper_rejected",
-            exit_code:126,
-            output:{ok:false, status:"helper_rejected", tool:$ref, error:$error},
-            execution_proxy:{isolation:"host_helper", helper:"host-ops", available:false}
+            ok:false,status:"helper_rejected",code:"helper_rejected",error_code:"helper_rejected",exit_code:126,
+            output:{ok:false,status:"helper_rejected",tool:$ref,error:$error},
+            execution_proxy:{isolation:"host_helper",helper:"host-ops",available:false}
         }'
         return 0
     fi
-    capability="$(linux_agent_skill_capability "${ref}")"
-    linux_agent_host_helper_result "${ref}" "${capability}" "${params}"
+    dispatch="$(jq -r '.dispatch // empty' <<<"${adapter_result}")"
+    if [[ "${dispatch}" == "runner" ]]; then
+        return 1
+    fi
+    capability="$(jq -r '.tool.execution.capability // empty' <<<"${contract}")"
+    operation="$(jq -r '.operation // empty' <<<"${adapter_result}")"
+    if [[ "${dispatch}" != "helper" || -z "${capability}" || "${operation}" != "${capability}" ]] ||
+        ! params="$(jq -c '.params | select(type == "object")' <<<"${adapter_result}")" || [[ -z "${params}" ]]; then
+        jq -cn --arg ref "${ref}" '{
+            ok:false,status:"helper_rejected",code:"helper_rejected",error_code:"helper_rejected",exit_code:126,
+            output:{ok:false,status:"helper_rejected",tool:$ref,error:"Skill helper adapter violated its declared capability contract."},
+            execution_proxy:{isolation:"host_helper",helper:"host-ops",available:false}
+        }'
+        return 0
+    fi
+    if ! linux_agent_managed_execution_enabled 2>/dev/null; then
+        return 1
+    fi
+    linux_agent_host_helper_result "${ref}" "${operation}" "${params}"
+    return 0
+}
+
+linux_agent_maybe_execute_credential_helper_skill() {
+    local scope="$1" subject_json="$2"
+    shift 2
+    local ref args contract origin capability adapter_result dispatch operation params summary
+    local component helper_name helper_client_rel helper_client socket_env default_socket socket_path response
+    [[ "${scope}" == "script" || "${scope}" == "step_skill_script" ]] || return 1
+    [[ "${1:-}" == "bash" && $# -eq 3 ]] || return 1
+    ref="$(jq -r '.ref // .step.skill_script // empty' <<<"${subject_json}")"
+    [[ -n "${ref}" ]] || return 1
+    contract="$(linux_agent_skill_tool_contract_json "${ref}")"
+    [[ "$(jq -r '.tool.execution.class // empty' <<<"${contract}")" == "credential_helper" ]] || return 1
+    args="${3:-}"
+    origin="$(jq -r '.origin // empty' <<<"${contract}")"
+    capability="$(jq -r '.tool.execution.capability // empty' <<<"${contract}")"
+    adapter_result="$(linux_agent_skill_adapter_result "${ref}" "${args}")"
+    dispatch="$(jq -r '.dispatch // empty' <<<"${adapter_result}")"
+    operation="$(jq -r '.operation // empty' <<<"${adapter_result}")"
+    if [[ "${origin}" != "builtin" || "${dispatch}" != "helper" || -z "${capability}" ||
+        "${operation}" != "${capability}" || "$(jq -r '.ok // false' <<<"${adapter_result}")" != "true" ]] ||
+        ! params="$(jq -c '.params | select(type == "object")' <<<"${adapter_result}")" || [[ -z "${params}" ]]; then
+        jq -cn --arg ref "${ref}" --arg error "$(jq -r '.error // "Credential helper adapter violated its declared capability contract."' <<<"${adapter_result}")" '{
+            ok:false, status:"failed", code:"helper_rejected",
+            error_code:"helper_rejected", exit_code:126,
+            output:{ok:false,status:"failed",code:"helper_rejected",tool:$ref,error:$error},
+            execution_proxy:{isolation:"credential_helper",helper:null,available:false}
+        }'
+        return 0
+    fi
+    component="$(jq -c '.components.credential_helper | select(type == "object")' <<<"${contract}" 2>/dev/null || true)"
+    helper_name="$(jq -r '.name // empty' <<<"${component}")"
+    helper_client_rel="$(jq -r '.client // empty' <<<"${component}")"
+    socket_env="$(jq -r '.socket_env // empty' <<<"${component}")"
+    default_socket="$(jq -r '.default_socket // empty' <<<"${component}")"
+    helper_client="$(jq -r --arg client "${helper_client_rel}" '(.package // "") + "/" + $client' <<<"${contract}")"
+    if [[ ! "${socket_env}" =~ ^[A-Z][A-Z0-9_]{0,127}$ || -z "${default_socket}" ]]; then
+        socket_path=""
+    else
+        socket_path="${!socket_env:-${default_socket}}"
+    fi
+    if ! linux_agent_managed_execution_enabled 2>/dev/null; then
+        jq -cn --arg ref "${ref}" --arg helper "${helper_name}" '{
+            ok:false, status:"failed", code:"credential_unavailable",
+            error_code:"credential_unavailable", exit_code:126,
+            output:{ok:false,status:"failed",code:"credential_unavailable",tool:$ref,error:"This operation requires a managed credential helper."},
+            execution_proxy:{isolation:"credential_helper",helper:$helper,available:false}
+        }'
+        return 0
+    fi
+    if [[ -z "${helper_name}" || -z "${helper_client_rel}" || ! -f "${helper_client}" ||
+        -L "${helper_client}" || -z "${socket_path}" || ! -S "${socket_path}" ]]; then
+        jq -cn --arg ref "${ref}" --arg helper "${helper_name}" '{
+            ok:false, status:"failed", code:"credential_unavailable",
+            error_code:"credential_unavailable", exit_code:126,
+            output:{ok:false,status:"failed",code:"credential_unavailable",tool:$ref,error:"Credential helper is unavailable."},
+            execution_proxy:{isolation:"credential_helper",helper:$helper,available:false}
+        }'
+        return 0
+    fi
+    summary="$(jq -r '.summary // "Run credential helper operation"' <<<"${adapter_result}")"
+    response="$(python3 "${helper_client}" request --socket "${socket_path}" "${operation}" \
+        --params "${params}" --summary "${summary}" 2>&1)" || true
+    if ! jq -e 'type == "object"' <<<"${response}" >/dev/null 2>&1; then
+        jq -cn --arg ref "${ref}" --arg helper "${helper_name}" --arg error "${response}" '{
+            ok:false,status:"failed",code:"credential_unavailable",
+            error_code:"credential_unavailable",exit_code:126,
+            output:{ok:false,status:"failed",code:"credential_unavailable",tool:$ref,error:$error},
+            execution_proxy:{isolation:"credential_helper",helper:$helper,available:false}
+        }'
+        return 0
+    fi
+    jq -cn --arg ref "${ref}" --arg helper_name "${helper_name}" --argjson helper "${response}" '{
+        ok:($helper.ok == true),
+        status:(if $helper.ok then ($helper.status // "checked") else "failed" end),
+        code:($helper.code // null),
+        error_code:($helper.code // null),
+        exit_code:(if $helper.ok then 0 else 1 end),
+        output:($helper + {tool:$ref, status:(if $helper.ok then ($helper.status // "checked") else "failed" end)}),
+        execution_proxy:{isolation:"credential_helper",helper:$helper_name,available:true}
+    }'
     return 0
 }
 
@@ -676,52 +628,27 @@ linux_agent_confirm_execution() {
 
 linux_agent_auto_approval_enabled() {
     local capability="$1"
-    case "${capability}" in
-        skill_readonly)
-            linux_agent_config_bool_default '.approvals.auto.skill_readonly' 'true'
-            ;;
-        shell_readonly)
-            linux_agent_config_bool_default '.approvals.auto.shell_readonly' 'false'
-            ;;
-        file_match)
-            linux_agent_config_bool_default '.approvals.auto.file_match' 'true'
-            ;;
-        file_patch)
-            linux_agent_config_bool_default '.approvals.auto.file_patch' 'false'
-            ;;
-        file_download)
-            linux_agent_config_bool_default '.approvals.auto.file_download' 'false'
-            ;;
-        local_analyze)
-            linux_agent_config_bool_default '.approvals.auto.local_analyze' 'true'
-            ;;
-        remote_script)
-            linux_agent_config_bool_default '.approvals.auto.remote_script' 'false'
-            ;;
-        *)
-            printf 'false\n'
-            ;;
-    esac
+    [[ "${capability}" =~ ^[a-z][a-z0-9_]{0,63}$ ]] || {
+        printf 'false\n'
+        return 0
+    }
+    jq -r --arg capability "${capability}" '
+        .approvals.auto as $auto
+        | if ($auto | type) == "object" and ($auto[$capability] | type) == "boolean"
+          then $auto[$capability]
+          else false end
+    ' <<<"${LINUX_AGENT_CONFIG_JSON}" 2>/dev/null || printf 'false\n'
 }
 
 linux_agent_auto_approval_config_json() {
-    jq -cn \
-        --argjson skill_readonly "$(linux_agent_auto_approval_enabled skill_readonly)" \
-        --argjson shell_readonly "$(linux_agent_auto_approval_enabled shell_readonly)" \
-        --argjson file_match "$(linux_agent_auto_approval_enabled file_match)" \
-        --argjson file_patch "$(linux_agent_auto_approval_enabled file_patch)" \
-        --argjson file_download "$(linux_agent_auto_approval_enabled file_download)" \
-        --argjson local_analyze "$(linux_agent_auto_approval_enabled local_analyze)" \
-        --argjson remote_script "$(linux_agent_auto_approval_enabled remote_script)" \
-        '{
-            skill_readonly:$skill_readonly,
-            shell_readonly:$shell_readonly,
-            file_match:$file_match,
-            file_patch:$file_patch,
-            file_download:$file_download,
-            local_analyze:$local_analyze,
-            remote_script:$remote_script
-        }'
+    jq -c '
+        (.approvals.auto // {})
+        | if type == "object" then . else {} end
+        | with_entries(select(
+            (.key | test("^[a-z][a-z0-9_]{0,63}$"))
+            and (.value | type) == "boolean"
+        ))
+    ' <<<"${LINUX_AGENT_CONFIG_JSON}" 2>/dev/null || printf '{}\n'
 }
 
 linux_agent_step_auto_approval_capability() {
@@ -729,15 +656,12 @@ linux_agent_step_auto_approval_capability() {
     local executor_type ref
     executor_type="$(jq -r '.executor_type' <<<"${step_json}")"
     case "${executor_type}" in
+        skill_load | skill_read)
+            printf 'skill_readonly\n'
+            ;;
         skill_script)
             ref="$(jq -r '.skill_script // empty' <<<"${step_json}")"
-            case "${ref}" in
-                controlled-tools/file-match) printf 'file_match\n' ;;
-                controlled-tools/file-patch) printf 'file_patch\n' ;;
-                controlled-tools/file-download) printf 'file_download\n' ;;
-                controlled-tools/local-analyze) printf 'local_analyze\n' ;;
-                *) printf 'skill_readonly\n' ;;
-            esac
+            linux_agent_skill_extension_field "${ref}" approval_scope unknown
             ;;
         shell)
             printf 'shell_readonly\n'
@@ -767,6 +691,9 @@ linux_agent_should_auto_execute_step() {
     capability="$(linux_agent_step_auto_approval_capability "${step_json}")"
     [[ "$(linux_agent_auto_approval_enabled "${capability}")" == "true" ]] || return 1
     case "${executor_type}" in
+        skill_load | skill_read)
+            [[ "$(jq -r '.skill // empty' <<<"${step_json}")" =~ ^[a-z0-9][a-z0-9-]*$ ]]
+            ;;
         skill_script)
             ref="$(jq -r '.skill_script // empty' <<<"${step_json}")"
             [[ -n "${ref}" ]] && linux_agent_skill_is_registered "${ref}"
@@ -796,87 +723,136 @@ linux_agent_step_arguments_json() {
     linux_agent_normalize_json_object_argument "${raw_args}" || printf '{}\n'
 }
 
+linux_agent_skill_guard_condition_matches() {
+    local guard_json="$1" args_json="$2"
+    jq -e -n --argjson guard "${guard_json}" --argjson args "${args_json}" '
+        ($guard.condition.field) as $field
+        | (if ($args | has($field)) then $args[$field]
+           else $guard.condition.default end) == $guard.condition.equals
+    ' >/dev/null
+}
+
 linux_agent_backup_policy_review() {
-    local ref="$1"
-    local args_json="$2"
-    local review_json="$3"
-    local finding=""
-    local apply backup dry_run backup_archive backup_sha256
+    local ref="$1" args_json="$2" review_json="$3"
+    local guard proof_valid finding message
 
-    case "${ref}" in
-        controlled-tools/file-patch)
-            apply="$(jq -r 'if has("apply") then (.apply | tostring) else "true" end' <<<"${args_json}")"
-            backup="$(jq -r 'if has("backup") then (.backup | tostring) else "true" end' <<<"${args_json}")"
-            if [[ "${apply}" == "true" && "${backup}" != "true" ]]; then
-                finding="$(jq -cn '{severity:"critical", code:"BACKUP_REQUIRED", category:"backup", action:"block", message:"真实文件变更必须启用 file-patch 的事务性备份。"}')"
-            fi
-            ;;
-        ops-basic/safe-log-cleanup)
-            dry_run="$(jq -r 'if has("dry_run") then (.dry_run | tostring) else "true" end' <<<"${args_json}")"
-            backup_archive="$(jq -r '.backup_archive // empty' <<<"${args_json}")"
-            backup_sha256="$(jq -r '.backup_sha256 // empty' <<<"${args_json}")"
-            if [[ "${dry_run}" == "false" && (-z "${backup_archive}" || ! "${backup_sha256}" =~ ^[0-9a-f]{64}$) ]]; then
-                finding="$(jq -cn '{severity:"critical", code:"BACKUP_REQUIRED", category:"backup", action:"block", message:"真实日志截断必须先完成 config-backup，并携带未改变目标的备份凭据。"}')"
-            fi
-            ;;
-    esac
-
-    if [[ -z "${finding}" ]]; then
+    guard="$(linux_agent_skill_guard_json "${ref}" backup_proof 2>/dev/null || true)"
+    if ! jq -e 'type == "object"' <<<"${guard}" >/dev/null 2>&1 ||
+        ! linux_agent_skill_guard_condition_matches "${guard}" "${args_json}"; then
         printf '%s\n' "${review_json}"
         return 0
     fi
-    jq -c --argjson finding "${finding}" \
-        '.findings = ((.findings // []) + [$finding])
+
+    proof_valid="$(jq -r -n --argjson guard "${guard}" --argjson args "${args_json}" '
+        def proof_value($proof):
+            if ($args | has($proof.argument)) then $args[$proof.argument]
+            elif ($proof | has("default")) then $proof.default
+            else null end;
+        all($guard.proofs[];
+            . as $proof
+            | proof_value($proof) as $value
+            | if $proof.validation == "boolean_true" then $value == true
+              elif $proof.validation == "nonempty_string" then
+                  ($value | type) == "string" and ($value | length) > 0
+              elif $proof.validation == "sha256" then
+                  ($value | type) == "string"
+                  and ($value | test("^[0-9a-f]{64}$"))
+              else false end)
+    ')"
+    if [[ "${proof_valid}" == "true" ]]; then
+        printf '%s\n' "${review_json}"
+        return 0
+    fi
+
+    message="$(jq -r '.message' <<<"${guard}")"
+    finding="$(jq -cn --arg message "${message}" \
+        '{severity:"critical",code:"BACKUP_REQUIRED",category:"backup",action:"block",message:$message}')"
+    jq -c --argjson finding "${finding}" '
+        .findings = ((.findings // []) + [$finding])
         | .approval_required = true
         | .approved = false
-        | .risk_level = "critical"' <<<"${review_json}"
+        | .risk_level = "critical"
+    ' <<<"${review_json}"
 }
 
 linux_agent_prepare_backup_protected_step() {
     local step_json="$1"
     local prior_results="${2:-[]}"
     local current_results="${3:-[]}"
-    local ref args dry_run path resolved all_results backup_result archive source_sha256
+    local ref args guard source target_argument normalization target resolved
+    local all_results backup_result prepared mapping argument output value
 
     ref="$(jq -r '.skill_script // empty' <<<"${step_json}")"
-    [[ "${ref}" == "ops-basic/safe-log-cleanup" ]] || {
-        printf '%s\n' "${step_json}"
-        return 0
-    }
-    args="$(linux_agent_step_arguments_json "${step_json}")"
-    dry_run="$(jq -r 'if has("dry_run") then (.dry_run | tostring) else "true" end' <<<"${args}")"
-    [[ "${dry_run}" == "false" ]] || {
-        printf '%s\n' "${step_json}"
-        return 0
-    }
-    path="$(jq -r '.path // empty' <<<"${args}")"
-    if [[ -z "${path}" || -L "${path}" ]]; then
+    guard="$(linux_agent_skill_guard_json "${ref}" backup_proof 2>/dev/null || true)"
+    if ! jq -e '.source | type == "object"' <<<"${guard}" >/dev/null 2>&1; then
         printf '%s\n' "${step_json}"
         return 0
     fi
-    resolved="$(realpath -e -- "${path}" 2>/dev/null || true)"
-    [[ -n "${resolved}" ]] || {
+    args="$(linux_agent_step_arguments_json "${step_json}")"
+    if ! linux_agent_skill_guard_condition_matches "${guard}" "${args}"; then
+        printf '%s\n' "${step_json}"
+        return 0
+    fi
+
+    source="$(jq -c '.source' <<<"${guard}")"
+    target_argument="$(jq -r '.target_argument' <<<"${source}")"
+    normalization="$(jq -r '.target_normalization' <<<"${source}")"
+    target="$(jq -r --arg field "${target_argument}" '.[$field] // empty' <<<"${args}")"
+    [[ -n "${target}" ]] || {
         printf '%s\n' "${step_json}"
         return 0
     }
-    all_results="$(printf '%s\n%s\n' "${prior_results}" "${current_results}" | jq -cs '.[0] + .[1]' 2>/dev/null || printf '[]')"
-    backup_result="$(jq -c --arg path "${resolved}" '
-        [ .[]
-          | select((.result.ok // false) == true)
-          | select((.result.output.tool // "") == "system.config.backup")
-          | select((.result.output.path // "") == $path)
-          | select((.result.output.archive // "") != "")
-          | select((.result.output.source_sha256 // "") | test("^[0-9a-f]{64}$"))
+    if [[ "${normalization}" == "realpath_existing" ]]; then
+        [[ ! -L "${target}" ]] || {
+            printf '%s\n' "${step_json}"
+            return 0
+        }
+        resolved="$(realpath -e -- "${target}" 2>/dev/null || true)"
+        [[ -n "${resolved}" ]] || {
+            printf '%s\n' "${step_json}"
+            return 0
+        }
+        target="${resolved}"
+    fi
+
+    all_results="$(printf '%s\n%s\n' "${prior_results}" "${current_results}" |
+        jq -cs '.[0] + .[1]' 2>/dev/null || printf '[]')"
+    backup_result="$(jq -c \
+        --argjson source "${source}" \
+        --arg target "${target}" '
+        [.[]
+         | select((.result.ok // false) == true)
+         | . as $result
+         | (.result.output // {}) as $output
+         | select(($output.tool // "") == $source.tool)
+         | select(($output[$source.target_output] // "") == $target)
+         | select(all($source.values[];
+             . as $mapping
+             | ($output[$mapping.output] // null) as $value
+             | if $mapping.validation == "nonempty_string" then
+                   ($value | type) == "string" and ($value | length) > 0
+               elif $mapping.validation == "sha256" then
+                   ($value | type) == "string"
+                   and ($value | test("^[0-9a-f]{64}$"))
+               else false end))
+         | $result
         ] | last // empty
     ' <<<"${all_results}" 2>/dev/null || true)"
     [[ -n "${backup_result}" ]] || {
         printf '%s\n' "${step_json}"
         return 0
     }
-    archive="$(jq -r '.result.output.archive' <<<"${backup_result}")"
-    source_sha256="$(jq -r '.result.output.source_sha256' <<<"${backup_result}")"
-    jq -c --arg archive "${archive}" --arg source_sha256 "${source_sha256}" \
-        '.arguments = ((.arguments // {}) + {backup_archive:$archive, backup_sha256:$source_sha256})' <<<"${step_json}"
+
+    prepared="${step_json}"
+    while IFS= read -r mapping; do
+        [[ -n "${mapping}" ]] || continue
+        argument="$(jq -r '.argument' <<<"${mapping}")"
+        output="$(jq -r '.output' <<<"${mapping}")"
+        value="$(jq -r --arg field "${output}" '.result.output[$field]' <<<"${backup_result}")"
+        prepared="$(jq -c --arg field "${argument}" --arg value "${value}" \
+            '.arguments = ((.arguments // {}) + {($field):$value})' <<<"${prepared}")"
+    done < <(jq -c '.values[]' <<<"${source}")
+    printf '%s\n' "${prepared}"
 }
 
 linux_agent_prompt_step_decision() {
@@ -958,6 +934,14 @@ linux_agent_print_step_for_approval() {
     printf '理由: %s\n' "$(jq -r '.reason' <<<"${step_json}")"
     printf '预测效果: %s\n' "$(jq -r '.expected_effect' <<<"${step_json}")"
     case "$(jq -r '.executor_type' <<<"${step_json}")" in
+        skill_load)
+            printf 'Skill: %s\n' "$(jq -r '.skill' <<<"${step_json}")"
+            printf '文件: SKILL.md\n'
+            ;;
+        skill_read)
+            printf 'Skill: %s\n' "$(jq -r '.skill' <<<"${step_json}")"
+            printf '文件: %s\n' "$(jq -r '.path' <<<"${step_json}")"
+            ;;
         skill_script)
             printf '脚本: %s\n' "$(jq -r '.skill_script' <<<"${step_json}")"
             printf '参数: %s\n' "$(linux_agent_step_arguments_json "${step_json}")"
@@ -1249,6 +1233,8 @@ linux_agent_compact_execution_result() {
                         title:.step.title,
                         executor_type:.step.executor_type,
                         risk_level:(.step.risk_level // null),
+                        skill:(.step.skill // null),
+                        path:(.step.path // null),
                         skill_script:(.step.skill_script // null),
                         command:(.step.command // null)
                     },
@@ -1308,6 +1294,9 @@ linux_agent_step_review_material() {
     executor_type="$(jq -r '.executor_type' <<<"${step_json}")"
 
     case "${executor_type}" in
+        skill_load | skill_read)
+            printf ''
+            ;;
         skill_script)
             local ref args content
             ref="$(jq -r '.skill_script' <<<"${step_json}")"
@@ -1470,6 +1459,9 @@ linux_agent_execute_observed_command_output() {
     if linux_agent_maybe_execute_host_helper_skill "${scope}" "${subject_json}" "$@"; then
         return 0
     fi
+    if linux_agent_maybe_execute_credential_helper_skill "${scope}" "${subject_json}" "$@"; then
+        return 0
+    fi
 
     local stdout_file stderr_file run_meta exit_code observer stdout_text stderr_text combined timed_out
     local is_skill_scope=false parsed_output="" parsed_output_is_json=false
@@ -1621,6 +1613,71 @@ linux_agent_execute_observed_command_output() {
     printf '%s\n' "${result_json}"
 }
 
+linux_agent_execute_skill_file_step() {
+    local step_json="$1" executor_type skill_name relative_path read_result source_path relative_source
+    executor_type="$(jq -r '.executor_type' <<<"${step_json}")"
+    skill_name="$(jq -r '.skill // empty' <<<"${step_json}")"
+    if [[ "${executor_type}" == "skill_load" ]]; then
+        relative_path="SKILL.md"
+    else
+        relative_path="$(jq -r '.path // empty' <<<"${step_json}")"
+    fi
+
+    read_result="$(linux_agent_skill_read "${skill_name}" "${relative_path}")"
+    if ! jq -e 'type == "object" and (.ok | type == "boolean")' <<<"${read_result}" >/dev/null 2>&1; then
+        jq -cn --arg executor_type "${executor_type}" '{
+            ok:false,
+            status:"invalid_output",
+            code:"invalid_output",
+            error_code:"invalid_output",
+            exit_code:1,
+            output:{raw:("invalid " + $executor_type + " result")}
+        }'
+        return 0
+    fi
+    if [[ "$(jq -r '.ok' <<<"${read_result}")" != "true" ]]; then
+        jq -cn --argjson read "${read_result}" '{
+            ok:false,
+            status:($read.status // "failed"),
+            code:($read.code // "skill_operation_failed"),
+            error_code:($read.code // "skill_operation_failed"),
+            exit_code:1,
+            output:$read
+        }'
+        return 0
+    fi
+
+    source_path="$(jq -r '.source_path // empty' <<<"${read_result}")"
+    if [[ -z "${source_path}" || ! -f "${source_path}" || -L "${source_path}" ]]; then
+        jq -cn --arg skill "${skill_name}" --arg path "${relative_path}" '{
+            ok:false,
+            status:"skill_operation_failed",
+            code:"skill_operation_failed",
+            error_code:"skill_operation_failed",
+            exit_code:1,
+            output:{skill:$skill,path:$path,error:"Skill disclosure source changed during read"}
+        }'
+        return 0
+    fi
+    relative_source="${source_path}"
+    if [[ "${source_path}" == "${LINUX_AGENT_ROOT}/"* ]]; then
+        relative_source="${source_path#${LINUX_AGENT_ROOT}/}"
+    fi
+    jq -cn \
+        --argjson read "${read_result}" \
+        --arg source_path "${source_path}" \
+        --arg relative_path "${relative_source}" \
+        '{
+            ok:true,
+            status:"read",
+            exit_code:0,
+            output:($read + {
+                source_path:$source_path,
+                relative_path:$relative_path
+            })
+        }'
+}
+
 linux_agent_execute_step_command() {
     local step_json="$1"
     local review_json="${2:-}"
@@ -1629,6 +1686,10 @@ linux_agent_execute_step_command() {
     executor_type="$(jq -r '.executor_type' <<<"${step_json}")"
 
     case "${executor_type}" in
+        skill_load | skill_read)
+            linux_agent_execute_skill_file_step "${step_json}"
+            return 0
+            ;;
         mcp_tool)
             linux_agent_execute_mcp_tool_step "${step_json}" "${review_json}"
             return 0
@@ -1778,6 +1839,8 @@ linux_agent_request_repair_plan() {
             id:($s.id // null),
             title:($s.title // null),
             executor_type:($s.executor_type // null),
+            skill:($s.skill // null),
+            path:($s.path // null),
             skill_script:($s.skill_script // null),
             mcp_server:($s.mcp_server // null),
             mcp_tool:($s.mcp_tool // null),
@@ -1831,6 +1894,7 @@ linux_agent_request_revised_work_plan() {
     local current_step="$4"
     local revision_request="$5"
     local remaining_steps="$6"
+    local skill_disclosures="${7:-[]}"
     local revision_context request_context revised_plan
 
     revision_context="$(jq -cn \
@@ -1859,6 +1923,7 @@ linux_agent_request_revised_work_plan() {
             current_request:$current_request
         }')"
     request_context="$(linux_agent_add_skill_context "${request_context}" "work_revision")"
+    request_context="$(linux_agent_add_loaded_skill_context "${request_context}" "${skill_disclosures}")"
     request_context="$(linux_agent_add_mcp_context "${request_context}" "work_revision")"
 
     linux_agent_log_event "work_revision_requested" "${revision_context}"
@@ -2115,15 +2180,57 @@ linux_agent_require_step_status_event() {
     linux_agent_require_audit_event_result "step_${status}" "${payload}"
 }
 
+linux_agent_step_disclosure_block() {
+    local step_json="$1" disclosures="${2:-[]}"
+    local executor_type skill_name ref
+    executor_type="$(jq -r '.executor_type // empty' <<<"${step_json}")"
+    case "${executor_type}" in
+        skill_load)
+            return 1
+            ;;
+        skill_read)
+            skill_name="$(jq -r '.skill // empty' <<<"${step_json}")"
+            ;;
+        skill_script)
+            ref="$(jq -r '.skill_script // empty' <<<"${step_json}")"
+            skill_name="${ref%%/*}"
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+    if linux_agent_skill_is_loaded "${skill_name}" "${disclosures}"; then
+        return 1
+    fi
+    jq -cn --arg skill "${skill_name}" --arg executor_type "${executor_type}" '{
+        ok:false,
+        status:"blocked",
+        code:"skill_not_loaded",
+        error_code:"skill_not_loaded",
+        exit_code:126,
+        error:("Skill " + $skill + " must be loaded through skill_load before " + $executor_type),
+        findings:[{
+            severity:"critical",
+            code:"SKILL_NOT_LOADED",
+            skill:$skill,
+            message:"Work plan attempted to use Skill instructions before controlled disclosure."
+        }]
+    }'
+}
+
 linux_agent_execute_work_plan() {
     local plan_json="$1"
     local user_input="$2"
     local resume_state="${3:-}"
     local iteration="${4:-0}"
     local step_scope="${5:-}"
+    local skill_disclosures="${6:-[]}"
     local execution_user sudo_probe step_count results executed_steps status step_states
     local prior_results prior_step_states resume_index restored_result_count execution_result
     [[ -n "${resume_state}" ]] || resume_state='{}'
+    if ! jq -e 'type == "array"' <<<"${skill_disclosures}" >/dev/null 2>&1; then
+        skill_disclosures='[]'
+    fi
     [[ "${iteration}" =~ ^[0-9]+$ ]] || iteration=0
     if [[ -z "${step_scope}" ]]; then
         if ((iteration > 0)); then
@@ -2177,7 +2284,7 @@ linux_agent_execute_work_plan() {
 
     local i="${resume_index}"
     while [[ "${i}" -lt "${step_count}" ]]; do
-        local step step_review_text review result skipped prepared step_decision revision_request auto_approved
+        local step step_review_text review result skipped prepared step_decision revision_request auto_approved disclosure_block
         step="$(jq -c --argjson index "${i}" '.steps[$index]' <<<"${plan_json}")"
         auto_approved=0
         step_states="$(linux_agent_update_step_state "${step_states}" "${i}" "pending" 'null')"
@@ -2226,6 +2333,28 @@ linux_agent_execute_work_plan() {
 
         step="$(linux_agent_prepare_backup_protected_step "${step}" "${prior_results}" "${results}")"
         linux_agent_print_step_for_approval "${step}" >&2
+        if disclosure_block="$(linux_agent_step_disclosure_block "${step}" "${skill_disclosures}")"; then
+            step_states="$(linux_agent_update_step_state "${step_states}" "${i}" "blocked" "${disclosure_block}")"
+            step_states="$(linux_agent_skip_remaining_step_states "${step_states}" "${i}")"
+            linux_agent_log_step_status "${step}" "blocked" "${disclosure_block}"
+            skipped="$(linux_agent_skipped_steps_after "${plan_json}" "${i}")"
+            while IFS= read -r skipped_step; do
+                [[ -n "${skipped_step}" ]] && linux_agent_log_step_status "${skipped_step}" "skipped_unexecuted"
+            done < <(jq -c '.[]' <<<"${skipped}")
+            results="$(jq -cn \
+                --argjson prior "${results}" \
+                --arg step_key "$(jq -r --argjson index "${i}" '.[$index].key' <<<"${step_states}")" \
+                --argjson step_index "${i}" \
+                --argjson iteration "${iteration}" \
+                --arg scope "${step_scope}" \
+                --argjson step "${step}" \
+                --argjson result "${disclosure_block}" \
+                '$prior + [{step_key:$step_key, step_index:$step_index, iteration:$iteration, scope:$scope, step:$step, result:$result}]')"
+            execution_result="$(jq -cn --arg execution_user "${execution_user}" --arg sudo_probe "${sudo_probe}" --argjson findings "$(jq '.findings' <<<"${disclosure_block}")" --argjson results "${results}" \
+                '{status:"blocked", execution_user:$execution_user, sudo_probe:$sudo_probe, findings:$findings, results:$results}')"
+            linux_agent_finalize_work_plan_execution "${execution_result}" "${plan_json}" "${step_states}" "${iteration}" "${step_scope}" "${i}" "${prior_results}" "${prior_step_states}"
+            return 0
+        fi
         if [[ "$(jq -r '.executor_type' <<<"${step}")" == "skill_script" ]] && ! linux_agent_skill_is_registered "$(jq -r '.skill_script' <<<"${step}")"; then
             local blocked_detail skipped_steps
             blocked_detail="$(jq -cn --arg ref "$(jq -r '.skill_script' <<<"${step}")" '{approved:false, risk_level:"critical", findings:[{severity:"critical", code:"SKILL_SCRIPT_UNREGISTERED", ref:$ref, message:"AI 提出的 skill 脚本未登记。"}]}')"
@@ -2378,7 +2507,7 @@ linux_agent_execute_work_plan() {
                     [[ -n "${skipped_step}" ]] && linux_agent_log_step_status "${skipped_step}" "skipped_unexecuted"
                 done < <(jq -c '.[]' <<<"${skipped}")
 
-                if ! revised_plan="$(linux_agent_request_revised_work_plan "${user_input}" "${plan_json}" "${executed_steps}" "${step}" "${revision_request}" "${skipped}")"; then
+                if ! revised_plan="$(linux_agent_request_revised_work_plan "${user_input}" "${plan_json}" "${executed_steps}" "${step}" "${revision_request}" "${skipped}" "${skill_disclosures}")"; then
                     result="$(jq -cn --arg error "${revised_plan}" '{ok:false, status:"revision_failed", output:{raw:$error}}')"
                     step_states="$(linux_agent_update_step_state "${step_states}" "${i}" "failed" "${result}")"
                     linux_agent_log_step_status "${step}" "failed" "${result}"
@@ -2402,7 +2531,8 @@ linux_agent_execute_work_plan() {
                     "${user_input}" \
                     "${revision_resume_state}" \
                     "${iteration}" \
-                    "${step_scope}.revision-${i}")"
+                    "${step_scope}.revision-${i}" \
+                    "${skill_disclosures}")"
                 printf '%s\n' "${revised_execution}"
                 return 0
                 ;;

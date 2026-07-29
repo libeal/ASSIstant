@@ -18,6 +18,7 @@ import threading
 import time
 from pathlib import Path
 
+from skill_package import SkillPackageError, load_index, load_package
 from helper_protocol import (
     MAX_REQUEST_BYTES,
     MAX_STREAM_FRAME_BYTES,
@@ -41,13 +42,6 @@ from helper_protocol import (
 EXECUTION_KINDS = frozenset({"terminal", "skill", "mcp", "remote_script"})
 SAFE_ID_PATTERN = re.compile(r"^[A-Za-z0-9_.:-]{0,128}$")
 SKILL_NAME_PATTERN = re.compile(r"^[a-z0-9][a-z0-9-]*$")
-SCRIPT_NAME_PATTERN = re.compile(r"^[a-z0-9][a-z0-9-]*\.sh$")
-RISK_LEVELS = frozenset({"low", "medium", "high", "critical"})
-SKILL_EXECUTION_CLASSES = frozenset({"runner", "host_helper"})
-HOST_HELPER_CAPABILITIES = {
-    "network-ops-tools/firewall": "firewall.apply",
-    "network-ops-tools/hosts-file-editor": "hosts.apply",
-}
 DEFAULT_SOCKET = "/run/linux-agent/runner.sock"
 MAX_OUTPUT_BYTES = 104_857_600
 DEFAULT_MAX_CONCURRENT = 4
@@ -161,20 +155,6 @@ def _json_object(raw: str, name: str) -> dict[str, object]:
     return value
 
 
-def _load_manifest(path: Path) -> dict[str, object]:
-    try:
-        value = json.loads(
-            path.read_text(encoding="utf-8"),
-            parse_constant=_reject_json_constant,
-            object_pairs_hook=_reject_duplicate_keys,
-        )
-    except (OSError, UnicodeError, json.JSONDecodeError, RunnerRequestError) as exc:
-        raise RunnerRequestError("Skill manifest is unavailable or invalid") from exc
-    if not isinstance(value, dict):
-        raise RunnerRequestError("Skill manifest must be a JSON object")
-    return value
-
-
 def _safe_skill_file(package: Path, name: str) -> Path:
     candidate = package / name
     if candidate.is_symlink() or not candidate.is_file():
@@ -190,127 +170,90 @@ def _safe_skill_file(package: Path, name: str) -> Path:
     return resolved
 
 
-def _validate_skill_manifest(script: Path, roots: dict[str, Path]) -> dict[str, object]:
-    """Re-check the release/user manifest at the execution trust boundary.
-
-    Web and CLI validation protects normal callers, but the Runner socket is a
-    separate authorization boundary.  A request that reaches it directly must
-    still be tied to a registered package and an allowed execution class.
-    """
+def _validate_skill_contract(script: Path, roots: dict[str, Path]) -> dict[str, object]:
+    """Re-check package identity and its selected tool at the Runner boundary."""
 
     resolved_script = script.resolve(strict=True)
     origin = None
     root = None
+    candidate_root = None
     for candidate_root, candidate_origin in (
         (roots["builtin_skills"], "builtin"),
         (roots["user_skills"], "user"),
     ):
         try:
-            resolved_script.relative_to(candidate_root.resolve(strict=True))
+            candidate_resolved = candidate_root.resolve(strict=True)
+            resolved_script.relative_to(candidate_resolved)
         except (ValueError, OSError):
             continue
         origin = candidate_origin
-        root = candidate_root.resolve(strict=True)
+        root = candidate_resolved
         break
-    if origin is None or root is None:
+    if origin is None or root is None or candidate_root is None:
         raise RunnerRequestError("Skill script is outside a registered Skill root")
     if candidate_root.is_symlink() or (origin == "user" and root != candidate_root):
         raise RunnerRequestError("Skill root must not be a symlink")
-    root_metadata = root.stat()
-    if root_metadata.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+    if root.stat().st_mode & (stat.S_IWGRP | stat.S_IWOTH):
         raise RunnerRequestError("Skill root must not be group/world writable")
+
     relative = resolved_script.relative_to(root)
-    if len(relative.parts) != 3 or relative.parts[1] != "scripts":
-        raise RunnerRequestError("Skill script must be directly below <skill>/scripts")
-    skill_name, _scripts_dir, script_name = relative.parts
-    if SKILL_NAME_PATTERN.fullmatch(skill_name) is None or SCRIPT_NAME_PATTERN.fullmatch(
-        script_name
-    ) is None:
-        raise RunnerRequestError("Skill package or script name is invalid")
+    if len(relative.parts) < 3 or relative.parts[1] != "scripts":
+        raise RunnerRequestError("Skill entrypoint must be below <skill>/scripts")
+    skill_name = relative.parts[0]
+    if SKILL_NAME_PATTERN.fullmatch(skill_name) is None:
+        raise RunnerRequestError("Skill package name is invalid")
     package = root / skill_name
-    if origin == "user":
-        builtin_package = roots["builtin_skills"].resolve(strict=True) / skill_name
-        if builtin_package.exists() or builtin_package.is_symlink():
-            raise RunnerRequestError("User Skill cannot override a built-in Skill")
     if package.is_symlink() or not package.is_dir():
         raise RunnerRequestError("Skill package must be a real directory")
-    scripts_dir = package / "scripts"
-    if scripts_dir.is_symlink() or not scripts_dir.is_dir():
-        raise RunnerRequestError("Skill scripts directory must be a real directory")
-    for directory, label in (
-        (package, "Skill package"),
-        (scripts_dir, "Skill scripts directory"),
+    for directory in (package, resolved_script.parent):
+        if directory.stat().st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+            raise RunnerRequestError(
+                "Skill package directories must not be group/world writable"
+            )
+
+    if origin == "user":
+        builtin_index = roots["builtin_skills"] / "INDEX.md"
+        try:
+            if skill_name in load_index(builtin_index):
+                raise RunnerRequestError("User Skill cannot use a reserved built-in name")
+        except SkillPackageError as exc:
+            raise RunnerRequestError("Built-in Skill catalog is invalid") from exc
+
+    try:
+        loaded = load_package(package, origin)
+    except SkillPackageError as exc:
+        raise RunnerRequestError(f"Skill package contract is invalid: {exc}") from exc
+    selected = None
+    relative_entrypoint = resolved_script.relative_to(package.resolve(strict=True)).as_posix()
+    for entry in loaded["tools"]:
+        if entry["entrypoint"] == relative_entrypoint:
+            selected = dict(entry)
+            break
+    if selected is None:
+        raise RunnerRequestError("Skill entrypoint is not declared by linux-agent.json")
+
+    if origin == "builtin":
+        try:
+            section = load_index(root / "INDEX.md")[skill_name]
+        except (KeyError, SkillPackageError) as exc:
+            raise RunnerRequestError("Built-in Skill is not registered in INDEX") from exc
+        ref = f"{skill_name}/{selected['name']}"
+        index_entries = [item for item in section["tools"] if item["ref"] == ref]
+        if len(index_entries) != 1 or index_entries[0]["description"] != selected["description"]:
+            raise RunnerRequestError("Built-in Skill INDEX contract does not match its package")
+
+    for path in (
+        resolved_script,
+        _safe_skill_file(package, "SKILL.md"),
+        _safe_skill_file(package, "linux-agent.json"),
     ):
-        metadata = directory.stat()
-        if metadata.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
-            raise RunnerRequestError(f"{label} must not be group/world writable")
-    script_file = _safe_skill_file(package, f"scripts/{script_name}")
-    manifest_path = _safe_skill_file(package, "manifest.json")
-    skill_markdown = _safe_skill_file(package, "SKILL.md")
-    for path in (script_file, manifest_path, skill_markdown):
         if path.stat().st_mode & (stat.S_IWGRP | stat.S_IWOTH):
             raise RunnerRequestError("Skill package files must not be group/world writable")
-    manifest = _load_manifest(manifest_path)
-    schema_version = manifest.get("schema_version")
-    if (
-        isinstance(schema_version, bool)
-        or not isinstance(schema_version, int)
-        or schema_version != 1
-        or manifest.get("name") != skill_name
-    ):
-        raise RunnerRequestError("Skill manifest identity is invalid")
-    if not isinstance(manifest.get("description"), str) or not manifest["description"].strip():
-        raise RunnerRequestError("Skill manifest description is invalid")
-    entries = manifest.get("scripts")
-    if not isinstance(entries, list) or not entries or not all(
-        isinstance(entry, dict) for entry in entries
-    ):
-        raise RunnerRequestError("Skill manifest scripts are invalid")
-    declared_names: set[str] = set()
-    selected = None
-    for entry in entries:
-        name = entry.get("name")
-        if not isinstance(name, str) or SCRIPT_NAME_PATTERN.fullmatch(name) is None:
-            raise RunnerRequestError("Skill manifest script name is invalid")
-        if name in declared_names:
-            raise RunnerRequestError("Skill manifest script names must be unique")
-        declared_names.add(name)
-        risk = entry.get("risk")
-        if not isinstance(risk, str) or risk not in RISK_LEVELS:
-            raise RunnerRequestError("Skill manifest script risk is invalid")
-        execution_class = entry.get("execution_class")
-        capability = entry.get("capability")
-        if execution_class not in SKILL_EXECUTION_CLASSES or not isinstance(capability, str):
-            raise RunnerRequestError("Skill manifest execution contract is invalid")
-        expected_capability = HOST_HELPER_CAPABILITIES.get(f"{skill_name}/{name[:-3]}")
-        if origin == "user":
-            if execution_class != "runner" or capability != "":
-                raise RunnerRequestError("User Skill may only use runner execution")
-        elif expected_capability is not None:
-            if execution_class != "host_helper" or capability != expected_capability:
-                raise RunnerRequestError("Privileged built-in Skill is not allowlisted")
-        elif execution_class != "runner" or capability != "":
-            raise RunnerRequestError("Built-in Skill execution contract is invalid")
-        if name == script_name:
-            selected = entry
-    if selected is None:
-        raise RunnerRequestError("Skill script is not declared by its manifest")
-    actual_names: set[str] = set()
-    for child in scripts_dir.iterdir():
-        if child.is_symlink():
-            raise RunnerRequestError("Skill scripts directory must not contain symlinks")
-        if child.is_file() and child.suffix == ".sh":
-            actual_names.add(child.name)
-    if actual_names != declared_names:
-        raise RunnerRequestError("Skill manifest does not match the script files")
     return selected
 
 
 def _validate_host_helper_runner_arguments(
-    skill_name: str,
-    script_name: str,
-    capability: object,
-    arguments: dict[str, object],
+    contract: dict[str, object], arguments: dict[str, object]
 ) -> None:
     """Allow only read/plan forms of helper-capable Skills in the Runner.
 
@@ -320,32 +263,38 @@ def _validate_host_helper_runner_arguments(
     value into the script and bypassing the helper contract.
     """
 
-    if not isinstance(capability, str):
-        raise RunnerRequestError("host-helper capability is invalid")
-    action_value = arguments.get("action")
-    if action_value is None:
-        action = "status" if capability == "firewall.apply" else "read"
-    elif isinstance(action_value, str):
-        action = action_value.strip().lower()
-    else:
-        raise RunnerRequestError("host-helper Skill action must be a string")
-    apply_value = arguments.get("apply", False)
+    execution = contract.get("execution")
+    guards = contract.get("guards")
+    if not isinstance(execution, dict) or execution.get("dispatch") != "apply_only":
+        raise RunnerRequestError("host-helper dispatch contract is invalid")
+    if not isinstance(guards, list):
+        raise RunnerRequestError("host-helper guards are invalid")
+    fallthrough = next(
+        (guard for guard in guards if isinstance(guard, dict) and guard.get("type") == "runner_fallthrough"),
+        None,
+    )
+    if not isinstance(fallthrough, dict):
+        raise RunnerRequestError("host-helper runner fallthrough is not declared")
+    field = fallthrough.get("field")
+    default = fallthrough.get("default")
+    allowed = fallthrough.get("allowed")
+    boolean_flag = fallthrough.get("boolean_flag", "apply")
+    if (
+        not isinstance(field, str)
+        or not isinstance(default, str)
+        or not isinstance(allowed, list)
+        or not all(isinstance(value, str) for value in allowed)
+        or not isinstance(boolean_flag, str)
+    ):
+        raise RunnerRequestError("host-helper runner fallthrough guard is invalid")
+    action_value = arguments.get(field, default)
+    if not isinstance(action_value, str):
+        raise RunnerRequestError("host-helper Skill dispatch value must be a string")
+    apply_value = arguments.get(boolean_flag, False)
     if not isinstance(apply_value, bool):
-        raise RunnerRequestError("host-helper Skill apply must be boolean")
-
-    if skill_name == "network-ops-tools" and script_name == "firewall.sh":
-        if action in {"status", "plan"}:
-            return
-        if action == "apply" and not apply_value:
-            return
-        raise RunnerRequestError("firewall apply must use the dedicated host helper")
-    if skill_name == "network-ops-tools" and script_name == "hosts-file-editor.sh":
-        if action in {"read", "search", "plan-add", "plan-remove"}:
-            return
-        if action in {"add", "remove"} and not apply_value:
-            return
-        raise RunnerRequestError("hosts apply must use the dedicated host helper")
-    raise RunnerRequestError("host-helper capability is not allowlisted")
+        raise RunnerRequestError("host-helper Skill apply flag must be boolean")
+    if apply_value or action_value.strip().lower() not in allowed:
+        raise RunnerRequestError("host-helper apply must use the dedicated helper")
 
 
 def _runtime_roots() -> dict[str, Path]:
@@ -419,27 +368,30 @@ def validate_execution(
         )
         if "/scripts/" not in script:
             raise RunnerRequestError("Skill script is outside a scripts directory")
-        manifest_entry = _validate_skill_manifest(Path(script), roots)
+        tool_contract = _validate_skill_contract(Path(script), roots)
         arguments = _json_object(argv[2], "Skill arguments")
-        if manifest_entry.get("execution_class") == "host_helper":
-            _validate_host_helper_runner_arguments(
-                Path(script).parent.parent.name,
-                Path(script).name,
-                manifest_entry.get("capability"),
-                arguments,
+        execution = tool_contract.get("execution")
+        if not isinstance(execution, dict):
+            raise RunnerRequestError("Skill execution contract is invalid")
+        execution_class = execution.get("class")
+        if execution_class == "credential_helper":
+            raise RunnerRequestError(
+                "database credential Skills must use the dedicated credential helper"
             )
+        if execution_class == "host_helper":
+            _validate_host_helper_runner_arguments(tool_contract, arguments)
         command = [_trusted_executable("bash"), script, argv[2]]
-        session_history = (
-            Path(script).name == "last-command-output.sh"
-            and Path(script).parent.name == "scripts"
-            and Path(script).parent.parent.name == "session-history"
-            and Path(script).parent.parent.parent
-            == roots["builtin_skills"].resolve(strict=True)
+        runtime_inputs = tool_contract.get("runtime_inputs", [])
+        accepts_audit_snapshot = (
+            "audit_snapshot" in runtime_inputs
+            and Path(script).resolve(strict=True).is_relative_to(
+                roots["builtin_skills"].resolve(strict=True)
+            )
         )
         if audit_snapshot is not None:
-            if not session_history:
+            if not accepts_audit_snapshot:
                 raise RunnerRequestError(
-                    "audit snapshots are restricted to the built-in session-history Skill"
+                    "audit snapshots require a signed builtin runtime-input declaration"
                 )
             snapshot = _safe_regular_path(
                 audit_snapshot,

@@ -1,0 +1,15 @@
+[Unit]
+Description=Linux Agent database-inspect Skill helper socket
+PartOf=linux-agent-web.service
+
+[Socket]
+ListenStream=/run/linux-agent/database-inspector.sock
+Service=linux-agent-database-inspector.service
+SocketUser=root
+SocketGroup=linux-agent
+SocketMode=0660
+DirectoryMode=0755
+RemoveOnStop=yes
+
+[Install]
+WantedBy=sockets.target

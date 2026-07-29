@@ -56,6 +56,8 @@ jobs:
             tests/audit_integrity.sh \
             tests/contract.sh \
             tests/security.sh \
+            tests/skill_lifecycle.sh \
+            tests/skill_stability.sh \
             tests/smoke.sh \
             tests/web_api.sh \
             tests/web_server.sh \

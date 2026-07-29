@@ -1,0 +1,96 @@
+<section class="screen" id="screen-database">
+  <div class="split-wide">
+    <div class="stack">
+      <div class="panel">
+        <div class="panel-header">
+          <div><h2>数据库巡检</h2><p>固定只读 health 与 metrics 查询。</p></div>
+          <span class="pill" id="databaseMode">未连接</span>
+        </div>
+        <div id="databaseManagedFields">
+          <div class="form-grid">
+            <label class="small" for="databaseProfileSelect">Profile
+              <select class="select" id="databaseProfileSelect"><option value="">连接后加载</option></select>
+            </label>
+            <label class="small" for="databaseCredentialSelect">临时凭据
+              <select class="select" id="databaseCredentialSelect"><option value="">未选择</option></select>
+            </label>
+            <label class="small" for="databaseUsername">用户名
+              <input class="field" id="databaseUsername" autocomplete="username">
+            </label>
+            <label class="small" for="databasePassword">密码
+              <input class="field" id="databasePassword" type="password" autocomplete="new-password">
+            </label>
+          </div>
+          <label class="toggle-row action-gap" for="databaseUseStored">
+            <span><strong class="white">使用 profile 存储凭据</strong></span>
+            <input id="databaseUseStored" type="checkbox">
+          </label>
+        </div>
+        <div id="databaseRemoteFields" hidden>
+          <div class="form-grid">
+            <label class="small" for="databaseEngine">Engine
+              <select class="select" id="databaseEngine"><option value="postgresql">PostgreSQL</option><option value="mysql">MySQL</option><option value="mariadb">MariaDB</option></select>
+            </label>
+            <label class="small" for="databaseTransport">Transport
+              <select class="select" id="databaseTransport"><option value="tcp">TCP</option><option value="socket">Unix socket</option></select>
+            </label>
+            <label class="small database-tcp-field" for="databaseEndpoint">IP endpoint
+              <input class="field mono" id="databaseEndpoint" placeholder="127.0.0.1">
+            </label>
+            <label class="small database-tcp-field" for="databasePort">Port
+              <input class="field" id="databasePort" type="number" min="1" max="65535" value="5432">
+            </label>
+            <label class="small database-socket-field" for="databaseSocket" hidden>Unix socket
+              <input class="field mono" id="databaseSocket" placeholder="/run/postgresql">
+            </label>
+            <label class="small" for="databaseName">Database
+              <input class="field" id="databaseName">
+            </label>
+            <label class="small database-tcp-field" for="databaseTls">TLS
+              <select class="select" id="databaseTls"><option value="verify-full">verify-full</option><option value="require">require</option><option value="disable">disable</option></select>
+            </label>
+            <label class="small" for="databaseRemoteUsername">用户名
+              <input class="field" id="databaseRemoteUsername" autocomplete="username">
+            </label>
+            <label class="small" for="databaseRemotePassword">密码
+              <input class="field" id="databaseRemotePassword" type="password" autocomplete="new-password">
+            </label>
+          </div>
+          <label class="toggle-row action-gap" for="databaseScopeAck">
+            <span><strong class="white">已获授权访问该 endpoint</strong></span>
+            <input id="databaseScopeAck" type="checkbox">
+          </label>
+        </div>
+        <div class="toolbar action-gap">
+          <button class="btn secondary" id="databaseCredentialSaveBtn" type="button">保存临时凭据</button>
+          <button class="btn secondary" id="databaseCredentialClearBtn" type="button">清除全部凭据</button>
+        </div>
+      </div>
+      <div class="panel">
+        <div class="panel-header">
+          <div><h3>固定查询</h3></div>
+          <span class="pill" id="databaseJobStatus">idle</span>
+        </div>
+        <div class="toolbar">
+          <button class="btn" id="databaseHealthBtn" type="button">Health</button>
+          <button class="btn secondary" id="databaseMetricsBtn" type="button">Metrics</button>
+          <button class="btn danger" id="databaseCancelBtn" type="button" disabled>终止</button>
+        </div>
+        <div class="terminal action-gap">
+          <div class="terminal-head"><span class="status-dot ok"></span><span>Database output</span></div>
+          <pre id="databaseOutput">等待数据库巡检。</pre>
+        </div>
+      </div>
+    </div>
+    <aside class="stack">
+      <div class="panel tight">
+        <div class="panel-header"><div><h3>Profile</h3></div><button class="btn secondary" id="databaseReloadBtn" type="button">刷新</button></div>
+        <div class="list" id="databaseProfileList"><div class="item">连接后加载。</div></div>
+      </div>
+      <div class="panel tight">
+        <div class="panel-header"><div><h3>进程内凭据</h3></div><span class="pill" id="databaseCredentialCount">0 / 8</span></div>
+        <div class="list" id="databaseCredentialList"><div class="item">暂无临时凭据。</div></div>
+      </div>
+    </aside>
+  </div>
+</section>

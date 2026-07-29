@@ -34,7 +34,8 @@ sudo bash install.sh --provider-cidr 203.0.113.0/24
 
 ```bash
 sudo systemctl enable --now linux-agent-observer-helper.socket linux-agent-runner.socket \
-  linux-agent-host-ops.socket linux-agent-policy-writer.socket linux-agent-web.service
+  linux-agent-host-ops.socket linux-agent-policy-writer.socket \
+  linux-agent-database-inspector.socket linux-agent-web.service
 ```
 
 如果 Web 控制台报告 `observer_helper_failed` 且错误是 observer socket 权限不足，先用当前版本安装器重建 unit 和 socket：

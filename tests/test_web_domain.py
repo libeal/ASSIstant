@@ -85,6 +85,19 @@ class DomainContractTest(unittest.TestCase):
         }
         self.assertIs(error, self.contract.validate_api_result(error))
 
+        for code in (
+            "skill_package_incompatible",
+            "skill_package_invalid",
+            "skill_digest_mismatch",
+            "skill_download_failed",
+        ):
+            with self.subTest(code=code):
+                remote_error = {**error, "status": code, "code": code}
+                self.assertIs(
+                    remote_error,
+                    self.contract.validate_api_result(remote_error),
+                )
+
         materialized = {
             "ok": True,
             "status": "skill_materialized",
@@ -277,6 +290,42 @@ class DomainContractTest(unittest.TestCase):
         with self.assertRaises(DomainValidationError):
             self.contract.validate_plan({**plan, "response_type": "invented"})
 
+        load_plan = {
+            "response_type": "work_plan",
+            "summary": "load Skill instructions",
+            "continue_decision": {"should_continue": True, "reason": "read contract"},
+            "steps": [
+                {
+                    "id": "load-one",
+                    "title": "load",
+                    "executor_type": "skill_load",
+                    "skill": "example-skill",
+                    "arguments": {},
+                    "reason": "read instructions",
+                    "expected_effect": "instructions available",
+                    "risk_level": "low",
+                    "rollback_hint": "none",
+                }
+            ],
+        }
+        self.assertIs(load_plan, self.contract.validate_plan(load_plan))
+        read_plan = json.loads(json.dumps(load_plan))
+        read_plan["steps"][0].update(
+            {
+                "executor_type": "skill_read",
+                "path": "references/details.md",
+            }
+        )
+        self.assertIs(read_plan, self.contract.validate_plan(read_plan))
+        invalid_read = json.loads(json.dumps(read_plan))
+        invalid_read["steps"][0]["path"] = "../SKILL.md"
+        with self.assertRaises(DomainValidationError):
+            self.contract.validate_plan(invalid_read)
+        no_reflection = json.loads(json.dumps(load_plan))
+        no_reflection["continue_decision"]["should_continue"] = False
+        with self.assertRaises(DomainValidationError):
+            self.contract.validate_plan(no_reflection)
+
         approval = {
             "id": "approval-one",
             "type": "terminal",
@@ -306,26 +355,14 @@ class DomainContractTest(unittest.TestCase):
         with self.assertRaises(DomainValidationError):
             self.contract.validate_audit_event({**audit_event, "hash": "not-a-hash"})
 
-        manifest = {
-            "schema_version": 1,
-            "name": "ops-basic",
-            "description": "operations",
-            "scripts": [
-                {
-                    "name": "resource-inspect.sh",
-                    "risk": "low",
-                    "execution_class": "runner",
-                    "capability": "",
-                }
-            ],
-        }
-        self.assertIs(manifest, self.contract.validate_skill_manifest(manifest))
-        with self.assertRaises(DomainValidationError):
-            self.contract.validate_skill_manifest({**manifest, "scripts": ["bad"]})
-        with self.assertRaisesRegex(DomainValidationError, "missing required fields"):
-            self.contract.validate_skill_manifest(
-                {**manifest, "scripts": [{"name": "resource-inspect.sh"}]}
-            )
+        self.assertEqual(
+            self.contract.skill_execution_classes,
+            frozenset({"runner", "host_helper", "credential_helper"}),
+        )
+        self.assertEqual(
+            self.contract.skill_dispatch_modes,
+            frozenset({"always", "apply_only"}),
+        )
 
     def test_execution_result_validates_embedded_work_plan(self):
         result = self.result()

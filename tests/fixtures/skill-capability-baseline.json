@@ -1,0 +1,438 @@
+{
+  "schema_version": 1,
+  "source_revision": "9fae8c14919ef26e3ce7457748adbc1d7e034634",
+  "captured_contract": [
+    "ref",
+    "single_json_object_parameters",
+    "risk",
+    "approval_scope",
+    "execution_class",
+    "capability"
+  ],
+  "runtime_surface": {
+    "cli_commands": [
+      "work",
+      "edit",
+      "script",
+      "terminal",
+      "doctor",
+      "sense",
+      "tools list",
+      "skills validate",
+      "mcp list|validate|tools",
+      "policy validate",
+      "api",
+      "audit",
+      "backup",
+      "restore"
+    ],
+    "api_actions": [
+      "health:get",
+      "config:web",
+      "doctor:run",
+      "sense:get",
+      "tools:list",
+      "skills:validate",
+      "skills:materialize",
+      "mcp:list",
+      "mcp:validate",
+      "mcp:tools",
+      "policy:validate",
+      "audit:list",
+      "audit:read",
+      "audit:verify",
+      "audit:export",
+      "work:run",
+      "script:run",
+      "script:review",
+      "terminal:run",
+      "terminal:review",
+      "edit:plan",
+      "edit:apply",
+      "edit:review"
+    ],
+    "web_routes": [
+      "/api/audit/list",
+      "/api/audit/read",
+      "/api/auth/bootstrap",
+      "/api/config",
+      "/api/config/models",
+      "/api/config/providers",
+      "/api/config/update",
+      "/api/config/web",
+      "/api/doctor",
+      "/api/edit/plan",
+      "/api/edit/review",
+      "/api/health",
+      "/api/jobs",
+      "/api/jobs/",
+      "/api/mcp",
+      "/api/mcp/tools",
+      "/api/mcp/validate",
+      "/api/metrics",
+      "/api/observer/bootstrap",
+      "/api/policies",
+      "/api/policies/command-guard",
+      "/api/policies/read",
+      "/api/policies/sudo-check",
+      "/api/policies/validate",
+      "/api/policies/write",
+      "/api/runtime/backup",
+      "/api/schema",
+      "/api/script/review",
+      "/api/sense",
+      "/api/server/shutdown",
+      "/api/session/leave",
+      "/api/session/restore",
+      "/api/session/state",
+      "/api/skills/materialize",
+      "/api/skills/read",
+      "/api/skills/tree",
+      "/api/skills/validate",
+      "/api/terminal/review",
+      "/api/terminal/run",
+      "/api/tools"
+    ],
+    "remote_behavior": {
+      "core_contains_builtin_index": true,
+      "core_contains_builtin_packages": false,
+      "skills_are_separate_assets": true
+    },
+    "helper_routes": {
+      "firewall.apply": "host_helper",
+      "hosts.apply": "host_helper"
+    },
+    "error_codes": {
+      "count": 125,
+      "sorted_names_sha256": "9743646738da0aa829dc37d400b64d0d6777b00882222574d520d92d7861633e"
+    }
+  },
+  "skills": {
+    "controlled-tools": {
+      "description": "受控文件与工具能力。用于文件匹配、原子补丁、安全下载和本地文本分析。",
+      "tools": {
+        "file-download": {
+          "risk": "high",
+          "execution_class": "runner",
+          "capability": "",
+          "parameters": "single_json_object",
+          "approval_scope": "file_download"
+        },
+        "file-match": {
+          "risk": "low",
+          "execution_class": "runner",
+          "capability": "",
+          "parameters": "single_json_object",
+          "approval_scope": "file_match"
+        },
+        "file-patch": {
+          "risk": "high",
+          "execution_class": "runner",
+          "capability": "",
+          "parameters": "single_json_object",
+          "approval_scope": "file_patch"
+        },
+        "local-analyze": {
+          "risk": "low",
+          "execution_class": "runner",
+          "capability": "",
+          "parameters": "single_json_object",
+          "approval_scope": "local_analyze"
+        }
+      }
+    },
+    "network-ops-tools": {
+      "description": "面向运维工程师和网络工程师的常用网络工具集。",
+      "tools": {
+        "bit-calculator": {
+          "risk": "medium",
+          "execution_class": "runner",
+          "capability": "",
+          "parameters": "single_json_object",
+          "approval_scope": "skill_readonly"
+        },
+        "connections": {
+          "risk": "medium",
+          "execution_class": "runner",
+          "capability": "",
+          "parameters": "single_json_object",
+          "approval_scope": "skill_readonly"
+        },
+        "discovery-protocol": {
+          "risk": "medium",
+          "execution_class": "runner",
+          "capability": "",
+          "parameters": "single_json_object",
+          "approval_scope": "skill_readonly"
+        },
+        "dns-lookup": {
+          "risk": "medium",
+          "execution_class": "runner",
+          "capability": "",
+          "parameters": "single_json_object",
+          "approval_scope": "skill_readonly"
+        },
+        "firewall": {
+          "risk": "high",
+          "execution_class": "host_helper",
+          "capability": "firewall.apply",
+          "parameters": "single_json_object",
+          "approval_scope": "skill_readonly"
+        },
+        "hosts-file-editor": {
+          "risk": "high",
+          "execution_class": "host_helper",
+          "capability": "hosts.apply",
+          "parameters": "single_json_object",
+          "approval_scope": "skill_readonly"
+        },
+        "http-check": {
+          "risk": "medium",
+          "execution_class": "runner",
+          "capability": "",
+          "parameters": "single_json_object",
+          "approval_scope": "skill_readonly"
+        },
+        "ip-geolocation": {
+          "risk": "medium",
+          "execution_class": "runner",
+          "capability": "",
+          "parameters": "single_json_object",
+          "approval_scope": "skill_readonly"
+        },
+        "ip-scanner": {
+          "risk": "high",
+          "execution_class": "runner",
+          "capability": "",
+          "parameters": "single_json_object",
+          "approval_scope": "skill_readonly"
+        },
+        "listeners": {
+          "risk": "medium",
+          "execution_class": "runner",
+          "capability": "",
+          "parameters": "single_json_object",
+          "approval_scope": "skill_readonly"
+        },
+        "lookup": {
+          "risk": "medium",
+          "execution_class": "runner",
+          "capability": "",
+          "parameters": "single_json_object",
+          "approval_scope": "skill_readonly"
+        },
+        "neighbor-table": {
+          "risk": "medium",
+          "execution_class": "runner",
+          "capability": "",
+          "parameters": "single_json_object",
+          "approval_scope": "skill_readonly"
+        },
+        "network-interface": {
+          "risk": "medium",
+          "execution_class": "runner",
+          "capability": "",
+          "parameters": "single_json_object",
+          "approval_scope": "skill_readonly"
+        },
+        "ping-monitor": {
+          "risk": "medium",
+          "execution_class": "runner",
+          "capability": "",
+          "parameters": "single_json_object",
+          "approval_scope": "skill_readonly"
+        },
+        "port-scanner": {
+          "risk": "high",
+          "execution_class": "runner",
+          "capability": "",
+          "parameters": "single_json_object",
+          "approval_scope": "skill_readonly"
+        },
+        "public-ip": {
+          "risk": "medium",
+          "execution_class": "runner",
+          "capability": "",
+          "parameters": "single_json_object",
+          "approval_scope": "skill_readonly"
+        },
+        "service-discovery": {
+          "risk": "medium",
+          "execution_class": "runner",
+          "capability": "",
+          "parameters": "single_json_object",
+          "approval_scope": "skill_readonly"
+        },
+        "snmp": {
+          "risk": "high",
+          "execution_class": "runner",
+          "capability": "",
+          "parameters": "single_json_object",
+          "approval_scope": "skill_readonly"
+        },
+        "sntp-lookup": {
+          "risk": "medium",
+          "execution_class": "runner",
+          "capability": "",
+          "parameters": "single_json_object",
+          "approval_scope": "skill_readonly"
+        },
+        "subnet-calculator": {
+          "risk": "medium",
+          "execution_class": "runner",
+          "capability": "",
+          "parameters": "single_json_object",
+          "approval_scope": "skill_readonly"
+        },
+        "tls-inspect": {
+          "risk": "medium",
+          "execution_class": "runner",
+          "capability": "",
+          "parameters": "single_json_object",
+          "approval_scope": "skill_readonly"
+        },
+        "traceroute": {
+          "risk": "medium",
+          "execution_class": "runner",
+          "capability": "",
+          "parameters": "single_json_object",
+          "approval_scope": "skill_readonly"
+        },
+        "wake-on-lan": {
+          "risk": "high",
+          "execution_class": "runner",
+          "capability": "",
+          "parameters": "single_json_object",
+          "approval_scope": "skill_readonly"
+        },
+        "whois": {
+          "risk": "medium",
+          "execution_class": "runner",
+          "capability": "",
+          "parameters": "single_json_object",
+          "approval_scope": "skill_readonly"
+        },
+        "wifi": {
+          "risk": "medium",
+          "execution_class": "runner",
+          "capability": "",
+          "parameters": "single_json_object",
+          "approval_scope": "skill_readonly"
+        }
+      }
+    },
+    "ops-basic": {
+      "description": "Linux 基础运维诊断与安全维护脚本。",
+      "tools": {
+        "config-backup": {
+          "risk": "medium",
+          "execution_class": "runner",
+          "capability": "",
+          "parameters": "single_json_object",
+          "approval_scope": "skill_readonly"
+        },
+        "disk-hotspots": {
+          "risk": "low",
+          "execution_class": "runner",
+          "capability": "",
+          "parameters": "single_json_object",
+          "approval_scope": "skill_readonly"
+        },
+        "log-cleanup-plan": {
+          "risk": "low",
+          "execution_class": "runner",
+          "capability": "",
+          "parameters": "single_json_object",
+          "approval_scope": "skill_readonly"
+        },
+        "log-search": {
+          "risk": "low",
+          "execution_class": "runner",
+          "capability": "",
+          "parameters": "single_json_object",
+          "approval_scope": "skill_readonly"
+        },
+        "process-inspect": {
+          "risk": "low",
+          "execution_class": "runner",
+          "capability": "",
+          "parameters": "single_json_object",
+          "approval_scope": "skill_readonly"
+        },
+        "resource-inspect": {
+          "risk": "low",
+          "execution_class": "runner",
+          "capability": "",
+          "parameters": "single_json_object",
+          "approval_scope": "skill_readonly"
+        },
+        "safe-log-cleanup": {
+          "risk": "high",
+          "execution_class": "runner",
+          "capability": "",
+          "parameters": "single_json_object",
+          "approval_scope": "skill_readonly"
+        },
+        "service-inspect": {
+          "risk": "low",
+          "execution_class": "runner",
+          "capability": "",
+          "parameters": "single_json_object",
+          "approval_scope": "skill_readonly"
+        },
+        "service-restart-plan": {
+          "risk": "low",
+          "execution_class": "runner",
+          "capability": "",
+          "parameters": "single_json_object",
+          "approval_scope": "skill_readonly"
+        }
+      }
+    },
+    "os-deep-inspect": {
+      "description": "Linux OS 环境深度感知与只读诊断脚本。",
+      "tools": {
+        "fd-inspect": {
+          "risk": "medium",
+          "execution_class": "runner",
+          "capability": "",
+          "parameters": "single_json_object",
+          "approval_scope": "skill_readonly"
+        },
+        "journal-inspect": {
+          "risk": "medium",
+          "execution_class": "runner",
+          "capability": "",
+          "parameters": "single_json_object",
+          "approval_scope": "skill_readonly"
+        },
+        "net-inspect": {
+          "risk": "medium",
+          "execution_class": "runner",
+          "capability": "",
+          "parameters": "single_json_object",
+          "approval_scope": "skill_readonly"
+        },
+        "os-snapshot": {
+          "risk": "medium",
+          "execution_class": "runner",
+          "capability": "",
+          "parameters": "single_json_object",
+          "approval_scope": "skill_readonly"
+        }
+      }
+    },
+    "session-history": {
+      "description": "读取本项目审计 session 中上一轮或指定轮次的输出预览。",
+      "tools": {
+        "last-command-output": {
+          "risk": "low",
+          "execution_class": "runner",
+          "capability": "",
+          "parameters": "single_json_object",
+          "approval_scope": "skill_readonly"
+        }
+      }
+    }
+  }
+}

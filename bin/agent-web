@@ -40,10 +40,6 @@ require_command flock
 linux_agent_require_python_runtime
 linux_agent_init_env "${ROOT_DIR}"
 linux_agent_load_config
-if ! linux_agent_recover_pending_skill_commit; then
-    linux_agent_print_error "检测到未完成的 Skill 提交事务，恢复失败；已停止 Web 启动以避免读取不一致的用户 Skill。"
-    exit 1
-fi
 
 enabled="$(config_get '.web.enabled' 'true')"
 case "${enabled,,}" in
@@ -106,6 +102,8 @@ fi
 
 export LINUX_AGENT_ROOT="${ROOT_DIR}"
 export LINUX_AGENT_DATA_DIR
+export LINUX_AGENT_BUILTIN_SKILLS_DIR
+export LINUX_AGENT_USER_SKILLS_DIR
 export LINUX_AGENT_WEB_HOST="${host}"
 export LINUX_AGENT_WEB_PORT="${port}"
 export LINUX_AGENT_WEB_TOKEN="${token}"

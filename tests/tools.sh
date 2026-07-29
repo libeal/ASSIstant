@@ -203,24 +203,33 @@ source "${ROOT_DIR}/lib/mcp.sh"
 source "${ROOT_DIR}/lib/doctor.sh"
 linux_agent_init_env "${ROOT_DIR}"
 linux_agent_load_config
+
+run_registered_skill_for_test() {
+    local ref="$1" raw_arguments="${2:-\{\}}" arguments script_path
+    linux_agent_skill_is_registered "${ref}"
+    arguments="$(linux_agent_normalize_json_object_argument "${raw_arguments}")"
+    script_path="$(linux_agent_skill_script_path "${ref}")"
+    bash "${script_path}" "${arguments}"
+}
+
 doctor_json="$(linux_agent_doctor)"
 grep -q '"skills_ok": true' <<<"$(jq . <<<"${doctor_json}")"
 skills_json="$(linux_agent_validate_skills)"
 grep -q '"ok": true' <<<"$(jq . <<<"${skills_json}")"
 disk_skill_context="$(linux_agent_skill_context_json "检查磁盘和日志占用" work)"
-jq -e '(.disclosed | map(.name)) == ["ops-basic"]
-    and .disclosure == "triggered_instructions"
-    and (.disclosed[0].instructions | contains("# Ops Basic"))' <<<"${disk_skill_context}" >/dev/null
+jq -e '(.candidates | map(.name)) == ["ops-basic"]
+    and .disclosure == "index_metadata_then_controlled_read"
+    and .loaded == []' <<<"${disk_skill_context}" >/dev/null
 network_skill_context="$(linux_agent_skill_context_json "检查网络连接与端口" work)"
-jq -e '([.disclosed[].name] | index("network-ops-tools"))
-    and ([.disclosed[].name] | index("os-deep-inspect"))
-    and ([.disclosed[].name] | index("ops-basic") | not)' <<<"${network_skill_context}" >/dev/null
+jq -e '([.candidates[].name] | index("network-ops-tools"))
+    and ([.candidates[].name] | index("os-deep-inspect"))
+    and ([.candidates[].name] | index("ops-basic") | not)' <<<"${network_skill_context}" >/dev/null
 file_skill_context="$(linux_agent_skill_context_json "用 controlled-tools/file-patch 修改文件" work)"
-jq -e '([.disclosed[].name] | index("controlled-tools"))' <<<"${file_skill_context}" >/dev/null
-resource_skill_result="$(linux_agent_run_skill_script ops-basic/resource-inspect '{"top_n":3}')"
-resource_skill_string_arg_result="$(linux_agent_run_skill_script ops-basic/resource-inspect "$(jq -cn --arg args '{"top_n":2}' '$args')")"
-process_skill_result="$(linux_agent_run_skill_script ops-basic/process-inspect '{"pattern":"systemd"}')"
-controlled_skill_result="$(linux_agent_run_skill_script controlled-tools/file-match "$(jq -cn --arg path "${ROOT_DIR}/README.md" '{path:$path, find:"Linux", max_matches:1}')")"
+jq -e '([.candidates[].name] | index("controlled-tools"))' <<<"${file_skill_context}" >/dev/null
+resource_skill_result="$(run_registered_skill_for_test ops-basic/resource-inspect '{"top_n":3}')"
+resource_skill_string_arg_result="$(run_registered_skill_for_test ops-basic/resource-inspect "$(jq -cn --arg args '{"top_n":2}' '$args')")"
+process_skill_result="$(run_registered_skill_for_test ops-basic/process-inspect '{"pattern":"systemd"}')"
+controlled_skill_result="$(run_registered_skill_for_test controlled-tools/file-match "$(jq -cn --arg path "${ROOT_DIR}/README.md" '{path:$path, find:"Linux", max_matches:1}')")"
 grep -q '"tool": "system.resource.inspect"' <<<"$(jq . <<<"${resource_skill_result}")"
 grep -q '"tool": "system.resource.inspect"' <<<"$(jq . <<<"${resource_skill_string_arg_result}")"
 grep -q '"tool": "system.process.inspect"' <<<"$(jq . <<<"${process_skill_result}")"
@@ -228,10 +237,7 @@ grep -q '"tool":"controlled.file.match"' <<<"${controlled_skill_result}"
 
 broken_skills_root="$(mktemp -d)"
 cp -a "${ROOT_DIR}/skills" "${broken_skills_root}/skills"
-printf '\n- `ops-basic/ghost-script`: bogus\n' >>"${broken_skills_root}/skills/INDEX.md"
-printf '\n- `scripts/ghost-script.sh`: bogus\n' >>"${broken_skills_root}/skills/ops-basic/SKILL.md"
-awk '!/^## .*传参/ && !/^## 参数契约/' "${broken_skills_root}/skills/ops-basic/SKILL.md" >"${broken_skills_root}/skills/ops-basic/SKILL.md.tmp"
-mv "${broken_skills_root}/skills/ops-basic/SKILL.md.tmp" "${broken_skills_root}/skills/ops-basic/SKILL.md"
+printf '{}\n' >"${broken_skills_root}/skills/ops-basic/manifest.json"
 original_config_json="${LINUX_AGENT_CONFIG_JSON}"
 original_builtin_skills_dir="${LINUX_AGENT_BUILTIN_SKILLS_DIR}"
 original_user_skills_dir="${LINUX_AGENT_USER_SKILLS_DIR}"
@@ -240,14 +246,74 @@ LINUX_AGENT_BUILTIN_SKILLS_DIR="${broken_skills_root}/skills"
 LINUX_AGENT_USER_SKILLS_DIR="${broken_skills_root}/user-skills"
 LINUX_AGENT_CONFIG_JSON="$(jq '.skills_dir=""' <<<"${LINUX_AGENT_CONFIG_JSON}")"
 broken_skills_json="$(linux_agent_validate_skills)"
-grep -q '"ok": false' <<<"$(jq . <<<"${broken_skills_json}")"
-grep -q 'SKILL_SCRIPT_FILE_MISSING' <<<"${broken_skills_json}"
-grep -q 'SKILL_INDEX_BROKEN_REF' <<<"${broken_skills_json}"
-grep -q 'SKILL_ARGUMENT_CONTRACT_MISSING' <<<"${broken_skills_json}"
+jq -e '.ok == true
+    and ([.findings[] | select(.severity == "warning" and .code == "SKILL_PACKAGE_INVALID" and .skill == "ops-basic")] | length) == 1' \
+    <<<"${broken_skills_json}" >/dev/null
+broken_catalog="$(linux_agent_skill_catalog_json)"
+jq -e '([.skills[] | select(.name == "ops-basic" and .state == "invalid")] | length) == 1
+    and ([.tools[] | select(.skill == "ops-basic")] | length) == 0' <<<"${broken_catalog}" >/dev/null
 LINUX_AGENT_CONFIG_JSON="${original_config_json}"
 LINUX_AGENT_BUILTIN_SKILLS_DIR="${original_builtin_skills_dir}"
 LINUX_AGENT_USER_SKILLS_DIR="${original_user_skills_dir}"
 rm -rf "${broken_skills_root}"
+
+remote_missing_index_root="$(mktemp -d)"
+mkdir -p "${remote_missing_index_root}/builtin" \
+    "${remote_missing_index_root}/user/reserved-remote"
+printf '%s\n' \
+    '---' \
+    'name: reserved-remote' \
+    'description: Conflicting user package.' \
+    '---' \
+    >"${remote_missing_index_root}/user/reserved-remote/SKILL.md"
+jq -n '{
+    schema_version:2,
+    skills:{
+        "reserved-remote":{
+            description:"Signed builtin package.",
+            category:"system",
+            refs:[{
+                ref:"reserved-remote/read",
+                description:"Read signed state.",
+                risk:"low",
+                approval_scope:"skill_readonly",
+                execution_class:"runner",
+                capability:"",
+                dispatch:"always",
+                runtime_inputs:[],
+                guards:[]
+            }]
+        }
+    }
+}' >"${remote_missing_index_root}/release-manifest.json"
+(
+    export LINUX_AGENT_REMOTE_MODE=1
+    export LINUX_AGENT_SKILLS_DIR="${remote_missing_index_root}/builtin"
+    export LINUX_AGENT_USER_SKILLS_DIR="${remote_missing_index_root}/user"
+    export LINUX_AGENT_REMOTE_MANIFEST="${remote_missing_index_root}/release-manifest.json"
+    remote_missing_index_catalog="$(linux_agent_skill_catalog_json)"
+    jq -e '.ok == true
+        and ([.skills[] | select(
+            .name == "reserved-remote"
+            and .origin == "builtin"
+            and .state == "unavailable"
+        )] | length) == 1
+        and ([.skills[] | select(.origin == "user")] | length) == 0
+        and (.tools | length) == 0
+        and ([.findings[] | select(
+            .code == "SKILL_NAME_RESERVED" and .skill == "reserved-remote"
+        )] | length) == 1
+        and ([.findings[] | select(
+            .code == "SKILL_INDEX_ENTRY_MISSING" and .skill == "reserved-remote"
+        )] | length) == 1' <<<"${remote_missing_index_catalog}" >/dev/null
+    linux_agent_builtin_skill_name_reserved reserved-remote
+    remote_missing_index_context="$(linux_agent_skill_context_json \
+        '运行 reserved-remote/read' work)"
+    jq -e '.candidates == [{name:"reserved-remote",state:"unavailable",score:100}]
+        and .unavailable == ["reserved-remote"]' \
+        <<<"${remote_missing_index_context}" >/dev/null
+)
+rm -rf "${remote_missing_index_root}"
 
 mcp_root="$(mktemp -d)"
 original_mcp_dir="${LINUX_AGENT_MCP_DIR}"

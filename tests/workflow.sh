@@ -150,7 +150,10 @@ jq -e '
 json_output="$(run_agent_cmd json env LINUX_AGENT_OUTPUT_JSON=1 bash bin/agent work "查看cpu占用,内存环境" 2>/dev/null)"
 grep -q '"status": "executed"' <<<"${json_output}"
 grep -q '"tool": "system.resource.inspect"' <<<"${json_output}"
-grep -q '"auto_executed_count": 1' <<<"${json_output}"
+grep -q '"auto_executed_count": 2' <<<"${json_output}"
+jq -e 'any(.results[]?;
+    .step.executor_type == "skill_load"
+    and .step.skill == "ops-basic")' <<<"${json_output}" >/dev/null
 grep -q '"final_answer": ""' <<<"${json_output}"
 grep -q '"stopped_reason": "资源检查 skill 的预期输出已经满足当前请求，执行成功后无需再次反思。"' <<<"${json_output}"
 
@@ -167,10 +170,11 @@ loop_history_file="${loop_history_project}/tmp/loop-history.json"
     cd "${loop_history_project}"
     LINUX_AGENT_CONVERSATION_HISTORY_FILE="${loop_history_file}" bash bin/agent work "查看cpu继续深入" >/dev/null
 )
-jq -e 'length == 2
+jq -e 'length == 3
     and all(.[]; .type == "agent_loop_iteration")
     and .[0].iteration == 1
     and .[1].iteration == 2
+    and .[2].iteration == 3
     and all(.[]; (.request.content | contains("查看cpu继续深入")) and (.response | type) == "object")' \
     "${loop_history_file}" >/dev/null
 

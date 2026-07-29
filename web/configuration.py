@@ -29,13 +29,6 @@ CONFIG_WRITABLE_FIELDS = {
     "agent_loop.thinking_trace_enabled": {"type": "bool"},
     "agent_loop.max_iterations": {"type": "int", "min": 1, "max": 100},
     "agent_loop.checkpoint_turns": {"type": "int", "min": 0, "max": 100},
-    "approvals.auto.skill_readonly": {"type": "bool"},
-    "approvals.auto.shell_readonly": {"type": "bool"},
-    "approvals.auto.file_match": {"type": "bool"},
-    "approvals.auto.file_patch": {"type": "bool"},
-    "approvals.auto.file_download": {"type": "bool"},
-    "approvals.auto.local_analyze": {"type": "bool"},
-    "approvals.auto.remote_script": {"type": "bool"},
     "audit_mode": {"type": "enum", "values": {"safe_summary", "redacted_verbose"}},
     "audit_text_limit": {"type": "int", "min": 40, "max": 200000},
     "observer.enabled": {"type": "enum", "values": {"auto", "auditd", "disabled"}},
@@ -62,6 +55,9 @@ CONFIG_SECRET_FIELDS = {"api_key"}
 CONFIG_READONLY_FIELDS = frozenset({"web.sensitive_edits_enabled"})
 CONFIG_CLEANUP_WARNING = "config_cleanup_pending"
 FAILOVER_API_KEY_ENV_PATTERN = re.compile(r"^[A-Z_][A-Z0-9_]*_API_KEY$")
+APPROVAL_SCOPE_CONFIG_PATTERN = re.compile(
+    r"^approvals[.]auto[.]([a-z][a-z0-9_]{0,63})$"
+)
 
 
 def _reject_json_constant(value):
@@ -79,6 +75,8 @@ def _reject_duplicate_keys(pairs):
 
 def normalize_config_value(key, value):
     spec = CONFIG_WRITABLE_FIELDS.get(key)
+    if spec is None and APPROVAL_SCOPE_CONFIG_PATTERN.fullmatch(key):
+        spec = {"type": "bool"}
     if not spec:
         return None, f"Unsupported writable config key: {key}"
     value_type = spec["type"]

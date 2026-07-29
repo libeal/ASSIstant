@@ -50,6 +50,23 @@ source "${ROOT_DIR}/lib/editor.sh"
 linux_agent_init_env "${ROOT_DIR}"
 linux_agent_load_config
 
+legacy_edit_json="$(jq -cn '{
+    response_type:"skill_edit",
+    skill:{name:"legacy-edit",description:"Legacy edit response fixture."},
+    scripts:[{
+        name:"run.sh",
+        description:"Legacy script fixture.",
+        content:"#!/usr/bin/env bash\nprintf \\\"{}\\\\n\\\"\n"
+    }]
+}')"
+if linux_agent_validate_edit_response "${legacy_edit_json}"; then
+    printf 'legacy edit JSON unexpectedly passed the next-major schema\n' >&2
+    exit 1
+fi
+legacy_edit_result="$(linux_agent_review_edit_package "${legacy_edit_json}")"
+jq -e '.ok == false and .status == "invalid_edit_package"' \
+    <<<"${legacy_edit_result}" >/dev/null
+
 # Config reads must reject ambiguous duplicate keys and non-standard finite
 # values before jq can normalize them. The live Web gate uses the same parser.
 (
@@ -78,185 +95,116 @@ linux_agent_load_config
     fi
 )
 
-# Skill overlay commits keep both the package and INDEX transactionally
-# recoverable when the final directory fsync or the second rename fails.
+# The next-major lifecycle owns one package at a time. It must replace packages
+# atomically, reject unsafe sources, preserve an installed version on failure,
+# reserve builtin names from INDEX, and never create a user-level INDEX.
 (
-    commit_root="${tmp_root}/skill-commit"
-    user_root="${commit_root}/user"
-    builtin_root="${commit_root}/builtin"
-    mkdir -p "${user_root}/existing/scripts" "${builtin_root}"
-    printf 'old-script\n' >"${user_root}/existing/scripts/run.sh"
-    printf 'old-index\n' >"${user_root}/INDEX.md"
-    mkdir -p "${user_root}/.staging-existing/scripts"
-    printf 'new-script\n' >"${user_root}/.staging-existing/scripts/run.sh"
-    candidate_index="${user_root}/.INDEX-existing.tmp"
-    printf 'new-index\n' >"${candidate_index}"
-    # shellcheck disable=SC2034
-    LINUX_AGENT_MANAGED_MODE=1
-    # shellcheck disable=SC2034
-    LINUX_AGENT_USER_SKILLS_DIR="${user_root}"
-    LINUX_AGENT_BUILTIN_SKILLS_DIR="${builtin_root}"
-    LINUX_AGENT_CONFIG_JSON='{"skills_dir":"/tmp/managed-skill-escape"}'
-    [[ "$(linux_agent_user_skills_dir)" == "${user_root}" ]]
-    [[ "$(linux_agent_skills_dir)" == "${builtin_root}" ]]
-    linux_agent_web_sensitive_edits_enabled() { return 0; }
-    fsync_calls=0
-    linux_agent_fsync_skill_paths() {
-        fsync_calls=$((fsync_calls + 1))
-        [[ "${fsync_calls}" -ne 2 ]]
+    lifecycle_root="${tmp_root}/skill-lifecycle"
+    user_root="${lifecycle_root}/user"
+    builtin_root="${lifecycle_root}/builtin"
+    source_root="${lifecycle_root}/source"
+    mkdir -p "${user_root}" "${builtin_root}" "${source_root}"
+    printf '# Builtin Skills\n\n## reserved\n\n> Reserved builtin fixture.\n' \
+        >"${builtin_root}/INDEX.md"
+
+    write_instruction_skill() {
+        local target="$1" name="$2" description="$3" body="$4"
+        mkdir -p "${target}"
+        printf '%s\n' \
+            '---' \
+            "name: ${name}" \
+            "description: ${description}" \
+            '---' \
+            '' \
+            "# ${name}" \
+            '' \
+            "${body}" >"${target}/SKILL.md"
     }
-    if linux_agent_commit_staged_skill existing "${user_root}/.staging-existing" "${candidate_index}"; then
-        printf 'skill commit unexpectedly succeeded after fsync failure\n' >&2
-        exit 1
-    fi
-    [[ "$(<"${user_root}/existing/scripts/run.sh")" == 'old-script' ]]
-    [[ "$(<"${user_root}/INDEX.md")" == 'old-index' ]]
 
-    rm -rf "${user_root}/existing" "${user_root}/.staging-existing" "${candidate_index}"
-    mkdir -p "${user_root}/existing/scripts" "${user_root}/.staging-existing/scripts"
-    printf 'old-script\n' >"${user_root}/existing/scripts/run.sh"
-    printf 'old-index\n' >"${user_root}/INDEX.md"
-    printf 'new-script\n' >"${user_root}/.staging-existing/scripts/run.sh"
-    candidate_index="${user_root}/.INDEX-existing.tmp"
-    printf 'new-index\n' >"${candidate_index}"
-    linux_agent_fsync_skill_paths() { return 0; }
-    failing_source="${candidate_index}"
-    failing_target="${user_root}/INDEX.md"
-    mv() {
-        if [[ "${3:-}" == "${failing_source}" && "${4:-}" == "${failing_target}" ]]; then
-            return 1
-        fi
-        command mv "$@"
-    }
-    if linux_agent_commit_staged_skill existing "${user_root}/.staging-existing" "${candidate_index}"; then
-        printf 'skill commit unexpectedly succeeded after index rename failure\n' >&2
-        exit 1
-    fi
-    [[ "$(<"${user_root}/existing/scripts/run.sh")" == 'old-script' ]]
-    [[ "$(<"${user_root}/INDEX.md")" == 'old-index' ]]
+    write_instruction_skill "${source_root}/existing" existing \
+        'Lifecycle replacement fixture.' 'version one'
+    mkdir -p "${source_root}/existing/scripts" \
+        "${source_root}/existing/references" "${source_root}/existing/assets"
+    printf '#!/usr/bin/env bash\nprintf "%s\\n" v1\n' '{}' \
+        >"${source_root}/existing/scripts/run.sh"
+    printf 'reference v1\n' >"${source_root}/existing/references/note.txt"
+    printf 'asset v1\n' >"${source_root}/existing/assets/blob"
 
-    unset -f mv
-    rm -rf "${user_root}/existing" "${user_root}/.staging-existing" "${candidate_index}"
-    mkdir -p "${user_root}/existing/scripts" "${user_root}/.staging-existing/scripts"
-    printf 'old-script\n' >"${user_root}/existing/scripts/run.sh"
-    printf 'old-index\n' >"${user_root}/INDEX.md"
-    printf 'new-script\n' >"${user_root}/.staging-existing/scripts/run.sh"
-    candidate_index="${user_root}/.INDEX-existing.tmp"
-    printf 'new-index\n' >"${candidate_index}"
-    gate_calls=0
-    linux_agent_web_sensitive_edits_enabled() {
-        gate_calls=$((gate_calls + 1))
-        [[ "${gate_calls}" -eq 1 ]]
-    }
-    if linux_agent_commit_staged_skill existing "${user_root}/.staging-existing" "${candidate_index}"; then
-        printf 'skill commit ignored a gate disabled after staging\n' >&2
-        exit 1
-    fi
-    [[ "${LINUX_AGENT_SKILL_COMMIT_STATUS}" == 'sensitive_edits_disabled' ]]
-    [[ "$(<"${user_root}/existing/scripts/run.sh")" == 'old-script' ]]
-    [[ "$(<"${user_root}/INDEX.md")" == 'old-index' ]]
-    [[ -d "${user_root}/.staging-existing" && -f "${candidate_index}" ]]
+    install_result="$(python3 "${ROOT_DIR}/lib/skill_lifecycle.py" install \
+        "${source_root}/existing" --root "${user_root}" --origin user \
+        --index "${builtin_root}/INDEX.md")"
+    jq -e '.ok == true and .status == "installed" and .skill == "existing"' \
+        <<<"${install_result}" >/dev/null
+    [[ "$(<"${user_root}/existing/references/note.txt")" == 'reference v1' ]]
+    [[ ! -e "${user_root}/INDEX.md" && ! -L "${user_root}/INDEX.md" ]]
+    [[ "$(stat -c '%a' "${user_root}/existing")" == '750' ]]
+    [[ "$(stat -c '%a' "${user_root}/existing/scripts/run.sh")" == '750' ]]
+    [[ "$(stat -c '%a' "${user_root}/existing/SKILL.md")" == '640' ]]
 
-    # A successful managed commit must leave the Runner-readable, Web-owned
-    # mode contract in place even though mktemp starts with 0700/0600.
-    linux_agent_web_sensitive_edits_enabled() { return 0; }
-    rm -rf "${user_root}/existing" "${user_root}/.staging-existing" "${candidate_index}"
-    mkdir -p "${user_root}/.staging-permissions/scripts" \
-        "${user_root}/.staging-permissions/references" \
-        "${user_root}/.staging-permissions/assets"
-    printf '#!/usr/bin/env bash\nprintf "{}\\n"\n' >"${user_root}/.staging-permissions/scripts/run.sh"
-    printf '# Skill\n' >"${user_root}/.staging-permissions/SKILL.md"
-    printf '{}\n' >"${user_root}/.staging-permissions/manifest.json"
-    printf 'reference\n' >"${user_root}/.staging-permissions/references/note.txt"
-    printf 'asset\n' >"${user_root}/.staging-permissions/assets/blob"
-    candidate_index="${user_root}/.INDEX-permissions.tmp"
-    printf '# index\n' >"${candidate_index}"
-    linux_agent_commit_staged_skill permissions \
-        "${user_root}/.staging-permissions" "${candidate_index}"
-    [[ "$(stat -c '%a' "${user_root}/permissions")" == '2750' ]]
-    [[ "$(stat -c '%a' "${user_root}/permissions/scripts")" == '2750' ]]
-    [[ "$(stat -c '%a' "${user_root}/permissions/scripts/run.sh")" == '750' ]]
-    [[ "$(stat -c '%a' "${user_root}/permissions/SKILL.md")" == '640' ]]
-    [[ "$(stat -c '%a' "${user_root}/permissions/manifest.json")" == '640' ]]
-    [[ "$(stat -c '%a' "${user_root}/permissions/references/note.txt")" == '640' ]]
-    [[ "$(stat -c '%a' "${user_root}/INDEX.md")" == '640' ]]
+    unsafe_root="${source_root}/unsafe"
+    write_instruction_skill "${unsafe_root}" unsafe \
+        'Unsafe symlink fixture.' 'must be rejected'
+    ln -s /etc/passwd "${unsafe_root}/references-link"
+    unsafe_result="$(python3 "${ROOT_DIR}/lib/skill_lifecycle.py" install \
+        "${unsafe_root}" --root "${user_root}" --origin user \
+        --index "${builtin_root}/INDEX.md" 2>/dev/null || true)"
+    jq -e '.ok == false and .code == "skill_operation_failed"' \
+        <<<"${unsafe_result}" >/dev/null
+    [[ ! -e "${user_root}/unsafe" && ! -L "${user_root}/unsafe" ]]
 
-    # A prepared journal represents an interrupted transaction. Recovery must
-    # restore the old package and index, then remove every transaction artifact.
-    rm -rf "${user_root}/permissions"
-    rm -f "${user_root}/INDEX.md"
-    mkdir -p "${user_root}/recover-prepared/scripts" \
-        "${user_root}/.staging-recover-prepared/scripts"
-    printf 'old-script\n' >"${user_root}/recover-prepared/scripts/run.sh"
-    printf 'old-index\n' >"${user_root}/INDEX.md"
-    printf 'new-script\n' >"${user_root}/.staging-recover-prepared/scripts/run.sh"
-    printf 'new-index\n' >"${user_root}/.INDEX-recover-prepared.tmp"
-    prepared_skill_identity="$(stat -c '%d:%i' "${user_root}/recover-prepared")"
-    prepared_index_identity="$(stat -c '%d:%i' "${user_root}/INDEX.md")"
-    linux_agent_write_skill_commit_journal \
-        "${user_root}" recover-prepared .staging-recover-prepared \
-        .INDEX-recover-prepared.tmp .backup.recover-prepared.fixture \
-        .backup-index.recover-prepared.fixture 1 1 \
-        "${prepared_skill_identity}" "${prepared_index_identity}" prepared
-    mv -T "${user_root}/recover-prepared" "${user_root}/.backup.recover-prepared.fixture"
-    mv -T "${user_root}/INDEX.md" "${user_root}/.backup-index.recover-prepared.fixture"
-    mv -T "${user_root}/.staging-recover-prepared" "${user_root}/recover-prepared"
+    invalid_replacement="${source_root}/existing-invalid"
+    mkdir -p "${invalid_replacement}"
+    printf '%s\n' '---' 'name: existing' 'description: Invalid directory name.' \
+        '---' '' '# existing' >"${invalid_replacement}/SKILL.md"
+    replace_failure="$(python3 "${ROOT_DIR}/lib/skill_lifecycle.py" install \
+        "${invalid_replacement}" --root "${user_root}" --origin user \
+        --index "${builtin_root}/INDEX.md" --replace 2>/dev/null || true)"
+    jq -e '.ok == false' <<<"${replace_failure}" >/dev/null
+    [[ "$(<"${user_root}/existing/references/note.txt")" == 'reference v1' ]]
 
-    # Startup recovery must wait behind an install/restore generation switch.
-    # While the exclusive runtime lock is held, neither the journal nor the
-    # currently visible (new) package may be touched.
-    LINUX_AGENT_DATA_DIR="${commit_root}/data"
-    mkdir -p "${LINUX_AGENT_DATA_DIR}"
-    : >"${LINUX_AGENT_DATA_DIR}/.runtime.lock"
-    chmod 0600 "${LINUX_AGENT_DATA_DIR}/.runtime.lock"
-    exec {runtime_exclusive_fd}<>"${LINUX_AGENT_DATA_DIR}/.runtime.lock"
-    flock -x "${runtime_exclusive_fd}"
-    linux_agent_recover_pending_skill_commit &
-    recovery_pid="$!"
-    sleep 0.2
-    kill -0 "${recovery_pid}"
-    [[ -f "${user_root}/.commit-recovery.json" ]]
-    [[ "$(<"${user_root}/recover-prepared/scripts/run.sh")" == 'new-script' ]]
-    flock -u "${runtime_exclusive_fd}"
-    exec {runtime_exclusive_fd}>&-
-    wait "${recovery_pid}"
-    [[ "$(<"${user_root}/recover-prepared/scripts/run.sh")" == 'old-script' ]]
-    [[ "$(<"${user_root}/INDEX.md")" == 'old-index' ]]
-    [[ ! -e "${user_root}/.commit-recovery.json" && ! -L "${user_root}/.commit-recovery.json" ]]
-    [[ ! -e "${user_root}/.staging-recover-prepared" && ! -L "${user_root}/.staging-recover-prepared" ]]
-    [[ ! -e "${user_root}/.INDEX-recover-prepared.tmp" && ! -L "${user_root}/.INDEX-recover-prepared.tmp" ]]
-    [[ ! -e "${user_root}/.backup.recover-prepared.fixture" && ! -L "${user_root}/.backup.recover-prepared.fixture" ]]
-    [[ ! -e "${user_root}/.backup-index.recover-prepared.fixture" && ! -L "${user_root}/.backup-index.recover-prepared.fixture" ]]
+    rm -rf -- "${source_root}/existing"
+    write_instruction_skill "${source_root}/existing" existing \
+        'Lifecycle replacement fixture updated.' 'version two'
+    mkdir -p "${source_root}/existing/scripts" \
+        "${source_root}/existing/references" "${source_root}/existing/assets"
+    printf '#!/usr/bin/env bash\nprintf "%s\\n" v2\n' '{}' \
+        >"${source_root}/existing/scripts/run.sh"
+    printf 'reference v2\n' >"${source_root}/existing/references/note.txt"
+    printf 'asset v2\n' >"${source_root}/existing/assets/blob"
+    replace_result="$(python3 "${ROOT_DIR}/lib/skill_lifecycle.py" install \
+        "${source_root}/existing" --root "${user_root}" --origin user \
+        --index "${builtin_root}/INDEX.md" --replace)"
+    jq -e '.ok == true and .status == "replaced" and .replaced == true' \
+        <<<"${replace_result}" >/dev/null
+    [[ "$(<"${user_root}/existing/references/note.txt")" == 'reference v2' ]]
+    [[ -z "$(find "${user_root}" -maxdepth 1 -name '.replaced.existing.*' -print -quit)" ]]
 
-    # Once the committed journal is durable, recovery keeps the new package
-    # and index and limits its work to cleaning the old backups and temporaries.
-    rm -rf "${user_root}/recover-prepared" "${user_root}/INDEX.md"
-    mkdir -p "${user_root}/recover-committed/scripts" \
-        "${user_root}/.backup.recover-committed.fixture/scripts" \
-        "${user_root}/.staging-recover-committed/scripts"
-    printf 'new-script\n' >"${user_root}/recover-committed/scripts/run.sh"
-    printf 'old-script\n' >"${user_root}/.backup.recover-committed.fixture/scripts/run.sh"
-    printf 'stale-staging\n' >"${user_root}/.staging-recover-committed/scripts/run.sh"
-    printf 'new-index\n' >"${user_root}/INDEX.md"
-    printf 'old-index\n' >"${user_root}/.backup-index.recover-committed.fixture"
-    printf 'stale-candidate\n' >"${user_root}/.INDEX-recover-committed.tmp"
-    committed_skill_identity="$(stat -c '%d:%i' "${user_root}/.backup.recover-committed.fixture")"
-    committed_index_identity="$(stat -c '%d:%i' "${user_root}/.backup-index.recover-committed.fixture")"
-    linux_agent_write_skill_commit_journal \
-        "${user_root}" recover-committed .staging-recover-committed \
-        .INDEX-recover-committed.tmp .backup.recover-committed.fixture \
-        .backup-index.recover-committed.fixture 1 1 \
-        "${committed_skill_identity}" "${committed_index_identity}" committed
+    write_instruction_skill "${source_root}/reserved" reserved \
+        'Reserved collision fixture.' 'must be rejected'
+    reserved_result="$(python3 "${ROOT_DIR}/lib/skill_lifecycle.py" install \
+        "${source_root}/reserved" --root "${user_root}" --origin user \
+        --index "${builtin_root}/INDEX.md" 2>/dev/null || true)"
+    jq -e '.ok == false and (.error | contains("reserved"))' \
+        <<<"${reserved_result}" >/dev/null
+    [[ ! -e "${user_root}/reserved" && ! -L "${user_root}/reserved" ]]
 
-    linux_agent_recover_pending_skill_commit
-    [[ "$(<"${user_root}/recover-committed/scripts/run.sh")" == 'new-script' ]]
-    [[ "$(<"${user_root}/INDEX.md")" == 'new-index' ]]
-    [[ ! -e "${user_root}/.commit-recovery.json" && ! -L "${user_root}/.commit-recovery.json" ]]
-    [[ ! -e "${user_root}/.staging-recover-committed" && ! -L "${user_root}/.staging-recover-committed" ]]
-    [[ ! -e "${user_root}/.INDEX-recover-committed.tmp" && ! -L "${user_root}/.INDEX-recover-committed.tmp" ]]
-    [[ ! -e "${user_root}/.backup.recover-committed.fixture" && ! -L "${user_root}/.backup.recover-committed.fixture" ]]
-    [[ ! -e "${user_root}/.backup-index.recover-committed.fixture" && ! -L "${user_root}/.backup-index.recover-committed.fixture" ]]
+    write_instruction_skill "${source_root}/legacy" legacy \
+        'Legacy fixture.' 'must be rejected'
+    printf '{}\n' >"${source_root}/legacy/manifest.json"
+    legacy_result="$(python3 "${ROOT_DIR}/lib/skill_lifecycle.py" install \
+        "${source_root}/legacy" --root "${user_root}" --origin user \
+        --index "${builtin_root}/INDEX.md" 2>/dev/null || true)"
+    jq -e '.ok == false and .code == "legacy_format_unsupported"' \
+        <<<"${legacy_result}" >/dev/null
+
+    uninstall_result="$(python3 "${ROOT_DIR}/lib/skill_lifecycle.py" uninstall existing \
+        --root "${user_root}" --origin user)"
+    jq -e '.ok == true and .status == "uninstalled" and .purged == false' \
+        <<<"${uninstall_result}" >/dev/null
+    [[ ! -e "${user_root}/existing" && ! -L "${user_root}/existing" ]]
+    [[ ! -e "${user_root}/INDEX.md" && ! -L "${user_root}/INDEX.md" ]]
 )
+
 LINUX_AGENT_CONFIG_JSON="$(jq --arg api_url "${FAKE_AI_URL}" '
     .api_url = $api_url
     | .api_key = "TEST_CONFIG_API_KEY_123456"
@@ -786,12 +734,26 @@ jq -e --arg archive "/tmp/verified-backup.tar.gz" --arg sha256 "${backup_gate_sh
     <<<"${prepared_backup_gate}" >/dev/null
 rm -f "${backup_gate_target}"
 readonly_skill_step='{"id":"auto-1","title":"resource","executor_type":"skill_script","skill_script":"ops-basic/resource-inspect","arguments":{},"reason":"test","expected_effect":"test","risk_level":"low","rollback_hint":"none"}'
+skill_load_step='{"id":"load-1","title":"load","executor_type":"skill_load","skill":"ops-basic","arguments":{},"reason":"test","expected_effect":"loaded","risk_level":"low","rollback_hint":"none"}'
 file_match_step='{"id":"auto-2","title":"match","executor_type":"skill_script","skill_script":"controlled-tools/file-match","arguments":{},"reason":"test","expected_effect":"test","risk_level":"low","rollback_hint":"none"}'
 file_patch_step='{"id":"auto-3","title":"patch","executor_type":"skill_script","skill_script":"controlled-tools/file-patch","arguments":{},"reason":"test","expected_effect":"test","risk_level":"low","rollback_hint":"none"}'
 shell_step='{"id":"auto-4","title":"shell","executor_type":"shell","command":"printf ok","arguments":{},"reason":"test","expected_effect":"test","risk_level":"low","rollback_hint":"none"}'
+skill_load_result="$(linux_agent_execute_skill_file_step "${skill_load_step}")"
+jq -e '.ok == true and .status == "read" and .output.skill == "ops-basic"
+    and .output.path == "SKILL.md"
+    and (.output.content | contains("# Ops Basic"))
+    and (.output.content_sha256 | test("^[0-9a-f]{64}$"))' <<<"${skill_load_result}" >/dev/null
+unloaded_block="$(linux_agent_step_disclosure_block "${readonly_skill_step}" '[]')"
+jq -e '.status == "blocked" and .code == "skill_not_loaded"' <<<"${unloaded_block}" >/dev/null
+loaded_disclosures="$(jq -cn --arg content "$(jq -r '.output.content' <<<"${skill_load_result}")" '[{name:"ops-basic",path:"SKILL.md",content:$content}]')"
+if loaded_block="$(linux_agent_step_disclosure_block "${readonly_skill_step}" "${loaded_disclosures}")"; then
+    printf 'loaded Skill was unexpectedly blocked: %s\n' "${loaded_block}" >&2
+    exit 1
+fi
 auto_config="${LINUX_AGENT_CONFIG_JSON}"
 LINUX_AGENT_CONFIG_JSON="$(jq 'del(.approvals) | .agent_loop.auto_execute_low_risk=false | .agent_loop.auto_execute_shell_low_risk=true' <<<"${auto_config}")"
-linux_agent_should_auto_execute_step "${readonly_skill_step}" "${low_review}"
+# Removed pre-major-version agent_loop flags must not silently grant approval.
+! linux_agent_should_auto_execute_step "${readonly_skill_step}" "${low_review}"
 ! linux_agent_should_auto_execute_step "${shell_step}" "${low_review}"
 LINUX_AGENT_CONFIG_JSON="$(jq '.approvals.auto.skill_readonly=false | .approvals.auto.file_match=true | .approvals.auto.file_patch=false' <<<"${auto_config}")"
 ! linux_agent_should_auto_execute_step "${readonly_skill_step}" "${low_review}"
@@ -799,6 +761,7 @@ linux_agent_should_auto_execute_step "${file_match_step}" "${low_review}"
 ! linux_agent_should_auto_execute_step "${file_patch_step}" "${low_review}"
 LINUX_AGENT_CONFIG_JSON="$(jq '.approvals.auto.skill_readonly=true | .approvals.auto.shell_readonly=false' <<<"${auto_config}")"
 linux_agent_should_auto_execute_step "${readonly_skill_step}" "${low_review}"
+linux_agent_should_auto_execute_step "${skill_load_step}" "${low_review}"
 ! linux_agent_should_auto_execute_step "${shell_step}" "${low_review}"
 terminal_review_when_shell_disabled="$(linux_agent_terminal_review "printf ok")"
 jq -e '.approved == true

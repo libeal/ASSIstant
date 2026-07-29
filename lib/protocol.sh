@@ -138,7 +138,7 @@ linux_agent_timeline_plan_items() {
                 title:($step.title // $step.id // "step"),
                 summary:([
                     $step.executor_type,
-                    ($step.skill_script // $step.command // (if (($step.mcp_server // "") != "" and ($step.mcp_tool // "") != "") then ($step.mcp_server + "/" + $step.mcp_tool) else "" end) // ""),
+                    ($step.skill_script // (if (($step.skill // "") != "") then ($step.skill + (if (($step.path // "") != "") then (":" + $step.path) else ":SKILL.md" end)) else null end) // $step.command // (if (($step.mcp_server // "") != "" and ($step.mcp_tool // "") != "") then ($step.mcp_server + "/" + $step.mcp_tool) else "" end) // ""),
                     ($step.expected_effect // "")
                 ] | map(select(. != "")) | join(" · ")),
                 risk_level:($step.risk_level // "low"),

@@ -95,15 +95,37 @@ linux_agent_build_system_prompt() {
 linux_agent_record_ai_request_files() {
     local request_context="$1"
     local prompt_file="${LINUX_AGENT_ROOT}/prompts/system.txt"
-    local skill_index_path relative_path
+    local skill_index_path source_path
 
     linux_agent_record_ai_file "${prompt_file}" "system_prompt" "system_message"
     skill_index_path="$(linux_agent_skill_index_path 2>/dev/null || true)"
     [[ -n "${skill_index_path}" ]] && linux_agent_record_ai_file "${skill_index_path}" "skill_index" "system_prompt_appendix"
-    while IFS= read -r relative_path; do
-        [[ -n "${relative_path}" ]] || continue
-        linux_agent_record_ai_file "${LINUX_AGENT_ROOT}/${relative_path}" "skill_instructions" "request_context.skills.disclosed"
-    done < <(jq -r '.skills.disclosed[]?.relative_path // empty' <<<"${request_context}" 2>/dev/null || true)
+    while IFS= read -r source_path; do
+        [[ -n "${source_path}" ]] || continue
+        linux_agent_record_ai_file "${source_path}" "skill_disclosure" "request_context.skills.loaded"
+    done < <(jq -r '.skills.loaded[]?.source_path // empty' <<<"${request_context}" 2>/dev/null || true)
+}
+
+linux_agent_record_skill_disclosure_files() {
+    local execution_json="$1" source_path
+    while IFS= read -r source_path; do
+        [[ -n "${source_path}" ]] || continue
+        linux_agent_record_ai_file "${source_path}" "skill_disclosure" "agent_observation"
+    done < <(jq -r '
+        .results[]?
+        | select(.result.ok == true)
+        | select(.step.executor_type == "skill_load" or .step.executor_type == "skill_read")
+        | .result.output.source_path // empty
+    ' <<<"${execution_json}" 2>/dev/null || true)
+}
+
+linux_agent_ai_context_text_limit() {
+    local limit
+    limit="$(linux_agent_config_positive_int_default '.agent_loop.skill_context_text_limit' '20000')"
+    if [[ "${limit}" -gt 65536 ]]; then
+        limit=65536
+    fi
+    printf '%s\n' "${limit}"
 }
 
 linux_agent_ai_error() {
@@ -146,6 +168,19 @@ linux_agent_validate_work_response() {
           (.title | type == "string") and
           (
             (
+              .executor_type == "skill_load" and
+              (.skill | type == "string" and test("^[a-z0-9][a-z0-9-]*$")) and
+              .risk_level == "low"
+            ) or
+            (
+              .executor_type == "skill_read" and
+              (.skill | type == "string" and test("^[a-z0-9][a-z0-9-]*$")) and
+              (.path | type == "string" and test("^references/[A-Za-z0-9][A-Za-z0-9._/-]{0,255}$")) and
+              (.path | contains("..") | not) and
+              (.path | contains("//") | not) and
+              .risk_level == "low"
+            ) or
+            (
               .executor_type == "skill_script" and
               (.skill_script | type == "string")
             ) or
@@ -185,6 +220,7 @@ linux_agent_validate_work_response() {
             all(.steps[]?; valid_step) and
             (([.steps[].id] | length) == ([.steps[].id] | unique | length)) and
             valid_continue and
+            ((any(.steps[]?; .executor_type == "skill_load" or .executor_type == "skill_read") | not) or .continue_decision.should_continue == true) and
             valid_thinking
           )
         )
@@ -195,11 +231,24 @@ linux_agent_validate_edit_response() {
     local response_json="$1"
     jq -e '
         .response_type == "skill_edit" and
+        .edit_schema_version == 1 and
         (.skill.name | test("^[a-z0-9][a-z0-9-]*$")) and
-        (.skill.description | type == "string") and
+        (.skill.description | type == "string" and length > 0) and
         (.scripts | type == "array") and
-        (.scripts | length > 0) and
-        all(.scripts[]; (.name | test("^[a-z0-9][a-z0-9-]*\\.sh$")) and (.content | type == "string") and (.description | type == "string"))
+        (.references | type == "array") and
+        (.assets | type == "array") and
+        all(.scripts[];
+            (.name | type == "string" and test("^[a-z0-9][a-z0-9-]*\\.sh$"))
+            and (.content | type == "string" and length > 0)
+            and (.description | type == "string" and length > 0)) and
+        all((.references + .assets)[];
+            (.path | type == "string" and test("^[A-Za-z0-9][A-Za-z0-9._/-]{0,255}$"))
+            and (.path | contains("..") | not)
+            and (.path | contains("//") | not)
+            and (.content | type == "string")) and
+        (([.scripts[].name] | length) == ([.scripts[].name] | unique | length)) and
+        (([.references[].path] | length) == ([.references[].path] | unique | length)) and
+        (([.assets[].path] | length) == ([.assets[].path] | unique | length))
     ' <<<"${response_json}" >/dev/null
 }
 
@@ -650,7 +699,7 @@ linux_agent_call_ai_with_context() {
     fi
 
     safe_current_request="$(linux_agent_sanitize_text "${current_request}")"
-    safe_request_context="$(linux_agent_sanitize_json "${request_context}")"
+    safe_request_context="$(linux_agent_sanitize_json "${request_context}" "$(linux_agent_ai_context_text_limit)")"
     payload_context="$(linux_agent_build_ai_payload_context "${safe_request_context}" "${runtime_context}")"
     payload_context="$(jq -c --arg current_request "${safe_current_request}" '.current_request = $current_request' <<<"${payload_context}")"
 

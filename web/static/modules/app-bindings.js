@@ -158,7 +158,7 @@ export function bindApplicationEvents(app, shell) {
     window.addEventListener("keydown", (event) => {
       if (event.altKey || event.metaKey || event.ctrlKey) return;
       if (["INPUT", "TEXTAREA", "SELECT"].includes(document.activeElement?.tagName || "")) return;
-      const map = { "1": "workbench", "2": "skills", "3": "mcp", "4": "policy", "5": "audit", "6": "config" };
-      if (map[event.key]) showScreen(map[event.key]);
+      const button = document.querySelector(`nav button[data-key="${CSS.escape(event.key)}"]`);
+      if (button instanceof HTMLElement && button.dataset.screen) showScreen(button.dataset.screen);
     });
 }

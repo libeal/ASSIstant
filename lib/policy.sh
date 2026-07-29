@@ -395,7 +395,7 @@ linux_agent_policy_review_step() {
 
     if [[ "${executor_type}" == "skill_script" ]] && declare -F linux_agent_review_with_declared_skill_risk >/dev/null 2>&1; then
         ref="$(jq -r '.skill_script // empty' <<<"${step_json}")"
-        review="$(linux_agent_review_with_declared_skill_risk "${ref}" "${review}")"
+        review="$(linux_agent_review_with_declared_skill_risk "${ref}" "${review}" "$(jq -c '.arguments // {}' <<<"${step_json}")")"
     fi
 
     printf '%s\n' "${review}"

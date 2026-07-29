@@ -315,7 +315,8 @@ global_warning_output="$(
         bash bin/agent edit "创建一个带历史坏 skill 的测试"
 )"
 grep -q 'Skill 保存结果: 成功' <<<"${global_warning_output}"
-grep -q '全局校验: 失败' <<<"${global_warning_output}"
+grep -q '全局校验: 通过' <<<"${global_warning_output}"
+grep -q 'SKILL_INDEX_ENTRY_MISSING' <<<"${global_warning_output}"
 grep -q 'manual edit marker' "${project_global_warning}/data/skills/custom-generated/scripts/generated.sh"
 
 printf 'interactive: ok\n'

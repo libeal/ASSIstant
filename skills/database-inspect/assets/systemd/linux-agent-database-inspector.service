@@ -1,0 +1,48 @@
+[Unit]
+Description=Linux Agent database-inspect Skill fixed-query helper
+Requires=linux-agent-database-inspector.socket
+After=linux-agent-database-inspector.socket network-online.target
+PartOf=linux-agent-web.service
+
+[Service]
+Type=simple
+User=linux-agent-credential
+Group=linux-agent-credential
+WorkingDirectory=/opt/linux-agent/current
+ExecStart=/usr/bin/python3 /opt/linux-agent/skills/database-inspect/scripts/database_inspector.py serve
+Environment=HOME=/var/lib/linux-agent-credential
+Environment=PYTHONPATH=/opt/linux-agent/current/lib
+Environment=LINUX_AGENT_SERVICE_USER=linux-agent
+Environment=LINUX_AGENT_DATA_DIR=/opt/linux-agent/data
+Environment=LINUX_AGENT_DATABASE_PROFILE_ROOT=/etc/linux-agent/database-profiles.d
+Environment=LINUX_AGENT_DATABASE_GROUP=linux-agent-credential
+Restart=on-failure
+RestartSec=2s
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ProtectControlGroups=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectKernelLogs=yes
+ProtectClock=yes
+PrivateDevices=yes
+LockPersonality=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources @mount @swap @reboot @raw-io
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+IPAddressDeny=any
+IPAddressAllow=localhost
+InaccessiblePaths=/opt/linux-agent/data /run/linux-agent/runner.sock /run/linux-agent/observer.sock /run/linux-agent/host-ops.sock /run/linux-agent/policy-writer.sock
+CPUQuota=100%
+MemoryMax=256M
+TasksMax=64
+StandardOutput=journal
+StandardError=journal

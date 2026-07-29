@@ -1,5 +1,5 @@
 [Unit]
-Description=Linux Agent narrow firewall and hosts helper
+Description=Linux Agent narrow allowlisted host operations helper
 Requires=linux-agent-host-ops.socket
 After=linux-agent-host-ops.socket
 PartOf=linux-agent-web.service
@@ -10,12 +10,16 @@ User=root
 Group=root
 ExecStart=/usr/bin/python3 /opt/linux-agent/current/lib/host_ops_helper.py serve
 Environment=LINUX_AGENT_SERVICE_USER=linux-agent
+Environment=LINUX_AGENT_ROOT=/opt/linux-agent/current
+Environment=LINUX_AGENT_BUILTIN_SKILLS_DIR=/opt/linux-agent/skills
+Environment=LINUX_AGENT_RELEASE_MANIFEST=/opt/linux-agent/release-manifest.json
 Environment=LINUX_AGENT_DATA_DIR=/opt/linux-agent/data
+Environment=LINUX_AGENT_HOST_OPS_POLICY_PATH=/etc/linux-agent/host-ops-policy.json
 Restart=on-failure
 RestartSec=2s
 NoNewPrivileges=yes
-# CAP_CHOWN preserves the existing /etc/hosts owner/group on same-directory
-# temporary files; no arbitrary command or path capability is exposed.
+# CAP_CHOWN preserves existing file ownership on same-directory temporary files;
+# no arbitrary command, unit, or path capability is exposed.
 CapabilityBoundingSet=CAP_NET_ADMIN CAP_DAC_OVERRIDE CAP_FOWNER CAP_CHOWN
 AmbientCapabilities=CAP_NET_ADMIN CAP_DAC_OVERRIDE CAP_FOWNER CAP_CHOWN
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK

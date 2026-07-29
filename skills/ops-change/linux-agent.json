@@ -1,0 +1,149 @@
+{
+  "schema_version": 1,
+  "package_version": "1.0.0",
+  "core_api": 1,
+  "category": "change",
+  "tools": [
+    {
+      "name": "account-audit",
+      "description": "有界审计 passwd、group 和当前可见登录，不读取 shadow。",
+      "entrypoint": "scripts/account-audit.sh",
+      "risk": "low",
+      "approval_scope": "skill_readonly",
+      "execution": {
+        "class": "runner",
+        "capability": "",
+        "dispatch": "always"
+      },
+      "runtime_inputs": [],
+      "guards": []
+    },
+    {
+      "name": "package-query",
+      "description": "使用本地包管理缓存查询已安装或可升级包。",
+      "entrypoint": "scripts/package-query.sh",
+      "risk": "low",
+      "approval_scope": "skill_readonly",
+      "execution": {
+        "class": "runner",
+        "capability": "",
+        "dispatch": "always"
+      },
+      "runtime_inputs": [],
+      "guards": []
+    },
+    {
+      "name": "package-upgrade-plan",
+      "description": "对指定包执行无下载升级模拟并返回版本、依赖和空间提示。",
+      "entrypoint": "scripts/package-upgrade-plan.sh",
+      "risk": "low",
+      "approval_scope": "skill_readonly",
+      "execution": {
+        "class": "runner",
+        "capability": "",
+        "dispatch": "always"
+      },
+      "runtime_inputs": [],
+      "guards": []
+    },
+    {
+      "name": "schedule-audit",
+      "description": "读取固定 cron 路径和 systemd timers，并记录不可见项。",
+      "entrypoint": "scripts/schedule-audit.sh",
+      "risk": "low",
+      "approval_scope": "skill_readonly",
+      "execution": {
+        "class": "runner",
+        "capability": "",
+        "dispatch": "always"
+      },
+      "runtime_inputs": [],
+      "guards": []
+    },
+    {
+      "name": "schedule-edit-plan",
+      "description": "为固定 cron 目标或既有 timer 调度属性生成只读 diff。",
+      "entrypoint": "scripts/schedule-edit-plan.sh",
+      "risk": "medium",
+      "approval_scope": "skill_readonly",
+      "execution": {
+        "class": "runner",
+        "capability": "",
+        "dispatch": "always"
+      },
+      "runtime_inputs": [],
+      "guards": []
+    },
+    {
+      "name": "service-restart",
+      "description": "读取或计划服务重启，并在 managed allowlist 内确认应用。",
+      "entrypoint": "scripts/service-restart.sh",
+      "risk": "high",
+      "approval_scope": "skill_readonly",
+      "execution": {
+        "class": "host_helper",
+        "capability": "service.restart",
+        "dispatch": "apply_only",
+        "adapter": "scripts/host-adapter.py"
+      },
+      "runtime_inputs": [],
+      "guards": [
+        {
+          "type": "risk_by_value",
+          "field": "action",
+          "values": {
+            "read": "low",
+            "plan": "low",
+            "apply": "high"
+          },
+          "default": "high"
+        },
+        {
+          "type": "runner_fallthrough",
+          "field": "action",
+          "default": "read",
+          "allowed": ["read", "plan"],
+          "boolean_flag": "apply"
+        }
+      ]
+    },
+    {
+      "name": "systemd-dropin",
+      "description": "计划或在 managed allowlist 内原子应用固定资源属性 drop-in。",
+      "entrypoint": "scripts/systemd-dropin.sh",
+      "risk": "high",
+      "approval_scope": "skill_readonly",
+      "execution": {
+        "class": "host_helper",
+        "capability": "systemd.dropin.apply",
+        "dispatch": "apply_only",
+        "adapter": "scripts/host-adapter.py"
+      },
+      "runtime_inputs": [],
+      "guards": [
+        {
+          "type": "risk_by_value",
+          "field": "action",
+          "values": {
+            "plan": "medium",
+            "apply": "high"
+          },
+          "default": "high"
+        },
+        {
+          "type": "runner_fallthrough",
+          "field": "action",
+          "default": "plan",
+          "allowed": ["plan"],
+          "boolean_flag": "apply"
+        }
+      ]
+    }
+  ],
+  "components": {
+    "host_helper": {
+      "handler": "scripts/host_handler.py",
+      "policy_asset": "assets/host-ops-policy.example.json"
+    }
+  }
+}

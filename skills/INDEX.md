@@ -4,6 +4,8 @@
 
 ## ops-basic
 
+> Linux 基础运维诊断与安全维护脚本。用于磁盘、日志、进程、服务、备份和低风险清理场景；工作模式和脚本模式可调用其中登记的脚本。
+
 - `ops-basic/disk-hotspots`: 采集磁盘热点目录、大文件与日志占用情况。
 - `ops-basic/log-search`: 检索 `/var/log` 下的日志文件；默认不读取 journal，可通过参数显式启用。
 - `ops-basic/log-cleanup-plan`: 扫描 `/var/log` 或 `/tmp` 下的大日志并生成清理建议。
@@ -16,23 +18,61 @@
 
 ## os-deep-inspect
 
+> Linux OS 环境深度感知与只读诊断脚本。用于排查端口占用、网络连接、打开文件、进程文件句柄、journalctl 日志、系统快照、异常服务和现场状态采集；工作模式和脚本模式可调用其中登记的脚本，尤其适合需要 lsof、netstat、ss、journalctl 等系统观察命令的场景。
+
 - `os-deep-inspect/os-snapshot`: 深度采集主机、负载、磁盘、网络、失败服务、近期告警日志和进程摘要。
 - `os-deep-inspect/net-inspect`: 通过 `ss` 或 `netstat` 查看监听端口、连接状态和可选进程信息。
 - `os-deep-inspect/fd-inspect`: 通过 `lsof` 或 `/proc/<pid>/fd` 检查打开文件、socket 和文件句柄占用。
 - `os-deep-inspect/journal-inspect`: 通过 `journalctl` 按 unit、priority、时间窗口和关键词读取系统日志样本。
 
+## ops-change
+
+> 固定边界的系统查询、变更计划和受管主机变更能力。
+
+- `ops-change/package-query`: 使用本地包管理缓存查询已安装或可升级包。
+- `ops-change/package-upgrade-plan`: 对指定包执行无下载升级模拟并返回版本、依赖和空间提示。
+- `ops-change/account-audit`: 有界审计 passwd、group 和当前可见登录，不读取 shadow。
+- `ops-change/schedule-audit`: 读取固定 cron 路径和 systemd timers，并记录不可见项。
+- `ops-change/schedule-edit-plan`: 为固定 cron 目标或既有 timer 调度属性生成只读 diff。
+- `ops-change/service-restart`: 读取或计划服务重启，并在 managed allowlist 内确认应用。
+- `ops-change/systemd-dropin`: 计划或在 managed allowlist 内原子应用固定资源属性 drop-in。
+
 ## controlled-tools
 
-- `controlled-tools/file-match`: 只读匹配目标文件中的字面量文本，返回出现次数和上下文。
-- `controlled-tools/file-patch`: 在 `expected_count` 匹配时对目标文件做字面量替换、diff 预览、备份和原子写入。
+> 受控文件与工具能力。用于文件匹配、原子补丁、安全下载和本地文本分析；文件修改必须优先使用这里登记的脚本。
+
+- `controlled-tools/file-match`: 只读匹配目标文件中的字面量文本，返回 SHA-256、出现次数和上下文。
+- `controlled-tools/file-patch`: 按 SHA-256 执行事务性多项补丁、幂等 block 追加或排他新建，并兼容旧单项替换调用。
 - `controlled-tools/file-download`: 安全下载 HTTPS 公网文件到本机路径，限制大小并可校验 sha256。
 - `controlled-tools/local-analyze`: 对文本或本地文件做只读关键词和错误样本分析。
 
 ## session-history
 
+> 读取本项目审计 session 中上一轮或指定轮次的命令、步骤和 shell/stdout/stderr 输出预览。用于 agent 需要回看上一轮执行了什么命令、终端返回了什么、审批前已完成哪些步骤，或需要从 logs/session_*.jsonl 恢复最近输出上下文时。
+
 - `session-history/last-command-output`: 从审计 session 中读取上一轮或指定轮次的命令、步骤和 shell/stdout/stderr 输出预览。
 
+## container-inspect
+
+> Docker、Podman 与 CRI 的固定只读容器巡检能力。
+
+- `container-inspect/runtime-summary`: 查看 Docker、Podman 与 CRI 客户端及运行时可达性。
+- `container-inspect/container-list`: 通过固定只读 CLI 有界列出容器。
+- `container-inspect/container-inspect`: 脱敏读取单个容器配置、状态、环境键、标签和挂载目标。
+- `container-inspect/image-inventory`: 通过固定只读 CLI 有界读取镜像清单。
+- `container-inspect/resource-snapshot`: 对容器执行单次有界资源采样。
+
+## database-inspect
+
+> PostgreSQL 与 MySQL/MariaDB 的发现及固定只读健康和指标巡检。
+
+- `database-inspect/instance-discovery`: 只读发现标准 PostgreSQL、MySQL/MariaDB socket 与固定客户端。
+- `database-inspect/instance-health`: 通过专用 credential helper 执行固定数据库健康查询。
+- `database-inspect/instance-metrics`: 通过专用 credential helper 执行固定数据库指标查询。
+
 ## network-ops-tools
+
+> 面向运维工程师和网络工程师的常用网络工具集；所有脚本同时登记给 script 模式和 work 模式，且最低声明为 medium 风险，避免主动网络行为被当作 low 风险自动执行。
 
 - `network-ops-tools/ip-scanner`: 有界扫描授权范围内的 IP/CIDR，支持 ping、TCP 探测、服务名提示与可选 MAC/厂商解析。
 - `network-ops-tools/port-scanner`: 有界扫描单个目标主机的 TCP/UDP 端口，标注服务名并可抓取 banner。

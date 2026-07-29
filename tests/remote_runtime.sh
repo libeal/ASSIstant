@@ -10,6 +10,14 @@ web_pid=""
 release_http_pid=""
 
 cleanup() {
+    local status=$?
+    if [[ "${status}" -ne 0 ]]; then
+        printf 'remote_runtime: exiting with status %s\n' "${status}" >&2
+        if [[ -f "${web_stderr:-}" ]]; then
+            printf '%s\n' 'remote_runtime: remote Web stderr tail:' >&2
+            tail -n 80 "${web_stderr}" >&2 || true
+        fi
+    fi
     if [[ -n "${web_pid}" ]] && kill -0 "${web_pid}" >/dev/null 2>&1; then
         kill -TERM "${web_pid}" >/dev/null 2>&1 || true
         wait "${web_pid}" 2>/dev/null || true
@@ -19,8 +27,20 @@ cleanup() {
         wait "${release_http_pid}" 2>/dev/null || true
     fi
     rm -rf "${tmp_root}"
+    return "${status}"
 }
 trap cleanup EXIT
+report_failure() {
+    local status=$?
+    local line="${1:-unknown}"
+    if [[ "$-" != *e* ]]; then
+        return "${status}"
+    fi
+    trap - ERR
+    printf 'remote_runtime: failed at line %s (exit=%s)\n' "${line}" "${status}" >&2
+    return "${status}"
+}
+trap 'report_failure "${LINENO}"' ERR
 
 release_dir="${tmp_root}/release"
 runtime_base="${tmp_root}/runtime"
@@ -85,7 +105,7 @@ mkdir -p "${fake_bin}"
 apply_marker="${tmp_root}/fake-cosign-invoked"
 printf '%s\n' '#!/usr/bin/env bash' ': >"${FAKE_COSIGN_MARKER:?}"' 'exit 1' >"${fake_bin}/cosign"
 chmod 0755 "${fake_bin}/cosign"
-release_http_port="$((22000 + RANDOM % 1000))"
+release_http_port="$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1]); s.close()')"
 python3 -m http.server "${release_http_port}" --bind 127.0.0.1 --directory "${release_dir}" \
     >"${tmp_root}/release-http.stdout" 2>"${tmp_root}/release-http.stderr" &
 release_http_pid="$!"
@@ -262,11 +282,78 @@ jq -e '
     and ([.scripts[].origin] | all(. == "builtin"))
 ' <<<"${tools_json}" >/dev/null
 
+database_username="database_owner_for_remote_http_test"
+database_password="DATABASE_PASSWORD_MUST_NOT_PERSIST_41c9"
+database_credential="$(
+    printf '%s' '{"engine":"postgresql","endpoint":"127.0.0.1","port":9,"database":"app","tls":"disable","username":"database_owner_for_remote_http_test","password":"DATABASE_PASSWORD_MUST_NOT_PERSIST_41c9","acknowledge_authorized_scope":true}' |
+        curl -sS -X POST \
+            -H "Authorization: Bearer ${web_token}" \
+            -H 'Content-Type: application/json' \
+            --data-binary @- \
+            "http://127.0.0.1:${web_port}/api/database/credentials"
+)"
+if ! jq -e '.ok == true and .status == "saved"
+    and (.credential_ref | test("^[0-9a-f]{32}$"))
+    and .metadata.mode == "remote"' <<<"${database_credential}" >/dev/null; then
+    printf 'Remote database credential returned an unexpected result: %s\n' \
+        "${database_credential}" >&2
+    exit 1
+fi
+if grep -Fq -- "${database_password}" <<<"${database_credential}" ||
+    grep -Fq -- "${database_username}" <<<"${database_credential}"; then
+    printf 'Remote database credential response exposed credential material\n' >&2
+    exit 1
+fi
+database_credential_ref="$(jq -r '.credential_ref' <<<"${database_credential}")"
+database_job="$(curl -fsS -X POST \
+    -H "Authorization: Bearer ${web_token}" \
+    -H 'Content-Type: application/json' \
+    -d "$(jq -cn --arg ref "${database_credential_ref}" \
+        '{resource:"database",action:"health",payload:{credential_ref:$ref}}')" \
+    "http://127.0.0.1:${web_port}/api/jobs")"
+database_result="$(wait_remote_job "$(jq -r '.job_id' <<<"${database_job}")")"
+if ! jq -e '.result.code as $code
+    | .status == "failed"
+    and .result.ok == false
+    and (["credential_unavailable", "database_unreachable", "database_query_failed"]
+        | index($code) != null)' <<<"${database_result}" >/dev/null; then
+    printf 'Remote database health Job returned an unexpected result: %s\n' \
+        "${database_result}" >&2
+    exit 1
+fi
+database_retry="$(curl -fsS -X POST \
+    -H "Authorization: Bearer ${web_token}" \
+    -H 'Content-Type: application/json' \
+    -d "$(jq -cn --argjson version "$(jq -r '.version' <<<"${database_result}")" \
+        '{expected_version:$version}')" \
+    "http://127.0.0.1:${web_port}/api/jobs/$(jq -r '.job_id' <<<"${database_result}")/retry")"
+database_retry_result="$(wait_remote_job "$(jq -r '.job_id' <<<"${database_retry}")")"
+jq -e '.status == "failed" and .result.ok == false
+    and .result.code == "credential_unavailable"' <<<"${database_retry_result}" >/dev/null
+jq -e '.credentials == []' < <(curl -fsS \
+    -H "Authorization: Bearer ${web_token}" \
+    "http://127.0.0.1:${web_port}/api/database/credentials") >/dev/null
+remote_agent_root="$(find "${runtime_base}" -maxdepth 4 -type d \
+    -path '*/linux-agent-remote.*/agent' -print -quit)"
+if grep -R -Fq -- "${database_password}" "${remote_agent_root}/data" \
+    "${web_stdout}" "${web_stderr}"; then
+    printf 'Remote database password was persisted or logged\n' >&2
+    exit 1
+fi
+if grep -R -Fq -- "${database_username}" "${remote_agent_root}/data" \
+    "${web_stdout}" "${web_stderr}"; then
+    printf 'Remote database username was persisted or logged without redaction\n' >&2
+    exit 1
+fi
+
 remote_user_script_v1=$'#!/usr/bin/env bash\nset -euo pipefail\nargs="${1:-}"\n[[ -n "${args}" ]] || args="{}"\npython3 - "${args}" <<PY\nimport json\nimport sys\nprint(json.dumps({"ok": True, "status": "executed", "tool": "remote-user/run", "version": "v1", "args": json.loads(sys.argv[1])}))\nPY'
 remote_user_edit="$(jq -cn --arg content "${remote_user_script_v1}" '{
     response_type:"skill_edit",
+    edit_schema_version:1,
     skill:{name:"remote-user",description:"Remote user overlay fixture"},
     scripts:[{name:"run.sh",description:"Accepts an optional JSON object and reports it.",content:$content}],
+    references:[],
+    assets:[],
     notes:"remote user create"
 }')"
 remote_user_review="$(curl -fsS -X POST \
@@ -315,8 +402,11 @@ grep -q '"version": "v2"' "${remote_agent_root}/data/skills/remote-user/scripts/
 remote_conflict_script=$'#!/usr/bin/env bash\nset -euo pipefail\nprintf '\''{"ok":true}\\n'\'''
 remote_conflict_edit="$(jq -cn --arg content "${remote_conflict_script}" '{
     response_type:"skill_edit",
+    edit_schema_version:1,
     skill:{name:"ops-basic",description:"Must conflict with lazy built-in"},
-    scripts:[{name:"run.sh",description:"Accepts a JSON object.",content:$content}]
+    scripts:[{name:"run.sh",description:"Accepts a JSON object.",content:$content}],
+    references:[],
+    assets:[]
 }')"
 remote_conflict_job="$(curl -fsS -X POST \
     -H "Authorization: Bearer ${web_token}" \
@@ -370,7 +460,8 @@ tools_after_materialize="$(curl -fsS -H "Authorization: Bearer ${web_token}" "ht
 jq -e '
     ([.scripts[] | select(.skill == "os-deep-inspect") | .materialization] | all(. == "ready"))
     and ([.scripts[] | select(.skill == "remote-user") | .materialization] | all(. == "ready"))
-    and ([.scripts[] | select(.skill != "os-deep-inspect" and .skill != "remote-user") | .materialization] | all(. == "available"))
+    and ([.scripts[] | select(.skill == "database-inspect") | .materialization] | all(. == "ready"))
+    and ([.scripts[] | select(.skill != "os-deep-inspect" and .skill != "remote-user" and .skill != "database-inspect") | .materialization] | all(. == "available"))
 ' <<<"${tools_after_materialize}" >/dev/null
 remote_skill_review="$(curl -fsS -X POST \
     -H "Authorization: Bearer ${web_token}" \
@@ -400,8 +491,8 @@ if grep -q '^skills/os-deep-inspect/' <<<"${web_backup_listing}"; then
     printf 'remote Web backup contains materialized built-in Skill files\n' >&2
     exit 1
 fi
-jq -e '.materialized[] | select(.skill == "os-deep-inspect")' \
-    "${web_backup_extract}/skills/materialized.json" >/dev/null
+jq -e '.builtin[] | select(.name == "os-deep-inspect" and .installed == true and .source == "remote")' \
+    "${web_backup_extract}/skills/installation-state.json" >/dev/null
 if grep -R -Fq -- "${web_token}" "${web_backup_extract}"; then
     printf 'remote Web backup contains the Web token\n' >&2
     exit 1

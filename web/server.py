@@ -5,6 +5,7 @@ import ipaddress
 import json
 import os
 import errno
+import re
 import secrets
 import signal
 import shutil
@@ -73,6 +74,10 @@ from sessions import (  # noqa: E402
     result_context_eligible,
 )
 from skills import SkillService  # noqa: E402
+from skill_components import (  # noqa: E402
+    SkillWebComponentError,
+    SkillWebRegistry,
+)
 from timeline import (  # noqa: E402
     TimelineDataError,
     legacy_timeline_unavailable,
@@ -92,9 +97,15 @@ STATIC_ROOT = ROOT / "web" / "static"
 LOG_ROOT = (ROOT / "logs").resolve()
 JOBS_DB = ROOT / "tmp" / "web" / "jobs.db"
 POLICIES_ROOT = ROOT / "policies"
-SKILLS_ROOT = ROOT / "skills"
+SKILLS_ROOT = Path(
+    os.environ.get("LINUX_AGENT_BUILTIN_SKILLS_DIR") or ROOT / "skills"
+)
 _ROOT_RESOLVED = ROOT.resolve()
 MANAGED_LAYOUT = _ROOT_RESOLVED.parent.name == "releases"
+APPROVAL_SCOPE_PATTERN = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
+CORE_APPROVAL_SCOPES = frozenset(
+    {"skill_readonly", "shell_readonly", "remote_script", "mcp_tool"}
+)
 
 
 def managed_execution_enabled():
@@ -127,7 +138,9 @@ if MANAGED_LAYOUT:
     DATA_ROOT = _ROOT_RESOLVED.parent.parent / "data"
 else:
     DATA_ROOT = ROOT / "data"
-USER_SKILLS_ROOT = DATA_ROOT / "skills"
+USER_SKILLS_ROOT = Path(
+    os.environ.get("LINUX_AGENT_USER_SKILLS_DIR") or DATA_ROOT / "skills"
+)
 USER_POLICIES_ROOT = DATA_ROOT / "policies"
 POLICY_HELPER_SOCKET = os.environ.get(
     "LINUX_AGENT_POLICY_HELPER_SOCKET",
@@ -364,7 +377,54 @@ def config_public_state():
     if not isinstance(command_guard_enabled, bool):
         command_guard_enabled = True
     approvals = config.get("approvals") if isinstance(config.get("approvals"), dict) else {}
-    auto_approvals = approvals.get("auto") if isinstance(approvals.get("auto"), dict) else {}
+    configured_auto_approvals = (
+        approvals.get("auto") if isinstance(approvals.get("auto"), dict) else {}
+    )
+    auto_approvals = {
+        name: value
+        for name, value in configured_auto_approvals.items()
+        if isinstance(name, str)
+        and APPROVAL_SCOPE_PATTERN.fullmatch(name)
+        and isinstance(value, bool)
+    }
+    approval_scopes = set(CORE_APPROVAL_SCOPES)
+    approval_scopes.update(auto_approvals)
+    skill_service = globals().get("SKILL_SERVICE")
+    if skill_service is not None:
+        try:
+            for package in skill_service.list_packages():
+                if package.get("state") != "installed":
+                    continue
+                for tool in package.get("tools", []):
+                    scope = tool.get("approval_scope")
+                    if isinstance(scope, str) and APPROVAL_SCOPE_PATTERN.fullmatch(scope):
+                        approval_scopes.add(scope)
+        except (OSError, ValueError):
+            pass
+    remote_manifest_path = os.environ.get("LINUX_AGENT_REMOTE_MANIFEST", "")
+    if REMOTE_MODE and remote_manifest_path:
+        try:
+            manifest_path = Path(remote_manifest_path)
+            if (
+                not manifest_path.is_symlink()
+                and manifest_path.is_file()
+                and manifest_path.stat().st_size <= 1024 * 1024
+            ):
+                manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+                if isinstance(manifest, dict) and manifest.get("schema_version") == 2:
+                    for skill in manifest.get("skills", {}).values():
+                        if not isinstance(skill, dict):
+                            continue
+                        for ref in skill.get("refs", []):
+                            if not isinstance(ref, dict):
+                                continue
+                            scope = ref.get("approval_scope")
+                            if isinstance(scope, str) and APPROVAL_SCOPE_PATTERN.fullmatch(scope):
+                                approval_scopes.add(scope)
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            pass
+    for scope in approval_scopes:
+        auto_approvals.setdefault(scope, False)
     observer = config.get("observer") if isinstance(config.get("observer"), dict) else {}
     execution = config.get("execution") if isinstance(config.get("execution"), dict) else {}
     provider_resilience = config.get("provider_resilience") if isinstance(config.get("provider_resilience"), dict) else {}
@@ -408,15 +468,8 @@ def config_public_state():
                 "checkpoint_turns": int(agent_loop.get("checkpoint_turns", 0) or 0),
             },
             "approvals": {
-                "auto": {
-                    "skill_readonly": bool(auto_approvals.get("skill_readonly", True)),
-                    "shell_readonly": bool(auto_approvals.get("shell_readonly", False)),
-                    "file_match": bool(auto_approvals.get("file_match", True)),
-                    "file_patch": bool(auto_approvals.get("file_patch", False)),
-                    "file_download": bool(auto_approvals.get("file_download", False)),
-                    "local_analyze": bool(auto_approvals.get("local_analyze", True)),
-                    "remote_script": bool(auto_approvals.get("remote_script", False)),
-                }
+                "auto": dict(sorted(auto_approvals.items())),
+                "scope_catalog": sorted(approval_scopes),
             },
             "audit_mode": config.get("audit_mode", "safe_summary"),
             "audit_text_limit": config.get("audit_text_limit", 1000),
@@ -893,12 +946,41 @@ def json_response(handler, status, payload):
 
 
 def normalize_error_payload(payload, request_id=""):
+    code = str(payload.get("code") or payload.get("status") or "") if isinstance(payload, dict) else ""
+    component_spec = skill_component_error_spec(code)
+    if component_spec is not None:
+        normalized = dict(payload)
+        message = str(normalized.get("message") or normalized.get("error") or code)
+        normalized.update(
+            {
+                "ok": False,
+                "status": code,
+                "code": code,
+                "message": message,
+                "error": message,
+                "retryable": bool(component_spec["retryable"]),
+                "request_id": str(normalized.get("request_id") or request_id or ""),
+                "details": normalized.get("details")
+                if isinstance(normalized.get("details"), dict)
+                else {},
+            }
+        )
+        return normalized
     return DOMAIN_CONTRACT.normalize_error(payload, request_id)
+
+
+def skill_component_error_spec(code):
+    registry = globals().get("SKILL_WEB_COMPONENTS")
+    if registry is None or not callable(getattr(registry, "error_spec", None)):
+        return None
+    return registry.error_spec(code)
 
 
 def domain_error(code, message="", request_id="", details=None, **extra):
     codes = DOMAIN_SCHEMA.get("error_codes") if isinstance(DOMAIN_SCHEMA, dict) else {}
     spec = codes.get(code) if isinstance(codes, dict) else None
+    if not isinstance(spec, dict):
+        spec = skill_component_error_spec(code)
     payload = {
         "ok": False,
         "status": code,
@@ -917,6 +999,8 @@ def domain_error(code, message="", request_id="", details=None, **extra):
 def domain_error_http(code, default=HTTPStatus.INTERNAL_SERVER_ERROR):
     codes = DOMAIN_SCHEMA.get("error_codes") if isinstance(DOMAIN_SCHEMA, dict) else {}
     spec = codes.get(code) if isinstance(codes, dict) else None
+    if not isinstance(spec, dict):
+        spec = skill_component_error_spec(code)
     try:
         return HTTPStatus(int(spec.get("http"))) if isinstance(spec, dict) else default
     except (TypeError, ValueError):
@@ -1229,6 +1313,7 @@ def restore_web_agent_session(session_id):
                 return domain_error("persisted_turns_invalid", str(exc))
             except ValueError as exc:
                 return domain_error("invalid_session_id", str(exc))
+            SKILL_WEB_COMPONENTS.clear_secrets()
             result = SESSION_STORE.restore(session_id)
     if result.get("ok"):
         restored_session = result.get("session") if isinstance(result.get("session"), dict) else {}
@@ -1251,6 +1336,7 @@ def leave_web_agent_session():
                     "Cannot rotate a workspace while Jobs are active.",
                     active_jobs=active_jobs,
                 )
+            SKILL_WEB_COMPONENTS.clear_secrets()
             return SESSION_STORE.leave()
 
 
@@ -1278,11 +1364,15 @@ def write_policy_file(relative_path, content, password=""):
     return policy_service().write_file(relative_path, content, password)
 
 
-SKILL_SERVICE = SkillService(
-    SKILLS_ROOT,
-    manifest_validator=DOMAIN_CONTRACT.validate_skill_manifest,
-    user_skills_root=USER_SKILLS_ROOT,
-    require_manifest_file=True,
+SKILL_SERVICE = SkillService(SKILLS_ROOT, user_skills_root=USER_SKILLS_ROOT)
+SKILL_WEB_COMPONENTS = SkillWebRegistry(
+    SKILL_SERVICE,
+    remote_mode=REMOTE_MODE,
+    managed_execution=MANAGED_EXECUTION,
+    remote_manifest=os.environ.get("LINUX_AGENT_REMOTE_MANIFEST"),
+    materialize=lambda name: run_agent_api(
+        "skills", "materialize", {"skill": name}, timeout=120
+    ),
 )
 
 
@@ -1382,28 +1472,39 @@ def execution_service():
 
 
 def run_agent_api(resource, action="", payload=None, timeout=None, job_context=None, request_id=None):
-    if job_context is not None:
-        if not isinstance(job_context, JobSessionContext):
-            raise TypeError("job_context must be JobSessionContext")
-        return execution_service().run_job(
+    def execute():
+        if job_context is not None:
+            if not isinstance(job_context, JobSessionContext):
+                raise TypeError("job_context must be JobSessionContext")
+            return execution_service().run_job(
+                resource,
+                action,
+                payload,
+                context=job_context,
+                timeout=timeout,
+            )
+        effective_request_id = str(
+            request_id
+            or getattr(REQUEST_CONTEXT, "request_id", "")
+            or uuid.uuid4().hex
+        )
+        return execution_service().run_sync(
             resource,
             action,
             payload,
-            context=job_context,
             timeout=timeout,
+            request_id=effective_request_id,
         )
-    effective_request_id = str(
-        request_id
-        or getattr(REQUEST_CONTEXT, "request_id", "")
-        or uuid.uuid4().hex
+
+    lifecycle_operation = (
+        (resource == "skills" and action in {"install", "uninstall", "materialize"})
+        or (resource == "edit" and action == "apply")
     )
-    return execution_service().run_sync(
-        resource,
-        action,
-        payload,
-        timeout=timeout,
-        request_id=effective_request_id,
-    )
+    runtime_barrier = getattr(REQUEST_CONTEXT, "runtime_barrier", None)
+    if lifecycle_operation and runtime_barrier is not None:
+        with runtime_barrier.suspended():
+            return execute()
+    return execute()
 
 
 def job_input_text(payload):
@@ -1440,8 +1541,15 @@ def hold_runtime_shared(function):
 
     @wraps(function)
     def locked(*args, **kwargs):
-        with runtime_shared_lock(DATA_ROOT):
-            return function(*args, **kwargs)
+        with runtime_shared_lock(DATA_ROOT) as runtime_barrier:
+            REQUEST_CONTEXT.runtime_barrier = runtime_barrier
+            try:
+                return function(*args, **kwargs)
+            finally:
+                try:
+                    del REQUEST_CONTEXT.runtime_barrier
+                except AttributeError:
+                    pass
 
     return locked
 
@@ -1467,13 +1575,18 @@ def run_job(job_id, job, resource, action, payload, job_context):
         elif current.get("cancel_requested_at"):
             result = cancelled_job_result(current)
         else:
-            result = run_agent_api(
-                resource,
-                action,
-                payload,
-                timeout=JOB_TIMEOUT_SEC,
-                job_context=job_context,
-            )
+            if SKILL_WEB_COMPONENTS.handles_job(resource, action):
+                result = SKILL_WEB_COMPONENTS.run_job(
+                    resource, action, payload, job_id
+                )
+            else:
+                result = run_agent_api(
+                    resource,
+                    action,
+                    payload,
+                    timeout=JOB_TIMEOUT_SEC,
+                    job_context=job_context,
+                )
     except Exception as exc:  # noqa: BLE001 - persisted as a structured Job failure.
         result = {"ok": False, "status": "job_exception", "error": str(exc)}
 
@@ -1773,7 +1886,16 @@ def cancel_job(job_id, expected_version=None):
     if not updated.get("cancel_requested_at"):
         return {"ok": False, "status": "not_running", "job": updated}
 
-    execution_service().terminate(job_id)
+    if updated.get("status") == "running":
+        resource = str(updated.get("resource") or "")
+        action = str(updated.get("action") or "")
+        if SKILL_WEB_COMPONENTS.handles_job(resource, action):
+            try:
+                SKILL_WEB_COMPONENTS.cancel_job(resource, job_id)
+            except SkillWebComponentError:
+                pass
+        else:
+            execution_service().terminate(job_id)
 
     deadline = time.monotonic() + max(5.0, CANCEL_GRACE_SEC + 3.0)
     current = updated
@@ -1790,7 +1912,7 @@ def cancel_job(job_id, expected_version=None):
         return {"ok": False, "status": "not_running", "job": current}
     return domain_error(
         "job_cancellation_failed",
-        "The process was signalled but the Job did not reach a durable cancelled state in time.",
+        "Cancellation was requested but the Job did not reach a durable cancelled state in time.",
         job=current,
     )
 
@@ -1909,6 +2031,9 @@ class Handler(SimpleHTTPRequestHandler):
                 return
             self.handle_api_get(parsed.path)
             return
+        if parsed.path.startswith("/skill-assets/"):
+            self.serve_skill_asset(parsed.path)
+            return
         self.serve_static(parsed.path)
 
     @hold_runtime_shared
@@ -2018,7 +2143,56 @@ class Handler(SimpleHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
+    def serve_skill_asset(self, path):
+        parts = unquote(path).split("/", 3)
+        if len(parts) != 4 or not parts[2] or not parts[3]:
+            json_response(self, HTTPStatus.NOT_FOUND, {"ok": False, "status": "not_found"})
+            return
+        try:
+            target = SKILL_WEB_COMPONENTS.asset_path(parts[2], parts[3])
+        except SkillWebComponentError:
+            json_response(self, HTTPStatus.NOT_FOUND, {"ok": False, "status": "not_found"})
+            return
+        content_type = (
+            "application/javascript; charset=utf-8"
+            if target.suffix == ".js"
+            else "text/html; charset=utf-8"
+        )
+        data = target.read_bytes()
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.end_headers()
+        self.wfile.write(data)
+
     def handle_api_get(self, path):
+        if path == "/api/skill-components":
+            json_response(
+                self,
+                HTTPStatus.OK,
+                {
+                    "ok": True,
+                    "status": "listed",
+                    "components": SKILL_WEB_COMPONENTS.public_components(),
+                    "findings": SKILL_WEB_COMPONENTS.findings,
+                },
+            )
+            return
+        try:
+            component_result = SKILL_WEB_COMPONENTS.handle_web_action(
+                "GET", path, {}
+            )
+        except SkillWebComponentError as exc:
+            component_result = domain_error(exc.code, str(exc))
+        if component_result is not None:
+            status = HTTPStatus.OK if component_result.get("ok") else domain_error_http(
+                str(component_result.get("code") or component_result.get("status") or ""),
+                HTTPStatus.SERVICE_UNAVAILABLE,
+            )
+            json_response(self, status, component_result)
+            return
         if path == "/api/metrics":
             if not metrics_enabled():
                 json_domain_error(
@@ -2084,7 +2258,7 @@ class Handler(SimpleHTTPRequestHandler):
             except ValueError as exc:
                 json_domain_error(
                     self,
-                    "invalid_skill_manifest",
+                    "invalid_skill_package",
                     str(exc),
                     default=HTTPStatus.CONFLICT,
                 )
@@ -2113,6 +2287,8 @@ class Handler(SimpleHTTPRequestHandler):
             timeout=120,
             request_id=self.request_id,
         )
+        if path == "/api/skills/materialize" and result.get("ok") is True:
+            SKILL_WEB_COMPONENTS.reload()
         try:
             validate_agent_api_response(result, route[2])
         except DomainValidationError as exc:
@@ -2131,6 +2307,19 @@ class Handler(SimpleHTTPRequestHandler):
         json_response(self, HTTPStatus.OK, result)
 
     def handle_api_post(self, path, body):
+        try:
+            component_result = SKILL_WEB_COMPONENTS.handle_web_action(
+                "POST", path, body
+            )
+        except SkillWebComponentError as exc:
+            component_result = domain_error(exc.code, str(exc))
+        if component_result is not None:
+            status = HTTPStatus.OK if component_result.get("ok") else domain_error_http(
+                str(component_result.get("code") or component_result.get("status") or ""),
+                HTTPStatus.BAD_REQUEST,
+            )
+            json_response(self, status, component_result)
+            return
         sync_routes = {
             "/api/sense": ("sense", "get", "sense"),
             "/api/script/review": ("script", "review", "review"),
@@ -2424,10 +2613,23 @@ class Handler(SimpleHTTPRequestHandler):
                 ("doctor", "run"),
                 ("tools", "list"),
                 ("skills", "validate"),
-            }
+            }.union(SKILL_WEB_COMPONENTS.job_refs())
             if (resource, action) not in allowed:
                 json_response(self, HTTPStatus.BAD_REQUEST, {"ok": False, "status": "unsupported_job"})
                 return
+            if SKILL_WEB_COMPONENTS.handles_job(resource, action):
+                try:
+                    payload = SKILL_WEB_COMPONENTS.sanitize_job_payload(
+                        resource, action, payload
+                    )
+                except SkillWebComponentError as exc:
+                    result = domain_error(exc.code, str(exc))
+                    json_response(
+                        self,
+                        domain_error_http(exc.code, HTTPStatus.BAD_REQUEST),
+                        result,
+                    )
+                    return
             idempotency_key = str(
                 body.get("idempotency_key") or self.headers.get("Idempotency-Key") or ""
             ).strip()
@@ -2576,6 +2778,7 @@ def main():
     except KeyboardInterrupt:
         print("\n[信息] Web 控制台已停止。", file=sys.stderr, flush=True)
     finally:
+        SKILL_WEB_COMPONENTS.clear_secrets()
         if AUTH_TOKEN_EPHEMERAL:
             try:
                 EPHEMERAL_TOKEN_FILE.unlink()

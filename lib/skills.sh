@@ -2,9 +2,9 @@
 
 set -euo pipefail
 
-# Skill registry boundary: callers should use this file instead of reaching into
-# skills/ directly. A future manifest-backed resolver should preserve these
-# registration, content and execution semantics.
+# Skill registry boundary: callers use this file instead of reaching into
+# package directories directly. Resolution is backed by SKILL.md,
+# linux-agent.json, the builtin INDEX, and the signed Remote catalog.
 linux_agent_skills_dir() {
     local configured
     if [[ "${LINUX_AGENT_REMOTE_MODE:-0}" == "1" ]]; then
@@ -50,13 +50,17 @@ linux_agent_user_skills_dir() {
 }
 
 linux_agent_builtin_skill_name_reserved() {
-    local skill_name="$1" builtin_dir
+    local skill_name="$1"
     [[ "${skill_name}" =~ ^[a-z0-9][a-z0-9-]*$ ]] || return 1
-    builtin_dir="$(linux_agent_builtin_skills_dir)"
-    if [[ -e "${builtin_dir}/${skill_name}" || -L "${builtin_dir}/${skill_name}" ]]; then
+    if linux_agent_remote_mode_enabled &&
+        [[ -f "${LINUX_AGENT_REMOTE_MANIFEST:-}" && ! -L "${LINUX_AGENT_REMOTE_MANIFEST}" ]] &&
+        jq -e --arg skill "${skill_name}" \
+            '.schema_version == 2 and (.skills[$skill] | type) == "object"' \
+            "${LINUX_AGENT_REMOTE_MANIFEST}" >/dev/null 2>&1; then
         return 0
     fi
-    linux_agent_remote_mode_enabled && linux_agent_remote_skill_is_known "${skill_name}"
+    linux_agent_skill_catalog_json |
+        jq -e --arg skill "${skill_name}" 'any(.skills[]?; .name == $skill and .origin == "builtin")' >/dev/null
 }
 
 linux_agent_skill_package_dir() {
@@ -95,125 +99,228 @@ linux_agent_skill_package_origin() {
 }
 
 linux_agent_skill_package_names() {
-    local builtin_dir user_dir name
-    builtin_dir="$(linux_agent_builtin_skills_dir)"
-    user_dir="$(linux_agent_user_skills_dir)"
-    {
-        find "${builtin_dir}" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' 2>/dev/null || true
-        if [[ "${user_dir}" != "${builtin_dir}" ]]; then
-            find "${user_dir}" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' 2>/dev/null || true
-        fi
-    } | while IFS= read -r name; do
-        [[ "${name}" =~ ^[a-z0-9][a-z0-9-]*$ ]] && printf '%s\n' "${name}"
-    done | sort -u
-}
-
-linux_agent_skill_index_path_for_dir() {
-    local skill_dir="$1"
-    local root
-    root="$(dirname -- "${skill_dir}")"
-    printf '%s/INDEX.md\n' "${root}"
+    linux_agent_skill_catalog_json | jq -r '.skills[]?.name' | sort -u
 }
 
 linux_agent_skill_index_path() {
     printf '%s/INDEX.md\n' "$(linux_agent_builtin_skills_dir)"
 }
 
-linux_agent_user_skill_index_path() {
-    printf '%s/INDEX.md\n' "$(linux_agent_user_skills_dir)"
-}
-
 linux_agent_skill_index_text() {
-    local index_path user_index
+    local index_path
     index_path="$(linux_agent_skill_index_path)"
     [[ -f "${index_path}" ]] && cat "${index_path}"
-    user_index="$(linux_agent_user_skill_index_path)"
-    if [[ "${user_index}" != "${index_path}" && -f "${user_index}" ]]; then
-        cat "${user_index}"
+}
+
+linux_agent_skill_catalog_json() {
+    local builtin_dir user_dir result
+    builtin_dir="$(linux_agent_builtin_skills_dir)"
+    user_dir="$(linux_agent_user_skills_dir)"
+    result="$(python3 "${LINUX_AGENT_ROOT}/lib/skill_package.py" catalog "${builtin_dir}" --user-root "${user_dir}" 2>/dev/null || true)"
+    if ! jq -e 'type == "object" and (.skills | type == "array") and (.tools | type == "array")' <<<"${result}" >/dev/null 2>&1; then
+        jq -cn --arg root "${builtin_dir}" '{ok:true,status:"unavailable",skills:[],tools:[],findings:[{severity:"warning",code:"SKILL_RESOLVER_UNAVAILABLE",message:("Skill resolver could not read " + $root)}]}'
+        return 0
     fi
+    if linux_agent_remote_mode_enabled; then
+        result="$(jq -c --slurpfile release "${LINUX_AGENT_REMOTE_MANIFEST}" '
+            . as $catalog
+            | ($release[0].skills // {}) as $remote
+            | ([.skills[] | select(.origin == "builtin") | .name]) as $indexed
+            | ([$remote | keys[] | select(($indexed | index(.)) == null)]) as $remote_only
+            | ([.skills[] | select(
+                .origin == "user" and (($remote[.name] | type) == "object")
+              ) | .name]) as $reserved_conflicts
+            | .findings += (
+                [$reserved_conflicts[] | {
+                    severity:"warning",
+                    code:"SKILL_NAME_RESERVED",
+                    skill:.,
+                    message:"user Skill conflicts with a signed builtin name"
+                }]
+                + [$remote_only[] | {
+                    severity:"warning",
+                    code:"SKILL_INDEX_ENTRY_MISSING",
+                    skill:.,
+                    message:"signed builtin Skill is absent from the local INDEX"
+                }]
+              )
+            | .skills = ([
+                .skills[]
+                | . as $skill
+                | select(
+                    ($skill.origin != "user")
+                    or (($remote[$skill.name] | type) != "object")
+                  )
+                | if $skill.origin == "builtin"
+                    and $skill.state == "unavailable"
+                    and (($remote[$skill.name] | type) == "object")
+                  then .state = "available"
+                  else . end
+              ] + [
+                $remote_only[] as $name
+                | {
+                    name:$name,
+                    description:($remote[$name].description // ""),
+                    tools:[],
+                    origin:"builtin",
+                    state:"unavailable",
+                    category:($remote[$name].category // "custom")
+                  }
+              ])
+            | ([.skills[] | select(
+                .origin == "builtin" and .state == "available"
+              ) | .name]) as $available
+            | .tools = (
+                [.tools[] | select(
+                    (.origin != "user")
+                    or (($remote[.skill] | type) != "object")
+                  )] as $installed
+                | [
+                    $remote | to_entries[] as $skill
+                    | select(($available | index($skill.key)) != null)
+                    | $skill.value.refs[]? as $ref
+                    | select(([$installed[].ref] | index($ref.ref)) == null)
+                    | {
+                        ref:$ref.ref,
+                        skill:$skill.key,
+                        name:($ref.ref | split("/")[1]),
+                        description:$ref.description,
+                        risk:$ref.risk,
+                        approval_scope:($ref.approval_scope // ""),
+                        execution:{
+                            class:$ref.execution_class,
+                            capability:($ref.capability // ""),
+                            dispatch:($ref.dispatch // "always")
+                        },
+                        runtime_inputs:($ref.runtime_inputs // []),
+                        guards:($ref.guards // []),
+                        origin:"builtin",
+                        state:"available",
+                        category:($skill.value.category // "custom")
+                    }
+                  ] as $pending
+                | ($installed + $pending | sort_by(.ref))
+              )
+            | .status = "listed"
+        ' <<<"${result}")"
+    fi
+    printf '%s\n' "${result}"
 }
 
 linux_agent_skill_disclosure_candidates() {
     local request="${1:-}"
     local mode="${2:-work}"
-    local lowered skill_name
-    lowered="${request,,}"
+    local result
 
     case "${mode}" in
         work | work_revision | work_reflect | edit | edit_revision) ;;
         *) return 0 ;;
     esac
 
-    if [[ "${lowered}" =~ (磁盘|日志|cpu|内存|进程|服务|disk|log|resource|memory|process|service) ]]; then
-        printf 'ops-basic\n'
+    result="$(linux_agent_skill_catalog_json |
+        python3 "${LINUX_AGENT_ROOT}/lib/skill_package.py" discover-catalog - \
+            --request "${request}" 2>/dev/null || true)"
+    if jq -e 'type == "object" and (.candidates | type == "array")' <<<"${result}" >/dev/null 2>&1; then
+        jq -c '[.candidates[]? | {
+            name,
+            state:(.state // "unavailable"),
+            score:(.score // 0)
+        }]' <<<"${result}"
+    else
+        printf '[]\n'
     fi
-    if [[ "${lowered}" =~ (端口|连接|句柄|journal|系统快照|network|socket|port|connection|fd|snapshot) ]]; then
-        printf 'os-deep-inspect\n'
-    fi
-    if [[ "${lowered}" =~ (文件|补丁|下载|字面量|file|patch|download|replace) ]]; then
-        printf 'controlled-tools\n'
-    fi
-    if [[ "${lowered}" =~ (上一轮|历史会话|审计会话|session.history|last.command|previous.turn) ]]; then
-        printf 'session-history\n'
-    fi
-    if [[ "${lowered}" =~ (网络|网卡|路由|dns|端口扫描|防火墙|子网|network|route|firewall|subnet|traceroute|whois|snmp) ]]; then
-        printf 'network-ops-tools\n'
-    fi
-
-    while IFS= read -r skill_name; do
-        [[ -n "${skill_name}" ]] || continue
-        if [[ "${lowered}" == *"${skill_name}"* ]]; then
-            printf '%s\n' "${skill_name}"
-        fi
-    done < <(linux_agent_skill_index_text 2>/dev/null | sed -n 's/^##[[:space:]]\+//p' | sort -u)
 }
 
 linux_agent_skill_context_json() {
     local request="${1:-}"
     local mode="${2:-work}"
-    local disclosed='[]' unavailable='[]' candidates skill_name skill_md instructions relative_path total_count
+    local candidates unavailable total_count
 
     case "${mode}" in
         work | work_revision | work_reflect | edit | edit_revision) ;;
         *)
-            jq -cn '{enabled:false, disclosure:"not_available_in_mode", disclosed:[], unavailable:[]}'
+            jq -cn '{enabled:false, disclosure:"not_available_in_mode", candidates:[], loaded:[], unavailable:[]}'
             return 0
             ;;
     esac
 
-    candidates="$(linux_agent_skill_disclosure_candidates "${request}" "${mode}" | awk 'NF && !seen[$0]++')"
-    while IFS= read -r skill_name; do
-        [[ -n "${skill_name}" ]] || continue
-        skill_md="$(linux_agent_skill_package_dir "${skill_name}" 2>/dev/null || true)/SKILL.md"
-        if [[ ! -r "${skill_md}" ]]; then
-            unavailable="$(jq -cn --argjson prior "${unavailable}" --arg name "${skill_name}" '$prior + [$name]')"
-            continue
-        fi
-        instructions="$(linux_agent_sanitize_text "$(cat "${skill_md}")" 20000)"
-        relative_path="skills/${skill_name}/SKILL.md"
-        disclosed="$(jq -cn \
-            --argjson prior "${disclosed}" \
-            --arg name "${skill_name}" \
-            --arg relative_path "${relative_path}" \
-            --arg instructions "${instructions}" \
-            '$prior + [{name:$name, relative_path:$relative_path, materialization:"local_ready", instructions:$instructions}]')"
-    done <<<"${candidates}"
+    candidates="$(linux_agent_skill_disclosure_candidates "${request}" "${mode}")"
+    unavailable="$(jq -c '[.[] | select(
+        .state == "unavailable" or .state == "invalid" or .state == "incompatible"
+    ) | .name]' <<<"${candidates}")"
 
     total_count="$(linux_agent_skill_package_names | wc -l | tr -d ' ')"
     [[ "${total_count}" =~ ^[0-9]+$ ]] || total_count=0
     jq -cn \
-        --argjson disclosed "${disclosed}" \
+        --argjson candidates "${candidates}" \
         --argjson unavailable "${unavailable}" \
         --argjson total_count "${total_count}" \
         '{
             enabled:true,
-            disclosure:"triggered_instructions",
+            disclosure:"index_metadata_then_controlled_read",
             discovery_source:"skills/INDEX.md",
             total_skill_count:$total_count,
-            disclosed_count:($disclosed | length),
-            disclosed:$disclosed,
+            candidate_count:($candidates | length),
+            candidates:$candidates,
+            loaded_count:0,
+            loaded:[],
             unavailable:$unavailable
         }'
+}
+
+linux_agent_skill_disclosures_from_results() {
+    local results_json="${1:-[]}"
+    jq -c '
+        [
+            .[]?
+            | select(.result.ok == true)
+            | select(.step.executor_type == "skill_load" or .step.executor_type == "skill_read")
+            | .result.output
+            | select(type == "object")
+            | select((.skill | type) == "string" and (.path | type) == "string" and (.content | type) == "string")
+            | {
+                name:.skill,
+                path:.path,
+                kind:(if .path == "SKILL.md" then "instructions" else "reference" end),
+                content:.content,
+                relative_path:(.relative_path // null),
+                source_path:(.source_path // null)
+            }
+        ]
+        | group_by(.name + "\u0000" + .path)
+        | map(last)
+        | sort_by(.name, .path)
+    ' <<<"${results_json}" 2>/dev/null || printf '[]\n'
+}
+
+linux_agent_add_loaded_skill_context() {
+    local request_context="$1"
+    local disclosures="${2:-[]}"
+    if ! jq -e 'type == "array"' <<<"${disclosures}" >/dev/null 2>&1; then
+        disclosures='[]'
+    fi
+    jq -c --argjson loaded "${disclosures}" '
+        .skills = ((.skills // {}) + {
+            loaded_count:($loaded | length),
+            loaded:[
+                $loaded[]
+                | {
+                    name,
+                    path,
+                    kind,
+                    content,
+                    relative_path
+                }
+            ]
+        })
+    ' <<<"${request_context}"
+}
+
+linux_agent_skill_is_loaded() {
+    local skill_name="$1" disclosures="${2:-[]}"
+    jq -e --arg skill "${skill_name}" '
+        any(.[]?; .name == $skill and .path == "SKILL.md" and (.content | type) == "string")
+    ' <<<"${disclosures}" >/dev/null 2>&1
 }
 
 linux_agent_add_skill_context() {
@@ -325,6 +432,18 @@ linux_agent_remote_skill_result() {
     '
 }
 
+linux_agent_materialize_runtime_lock_release() {
+    local upgraded="$1"
+    if [[ "${upgraded}" == "true" ]]; then
+        linux_agent_runtime_lock_downgrade_shared || {
+            linux_agent_runtime_lock_release
+            return 1
+        }
+    else
+        linux_agent_runtime_lock_release
+    fi
+}
+
 linux_agent_remote_validate_archive() {
     local archive_path="$1" skill_name="$2"
     python3 - "${archive_path}" "${skill_name}" <<'PY'
@@ -367,13 +486,24 @@ PY
 
 linux_agent_materialize_skill() {
     local skill_name="$1"
+    local retain_runtime_lock="${2:-false}"
     local skills_dir target_skill lock_root lock_dir lock_acquired asset_name expected_sha expected_size max_size
     local release_base archive_path download_ok actual_size actual_sha stage_root staged_skill validation files marker_tmp
     local manifest_refs index_refs actual_refs observer_gate observer_subject audit_rc audit_payload rollback_ok
-    local audit_failure mutation_state user_dir
+    local expected_contract_digest actual_contract_digest expected_index_digest actual_index_digest
+    local expected_components actual_components
+    local audit_failure mutation_state user_dir runtime_lock_upgraded=false
 
     if ! linux_agent_remote_mode_enabled; then
         linux_agent_remote_skill_result false skill_package_invalid "${skill_name}" "当前不是 remote runtime。"
+        return 0
+    fi
+    if [[ "${retain_runtime_lock}" != "true" && "${retain_runtime_lock}" != "false" ]]; then
+        linux_agent_remote_skill_result false skill_package_invalid "${skill_name}" "Runtime lock retention mode is invalid."
+        return 0
+    fi
+    if [[ "${retain_runtime_lock}" == "true" && "${LINUX_AGENT_RUNTIME_LOCK_DEPTH:-0}" -gt 0 ]]; then
+        linux_agent_remote_skill_result false runtime_busy "${skill_name}" "调用方已持有 Runtime 锁，无法保留独占事务。"
         return 0
     fi
     if [[ ! "${skill_name}" =~ ^[a-z0-9][a-z0-9-]*$ ]] || ! linux_agent_remote_skill_is_known "${skill_name}"; then
@@ -387,6 +517,17 @@ linux_agent_materialize_skill() {
         return 0
     fi
     if linux_agent_remote_skill_ready "${skill_name}"; then
+        if [[ "${retain_runtime_lock}" == "true" ]]; then
+            if ! linux_agent_runtime_lock_exclusive_nonblocking; then
+                linux_agent_remote_skill_result false runtime_busy "${skill_name}" "Runtime 正在执行或变更，无法安装 Skill 组件。"
+                return 0
+            fi
+            if ! linux_agent_remote_skill_ready "${skill_name}"; then
+                linux_agent_runtime_lock_release
+                linux_agent_remote_skill_result false runtime_busy "${skill_name}" "Skill 在事务锁获取期间发生变化，请重试。"
+                return 0
+            fi
+        fi
         files="$(find "$(linux_agent_skills_dir)/${skill_name}" -type f ! -name .remote-verified.json -printf '%P\n' | sort | jq -R -s --arg skill "${skill_name}" 'split("\n") | map(select(length > 0) | "skills/" + $skill + "/" + .)')"
         linux_agent_remote_skill_result true skill_materialized "${skill_name}" "" "${files}"
         return 0
@@ -436,7 +577,7 @@ linux_agent_materialize_skill() {
             break
         fi
         if linux_agent_remote_skill_ready "${skill_name}"; then
-            linux_agent_materialize_skill "${skill_name}"
+            linux_agent_materialize_skill "${skill_name}" "${retain_runtime_lock}"
             return 0
         fi
         sleep 0.05
@@ -499,21 +640,43 @@ linux_agent_materialize_skill() {
     tar --no-same-owner --no-same-permissions -xzf "${archive_path}" -C "${stage_root}"
     staged_skill="${stage_root}/skills/${skill_name}"
     manifest_refs="$(jq -c --arg skill "${skill_name}" '[.skills[$skill].refs[].ref] | sort | unique' "${LINUX_AGENT_REMOTE_MANIFEST}")"
-    index_refs="$(linux_agent_index_declared_refs_at "$(linux_agent_skill_index_path)" |
-        sed 's/\.sh$//' |
-        awk -v prefix="${skill_name}/" 'index($0, prefix) == 1' |
-        jq -R -s -c 'split("\n") | map(select(length > 0)) | sort | unique')"
-    actual_refs="$(find "${staged_skill}/scripts" -maxdepth 1 -type f -name '*.sh' -printf '%f\n' 2>/dev/null |
-        sed 's/\.sh$//' |
-        awk -v prefix="${skill_name}/" '{print prefix $0}' |
-        jq -R -s -c 'split("\n") | map(select(length > 0)) | sort | unique')"
+    index_refs="$(python3 "${LINUX_AGENT_ROOT}/lib/skill_package.py" index \
+        "$(linux_agent_skill_index_path)" 2>/dev/null |
+        jq -c --arg skill "${skill_name}" \
+            '[.skills[]? | select(.name == $skill) | .tools[]?.ref] | sort | unique')"
+    actual_refs="$(jq -c --arg skill "${skill_name}" '[.tools[]? | $skill + "/" + .name] | sort | unique' \
+        "${staged_skill}/linux-agent.json" 2>/dev/null || printf '[]')"
     if [[ "${manifest_refs}" != "${index_refs}" ]] || [[ "${manifest_refs}" != "${actual_refs}" ]]; then
         rm -rf "${stage_root}" "${archive_path}"
         rmdir "${lock_dir}" 2>/dev/null || true
         linux_agent_remote_skill_result false skill_package_invalid "${skill_name}" "Skill 包、INDEX 与远程登记引用不一致。"
         return 0
     fi
-    validation="$(linux_agent_validate_skill_at "${skill_name}" "${staged_skill}" "$(linux_agent_skill_index_path)")"
+    expected_contract_digest="$(jq -r --arg skill "${skill_name}" '.skills[$skill].contract_digest // empty' "${LINUX_AGENT_REMOTE_MANIFEST}")"
+    actual_contract_digest="$(python3 "${LINUX_AGENT_ROOT}/lib/skill_package.py" digest "${staged_skill}" --origin builtin 2>/dev/null |
+        jq -r '.contract_digest // empty')"
+    expected_index_digest="$(jq -r --arg skill "${skill_name}" '.skills[$skill].index_section_digest // empty' "${LINUX_AGENT_REMOTE_MANIFEST}")"
+    actual_index_digest="$(python3 "${LINUX_AGENT_ROOT}/lib/skill_package.py" index "$(linux_agent_skill_index_path)" 2>/dev/null |
+        jq -r --arg skill "${skill_name}" '.skills[]? | select(.name == $skill) | .section_digest')"
+    if [[ ! "${expected_contract_digest}" =~ ^[0-9a-f]{64}$ || "${actual_contract_digest}" != "${expected_contract_digest}" ||
+        ! "${expected_index_digest}" =~ ^[0-9a-f]{64}$ || "${actual_index_digest}" != "${expected_index_digest}" ]]; then
+        rm -rf "${stage_root}" "${archive_path}"
+        rmdir "${lock_dir}" 2>/dev/null || true
+        linux_agent_remote_skill_result false skill_digest_mismatch "${skill_name}" "Skill contract 或 INDEX section 摘要不匹配。"
+        return 0
+    fi
+    expected_components="$(jq -Sc --arg skill "${skill_name}" '.skills[$skill].components // {}' \
+        "${LINUX_AGENT_REMOTE_MANIFEST}")"
+    actual_components="$(python3 "${LINUX_AGENT_ROOT}/lib/skill_package.py" inspect \
+        "${staged_skill}" --origin builtin 2>/dev/null | jq -Sc '.components // {}')"
+    if [[ "${actual_components}" != "${expected_components}" ]]; then
+        rm -rf "${stage_root}" "${archive_path}"
+        rmdir "${lock_dir}" 2>/dev/null || true
+        linux_agent_remote_skill_result false skill_package_invalid "${skill_name}" "Skill 组件契约与签名远程登记不一致。"
+        return 0
+    fi
+    validation="$(python3 "${LINUX_AGENT_ROOT}/lib/skill_package.py" validate \
+        "${staged_skill}" --origin builtin 2>/dev/null || true)"
     if [[ "$(jq -r '.ok // false' <<<"${validation}")" != "true" ]]; then
         rm -rf "${stage_root}" "${archive_path}"
         rmdir "${lock_dir}" 2>/dev/null || true
@@ -566,10 +729,26 @@ linux_agent_materialize_skill() {
     jq -cn --arg skill "${skill_name}" --arg sha256 "${actual_sha}" --arg version "$(jq -r '.version' "${LINUX_AGENT_REMOTE_MANIFEST}")" \
         '{skill:$skill, sha256:$sha256, release_version:$version}' >"${marker_tmp}"
     mv "${marker_tmp}" "${staged_skill}/.remote-verified.json"
+    if [[ "${LINUX_AGENT_RUNTIME_LOCK_DEPTH:-0}" -gt 0 ]]; then
+        if linux_agent_runtime_lock_upgrade_exclusive_nonblocking; then
+            runtime_lock_upgraded=true
+        else
+            rm -rf "${stage_root}" "${archive_path}"
+            rmdir "${lock_dir}" 2>/dev/null || true
+            linux_agent_remote_skill_result false runtime_busy "${skill_name}" "Runtime 正在执行或变更，无法提交 Skill。"
+            return 0
+        fi
+    elif ! linux_agent_runtime_lock_exclusive_nonblocking; then
+        rm -rf "${stage_root}" "${archive_path}"
+        rmdir "${lock_dir}" 2>/dev/null || true
+        linux_agent_remote_skill_result false runtime_busy "${skill_name}" "Runtime 正在执行或变更，无法提交 Skill。"
+        return 0
+    fi
     # Re-read the server-side gate immediately before the materializing rename;
     # a package may have been reviewed while an administrator disabled Web
     # sensitive edits in the meantime.
     if ! linux_agent_web_sensitive_edits_enabled; then
+        linux_agent_materialize_runtime_lock_release "${runtime_lock_upgraded}" || true
         rm -rf "${stage_root}" "${archive_path}"
         rmdir "${lock_dir}" 2>/dev/null || true
         linux_agent_sensitive_edits_disabled_result
@@ -577,6 +756,7 @@ linux_agent_materialize_skill() {
     fi
     if ! mv -nT -- "${staged_skill}" "${target_skill}" ||
         [[ -e "${staged_skill}" || -L "${staged_skill}" ]]; then
+        linux_agent_materialize_runtime_lock_release "${runtime_lock_upgraded}" || true
         rm -rf "${stage_root}" "${archive_path}"
         rmdir "${lock_dir}" 2>/dev/null || true
         linux_agent_remote_skill_result false skill_package_invalid "${skill_name}" "Skill 目标目录在原子提交时已被占用。"
@@ -589,6 +769,7 @@ linux_agent_materialize_skill() {
         else
             rollback_ok=false
         fi
+        linux_agent_materialize_runtime_lock_release "${runtime_lock_upgraded}" || true
         rm -rf "${stage_root}" "${archive_path}"
         rmdir "${lock_dir}" 2>/dev/null || true
         if [[ "${rollback_ok}" != "true" ]]; then
@@ -614,6 +795,7 @@ linux_agent_materialize_skill() {
             rm -rf "${stage_root}" "${archive_path}"
             rmdir "${lock_dir}" 2>/dev/null || true
             if [[ "${rollback_ok}" == "true" ]]; then
+                linux_agent_materialize_runtime_lock_release "${runtime_lock_upgraded}" || true
                 linux_agent_audit_failure_result "${audit_rc}" "skill_materialized"
                 return 0
             fi
@@ -623,6 +805,7 @@ linux_agent_materialize_skill() {
                 mutation_state="rollback_unconfirmed"
             fi
             audit_failure="$(linux_agent_audit_failure_result "${audit_rc}" "skill_materialized")"
+            linux_agent_materialize_runtime_lock_release "${runtime_lock_upgraded}" || true
             jq -c \
                 --arg skill "${skill_name}" \
                 --arg mutation_state "${mutation_state}" \
@@ -632,6 +815,13 @@ linux_agent_materialize_skill() {
                 <<<"${audit_failure}"
             return 0
         fi
+    fi
+    if [[ "${retain_runtime_lock}" != "true" ]] &&
+        ! linux_agent_materialize_runtime_lock_release "${runtime_lock_upgraded}"; then
+        rm -rf "${stage_root}" "${archive_path}"
+        rmdir "${lock_dir}" 2>/dev/null || true
+        linux_agent_remote_skill_result false runtime_busy "${skill_name}" "Skill 已提交，但无法恢复执行共享锁。"
+        return 0
     fi
     rm -rf "${stage_root}" "${archive_path}"
     rmdir "${lock_dir}" 2>/dev/null || true
@@ -676,116 +866,43 @@ linux_agent_skill_script_name_from_ref() {
 
 linux_agent_skill_script_path() {
     local ref="$1"
-    local skill_name script_name package_dir
+    local skill_name package_dir entrypoint
     skill_name="$(linux_agent_skill_name_from_ref "${ref}")"
-    script_name="$(linux_agent_skill_script_name_from_ref "${ref}")"
     package_dir="$(linux_agent_skill_package_dir "${skill_name}")" || return $?
-    printf '%s/scripts/%s\n' "${package_dir}" "${script_name}"
-}
-
-linux_agent_skill_manifest_path() {
-    local skill_name="$1"
-    local package_dir
-    package_dir="$(linux_agent_skill_package_dir "${skill_name}")" || return $?
-    printf '%s/SKILL.md\n' "${package_dir}"
+    entrypoint="$(python3 "${LINUX_AGENT_ROOT}/lib/skill_package.py" tool "${package_dir}" "${ref%.sh}" \
+        --origin "$(linux_agent_skill_package_origin "${skill_name}")" 2>/dev/null |
+        jq -r '.tool.entrypoint // empty')"
+    [[ -n "${entrypoint}" ]] || return 1
+    printf '%s/%s\n' "${package_dir}" "${entrypoint}"
 }
 
 linux_agent_skill_metadata_path() {
     local skill_name="$1"
     local package_dir
     package_dir="$(linux_agent_skill_package_dir "${skill_name}")" || return $?
-    printf '%s/manifest.json\n' "${package_dir}"
+    printf '%s/linux-agent.json\n' "${package_dir}"
 }
 
 linux_agent_skill_is_registered() {
     local ref="$1"
-    local skill_name script_name skill_md index_path script_path package_dir metadata_path origin
+    local skill_name script_path package_dir origin
     linux_agent_skill_ref_is_valid "${ref}" || return 1
     skill_name="$(linux_agent_skill_name_from_ref "${ref}")"
     if linux_agent_remote_builtin_pending "${skill_name}"; then
         linux_agent_remote_ref_is_registered "${ref}"
         return $?
     fi
-    script_name="$(linux_agent_skill_script_name_from_ref "${ref}")"
     package_dir="$(linux_agent_skill_package_dir "${skill_name}")" || return 1
-    skill_md="${package_dir}/SKILL.md"
-    metadata_path="${package_dir}/manifest.json"
-    index_path="$(linux_agent_skill_index_path_for_dir "${package_dir}")"
-    script_path="${package_dir}/scripts/${script_name}"
-
-    [[ -f "${skill_md}" && ! -L "${skill_md}" && -f "${metadata_path}" && ! -L "${metadata_path}" &&
-        -f "${index_path}" && ! -L "${index_path}" && -f "${script_path}" && ! -L "${script_path}" ]] || return 1
-    grep -Eq "(^|[^a-z0-9-])${skill_name}/${script_name%.sh}(\.sh)?([^a-z0-9-]|$)" "${index_path}" || return 1
     origin="$(linux_agent_skill_package_origin "${skill_name}")" || return 1
-    linux_agent_skill_manifest_contract_valid "${metadata_path}" "${skill_name}" "${script_name}" "${origin}" || return 1
-}
-
-linux_agent_skill_is_registered_at() {
-    local ref="$1"
-    local skill_md="$2"
-    local index_path="$3"
-    local skill_name script_name script_path metadata_path origin package_dir
-    linux_agent_skill_ref_is_valid "${ref}" || return 1
-    skill_name="$(linux_agent_skill_name_from_ref "${ref}")"
-    script_name="$(linux_agent_skill_script_name_from_ref "${ref}")"
-    script_path="$(dirname "${skill_md}")/scripts/${script_name}"
-    metadata_path="$(dirname "${skill_md}")/manifest.json"
-
-    [[ -f "${skill_md}" && -f "${metadata_path}" && -f "${index_path}" && -f "${script_path}" ]] || return 1
-    grep -Eq "(^|[^a-z0-9-])${skill_name}/${script_name%.sh}(\.sh)?([^a-z0-9-]|$)" "${index_path}" || return 1
-    package_dir="$(dirname "${metadata_path}")"
-    origin="builtin"
-    if [[ "${package_dir}" == "$(linux_agent_user_skills_dir)"/* ]]; then
-        origin="user"
+    python3 "${LINUX_AGENT_ROOT}/lib/skill_package.py" tool "${package_dir}" "${ref%.sh}" --origin "${origin}" >/dev/null 2>&1 || return 1
+    if [[ "${origin}" == "builtin" ]]; then
+        linux_agent_skill_catalog_json |
+            jq -e --arg ref "${ref%.sh}" \
+                'any(.tools[]?; .ref == $ref and .origin == "builtin" and .state == "installed")' \
+                >/dev/null || return 1
     fi
-    linux_agent_skill_manifest_contract_valid "${metadata_path}" "${skill_name}" "${script_name}" "${origin}" || return 1
-}
-
-linux_agent_skill_manifest_contract_valid() {
-    local metadata_path="$1" skill_name="$2" script_name="$3" origin="${4:-builtin}"
-    local package_dir actual_names declared_names
-    [[ -f "${metadata_path}" && ! -L "${metadata_path}" ]] || return 1
-    package_dir="$(dirname "${metadata_path}")"
-    [[ -d "${package_dir}/scripts" && ! -L "${package_dir}/scripts" ]] || return 1
-    declared_names="$(jq -c '[.scripts[].name] | sort' "${metadata_path}" 2>/dev/null || true)"
-    actual_names="$(find "${package_dir}/scripts" -maxdepth 1 -type f -name '*.sh' -printf '%f\n' 2>/dev/null | sort | jq -c -R -s 'split("\n") | map(select(length > 0))')"
-    [[ -n "${declared_names}" && "${declared_names}" == "${actual_names}" ]] || return 1
-    jq -e \
-        --arg skill "${skill_name}" \
-        --arg script "${script_name}" \
-        --arg origin "${origin}" '
-        type == "object" and .schema_version == 1 and .name == $skill
-        and (.description | type == "string" and length > 0)
-        and (.scripts | type == "array" and length > 0)
-        and all(.scripts[]; . as $entry
-            | ($entry.name | type == "string" and test("^[a-z0-9][a-z0-9-]*\\.sh$"))
-            and ($entry.risk | type == "string" and (["low","medium","high","critical"] | index(.)) != null)
-            and ($entry.execution_class | type == "string" and (["runner","host_helper"] | index(.)) != null)
-            and ($entry.capability | type == "string")
-            and (($entry.execution_class == "runner" and $entry.capability == "") or
-                 ($entry.execution_class == "host_helper" and (["firewall.apply","hosts.apply"] | index($entry.capability)) != null))
-        )
-        and ([.scripts[] | select(.name == $script)] | length == 1)
-        and (if $origin == "user" then all(.scripts[]; .execution_class == "runner" and .capability == "")
-             elif $skill == "network-ops-tools" then
-                all(.scripts[];
-                    if .name == "firewall.sh" then .execution_class == "host_helper" and .capability == "firewall.apply"
-                    elif .name == "hosts-file-editor.sh" then .execution_class == "host_helper" and .capability == "hosts.apply"
-                    else .execution_class == "runner" and .capability == ""
-                    end)
-             else all(.scripts[]; .execution_class == "runner" and .capability == "")
-             end)
-    ' "${metadata_path}" >/dev/null 2>&1
-}
-
-linux_agent_skill_manifest_declared_script_names_at() {
-    local skill_md="$1"
-    [[ -f "${skill_md}" ]] || return 0
-
-    grep -oE '`scripts/[a-z0-9][a-z0-9-]*\.sh`' "${skill_md}" 2>/dev/null |
-        tr -d '`' |
-        sed 's#^scripts/##' |
-        sort -u
+    script_path="$(linux_agent_skill_script_path "${ref}")" || return 1
+    [[ -f "${script_path}" && ! -L "${script_path}" ]]
 }
 
 linux_agent_risk_is_valid() {
@@ -805,7 +922,7 @@ linux_agent_skill_declared_risk_at() {
         printf 'critical\n'
         return 0
     }
-    risk="$(jq -r --arg script "${script_name}" '[.scripts[]? | select(.name == $script) | .risk][0] // empty' "${metadata_path}" 2>/dev/null || true)"
+    risk="$(jq -r --arg script "${script_name%.sh}" '[.tools[]? | select(.name == $script) | .risk][0] // empty' "${metadata_path}" 2>/dev/null || true)"
     if linux_agent_risk_is_valid "${risk}"; then
         printf '%s\n' "${risk}"
     else
@@ -829,7 +946,32 @@ linux_agent_skill_declared_risk() {
     linux_agent_skill_declared_risk_at "${ref}" "${metadata_path}"
 }
 
-linux_agent_skill_manifest_field() {
+linux_agent_skill_effective_risk() {
+    local ref="$1" arguments_json="${2:-}" metadata_path skill_name tool_name dynamic
+    [[ -n "${arguments_json}" ]] || arguments_json='{}'
+    skill_name="$(linux_agent_skill_name_from_ref "${ref}")"
+    tool_name="$(linux_agent_skill_script_name_from_ref "${ref}")"
+    metadata_path="$(linux_agent_skill_metadata_path "${skill_name}" 2>/dev/null || true)"
+    if [[ -f "${metadata_path}" && ! -L "${metadata_path}" ]] && jq -e 'type == "object"' <<<"${arguments_json}" >/dev/null 2>&1; then
+        dynamic="$(jq -nr \
+            --slurpfile extension "${metadata_path}" \
+            --arg tool "${tool_name%.sh}" \
+            --argjson arguments "${arguments_json}" '
+            [$extension[0].tools[]? | select(.name == $tool) | .guards[]?
+                | select(.type == "risk_by_value")][0] as $guard
+            | if ($guard | type) != "object" then empty
+              else ($arguments[$guard.field] // "") as $value
+              | ($guard.values[($value | tostring | ascii_downcase)] // $guard.default // empty)
+              end' 2>/dev/null || true)"
+        if linux_agent_risk_is_valid "${dynamic}"; then
+            printf '%s\n' "${dynamic}"
+            return 0
+        fi
+    fi
+    linux_agent_skill_declared_risk "${ref}"
+}
+
+linux_agent_skill_extension_field() {
     local ref="$1" field="$2" fallback="$3"
     local skill_name script_name metadata_path
     linux_agent_skill_ref_is_valid "${ref}" || {
@@ -849,17 +991,58 @@ linux_agent_skill_manifest_field() {
         printf '%s\n' "${fallback}"
         return 0
     }
-    jq -r --arg script "${script_name}" --arg field "${field}" --arg fallback "${fallback}" \
-        '[.scripts[]? | select(.name == $script) | .[$field]][0] // $fallback' \
+    jq -r --arg script "${script_name%.sh}" --arg field "${field}" --arg fallback "${fallback}" \
+        '[.tools[]? | select(.name == $script) |
+            if $field == "execution_class" then .execution.class
+            elif $field == "capability" then .execution.capability
+            elif $field == "dispatch" then .execution.dispatch
+            elif $field == "approval_scope" then .approval_scope
+            else .[$field] end][0] // $fallback' \
         "${metadata_path}" 2>/dev/null || printf '%s\n' "${fallback}"
 }
 
-linux_agent_skill_execution_class() {
-    linux_agent_skill_manifest_field "$1" execution_class invalid
+linux_agent_skill_tool_contract_json() {
+    local ref="$1" skill_name package origin result
+    skill_name="$(linux_agent_skill_name_from_ref "${ref}")"
+    package="$(linux_agent_skill_package_dir "${skill_name}" 2>/dev/null || true)"
+    origin="$(linux_agent_skill_package_origin "${skill_name}" 2>/dev/null || true)"
+    [[ -n "${package}" && -n "${origin}" ]] || {
+        jq -cn --arg ref "${ref%.sh}" '{ok:false,status:"unavailable",ref:$ref,error:"Skill package is unavailable"}'
+        return 0
+    }
+    result="$(python3 "${LINUX_AGENT_ROOT}/lib/skill_package.py" tool "${package}" "${ref%.sh}" --origin "${origin}" 2>/dev/null || true)"
+    if ! jq -e '.ok == true and (.tool | type == "object")' <<<"${result}" >/dev/null 2>&1; then
+        jq -cn --arg ref "${ref%.sh}" '{ok:false,status:"invalid",ref:$ref,error:"Skill tool contract is invalid"}'
+        return 0
+    fi
+    printf '%s\n' "${result}"
 }
 
-linux_agent_skill_capability() {
-    linux_agent_skill_manifest_field "$1" capability invalid
+linux_agent_skill_guard_json() {
+    local ref="$1" guard_type="$2" skill_name contract
+    linux_agent_skill_ref_is_valid "${ref}" || return 1
+    skill_name="$(linux_agent_skill_name_from_ref "${ref}")"
+    if linux_agent_remote_builtin_pending "${skill_name}"; then
+        jq -c --arg ref "${ref%.sh}" --arg type "${guard_type}" '
+            [.skills[].refs[]? | select(.ref == $ref) | .guards[]?
+             | select(.type == $type)][0] | select(type == "object")
+        ' "${LINUX_AGENT_REMOTE_MANIFEST}" 2>/dev/null
+        return $?
+    fi
+    contract="$(linux_agent_skill_tool_contract_json "${ref}")"
+    jq -c --arg type "${guard_type}" '
+        [.tool.guards[]? | select(.type == $type)][0]
+        | select(type == "object")
+    ' <<<"${contract}" 2>/dev/null
+}
+
+linux_agent_skill_adapter_path() {
+    local ref="$1" contract package adapter
+    contract="$(linux_agent_skill_tool_contract_json "${ref}")"
+    package="$(jq -r '.package // empty' <<<"${contract}")"
+    adapter="$(jq -r '.tool.execution.adapter // empty' <<<"${contract}")"
+    [[ -n "${package}" && -n "${adapter}" ]] || return 1
+    printf '%s/%s\n' "${package}" "${adapter}"
 }
 
 linux_agent_filter_builtin_skill_review() {
@@ -917,8 +1100,10 @@ linux_agent_filter_builtin_skill_review() {
 linux_agent_review_with_declared_skill_risk() {
     local ref="$1"
     local review_json="$2"
+    local arguments_json="${3:-}"
     local declared_risk severity action
-    declared_risk="$(linux_agent_skill_declared_risk "${ref}")"
+    [[ -n "${arguments_json}" ]] || arguments_json='{}'
+    declared_risk="$(linux_agent_skill_effective_risk "${ref}" "${arguments_json}")"
     if [[ "${declared_risk}" == "low" ]]; then
         printf '%s\n' "${review_json}"
         return 0
@@ -958,15 +1143,6 @@ linux_agent_review_with_declared_skill_risk() {
     ' <<<"${review_json}"
 }
 
-linux_agent_index_declared_refs_at() {
-    local index_path="$1"
-    [[ -f "${index_path}" ]] || return 0
-
-    grep -oE '`[a-z0-9][a-z0-9-]*/[a-z0-9][a-z0-9-]*(\.sh)?`' "${index_path}" 2>/dev/null |
-        tr -d '`' |
-        sort -u
-}
-
 linux_agent_skill_script_content() {
     local ref="$1"
     local script_path
@@ -976,233 +1152,388 @@ linux_agent_skill_script_content() {
     cat "${script_path}"
 }
 
-linux_agent_run_skill_script() {
-    local ref="$1"
-    local arguments_json="${2:-}"
-    local script_path
-    [[ -z "${arguments_json}" ]] && arguments_json='{}'
-
-    if ! arguments_json="$(linux_agent_normalize_json_object_argument "${arguments_json}")"; then
-        jq -cn --arg ref "${ref}" '{ok:false, error:"skill script arguments must be a JSON object", ref:$ref}'
-        return 1
-    fi
-
-    if ! linux_agent_skill_is_registered "${ref}"; then
-        jq -cn --arg ref "${ref}" '{ok:false, error:"skill script is not registered", ref:$ref}'
-        return 1
-    fi
-
-    linux_agent_ensure_skill_materialized "${ref}" || {
-        jq -cn --arg ref "${ref}" '{ok:false, error:"skill package could not be materialized", ref:$ref}'
-        return 1
-    }
-    script_path="$(linux_agent_skill_script_path "${ref}")"
-    if [[ ! -r "${script_path}" ]]; then
-        jq -cn --arg ref "${ref}" '{ok:false, error:"skill script is not readable", ref:$ref}'
-        return 1
-    fi
-
-    bash "${script_path}" "${arguments_json}"
+linux_agent_skills_list() {
+    linux_agent_skill_catalog_json
 }
 
-linux_agent_validate_skill_at() {
-    local skill_name="$1"
-    local skill_dir="$2"
-    local index_path="$3"
-    local origin="${4:-builtin}"
-    local ok findings skill_md metadata_path manifest_validity
-    ok="true"
-    findings='[]'
-    skill_md="${skill_dir}/SKILL.md"
-    metadata_path="${skill_dir}/manifest.json"
+linux_agent_managed_skill_component_command() {
+    local action="$1" package="$2" purge="${3:-false}"
+    local state="${LINUX_AGENT_INSTALL_PREFIX}/.install-state.json"
+    local ledger="${LINUX_AGENT_DATA_DIR}/skill-components.json"
+    local service_user service_group credential_user credential_group
+    local unit_dir="${LINUX_AGENT_SYSTEMD_UNIT_DIR:-/etc/systemd/system}"
+    local host_policy="${LINUX_AGENT_HOST_OPS_POLICY_PATH:-/etc/linux-agent/host-ops-policy.json}"
+    local -a command=()
+    [[ -f "${state}" && ! -L "${state}" ]] || {
+        jq -cn '{ok:false,status:"invalid_install_state",code:"invalid_install_state",error:"Managed install state is unavailable"}'
+        return 1
+    }
+    service_user="$(jq -er '.service_user' "${state}")" || return 1
+    service_group="$(id -gn "${service_user}" 2>/dev/null || true)"
+    [[ -n "${service_group}" ]] || {
+        jq -cn '{ok:false,status:"invalid_install_state",code:"invalid_install_state",error:"Managed service group is unavailable"}'
+        return 1
+    }
+    credential_user="$(jq -r '.credential_user // ""' "${state}")"
+    credential_group="$(id -gn "${credential_user}" 2>/dev/null || true)"
+    [[ -n "${credential_user}" && -n "${credential_group}" ]] || {
+        credential_user="linux-agent-credential"
+        credential_group="linux-agent-credential"
+    }
+    command=(python3 "${LINUX_AGENT_ROOT}/lib/skill_component_runtime.py" "${action}"
+        "${package}" --ledger "${ledger}" --prefix "${LINUX_AGENT_INSTALL_PREFIX}"
+        --unit-dir "${unit_dir}" --host-policy "${host_policy}"
+        --web-user "${service_user}" --web-group "${service_group}"
+        --credential-user "${credential_user}" --credential-group "${credential_group}")
+    linux_agent_managed_execution_enabled && command+=(--systemd)
+    if [[ "${purge}" == "true" ]]; then
+        command+=(--purge --confirm PURGE_SKILL_DATA)
+    fi
+    "${command[@]}"
+}
 
-    if [[ ! "${skill_name}" =~ ^[a-z0-9][a-z0-9-]*$ ]]; then
-        ok="false"
-        findings="$(jq -cn --argjson prior "${findings}" --arg skill "${skill_name}" '$prior + [{severity:"critical", code:"SKILL_NAME_INVALID", skill:$skill, message:"skill 目录名非法。"}]')"
+linux_agent_skill_read() {
+    local skill_name="$1" relative_path="${2:-SKILL.md}" package origin result
+    [[ "${skill_name}" =~ ^[a-z0-9][a-z0-9-]*$ ]] || {
+        jq -cn '{ok:false,status:"invalid_path",code:"invalid_path",error:"Skill name is invalid"}'
+        return 0
+    }
+    if linux_agent_remote_builtin_pending "${skill_name}"; then
+        result="$(linux_agent_materialize_skill "${skill_name}")"
+        if [[ "$(jq -r '.ok // false' <<<"${result}")" != "true" ]]; then
+            printf '%s\n' "${result}"
+            return 0
+        fi
     fi
-    if [[ ! -f "${skill_md}" ]] || ! sed -n '1,20p' "${skill_md}" | grep -Eq '^name:[[:space:]]*'; then
-        ok="false"
-        findings="$(jq -cn --argjson prior "${findings}" --arg skill "${skill_name}" '$prior + [{severity:"critical", code:"SKILL_MANIFEST_INVALID", skill:$skill, message:"SKILL.md 缺少 name frontmatter。"}]')"
+    package="$(linux_agent_skill_package_dir "${skill_name}" 2>/dev/null || true)"
+    origin="$(linux_agent_skill_package_origin "${skill_name}" 2>/dev/null || true)"
+    if [[ -z "${package}" || -z "${origin}" ]]; then
+        jq -cn --arg skill "${skill_name}" '{ok:false,status:"not_found",code:"not_found",skill:$skill,error:"Skill is not installed"}'
+        return 0
     fi
-    if [[ ! -f "${skill_md}" ]] || ! sed -n '1,30p' "${skill_md}" | grep -Eq '^description:[[:space:]]*'; then
-        ok="false"
-        findings="$(jq -cn --argjson prior "${findings}" --arg skill "${skill_name}" '$prior + [{severity:"critical", code:"SKILL_DESCRIPTION_MISSING", skill:$skill, message:"SKILL.md 缺少 description frontmatter。"}]')"
+    if ! linux_agent_runtime_lock_shared; then
+        jq -cn '{ok:false,status:"runtime_busy",code:"runtime_busy",error:"Runtime is being changed"}'
+        return 0
     fi
-    if [[ ! -f "${metadata_path}" || -L "${metadata_path}" ]]; then
-        ok="false"
-        findings="$(jq -cn --argjson prior "${findings}" --arg skill "${skill_name}" '$prior + [{severity:"critical", code:"SKILL_METADATA_MISSING", skill:$skill, message:"Skill 必须提供 manifest.json。"}]')"
-    else
-        manifest_validity="$(
-            jq -e --arg skill "${skill_name}" '
-            type == "object" and .schema_version == 1 and .name == $skill
-            and (.description | type == "string" and length > 0)
-            and (.scripts | type == "array" and length > 0)
-            and all(.scripts[]; . as $script
-                | ($script.name | type == "string" and test("^[a-z0-9][a-z0-9-]*\\.sh$"))
-                and ($script.risk | type == "string")
-                and (["low","medium","high","critical"] | index($script.risk)) != null
-                and ($script.execution_class | type == "string")
-                and (["runner","host_helper"] | index($script.execution_class)) != null
-                and ($script.capability | type == "string")
-                and (($script.execution_class == "runner" and $script.capability == "") or
-                     ($script.execution_class == "host_helper" and (["firewall.apply","hosts.apply"] | index($script.capability)) != null))
-            )
-        ' "${metadata_path}" >/dev/null 2>&1
-            printf '%s' "$?"
-        )"
-        if [[ "${manifest_validity}" != "0" ]]; then
-            ok="false"
-            findings="$(jq -cn --argjson prior "${findings}" --arg skill "${skill_name}" '$prior + [{severity:"critical", code:"SKILL_METADATA_INVALID", skill:$skill, message:"manifest.json 字段或执行类非法。"}]')"
-        else
-            local declared_names actual_names
-            declared_names="$(jq -c '[.scripts[].name] | sort' "${metadata_path}")"
-            actual_names="$(find "${skill_dir}/scripts" -maxdepth 1 -type f -name '*.sh' -printf '%f\n' 2>/dev/null | sort | jq -c -R -s 'split("\n") | map(select(length > 0))')"
-            if [[ "${declared_names}" != "${actual_names}" ]]; then
-                ok="false"
-                findings="$(jq -cn --argjson prior "${findings}" --arg skill "${skill_name}" '$prior + [{severity:"critical", code:"SKILL_METADATA_SCRIPT_MISMATCH", skill:$skill, message:"manifest.json 与 scripts/ 文件集合不一致。"}]')"
+    result="$(python3 "${LINUX_AGENT_ROOT}/lib/skill_lifecycle.py" read "${package}" \
+        --root "$(dirname "${package}")" --origin "${origin}" --path "${relative_path}" 2>/dev/null || true)"
+    linux_agent_runtime_lock_release
+    printf '%s\n' "${result}"
+}
+
+linux_agent_skill_install() {
+    local scope="$1" subject="$2" result component_result package result_file
+    local manifest_path saved_remote_mode saved_manifest saved_base saved_skills_dir
+    case "${scope}" in
+        user)
+            if ! linux_agent_runtime_lock_exclusive_nonblocking; then
+                jq -cn '{ok:false,status:"runtime_busy",code:"runtime_busy",error:"Runtime is executing or being changed"}'
+                return 0
             fi
-            if [[ "${origin}" == "user" ]] && jq -e 'any(.scripts[]; .execution_class != "runner" or .capability != "")' "${metadata_path}" >/dev/null 2>&1; then
-                ok="false"
-                findings="$(jq -cn --argjson prior "${findings}" --arg skill "${skill_name}" '$prior + [{severity:"critical", code:"USER_SKILL_PRIVILEGED_CLASS", skill:$skill, message:"用户 Skill 只能使用 runner 且 capability 为空。"}]')"
-            fi
-            if [[ "${origin}" == "builtin" ]]; then
-                if jq -e --arg skill "${skill_name}" '
-                    any(.scripts[];
-                        if $skill == "network-ops-tools" and .name == "firewall.sh" then
-                            .execution_class != "host_helper" or .capability != "firewall.apply"
-                        elif $skill == "network-ops-tools" and .name == "hosts-file-editor.sh" then
-                            .execution_class != "host_helper" or .capability != "hosts.apply"
-                        else
-                            .execution_class == "host_helper" or .capability != ""
-                        end
-                    )
-                ' "${metadata_path}" >/dev/null 2>&1; then
-                    ok="false"
-                    findings="$(jq -cn --argjson prior "${findings}" --arg skill "${skill_name}" '$prior + [{severity:"critical", code:"BUILTIN_HELPER_CLASS_INVALID", skill:$skill, message:"特权内置 Skill 的 helper capability 不符合固定登记。"}]')"
+            result="$(python3 "${LINUX_AGENT_ROOT}/lib/skill_lifecycle.py" install "${subject}" \
+                --root "$(linux_agent_user_skills_dir)" --origin user --index "$(linux_agent_skill_index_path)" 2>/dev/null || true)"
+            linux_agent_runtime_lock_release
+            printf '%s\n' "${result}"
+            ;;
+        builtin)
+            if linux_agent_remote_mode_enabled; then
+                result="$(linux_agent_materialize_skill "${subject}")"
+                if [[ "$(jq -r '.ok // false' <<<"${result}" 2>/dev/null || printf false)" == "true" ]]; then
+                    jq -c '.materialization_status = .status | .status = "installed" | .scope = "builtin"' \
+                        <<<"${result}"
+                else
+                    printf '%s\n' "${result}"
                 fi
+                return 0
             fi
+            if ! linux_agent_managed_mode_enabled; then
+                jq -cn '{ok:false,status:"unsupported",code:"unsupported",error:"builtin install is available only in Remote or Managed mode"}'
+                return 0
+            fi
+            if [[ "${EUID}" -ne 0 ]]; then
+                jq -cn '{ok:false,status:"forbidden",code:"forbidden",error:"Managed builtin Skill installation requires administrator privileges"}'
+                return 0
+            fi
+            manifest_path="${LINUX_AGENT_INSTALL_PREFIX}/release-manifest.json"
+            if [[ ! -f "${manifest_path}" || -L "${manifest_path}" ]]; then
+                jq -cn '{ok:false,status:"skill_package_unavailable",code:"skill_package_unavailable",error:"signed release manifest is unavailable"}'
+                return 0
+            fi
+            saved_remote_mode="${LINUX_AGENT_REMOTE_MODE:-0}"
+            saved_manifest="${LINUX_AGENT_REMOTE_MANIFEST:-}"
+            saved_base="${LINUX_AGENT_REMOTE_RELEASE_BASE:-}"
+            saved_skills_dir="${LINUX_AGENT_SKILLS_DIR:-}"
+            LINUX_AGENT_REMOTE_MODE=1
+            LINUX_AGENT_REMOTE_MANIFEST="${manifest_path}"
+            LINUX_AGENT_REMOTE_RELEASE_BASE="${LINUX_AGENT_MANAGED_RELEASE_BASE:-https://github.com/libeal/ASSIstant/releases/download/$(jq -r '.version' "${manifest_path}")}"
+            LINUX_AGENT_SKILLS_DIR="$(linux_agent_builtin_skills_dir)"
+            result_file="$(mktemp "${LINUX_AGENT_TMP_ROOT}/managed-skill-install.XXXXXX")" || {
+                LINUX_AGENT_REMOTE_MODE="${saved_remote_mode}"
+                LINUX_AGENT_REMOTE_MANIFEST="${saved_manifest}"
+                LINUX_AGENT_REMOTE_RELEASE_BASE="${saved_base}"
+                LINUX_AGENT_SKILLS_DIR="${saved_skills_dir}"
+                jq -cn '{ok:false,status:"skill_package_unavailable",code:"skill_package_unavailable",error:"cannot create managed Skill transaction result file"}'
+                return 0
+            }
+            if linux_agent_materialize_skill "${subject}" true >"${result_file}"; then
+                result="$(<"${result_file}")"
+            else
+                result='{"ok":false,"status":"skill_package_unavailable","code":"skill_package_unavailable","error":"managed Skill materialization failed"}'
+            fi
+            rm -f -- "${result_file}"
+            LINUX_AGENT_REMOTE_MODE="${saved_remote_mode}"
+            LINUX_AGENT_REMOTE_MANIFEST="${saved_manifest}"
+            LINUX_AGENT_REMOTE_RELEASE_BASE="${saved_base}"
+            LINUX_AGENT_SKILLS_DIR="${saved_skills_dir}"
+            if [[ "$(jq -r '.ok // false' <<<"${result}")" != "true" ]]; then
+                linux_agent_runtime_lock_release
+                printf '%s\n' "${result}"
+                return 0
+            fi
+            result="$(jq -c '.materialization_status = .status | .status = "installed" | .scope = "builtin"' \
+                <<<"${result}")"
+            package="$(linux_agent_builtin_skills_dir)/${subject}"
+            component_result="$(linux_agent_managed_skill_component_command install "${package}" 2>/dev/null || true)"
+            if [[ "$(jq -r '.ok // false' <<<"${component_result}" 2>/dev/null || printf false)" != "true" ]]; then
+                python3 "${LINUX_AGENT_ROOT}/lib/skill_lifecycle.py" uninstall "${subject}" \
+                    --root "$(linux_agent_builtin_skills_dir)" --origin builtin >/dev/null 2>&1 || true
+                linux_agent_runtime_lock_release
+                jq -cn --arg skill "${subject}" \
+                    --arg error "$(jq -r '.error // "component installation failed"' <<<"${component_result:-\{\}}" 2>/dev/null || printf 'component installation failed')" \
+                    '{ok:false,status:"skill_component_install_failed",code:"skill_component_install_failed",skill:$skill,error:$error}'
+                return 0
+            fi
+            linux_agent_runtime_lock_release
+            jq -cn --argjson package_result "${result}" --argjson components "${component_result}" \
+                '$package_result + {components:$components}'
+            ;;
+        *)
+            jq -cn '{ok:false,status:"invalid_action",code:"invalid_action",error:"scope must be user or builtin"}'
+            ;;
+    esac
+}
+
+linux_agent_skill_uninstall() {
+    local scope="$1" skill_name="$2" purge="${3:-false}" confirm="${4:-}"
+    local root origin result component_result package managed_components=false
+    local package_removed=false web_restart_required=false
+    if [[ "${purge}" == "true" && "${confirm}" != "PURGE_SKILL_DATA" ]]; then
+        jq -cn '{ok:false,status:"invalid_action",code:"invalid_action",error:"purge requires confirm=PURGE_SKILL_DATA"}'
+        return 0
+    fi
+    case "${scope}" in
+        user)
+            root="$(linux_agent_user_skills_dir)"
+            origin=user
+            ;;
+        builtin)
+            if ! linux_agent_remote_mode_enabled && ! linux_agent_managed_mode_enabled; then
+                jq -cn '{ok:false,status:"unsupported",code:"unsupported",error:"builtin uninstall is available only in Remote or Managed mode"}'
+                return 0
+            fi
+            if linux_agent_managed_mode_enabled && [[ "${EUID}" -ne 0 ]]; then
+                jq -cn '{ok:false,status:"forbidden",code:"forbidden",error:"Managed builtin Skill removal requires administrator privileges"}'
+                return 0
+            fi
+            root="$(linux_agent_builtin_skills_dir)"
+            origin=builtin
+            linux_agent_managed_mode_enabled && managed_components=true
+            ;;
+        *)
+            jq -cn '{ok:false,status:"invalid_action",code:"invalid_action",error:"scope must be user or builtin"}'
+            return 0
+            ;;
+    esac
+    if ! linux_agent_runtime_lock_exclusive_nonblocking; then
+        jq -cn '{ok:false,status:"runtime_busy",code:"runtime_busy",error:"Runtime is executing or being changed"}'
+        return 0
+    fi
+    package="${root}/${skill_name}"
+    component_result='{"ok":true,"result":{"purged_paths":[]}}'
+    if [[ "${managed_components}" == "true" ]]; then
+        component_result="$(linux_agent_managed_skill_component_command uninstall \
+            "${package}" false 2>/dev/null || true)"
+        if [[ "$(jq -r '.ok // false' <<<"${component_result}" 2>/dev/null || printf false)" != "true" ]]; then
+            linux_agent_runtime_lock_release
+            jq -cn --arg skill "${skill_name}" \
+                --arg error "$(jq -r '.error // "component removal failed"' <<<"${component_result:-\{\}}" 2>/dev/null || printf 'component removal failed')" \
+                '{ok:false,status:"skill_component_uninstall_failed",code:"skill_component_uninstall_failed",skill:$skill,error:$error}'
+            return 0
+        fi
+        web_restart_required="$(jq -r '.web_restart_required // false' <<<"${component_result}")"
+    fi
+    local -a command=(python3 "${LINUX_AGENT_ROOT}/lib/skill_lifecycle.py" uninstall "${skill_name}" --root "${root}" --origin "${origin}")
+    result="$("${command[@]}" 2>/dev/null || true)"
+    if [[ "$(jq -r '.ok // false' <<<"${result}" 2>/dev/null || printf false)" == "true" ]]; then
+        package_removed=true
+    fi
+    if [[ "${managed_components}" == "true" &&
+        "$(jq -r '.ok // false' <<<"${result}" 2>/dev/null || printf false)" != "true" ]]; then
+        linux_agent_managed_skill_component_command install "${package}" >/dev/null 2>&1 || true
+    fi
+    if [[ "${managed_components}" == "true" && "${purge}" == "true" &&
+        "$(jq -r '.ok // false' <<<"${result}" 2>/dev/null || printf false)" == "true" ]]; then
+        component_result="$(linux_agent_managed_skill_component_command uninstall \
+            "${package}" true 2>/dev/null || true)"
+        if [[ "$(jq -r '.ok // false' <<<"${component_result}" 2>/dev/null || printf false)" != "true" ]]; then
+            result="$(jq -cn --arg skill "${skill_name}" \
+                --arg error "$(jq -r '.error // "owned data purge failed"' <<<"${component_result:-\{\}}" 2>/dev/null || printf 'owned data purge failed')" \
+                '{ok:false,status:"skill_component_uninstall_failed",code:"skill_component_uninstall_failed",skill:$skill,error:$error,package_removed:true}')"
         fi
     fi
-    if [[ ! -f "${skill_md}" ]] || ! grep -Eq '^## .*(传参|参数契约|参数规范|[Aa]rguments|[Pp]arameters)' "${skill_md}"; then
-        ok="false"
-        findings="$(jq -cn --argjson prior "${findings}" --arg skill "${skill_name}" '$prior + [{severity:"critical", code:"SKILL_ARGUMENT_CONTRACT_MISSING", skill:$skill, message:"SKILL.md 缺少参数类型、必填性、默认值和约束说明。"}]')"
+    if [[ "${managed_components}" == "true" && "${package_removed}" == "true" &&
+        "${web_restart_required}" == "true" ]] &&
+        ! systemctl try-restart linux-agent-web.service >/dev/null 2>&1; then
+        if [[ "$(jq -r '.ok // false' <<<"${result}" 2>/dev/null || printf false)" == "true" ]]; then
+            result="$(jq -cn --arg skill "${skill_name}" \
+                '{ok:false,status:"skill_web_restart_failed",code:"skill_web_restart_failed",skill:$skill,error:"Skill was removed, but Web could not reload the installed package set",package_removed:true}')"
+        else
+            result="$(jq -c '.web_restart_failed = true
+                | .error = ((.error // "Skill removal failed") + "; Web could not reload the installed package set")' \
+                <<<"${result}")"
+        fi
     fi
+    linux_agent_runtime_lock_release
+    if [[ "$(jq -r '.ok // false' <<<"${result}" 2>/dev/null || printf false)" == "true" ]]; then
+        jq -cn --argjson result "${result}" --argjson components "${component_result}" \
+            --argjson purge "${purge}" '
+            $result
+            + {
+                purged:$purge,
+                purged_paths:($components.purged_paths // $components.result.purged_paths // []),
+                cleanup_pending:(
+                    ($result.cleanup_pending // [])
+                    + ($components.cleanup_pending // $components.result.cleanup_pending // [])
+                )
+            }
+            + {components:$components}'
+    else
+        printf '%s\n' "${result}"
+    fi
+}
 
-    while IFS= read -r script_path; do
-        [[ -z "${script_path}" ]] && continue
-        local script_name ref review
-        script_name="$(basename "${script_path}")"
-        ref="${skill_name}/${script_name%.sh}"
-        if ! linux_agent_skill_is_registered_at "${ref}" "${skill_md}" "${index_path}"; then
-            ok="false"
-            findings="$(jq -cn --argjson prior "${findings}" --arg ref "${ref}" '$prior + [{severity:"critical", code:"SKILL_SCRIPT_UNREGISTERED", ref:$ref, message:"脚本未在 INDEX.md 和 SKILL.md 中登记。"}]')"
-        fi
-        review="$(linux_agent_policy_review_text "skill:${ref}" "$(cat "${script_path}")")"
-        if [[ "$(jq -r '.approved' <<<"${review}")" != "true" ]]; then
-            ok="false"
-            findings="$(jq -cn --argjson prior "${findings}" --argjson review "${review}" '$prior + ($review.findings // [])')"
-        fi
-    done < <(find "${skill_dir}/scripts" -maxdepth 1 -type f -name '*.sh' 2>/dev/null | sort)
-
-    while IFS= read -r declared_script; do
-        [[ -n "${declared_script}" ]] || continue
-        if [[ ! -f "${skill_dir}/scripts/${declared_script}" ]]; then
-            ok="false"
-            findings="$(jq -cn \
-                --argjson prior "${findings}" \
-                --arg ref "${skill_name}/${declared_script%.sh}" \
-                '$prior + [{severity:"critical", code:"SKILL_SCRIPT_FILE_MISSING", ref:$ref, message:"脚本已在 SKILL.md 中声明，但 scripts/ 下不存在对应文件。"}]')"
-        fi
-    done < <(linux_agent_skill_manifest_declared_script_names_at "${skill_md}")
-
-    jq -cn --argjson ok "${ok}" --arg skill "${skill_name}" --arg skill_dir "${skill_dir}" --arg index_path "${index_path}" --argjson findings "${findings}" \
-        '{ok:$ok, skill:$skill, skill_dir:$skill_dir, index_path:$index_path, findings:$findings}'
+linux_agent_credential_admin() {
+    local admin_name="$1" action="$2"
+    shift 2 || true
+    local registry match package component egress_dropin admin entrypoint command_contract
+    local environment_name environment_value resolved_value credential_group
+    local expected_operands activate_systemd result exit_status
+    local -a command=(env "PYTHONPATH=${LINUX_AGENT_ROOT}/lib")
+    [[ "${admin_name}" =~ ^[a-z0-9][a-z0-9-]*$ &&
+        "${action}" =~ ^[a-z0-9][a-z0-9-]*$ ]] || {
+        jq -cn '{ok:false,status:"invalid_action",code:"invalid_action",error:"Credential component or action is invalid"}'
+        return 0
+    }
+    if ! linux_agent_runtime_lock_exclusive_nonblocking; then
+        jq -cn '{ok:false,status:"runtime_busy",code:"runtime_busy",error:"Runtime is executing or being changed"}'
+        return 0
+    fi
+    registry="$(python3 "${LINUX_AGENT_ROOT}/lib/skill_package.py" validate-root \
+        "$(linux_agent_builtin_skills_dir)" 2>/dev/null || true)"
+    match="$(jq -c --arg name "${admin_name}" '[
+        .skills[]?
+        | select(.state == "installed" and .components.credential_helper.admin.name == $name)
+        | {
+            package:.name,
+            component:.components.credential_helper.name,
+            egress_dropin:(.components.credential_helper.egress_dropin // ""),
+            admin:.components.credential_helper.admin
+        }
+    ]' <<<"${registry}" 2>/dev/null || printf '[]')"
+    if [[ "$(jq -r 'length' <<<"${match}")" -ne 1 ]]; then
+        linux_agent_runtime_lock_release
+        jq -cn --arg name "${admin_name}" \
+            '{ok:false,status:"not_found",code:"not_found",component:$name,error:"Credential component is unavailable or ambiguous"}'
+        return 0
+    fi
+    package="$(jq -r '.[0].package' <<<"${match}")"
+    component="$(jq -r '.[0].component' <<<"${match}")"
+    egress_dropin="$(jq -r '.[0].egress_dropin' <<<"${match}")"
+    admin="$(jq -c '.[0].admin' <<<"${match}")"
+    command_contract="$(jq -c --arg action "${action}" '[.commands[] | select(.name == $action)]' \
+        <<<"${admin}")"
+    if [[ "$(jq -r 'length' <<<"${command_contract}")" -ne 1 ]]; then
+        linux_agent_runtime_lock_release
+        jq -cn --arg action "${action}" \
+            '{ok:false,status:"invalid_action",code:"invalid_action",action:$action,error:"Credential action is not declared"}'
+        return 0
+    fi
+    expected_operands="$(jq -r '.[0].operands' <<<"${command_contract}")"
+    if [[ "$#" -ne "${expected_operands}" ]]; then
+        linux_agent_runtime_lock_release
+        jq -cn --arg action "${action}" --argjson expected "${expected_operands}" \
+            '{ok:false,status:"invalid_action",code:"invalid_action",action:$action,expected_operands:$expected,error:"Credential action operand count is invalid"}'
+        return 0
+    fi
+    entrypoint="$(jq -r '.entrypoint' <<<"${admin}")"
+    credential_group="${LINUX_AGENT_CREDENTIAL_GROUP:-linux-agent-credential}"
+    while IFS=$'\t' read -r environment_name environment_value; do
+        [[ -n "${environment_name}" ]] || continue
+        case "${environment_value}" in
+            credential_group) resolved_value="${credential_group}" ;;
+            component_egress_dropin)
+                [[ -n "${egress_dropin}" ]] || {
+                    linux_agent_runtime_lock_release
+                    jq -cn '{ok:false,status:"invalid_contract",code:"invalid_contract",error:"Credential egress contract is incomplete"}'
+                    return 0
+                }
+                resolved_value="${LINUX_AGENT_SYSTEMD_UNIT_DIR:-/etc/systemd/system}/linux-agent-${component}.service.d/${egress_dropin}"
+                ;;
+            *)
+                linux_agent_runtime_lock_release
+                jq -cn '{ok:false,status:"invalid_contract",code:"invalid_contract",error:"Credential environment contract is invalid"}'
+                return 0
+                ;;
+        esac
+        command+=("${environment_name}=${resolved_value}")
+    done < <(jq -r '.environment | to_entries[] | [.key, .value] | @tsv' <<<"${admin}")
+    command+=(python3 "$(linux_agent_builtin_skills_dir)/${package}/${entrypoint}" "${action}" "$@")
+    activate_systemd="$(jq -r '.[0].activate_systemd' <<<"${command_contract}")"
+    if [[ "${activate_systemd}" == "true" ]] && linux_agent_managed_execution_enabled; then
+        command+=(--activate-systemd)
+    fi
+    exit_status=0
+    result="$("${command[@]}")" || exit_status=$?
+    linux_agent_runtime_lock_release
+    printf '%s\n' "${result}"
+    return "${exit_status}"
 }
 
 linux_agent_validate_skills() {
-    local skills_dir index_path ok findings builtin_dir user_dir skill_name skill_dir skill_result origin
-    ok="true"
-    findings='[]'
-
-    skills_dir="$(linux_agent_skills_dir)"
-    builtin_dir="$(linux_agent_builtin_skills_dir)"
-    user_dir="$(linux_agent_user_skills_dir)"
-    index_path="$(linux_agent_skill_index_path)"
-
-    if [[ ! -f "${index_path}" ]]; then
-        ok="false"
-        findings="$(jq -cn --argjson prior "${findings}" '$prior + [{severity:"critical", code:"SKILL_INDEX_MISSING", message:"skills/INDEX.md 不存在。"}]')"
+    local catalog findings ok status skills tools
+    catalog="$(linux_agent_skill_catalog_json)"
+    findings="$(jq -c '.findings // []' <<<"${catalog}")"
+    ok="$(jq -r '.ok // true' <<<"${catalog}")"
+    skills="$(jq -c '.skills // []' <<<"${catalog}")"
+    tools="$(jq -c '.tools // []' <<<"${catalog}")"
+    status="validated"
+    if jq -e 'any(.[]?;
+        .code == "SKILL_INDEX_INVALID"
+        or .code == "SKILL_RESOLVER_UNAVAILABLE"
+    )' <<<"${findings}" >/dev/null; then
+        status="unavailable"
     fi
-
-    if linux_agent_remote_mode_enabled; then
-        if ! jq -e '.schema_version == 1 and (.skills | type == "object")' "${LINUX_AGENT_REMOTE_MANIFEST}" >/dev/null 2>&1; then
-            ok="false"
-            findings="$(jq -cn --argjson prior "${findings}" '$prior + [{severity:"critical", code:"REMOTE_SKILL_MANIFEST_INVALID", message:"远程 Skill manifest 非法。"}]')"
-        fi
-        while IFS= read -r ref; do
-            [[ -n "${ref}" ]] || continue
-            if ! linux_agent_remote_ref_is_registered "${ref}"; then
-                ok="false"
-                findings="$(jq -cn --argjson prior "${findings}" --arg ref "${ref%.sh}" '$prior + [{severity:"critical", code:"REMOTE_SKILL_INDEX_MISMATCH", ref:$ref, message:"INDEX.md 与远程 Skill manifest 不一致。"}]')"
-            fi
-        done < <(linux_agent_index_declared_refs_at "${index_path}")
-    fi
-
-    while IFS= read -r skill_name; do
-        [[ -z "${skill_name}" ]] && continue
-        skill_dir="$(linux_agent_skill_package_dir "${skill_name}" 2>/dev/null || true)"
-        [[ -n "${skill_dir}" ]] || {
-            ok="false"
-            findings="$(jq -cn --argjson prior "${findings}" --arg skill "${skill_name}" '$prior + [{severity:"critical", code:"SKILL_PACKAGE_CONFLICT", skill:$skill, message:"用户 Skill 不能覆盖同名内置 Skill 或使用非法目录。"}]')"
-            continue
-        }
-        origin="$(linux_agent_skill_package_origin "${skill_name}" 2>/dev/null || printf 'unknown')"
-        index_path="$(linux_agent_skill_index_path_for_dir "${skill_dir}")"
-        skill_result="$(linux_agent_validate_skill_at "${skill_name}" "${skill_dir}" "${index_path}" "${origin}")"
-        if [[ "$(jq -r '.ok // false' <<<"${skill_result}")" != "true" ]]; then
-            ok="false"
-            findings="$(jq -cn --argjson prior "${findings}" --argjson next "$(jq '.findings' <<<"${skill_result}")" '$prior + $next')"
-        fi
-    done < <(linux_agent_skill_package_names)
-
-    if linux_agent_remote_mode_enabled; then
-        index_path="$(linux_agent_user_skill_index_path)"
-        if [[ -f "${index_path}" && ! -L "${index_path}" ]]; then
-            while IFS= read -r ref; do
-                [[ -n "${ref}" ]] || continue
-                skill_name="${ref%%/*}"
-                if [[ "$(linux_agent_skill_package_origin "${skill_name}" 2>/dev/null || true)" != "user" ]] ||
-                    ! linux_agent_skill_is_registered "${ref}"; then
-                    ok="false"
-                    findings="$(jq -cn \
-                        --argjson prior "${findings}" \
-                        --arg ref "${ref%.sh}" \
-                        '$prior + [{severity:"critical", code:"SKILL_INDEX_BROKEN_REF", ref:$ref, message:"用户 Skill INDEX.md 引用了缺失、冲突或非用户脚本。"}]')"
-                fi
-            done < <(linux_agent_index_declared_refs_at "${index_path}")
-        fi
-        jq -cn --argjson ok "${ok}" --arg skills_dir "${skills_dir}" --argjson remote true --argjson findings "${findings}" \
-            '{ok:$ok, skills_dir:$skills_dir, remote:$remote, findings:$findings}'
-        return 0
-    fi
-
-    while IFS= read -r index_path; do
-        [[ -f "${index_path}" ]] || continue
-        while IFS= read -r ref; do
-            [[ -n "${ref}" ]] || continue
-            if ! linux_agent_skill_is_registered "${ref}"; then
-                ok="false"
-                findings="$(jq -cn \
-                    --argjson prior "${findings}" \
-                    --arg ref "${ref%.sh}" \
-                    '$prior + [{severity:"critical", code:"SKILL_INDEX_BROKEN_REF", ref:$ref, message:"INDEX.md 中声明的脚本缺少对应文件或 manifest 登记。"}]')"
-            fi
-        done < <(linux_agent_index_declared_refs_at "${index_path}")
-    done < <(printf '%s\n%s\n' "$(linux_agent_skill_index_path)" "$(linux_agent_user_skill_index_path)" | sort -u)
-
-    jq -cn --argjson ok "${ok}" --arg skills_dir "${skills_dir}" \
-        --arg builtin_dir "${builtin_dir}" --arg user_dir "${user_dir}" \
+    jq -cn \
+        --argjson ok "${ok}" \
+        --arg status "${status}" \
+        --arg skills_dir "$(linux_agent_skills_dir)" \
+        --arg builtin_dir "$(linux_agent_builtin_skills_dir)" \
+        --arg user_dir "$(linux_agent_user_skills_dir)" \
         --argjson managed "$(linux_agent_managed_mode_enabled && printf true || printf false)" \
+        --argjson remote "$(linux_agent_remote_mode_enabled && printf true || printf false)" \
+        --argjson skills "${skills}" \
+        --argjson tools "${tools}" \
         --argjson findings "${findings}" \
-        '{ok:$ok, skills_dir:$skills_dir, builtin_skills_dir:$builtin_dir, user_skills_dir:$user_dir, managed:$managed, findings:$findings}'
+        '{
+            ok:$ok,
+            status:$status,
+            skills_dir:$skills_dir,
+            builtin_skills_dir:$builtin_dir,
+            user_skills_dir:$user_dir,
+            managed:$managed,
+            remote:$remote,
+            skills:$skills,
+            tools:$tools,
+            findings:$findings
+        }'
 }

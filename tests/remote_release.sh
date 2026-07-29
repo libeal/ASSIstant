@@ -14,9 +14,37 @@ trap cleanup EXIT
 
 first="${tmp_root}/first"
 second="${tmp_root}/second"
+zero_source="${tmp_root}/zero-source"
+zero_release="${tmp_root}/zero-release"
 
 SOURCE_DATE_EPOCH=0 bash "${ROOT_DIR}/scripts/build-remote-release.sh" v0.0.0-test "${first}"
 SOURCE_DATE_EPOCH=0 bash "${ROOT_DIR}/scripts/build-remote-release.sh" v0.0.0-test "${second}"
+
+# Build from an isolated source snapshot with only the project-level INDEX.
+# This proves that a release does not require at least one Skill package.
+mkdir -p "${zero_source}"
+for source_entry in bin config lib mcp packaging policies prompts remote schema scripts web; do
+    cp -a "${ROOT_DIR}/${source_entry}" "${zero_source}/${source_entry}"
+done
+mkdir -p "${zero_source}/skills"
+printf '# Skill catalog\n' >"${zero_source}/skills/INDEX.md"
+SOURCE_DATE_EPOCH=0 bash "${zero_source}/scripts/build-remote-release.sh" \
+    v0.0.0-zero-skills "${zero_release}"
+
+jq -e '
+    .schema_version == 2
+    and .version == "v0.0.0-zero-skills"
+    and .core_contents.builtin_skill_index == true
+    and .core_contents.builtin_skill_packages == false
+    and .skills == {}
+' "${zero_release}/release-manifest.json" >/dev/null
+zero_core_listing="$(tar -tzf "${zero_release}/linux-agent-core.tar.gz")"
+grep -qx 'skills/INDEX.md' <<<"${zero_core_listing}"
+if find "${zero_release}" -maxdepth 1 -type f -name 'linux-agent-skill-*.tar.gz' -print -quit |
+    grep -q .; then
+    printf 'zero-Skill release unexpectedly contains a Skill archive\n' >&2
+    exit 1
+fi
 
 required_assets=(
     linux-agent-cli.sh
@@ -37,7 +65,7 @@ done
 ! grep -q 'release-manifest.json' "${first}/SHA256SUMS"
 
 jq -e '
-    .schema_version == 1
+    .schema_version == 2
     and .version == "v0.0.0-test"
     and .repository == "libeal/ASSIstant"
     and (.assets.bootstrap_cli.name == "linux-agent-cli.sh")
@@ -47,9 +75,14 @@ jq -e '
     and (.assets.installer.name == "linux-agent-install.sh")
     and (.assets.sbom.name == "sbom.spdx.json")
     and (.assets.checksums.name == "SHA256SUMS")
-    and ([.skills | keys[]] | length > 0)
-    and ([.skills[] | select((.refs | length) == 0)] | length == 0)
+    and .core_contents.builtin_skill_index == true
+    and .core_contents.builtin_skill_packages == false
+    and (.skills | type == "object")
+    and ([.skills[] | select((.refs | type) != "array")] | length == 0)
     and ([.skills[] | select((.description | length) == 0 or (.risk | IN("low", "medium", "high", "critical") | not))] | length == 0)
+    and ([.skills[] | select((.contract_digest | test("^[0-9a-f]{64}$") | not))] | length == 0)
+    and ([.skills[] | select((.index_section_digest | test("^[0-9a-f]{64}$") | not))] | length == 0)
+    and ([.skills[] | select((.components | type) != "object")] | length == 0)
 ' "${first}/release-manifest.json" >/dev/null
 
 registered_assets="$(jq -r '[.assets[].name, .skills[].asset.name] | sort | .[]' "${first}/release-manifest.json")"
@@ -111,13 +144,16 @@ while IFS= read -r skill_name; do
     [[ -f "${first}/${asset}" ]]
     skill_listing="$(tar -tzf "${first}/${asset}")"
     grep -qx "skills/${skill_name}/SKILL.md" <<<"${skill_listing}"
+    grep -qx "skills/${skill_name}/linux-agent.json" <<<"${skill_listing}"
+    ! grep -qx "skills/${skill_name}/manifest.json" <<<"${skill_listing}"
     grep -q "^skills/${skill_name}/scripts/" <<<"${skill_listing}"
     skill_extract="${tmp_root}/extract-${skill_name}"
     mkdir -p "${skill_extract}"
     tar -xzf "${first}/${asset}" -C "${skill_extract}"
     manifest_refs="$(jq -r --arg skill "${skill_name}" '.skills[$skill].refs[].ref' "${first}/release-manifest.json" | sort)"
-    package_refs="$(find "${skill_extract}/skills/${skill_name}/scripts" -maxdepth 1 -type f -name '*.sh' -printf '%f\n' |
-        sed 's/\.sh$//' | awk -v prefix="${skill_name}/" '{print prefix $0}' | sort)"
+    package_refs="$(python3 "${ROOT_DIR}/lib/skill_package.py" inspect \
+        "${skill_extract}/skills/${skill_name}" --origin builtin |
+        jq -r --arg skill "${skill_name}" '.tools[]? | $skill + "/" + .name' | sort)"
     [[ "${manifest_refs}" == "${package_refs}" ]]
 done < <(jq -r '.skills | keys[]' "${first}/release-manifest.json")
 

@@ -52,19 +52,34 @@
     "high",
     "critical"
   ],
-  "skill_execution_class": [
-    "runner",
-    "host_helper"
-  ],
-  "skill_capability": [
-    "",
-    "firewall.apply",
-    "hosts.apply"
-  ],
+  "skill_extension_contract": {
+    "schema_version": 1,
+    "core_api": 1,
+    "execution_classes": [
+      "runner",
+      "host_helper",
+      "credential_helper"
+    ],
+    "dispatch_modes": [
+      "always",
+      "apply_only"
+    ],
+    "component_types": [
+      "host_helper",
+      "credential_helper",
+      "web"
+    ],
+    "guard_types": [
+      "risk_by_value",
+      "runner_fallthrough",
+      "backup_proof"
+    ]
+  },
   "execution_isolation": [
     "runner_uid",
     "degraded_same_uid",
     "host_helper",
+    "credential_helper",
     "unavailable"
   ],
   "helper_status": [
@@ -72,6 +87,8 @@
     "unavailable"
   ],
   "executor_type": [
+    "skill_load",
+    "skill_read",
     "skill_script",
     "shell",
     "remote_script",
@@ -143,9 +160,15 @@
     "job_exception",
     "invalid_output",
     "invalid_agent_output",
-    "invalid_skill_manifest",
+    "invalid_skill_package",
     "output_limit_exceeded",
     "skill_materialized",
+    "installed",
+    "uninstalled",
+    "replaced",
+    "available",
+    "unavailable",
+    "incompatible",
     "invalid_skill_output",
     "skill_reported_failure",
     "skill_exit_failed",
@@ -273,19 +296,63 @@
         "system_user",
         "execution_user"
       ]
-    },
-    "skill_manifest": {
-      "required": [
-        "schema_version",
-        "name",
-        "description",
-        "scripts"
-      ]
     }
   },
   "error_codes": {
     "internal_error": {
       "retryable": true,
+      "http": 500
+    },
+    "runtime_busy": {
+      "retryable": true,
+      "http": 409
+    },
+    "unsupported": {
+      "retryable": false,
+      "http": 400
+    },
+    "invalid_install_state": {
+      "retryable": false,
+      "http": 409
+    },
+    "skill_operation_failed": {
+      "retryable": false,
+      "http": 409
+    },
+    "skill_not_loaded": {
+      "retryable": false,
+      "http": 409
+    },
+    "legacy_format_unsupported": {
+      "retryable": false,
+      "http": 422
+    },
+    "skill_package_unavailable": {
+      "retryable": true,
+      "http": 503
+    },
+    "skill_package_incompatible": {
+      "retryable": false,
+      "http": 409
+    },
+    "skill_package_invalid": {
+      "retryable": false,
+      "http": 409
+    },
+    "skill_digest_mismatch": {
+      "retryable": false,
+      "http": 409
+    },
+    "skill_download_failed": {
+      "retryable": true,
+      "http": 503
+    },
+    "skill_component_install_failed": {
+      "retryable": false,
+      "http": 500
+    },
+    "skill_component_uninstall_failed": {
+      "retryable": false,
       "http": 500
     },
     "not_found": {
@@ -335,6 +402,22 @@
     "helper_rejected": {
       "retryable": false,
       "http": 403
+    },
+    "target_changed": {
+      "retryable": false,
+      "http": 409
+    },
+    "host_operation_not_allowed": {
+      "retryable": false,
+      "http": 403
+    },
+    "credential_unavailable": {
+      "retryable": false,
+      "http": 503
+    },
+    "credential_expired": {
+      "retryable": false,
+      "http": 410
     },
     "skill_conflict": {
       "retryable": false,
@@ -420,7 +503,7 @@
       "retryable": true,
       "http": 502
     },
-    "invalid_skill_manifest": {
+    "invalid_skill_package": {
       "retryable": false,
       "http": 409
     },

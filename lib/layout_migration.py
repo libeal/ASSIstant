@@ -14,8 +14,12 @@ import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 
+try:
+    from .skill_package import SkillPackageError, load_package
+except ImportError:  # Executed as a standalone migration command.
+    from skill_package import SkillPackageError, load_package
 
-VALID_RISKS = frozenset({"low", "medium", "high", "critical"})
+
 MARKER_NAME = ".overlay-layout-v1.json"
 
 
@@ -158,79 +162,6 @@ def _directory_digest(root: Path) -> str:
     return digest.hexdigest()
 
 
-def _description(skill_dir: Path, name: str) -> str:
-    skill_md = skill_dir / "SKILL.md"
-    try:
-        lines = skill_md.read_text(encoding="utf-8").splitlines()
-    except (OSError, UnicodeError):
-        return f"Migrated user Skill {name}."
-    if lines and lines[0].strip() == "---":
-        for line in lines[1:]:
-            if line.strip() == "---":
-                break
-            key, separator, value = line.partition(":")
-            if separator and key.strip() == "description" and value.strip():
-                return value.strip()[:500]
-    return f"Migrated user Skill {name}."
-
-
-def _normalized_manifest(skill_dir: Path, name: str) -> dict:
-    skill_md = skill_dir / "SKILL.md"
-    scripts_dir = skill_dir / "scripts"
-    if skill_md.is_symlink() or not skill_md.is_file():
-        raise MigrationError("SKILL.md is missing")
-    if scripts_dir.is_symlink() or not scripts_dir.is_dir():
-        raise MigrationError("scripts directory is missing")
-    scripts = sorted(
-        path for path in scripts_dir.iterdir() if path.is_file() and path.suffix == ".sh"
-    )
-    if not scripts or any(path.is_symlink() for path in scripts):
-        raise MigrationError("no safe shell scripts were found")
-    unexpected = [
-        path.name
-        for path in scripts_dir.iterdir()
-        if not path.name.startswith(".") and (not path.is_file() or path.suffix != ".sh")
-    ]
-    if unexpected:
-        raise MigrationError(f"unsupported scripts entries: {', '.join(sorted(unexpected))}")
-
-    existing = {}
-    manifest_path = skill_dir / "manifest.json"
-    if manifest_path.is_file() and not manifest_path.is_symlink():
-        try:
-            loaded = _strict_json_loads(manifest_path.read_text(encoding="utf-8"))
-            if isinstance(loaded, dict):
-                existing = loaded
-        except (OSError, UnicodeError, ValueError):
-            existing = {}
-    prior_scripts = {
-        item.get("name"): item
-        for item in existing.get("scripts", [])
-        if isinstance(item, dict) and isinstance(item.get("name"), str)
-    }
-    entries = []
-    for script in scripts:
-        prior = prior_scripts.get(script.name, {})
-        risk = prior.get("risk") if prior.get("risk") in VALID_RISKS else "high"
-        entries.append(
-            {
-                "name": script.name,
-                "risk": risk,
-                "execution_class": "runner",
-                "capability": "",
-            }
-        )
-    description = existing.get("description")
-    if not isinstance(description, str) or not description.strip():
-        description = _description(skill_dir, name)
-    return {
-        "schema_version": 1,
-        "name": name,
-        "description": description.strip()[:500],
-        "scripts": entries,
-    }
-
-
 def _unique_conflict_path(root: Path, name: str) -> Path:
     candidate = root / name
     index = 1
@@ -238,14 +169,6 @@ def _unique_conflict_path(root: Path, name: str) -> Path:
         index += 1
         candidate = root / f"{name}.{index}"
     return candidate
-
-
-def _quarantine_copy(source: Path, conflict_root: Path, name: str) -> Path:
-    _assert_safe_tree(source)
-    conflict_root.mkdir(parents=True, exist_ok=True)
-    target = _unique_conflict_path(conflict_root, name)
-    shutil.copytree(source, target, symlinks=False)
-    return target
 
 
 def _quarantine_move(source: Path, conflict_root: Path, name: str) -> Path:
@@ -330,36 +253,6 @@ def _restore_reversible_conflicts(
         )
 
 
-def _write_user_index(overlay: Path, manifests: list[dict]) -> None:
-    lines = [
-        "# User Skill Index",
-        "",
-        "This file is generated from the validated user Skill overlay.",
-        "",
-    ]
-    for manifest in sorted(manifests, key=lambda item: item["name"]):
-        lines.extend((f"## {manifest['name']}", ""))
-        for script in manifest["scripts"]:
-            ref = Path(script["name"]).stem
-            lines.append(
-                f"- `{manifest['name']}/{ref}`: {manifest['description']}"
-            )
-        lines.append("")
-    target = overlay / "INDEX.md"
-    descriptor, raw_temp = tempfile.mkstemp(prefix=".INDEX.", suffix=".tmp", dir=overlay)
-    temp_path = Path(raw_temp)
-    try:
-        os.fchmod(descriptor, 0o640)
-        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
-            handle.write("\n".join(lines))
-            handle.flush()
-            os.fsync(handle.fileno())
-        _replace_with_recovery(temp_path, target)
-    except Exception:
-        temp_path.unlink(missing_ok=True)
-        raise
-
-
 def _migrate_skills(
     legacy_root: Path | None,
     release_root: Path,
@@ -373,23 +266,61 @@ def _migrate_skills(
     overlay = data_root / "skills"
     builtins = release_root / "skills"
     overlay.mkdir(parents=True, exist_ok=True)
-    _assert_safe_tree(overlay)
-    builtin_names = {
-        path.name
-        for path in builtins.iterdir()
-        if path.is_dir() and not path.is_symlink()
-    }
+    if overlay.is_symlink() or not overlay.is_dir():
+        raise MigrationError("user Skill root must be a real directory")
+    index_path = builtins / "INDEX.md"
+    builtin_names: set[str] = set()
+    if index_path.is_file() and not index_path.is_symlink():
+        for line in index_path.read_text(encoding="utf-8").splitlines():
+            match = re.fullmatch(r"## ([a-z0-9][a-z0-9-]*)", line)
+            if match:
+                builtin_names.add(match.group(1))
     _restore_reversible_conflicts(
         overlay, builtin_names, data_root, previous_report, report
     )
 
+    legacy_skills = legacy_root / "skills" if legacy_root is not None else None
+    if (
+        legacy_skills is not None
+        and legacy_skills.is_dir()
+        and not legacy_skills.is_symlink()
+    ):
+        for path in sorted(legacy_skills.iterdir(), key=lambda item: item.name):
+            if path.name.startswith(".") or path.name == "INDEX.md":
+                continue
+            report["skills_skipped"].append(
+                {
+                    "name": path.name,
+                    "reason": "legacy_format_unsupported",
+                    "source": "legacy_release",
+                }
+            )
+
     for path in sorted(overlay.iterdir(), key=lambda item: item.name):
-        if path.name.startswith(".") or path.name == "INDEX.md":
+        if path.name == "INDEX.md":
+            report["skills_skipped"].append(
+                {"name": "INDEX.md", "reason": "legacy_format_unsupported"}
+            )
+            continue
+        if path.name.startswith("."):
             continue
         if not path.is_dir() or path.is_symlink():
-            raise MigrationError(f"invalid user Skill overlay entry: {path}")
+            report["skills_skipped"].append(
+                {"name": path.name, "reason": "invalid_package"}
+            )
+            continue
         if path.name in builtin_names:
-            source_digest = _directory_digest(path)
+            try:
+                source_digest = _directory_digest(path)
+            except MigrationError as exc:
+                report["skills_skipped"].append(
+                    {
+                        "name": path.name,
+                        "reason": "invalid_package",
+                        "error": str(exc),
+                    }
+                )
+                continue
             quarantined = _quarantine_move(path, conflict_root, path.name)
             report["skill_conflicts"].append(
                 {
@@ -401,92 +332,18 @@ def _migrate_skills(
                     "target_version": target_version,
                 }
             )
-
-    legacy_skills = legacy_root / "skills" if legacy_root is not None else None
-    if legacy_skills is not None and legacy_skills.is_dir() and not legacy_skills.is_symlink():
-        for source in sorted(legacy_skills.iterdir(), key=lambda item: item.name):
-            name = source.name
-            if name.startswith(".") or name == "INDEX.md" or not source.is_dir():
-                continue
-            if source.is_symlink() or re.fullmatch(r"[a-z0-9][a-z0-9-]*", name) is None:
-                raise MigrationError(f"invalid legacy Skill entry: {source}")
-            if name in builtin_names:
-                report["skills_skipped"].append(
-                    {"name": name, "reason": "registered_builtin"}
-                )
-                continue
-            target = overlay / name
-            if target.exists():
-                if _directory_digest(source) == _directory_digest(target):
-                    report["skills_skipped"].append(
-                        {"name": name, "reason": "already_present"}
-                    )
-                else:
-                    source_digest = _directory_digest(source)
-                    quarantined = _quarantine_copy(source, conflict_root, name)
-                    report["skill_conflicts"].append(
-                        {
-                            "name": name,
-                            "reason": "different_overlay_content",
-                            "quarantined": str(quarantined.relative_to(data_root)),
-                            "sha256": source_digest,
-                            "source_version": previous_version,
-                            "target_version": target_version,
-                        }
-                    )
-                continue
-            try:
-                stage = None
-                _assert_safe_tree(source)
-                stage = Path(tempfile.mkdtemp(prefix=f".migrate.{name}.", dir=overlay))
-                stage.rmdir()
-                shutil.copytree(source, stage, symlinks=False)
-                manifest = _normalized_manifest(stage, name)
-                _atomic_json(stage / "manifest.json", manifest, 0o640)
-                os.replace(stage, target)
-                _fsync_directory(overlay)
-                report["skills_migrated"].append(name)
-            except (MigrationError, OSError, UnicodeError, json.JSONDecodeError) as exc:
-                if stage is not None and stage.exists():
-                    shutil.rmtree(stage)
-                source_digest = _directory_digest(source)
-                quarantined = _quarantine_copy(source, conflict_root, name)
-                report["skill_conflicts"].append(
-                    {
-                        "name": name,
-                        "reason": f"invalid_legacy_package: {exc}",
-                        "quarantined": str(quarantined.relative_to(data_root)),
-                        "sha256": source_digest,
-                        "source_version": previous_version,
-                        "target_version": target_version,
-                    }
-                )
-
-    manifests = []
-    for path in sorted(overlay.iterdir(), key=lambda item: item.name):
-        if path.name.startswith(".") or path.name == "INDEX.md":
             continue
-        if not path.is_dir() or path.is_symlink():
-            raise MigrationError(f"invalid user Skill overlay entry: {path}")
         try:
-            manifest = _normalized_manifest(path, path.name)
-        except MigrationError as exc:
-            source_digest = _directory_digest(path)
-            quarantined = _quarantine_move(path, conflict_root, path.name)
-            report["skill_conflicts"].append(
-                {
-                    "name": path.name,
-                    "reason": f"invalid_overlay_package: {exc}",
-                    "quarantined": str(quarantined.relative_to(data_root)),
-                    "sha256": source_digest,
-                    "source_version": previous_version,
-                    "target_version": target_version,
-                }
+            load_package(path, "user")
+        except SkillPackageError as exc:
+            reason = (
+                "legacy_format_unsupported"
+                if "legacy_format_unsupported" in str(exc)
+                else "invalid_package"
             )
-            continue
-        _atomic_json(path / "manifest.json", manifest, 0o640)
-        manifests.append(manifest)
-    _write_user_index(overlay, manifests)
+            report["skills_skipped"].append(
+                {"name": path.name, "reason": reason, "error": str(exc)}
+            )
 
 
 def _valid_json_object(path: Path) -> bool:

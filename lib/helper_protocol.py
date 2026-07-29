@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import array
 import hashlib
 import fcntl
 import json
@@ -33,6 +34,31 @@ class ProtocolError(ValueError):
     """A peer sent data outside the helper protocol contract."""
 
 
+class RuntimeSharedBarrier:
+    """A held runtime barrier that may be suspended for a lifecycle commit."""
+
+    def __init__(self, descriptor: int):
+        self.descriptor = descriptor
+        self.held = True
+
+    @contextmanager
+    def suspended(self):
+        if not self.held:
+            raise ProtocolError("runtime lock is already suspended")
+        fcntl.flock(self.descriptor, fcntl.LOCK_UN)
+        self.held = False
+        try:
+            yield
+        finally:
+            fcntl.flock(self.descriptor, fcntl.LOCK_SH)
+            self.held = True
+
+    def release(self):
+        if self.held:
+            fcntl.flock(self.descriptor, fcntl.LOCK_UN)
+            self.held = False
+
+
 @contextmanager
 def runtime_shared_lock(data_root: str | os.PathLike[str] | None = None):
     """Hold the global runtime barrier for one helper operation."""
@@ -47,14 +73,19 @@ def runtime_shared_lock(data_root: str | os.PathLike[str] | None = None):
         path,
         os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0),
     )
+    barrier = None
     try:
         if not stat.S_ISREG(os.fstat(descriptor).st_mode):
             raise ProtocolError("runtime lock is not a regular file")
         fcntl.flock(descriptor, fcntl.LOCK_SH)
-        yield
+        barrier = RuntimeSharedBarrier(descriptor)
+        yield barrier
     finally:
         try:
-            fcntl.flock(descriptor, fcntl.LOCK_UN)
+            if barrier is not None:
+                barrier.release()
+            else:
+                fcntl.flock(descriptor, fcntl.LOCK_UN)
         finally:
             os.close(descriptor)
 
@@ -192,6 +223,10 @@ def receive_json(connection: socket.socket, limit: int = MAX_REQUEST_BYTES) -> o
         payload.extend(chunk)
         if len(payload) > limit:
             raise ProtocolError("request exceeds the protocol byte limit")
+    return _decode_request_payload(payload)
+
+
+def _decode_request_payload(payload: bytes | bytearray) -> object:
     if not payload:
         raise ProtocolError("request is empty")
     first_line, separator, remainder = bytes(payload).partition(b"\n")
@@ -206,6 +241,57 @@ def receive_json(connection: socket.socket, limit: int = MAX_REQUEST_BYTES) -> o
     except (UnicodeDecodeError, json.JSONDecodeError, ProtocolError) as exc:
         raise ProtocolError("request is not valid UTF-8 JSON") from exc
     return value
+
+
+def receive_json_with_descriptors(
+    connection: socket.socket,
+    *,
+    limit: int = MAX_REQUEST_BYTES,
+    maximum_descriptors: int = 1,
+) -> tuple[object, tuple[int, ...]]:
+    """Receive one helper request and a tightly bounded SCM_RIGHTS payload."""
+
+    if (
+        isinstance(maximum_descriptors, bool)
+        or not isinstance(maximum_descriptors, int)
+        or not 0 <= maximum_descriptors <= 8
+    ):
+        raise ProtocolError("maximum_descriptors must be an integer in 0..8")
+    payload = bytearray()
+    descriptors: list[int] = []
+    descriptor_size = array.array("i").itemsize
+    ancillary_size = socket.CMSG_SPACE(max(1, maximum_descriptors + 1) * descriptor_size)
+    try:
+        while True:
+            chunk, ancillary, flags, _address = connection.recvmsg(
+                min(65_536, limit + 1 - len(payload)),
+                ancillary_size,
+                getattr(socket, "MSG_CMSG_CLOEXEC", 0),
+            )
+            for level, kind, data in ancillary:
+                if level != socket.SOL_SOCKET or kind != socket.SCM_RIGHTS:
+                    raise ProtocolError("request contains unsupported ancillary data")
+                usable = len(data) - (len(data) % descriptor_size)
+                received = array.array("i")
+                received.frombytes(data[:usable])
+                descriptors.extend(received.tolist())
+            if flags & getattr(socket, "MSG_CTRUNC", 0):
+                raise ProtocolError("request ancillary data was truncated")
+            if len(descriptors) > maximum_descriptors:
+                raise ProtocolError("request contains too many file descriptors")
+            if not chunk:
+                break
+            payload.extend(chunk)
+            if len(payload) > limit:
+                raise ProtocolError("request exceeds the protocol byte limit")
+        return _decode_request_payload(payload), tuple(descriptors)
+    except Exception:
+        for descriptor in descriptors:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+        raise
 
 
 def receive_json_frame(connection: socket.socket, limit: int = MAX_REQUEST_BYTES) -> object:
@@ -325,6 +411,7 @@ def client_request(
     request: dict[str, object],
     *,
     timeout: float = 30.0,
+    descriptor: int | None = None,
 ) -> dict[str, object]:
     encoded = canonical_json(request) + b"\n"
     if len(encoded) > MAX_REQUEST_BYTES:
@@ -333,7 +420,21 @@ def client_request(
     with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
         connection.settimeout(timeout)
         connection.connect(socket_path)
-        connection.sendall(encoded)
+        if descriptor is None:
+            connection.sendall(encoded)
+        else:
+            if isinstance(descriptor, bool) or not isinstance(descriptor, int):
+                raise ProtocolError("helper descriptor must be an integer")
+            os.fstat(descriptor)
+            rights = array.array("i", [descriptor]).tobytes()
+            sent = connection.sendmsg(
+                [encoded],
+                [(socket.SOL_SOCKET, socket.SCM_RIGHTS, rights)],
+            )
+            if sent <= 0:
+                raise ProtocolError("helper request descriptor could not be sent")
+            if sent < len(encoded):
+                connection.sendall(encoded[sent:])
         connection.shutdown(socket.SHUT_WR)
         while True:
             chunk = connection.recv(65_536)

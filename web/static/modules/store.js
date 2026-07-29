@@ -19,6 +19,7 @@ export function createInitialState() {
     mcpTools: [],
     mcpFindings: [],
     mcpRoot: "",
+    skillWebComponents: [],
     activeWorkJobId: "",
     activeScriptJobId: "",
     activeTerminalJobId: "",

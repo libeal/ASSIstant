@@ -1,0 +1,25 @@
+{
+  "schema_version": 1,
+  "package_version": "1.0.0",
+  "core_api": 1,
+  "category": "history",
+  "tools": [
+    {
+      "name": "last-command-output",
+      "description": "从审计 session 中读取上一轮或指定轮次的命令、步骤和 shell/stdout/stderr 输出预览。",
+      "entrypoint": "scripts/last-command-output.sh",
+      "risk": "low",
+      "approval_scope": "skill_readonly",
+      "execution": {
+        "class": "runner",
+        "capability": "",
+        "dispatch": "always"
+      },
+      "runtime_inputs": [
+        "audit_snapshot"
+      ],
+      "guards": []
+    }
+  ],
+  "components": {}
+}

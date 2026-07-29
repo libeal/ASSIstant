@@ -7,6 +7,7 @@ import {
   pendingConfigChanges as configDiff,
   remoteSecretTransmissionBlocked,
 } from "./config-utils.js";
+import { syncApprovalScopeFields } from "./policy-config.js";
 
 /** @typedef {import("./types.js").AppContext} AppContext */
 /** @typedef {import("./types.js").ConfigView} ConfigView */
@@ -92,6 +93,7 @@ export function createConfigView(app, hooks = {}) {
     }
     const data = await app.api("/api/config");
     state.configSnapshot = data.config || {};
+    syncApprovalScopeFields(state.configSnapshot || {}, CONFIG_GROUPS);
     state.commandGuardEnabled = state.configSnapshot?.command_guard?.enabled !== false;
     state.configOriginal = collectEditableConfigValues(state.configSnapshot || {}, CONFIG_GROUPS, providerRules());
     state.configDraft = { ...state.configOriginal };

@@ -67,6 +67,9 @@ for distro in debian fedora; do
 
     manifest_assets="$(jq -r '[.assets[].name, .skills[].asset.name] | sort | .[]' \
         "${package_root}/release/release-manifest.json")"
+    jq -e '.schema_version == 2
+        and .core_contents == {builtin_skill_index:true,builtin_skill_packages:false}' \
+        "${package_root}/release/release-manifest.json" >/dev/null
     packaged_assets="$(find "${package_root}/release" -maxdepth 1 -type f \
         ! -name release-manifest.json -printf '%f\n' | LC_ALL=C sort)"
     [[ "${manifest_assets}" == "${packaged_assets}" ]]

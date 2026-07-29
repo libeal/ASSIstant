@@ -50,12 +50,21 @@ printf '%s\n' \
 printf '%s\n' '#!/usr/bin/env bash' 'printf '\''{"ok":true}\\n'\''' >"${project}/data/skills/custom-backup/scripts/custom.sh"
 jq -n '{
     schema_version:1,
-    name:"custom-backup",
-    description:"backup fixture",
-    scripts:[{name:"custom.sh",risk:"low",execution_class:"runner",capability:""}]
-}' >"${project}/data/skills/custom-backup/manifest.json"
-printf '# User Skills\n\n## custom-backup\n\n- `custom-backup/custom`: backup fixture.\n' \
-    >"${project}/data/skills/INDEX.md"
+    package_version:"1.0.0",
+    core_api:1,
+    category:"custom",
+    tools:[{
+        name:"custom",
+        description:"accepts one JSON object.",
+        entrypoint:"scripts/custom.sh",
+        risk:"low",
+        approval_scope:"skill_readonly",
+        execution:{class:"runner",capability:"",dispatch:"always"},
+        runtime_inputs:[],
+        guards:[]
+    }],
+    components:{}
+}' >"${project}/data/skills/custom-backup/linux-agent.json"
 project_remote_skills='{}'
 while IFS= read -r builtin_skill; do
     skill_name="$(basename "${builtin_skill}")"
@@ -65,12 +74,12 @@ while IFS= read -r builtin_skill; do
     project_remote_skills="$(jq -cn \
         --argjson prior "${project_remote_skills}" \
         --arg skill "${skill_name}" \
-        '$prior + {($skill):{asset:{sha256:"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}}')"
+        '$prior + {($skill):{asset:{sha256:"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},contract_digest:"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}}')"
 done < <(find "${project}/skills" -mindepth 1 -maxdepth 1 -type d | sort)
 mkdir -p "${project}/remote"
 project_remote_manifest="${project}/remote/release-manifest.json"
 jq -S -n --argjson skills "${project_remote_skills}" \
-    '{schema_version:1,version:"v0.0.0-test",skills:$skills}' \
+    '{schema_version:2,version:"v0.0.0-test",skills:$skills}' \
     >"${project_remote_manifest}"
 jq '.warn_patterns += ["backup-restore-marker"]' \
     "${project}/policies/risk-rules.json" >"${project}/data/policies/risk-rules.json"
@@ -89,7 +98,10 @@ grep -qx 'logs/session_backup.jsonl.1' <<<"${listing}"
 grep -qx 'logs/session_backup.jsonl.2' <<<"${listing}"
 grep -qx 'config/config.redacted.json' <<<"${listing}"
 grep -qx 'skills/custom-backup/SKILL.md' <<<"${listing}"
-grep -qx 'skills/materialized.json' <<<"${listing}"
+grep -qx 'skills/custom-backup/linux-agent.json' <<<"${listing}"
+grep -qx 'skills/installation-state.json' <<<"${listing}"
+! grep -q '^skills/INDEX.md$' <<<"${listing}"
+! grep -q '^skills/custom-backup/manifest.json$' <<<"${listing}"
 grep -qx 'policies/risk-rules.json' <<<"${listing}"
 if grep -q 'skills/ops-basic/' <<<"${listing}" || grep -q 'tmp/web/jobs' <<<"${listing}"; then
     printf 'backup contains excluded runtime assets\n' >&2
@@ -103,9 +115,10 @@ if grep -R -Eq -- 'backup-secret-api-key|backup-secret-web-token|job-secret-shou
     printf 'backup leaked secret or raw job output\n' >&2
     exit 1
 fi
-jq -e '.materialized[] | select(.skill == "ops-basic")' "${extract_root}/skills/materialized.json" >/dev/null
+jq -e '.builtin[] | select(.name == "ops-basic" and .installed == true and .source == "remote")' \
+    "${extract_root}/skills/installation-state.json" >/dev/null
 jq -e '
-    .schema_version == 2
+    .schema_version == 3
     and .redacted == true
     and .contents.user_skills == true
     and .contents.effective_policies == true
@@ -145,7 +158,7 @@ mv "${config_tmp}" "${restore_project}/config/config.json"
 mkdir -p "${restore_project}/remote"
 restore_remote_manifest="${restore_project}/remote/release-manifest.json"
 jq -S -n \
-    '{schema_version:1,version:"v0.0.0-test",skills:{}}' \
+    '{schema_version:2,version:"v0.0.0-test",skills:{}}' \
     >"${restore_remote_manifest}"
 
 mkdir -p "${restore_project}/data"
@@ -179,7 +192,9 @@ exec {busy_lock_fd}>&-
 
 restore_result="$(cd "${restore_project}" && bash bin/agent restore "${backup_path}")"
 jq -e '.ok == true and .status == "restored"' <<<"${restore_result}" >/dev/null
-[[ -f "${restore_project}/data/skills/custom-backup/manifest.json" ]]
+[[ -f "${restore_project}/data/skills/custom-backup/linux-agent.json" ]]
+[[ ! -e "${restore_project}/data/skills/INDEX.md" ]]
+[[ ! -e "${restore_project}/data/skills/custom-backup/manifest.json" ]]
 jq -e '.warn_patterns | index("backup-restore-marker") != null' \
     "${restore_project}/data/policies/risk-rules.json" >/dev/null
 jq -e '

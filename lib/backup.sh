@@ -5,9 +5,9 @@ set -euo pipefail
 linux_agent_backup_runtime() {
     local output_path="$1"
     local output_dir output_name resolved_output_dir resolved_root stage_root archive_tmp
-    local config_json size_bytes sha256 skill_dir skill_name log_file session_id line marker ledger unsafe_path
+    local config_json size_bytes sha256 skill_dir skill_name log_file session_id line marker installation_state unsafe_path
     local snapshot_path segment sanitized_tmp
-    local user_skills_dir builtin_skills_dir user_index policy_default policy_name effective_policy archive_tool
+    local user_skills_dir builtin_skills_dir policy_default policy_name effective_policy archive_tool validation
     local audit_rc audit_payload
     local -a archive_entries=()
 
@@ -94,7 +94,7 @@ linux_agent_backup_runtime() {
     config_json="$(cat "${LINUX_AGENT_CONFIG_FILE}")"
     linux_agent_redact_json_full "${config_json}" | jq . >"${stage_root}/config/config.redacted.json"
 
-    ledger='[]'
+    installation_state='[]'
     user_skills_dir="$(linux_agent_user_skills_dir)"
     if [[ (-e "${user_skills_dir}" || -L "${user_skills_dir}") &&
         (! -d "${user_skills_dir}" || -L "${user_skills_dir}") ]]; then
@@ -122,8 +122,16 @@ linux_agent_backup_runtime() {
                 jq -cn --arg skill "${skill_name}" '{ok:false, status:"backup_unsafe_skill", error:("user skill contains an unsafe file type: " + $skill)}'
                 return 1
             fi
+            validation="$(python3 "${LINUX_AGENT_ROOT}/lib/skill_package.py" validate "${skill_dir}" --origin user 2>/dev/null || true)"
+            if ! jq -e '.ok == true' <<<"${validation}" >/dev/null 2>&1; then
+                rm -rf "${stage_root}"
+                rm -f "${archive_tmp}"
+                jq -cn --arg skill "${skill_name}" --arg error "$(jq -r '.error // "invalid package"' <<<"${validation}" 2>/dev/null || printf 'invalid package')" \
+                    '{ok:false,status:"backup_unsafe_skill",code:"backup_unsafe_skill",error:("user Skill is invalid: " + $skill + ": " + $error)}'
+                return 1
+            fi
             cp -a "${skill_dir}" "${stage_root}/skills/${skill_name}"
-        done < <(find "${user_skills_dir}" -mindepth 1 -maxdepth 1 -type d | sort)
+        done < <(find "${user_skills_dir}" -mindepth 1 -maxdepth 1 -type d ! -name .locks | sort)
     fi
     builtin_skills_dir="${LINUX_AGENT_BUILTIN_SKILLS_DIR}"
     if linux_agent_remote_mode && [[ -d "${builtin_skills_dir}" && ! -L "${builtin_skills_dir}" ]]; then
@@ -139,25 +147,35 @@ linux_agent_backup_runtime() {
                     '{ok:false, status:"backup_unsafe_skill", code:"backup_unsafe_skill", error:("remote Skill marker is not trusted: " + $skill)}'
                 return 1
             fi
-            ledger="$(jq -cn --argjson prior "${ledger}" --argjson marker "$(jq '{skill, sha256, release_version}' "${marker}")" '$prior + [$marker]')"
+            installation_state="$(jq -cn \
+                --argjson prior "${installation_state}" \
+                --arg name "${skill_name}" \
+                --arg contract_digest "$(jq -r --arg skill "${skill_name}" '.skills[$skill].contract_digest // ""' "${LINUX_AGENT_REMOTE_MANIFEST}")" \
+                --arg asset_sha256 "$(jq -r '.sha256' "${marker}")" \
+                --arg release_version "$(jq -r '.release_version' "${marker}")" \
+                '$prior + [{name:$name,installed:true,source:"remote",contract_digest:$contract_digest,asset_sha256:$asset_sha256,release_version:$release_version}]')"
         done < <(find "${builtin_skills_dir}" -mindepth 1 -maxdepth 1 -type d | sort)
-    fi
-    user_index="${user_skills_dir}/INDEX.md"
-    if [[ -L "${user_index}" || (-e "${user_index}" && ! -f "${user_index}") ]]; then
-        rm -rf "${stage_root}"
-        rm -f "${archive_tmp}"
-        jq -cn '{ok:false, status:"backup_failed", error:"user Skill index has an unsafe file type"}'
-        return 1
+    elif linux_agent_managed_mode_enabled && [[ -f "${LINUX_AGENT_DATA_DIR}/skill-components.json" ]]; then
+        installation_state="$(python3 "${LINUX_AGENT_ROOT}/lib/skill_component_ledger.py" list \
+            "${LINUX_AGENT_DATA_DIR}/skill-components.json" | jq -c '[
+                .result.skills | to_entries[]
+                | {
+                    name:.key,
+                    installed:.value.installed,
+                    source:"managed",
+                    contract_digest:.value.contract_digest
+                }
+            ]')" || {
+            rm -rf "${stage_root}"
+            rm -f "${archive_tmp}"
+            jq -cn '{ok:false,status:"backup_failed",error:"managed Skill installation state is invalid"}'
+            return 1
+        }
     fi
     archive_tool="${LINUX_AGENT_ROOT}/lib/runtime_archive.py"
-    if ! python3 "${archive_tool}" build-index \
-        "${stage_root}/skills" "${stage_root}/skills/INDEX.md" >/dev/null; then
-        rm -rf "${stage_root}"
-        rm -f "${archive_tmp}"
-        jq -cn '{ok:false, status:"backup_failed", error:"could not build portable user Skill index"}'
-        return 1
-    fi
-    jq -S -n --argjson materialized "${ledger}" '{schema_version:1, materialized:$materialized}' >"${stage_root}/skills/materialized.json"
+    jq -S -n --argjson builtin "${installation_state}" \
+        '{schema_version:1,builtin:$builtin}' \
+        >"${stage_root}/skills/installation-state.json"
 
     while IFS= read -r policy_default; do
         [[ -n "${policy_default}" ]] || continue
@@ -253,7 +271,7 @@ linux_agent_restore_runtime() {
     local archive_tool stage_root extract_result
     local candidate_skills candidate_policies merged_config
     local user_skills_dir user_policies_dir log_dir policy_name policy_path validation
-    local skill_name skill_dir index_path ref ref_skill
+    local skill_name skill_dir
     local current_config managed_json commit_result restore_warning audit_rc
     local resolved_current_config expected_config
     local restore_lock before_fingerprint after_fingerprint locked_fingerprint
@@ -311,7 +329,7 @@ linux_agent_restore_runtime() {
             restore_failed '无法准备 restore 候选目录'
         return 1
     fi
-    rm -f -- "${candidate_skills}/materialized.json"
+    rm -f -- "${candidate_skills}/installation-state.json"
 
     user_skills_dir="$(linux_agent_user_skills_dir)"
     user_policies_dir="${LINUX_AGENT_USER_POLICIES_DIR:-${LINUX_AGENT_ROOT}/data/policies}"
@@ -368,12 +386,6 @@ linux_agent_restore_runtime() {
         return 1
     fi
 
-    if [[ ! -f "${candidate_skills}/INDEX.md" || -L "${candidate_skills}/INDEX.md" ]]; then
-        linux_agent_restore_error_result "${stage_root}" "${restore_lock}" \
-            invalid_backup '归档缺少用户 Skill INDEX.md'
-        return 1
-    fi
-    index_path="${candidate_skills}/INDEX.md"
     while IFS= read -r skill_dir; do
         [[ -n "${skill_dir}" ]] || continue
         skill_name="$(basename "${skill_dir}")"
@@ -382,8 +394,7 @@ linux_agent_restore_runtime() {
                 invalid_backup "归档 Skill 名称非法: ${skill_name}"
             return 1
         fi
-        if [[ -e "${LINUX_AGENT_BUILTIN_SKILLS_DIR}/${skill_name}" ||
-            -L "${LINUX_AGENT_BUILTIN_SKILLS_DIR}/${skill_name}" ]]; then
+        if linux_agent_builtin_skill_name_reserved "${skill_name}"; then
             linux_agent_restore_error_result "${stage_root}" "${restore_lock}" \
                 invalid_backup "归档 Skill 与内置 Skill 冲突: ${skill_name}"
             return 1
@@ -396,23 +407,14 @@ linux_agent_restore_runtime() {
             fi
             continue
         fi
-        validation="$(linux_agent_validate_skill_at "${skill_name}" "${skill_dir}" "${index_path}" user)"
+        validation="$(python3 "${LINUX_AGENT_ROOT}/lib/skill_package.py" validate \
+            "${skill_dir}" --origin user 2>/dev/null || true)"
         if ! jq -e '.ok == true' <<<"${validation}" >/dev/null; then
             linux_agent_restore_error_result "${stage_root}" "${restore_lock}" \
                 invalid_backup "归档 Skill 校验失败: ${skill_name}"
             return 1
         fi
     done < <(find "${candidate_skills}" -mindepth 1 -maxdepth 1 -type d | sort)
-    while IFS= read -r ref; do
-        [[ -n "${ref}" ]] || continue
-        ref_skill="${ref%%/*}"
-        if [[ ! -d "${candidate_skills}/${ref_skill}" ]]; then
-            linux_agent_restore_error_result "${stage_root}" "${restore_lock}" \
-                invalid_backup "归档 INDEX 引用了缺失 Skill: ${ref}"
-            return 1
-        fi
-    done < <(linux_agent_index_declared_refs_at "${index_path}")
-
     while IFS= read -r policy_path; do
         [[ -n "${policy_path}" ]] || continue
         policy_name="$(basename "${policy_path}")"

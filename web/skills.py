@@ -1,56 +1,40 @@
-"""Read-only Web view of built-in Skills and the persistent user overlay."""
+"""Read-only Web view of builtin and user Agent Skills packages."""
 
-import json
+from __future__ import annotations
+
 import os
 from pathlib import Path
 
+from skill_package import (
+    SkillPackageError,
+    SkillPackageIncompatibleError,
+    load_index,
+    load_package,
+)
 
-READABLE_SUFFIXES = frozenset({".md", ".sh", ".json"})
-HOST_HELPER_CAPABILITIES = {
-    "network-ops-tools/firewall": "firewall.apply",
-    "network-ops-tools/hosts-file-editor": "hosts.apply",
-}
 
-
-def _reject_duplicate_keys(pairs):
-    result = {}
-    for key, value in pairs:
-        if key in result:
-            raise ValueError(f"duplicate JSON key is not allowed: {key}")
-        result[key] = value
-    return result
+READABLE_SUFFIXES = frozenset({".json", ".md", ".py", ".sh", ".txt"})
+MAX_READ_BYTES = 256 * 1024
 
 
 class SkillService:
-    """Merge immutable release Skills with a non-overriding user overlay."""
+    """Expose Skill files while delegating package validation to the resolver."""
 
-    def __init__(
-        self,
-        skills_root,
-        manifest_validator=None,
-        *,
-        user_skills_root=None,
-        require_manifest_file=False,
-    ):
-        self.root = Path(skills_root).resolve()
+    def __init__(self, skills_root, *, user_skills_root=None):
+        self.root = Path(os.path.abspath(os.fspath(skills_root)))
         self.user_root = (
             Path(os.path.abspath(os.fspath(user_skills_root)))
             if user_skills_root is not None
             else None
         )
+        self._assert_no_symlink_components(self.root)
         if self.user_root is not None:
             self._assert_no_symlink_components(self.user_root)
         if self.user_root == self.root:
             self.user_root = None
-        if manifest_validator is not None and not callable(manifest_validator):
-            raise TypeError("manifest_validator must be callable")
-        self.manifest_validator = manifest_validator
-        self.require_manifest_file = bool(require_manifest_file)
 
     @staticmethod
     def _assert_no_symlink_components(path):
-        """Reject an overlay root before any lexical path can escape it."""
-
         if not path.is_absolute():
             raise ValueError("Skill root must be an absolute path")
         current = Path(path.anchor)
@@ -61,19 +45,23 @@ class SkillService:
 
     @staticmethod
     def _kind(path):
-        if path.name == "manifest.json":
-            return "manifest"
-        return "markdown" if path.suffix == ".md" else "script"
+        if path.name == "linux-agent.json":
+            return "extension"
+        if path.suffix == ".md":
+            return "markdown"
+        if path.suffix in {".py", ".sh"}:
+            return "script"
+        return "reference"
 
     @staticmethod
     def _is_readable_file(path):
-        return path.suffix in {".md", ".sh"} or path.name == "manifest.json"
+        return path.suffix in READABLE_SUFFIXES
 
     @staticmethod
     def _visible_entries(directory):
         try:
             entries = list(directory.iterdir())
-        except (FileNotFoundError, NotADirectoryError):
+        except (FileNotFoundError, NotADirectoryError, PermissionError):
             return []
         return sorted(
             (
@@ -84,43 +72,50 @@ class SkillService:
             key=lambda entry: (not entry.is_dir(), entry.name.lower(), entry.name),
         )
 
-    def _roots(self):
-        roots = [(self.root, "builtin")]
-        if self.user_root is not None:
-            roots.append((self.user_root, "user"))
-        return roots
+    def _reserved_builtin_names(self):
+        index_path = self.root / "INDEX.md"
+        try:
+            return frozenset(load_index(index_path))
+        except SkillPackageError:
+            return frozenset()
 
-    def _package_roots(self):
+    def _scan_packages(self):
         packages = {}
-        for root, origin in self._roots():
-            if origin == "user":
-                self._assert_no_symlink_components(root)
-            if root.is_symlink():
-                raise ValueError(f"{origin} skills root must not be a symbolic link")
-            for entry in self._visible_entries(root):
-                if not entry.is_dir():
-                    continue
-                if not (entry / "SKILL.md").exists() and not (entry / "scripts").exists():
-                    continue
-                previous = packages.get(entry.name)
-                if previous is not None:
-                    raise ValueError(
-                        f"User Skill conflicts with built-in Skill: {entry.name}"
-                    )
-                packages[entry.name] = (entry, origin)
-        return packages
+        findings = []
+        reserved = self._reserved_builtin_names()
+        for entry in self._visible_entries(self.root):
+            if entry.is_dir() and (entry / "SKILL.md").is_file():
+                packages[entry.name] = (entry, "builtin")
+        if self.user_root is None:
+            return packages, findings
+        self._assert_no_symlink_components(self.user_root)
+        for entry in self._visible_entries(self.user_root):
+            if not entry.is_dir() or not (entry / "SKILL.md").is_file():
+                continue
+            if entry.name in reserved or entry.name in packages:
+                findings.append(
+                    {
+                        "severity": "warning",
+                        "code": "SKILL_NAME_RESERVED",
+                        "skill": entry.name,
+                        "message": "User Skill conflicts with a reserved builtin name.",
+                    }
+                )
+                continue
+            packages[entry.name] = (entry, "user")
+        return packages, findings
 
     def _root_for_path(self, candidate):
         if len(candidate.parts) == 1:
             return self.root, "builtin"
-        packages = self._package_roots()
+        packages, _findings = self._scan_packages()
         package = packages.get(candidate.parts[0])
         if package is None:
             return self.root, "builtin"
         return package[0].parent, package[1]
 
     def safe_path(self, relative_path):
-        """Resolve a readable Skill path without following overlay symlinks."""
+        """Resolve a readable Skill path without following symbolic links."""
 
         if not isinstance(relative_path, str) or not relative_path or "\x00" in relative_path:
             raise ValueError("skill path is required")
@@ -130,14 +125,12 @@ class SkillService:
         if any(part.startswith(".") for part in candidate.parts):
             raise ValueError("hidden skill paths are not readable from the web console")
         if not self._is_readable_file(candidate):
-            raise ValueError(
-                "only Markdown, shell, and manifest.json Skill files are readable"
-            )
+            raise ValueError("only UTF-8 Skill metadata, scripts, and references are readable")
 
         root, _origin = self._root_for_path(candidate)
         current = root
         for part in candidate.parts:
-            current = current / part
+            current /= part
             if current.is_symlink():
                 raise ValueError("symbolic links are not readable from the web console")
         target = (root / candidate).resolve()
@@ -175,16 +168,17 @@ class SkillService:
                             "mtime": int(metadata.st_mtime),
                         }
                     )
-            except FileNotFoundError:
+            except (FileNotFoundError, PermissionError):
                 continue
         return children
 
     def build_tree(self, directory=None):
-        """Return one deterministic tree for both non-conflicting roots."""
-
-        if directory is not None and Path(directory).resolve() != self.root:
+        if directory is not None and Path(directory).resolve() != self.root.resolve():
             resolved = Path(directory).resolve()
-            for root, origin in self._roots():
+            roots = [(self.root, "builtin")]
+            if self.user_root is not None:
+                roots.append((self.user_root, "user"))
+            for root, origin in roots:
                 try:
                     resolved.relative_to(root)
                 except ValueError:
@@ -192,7 +186,7 @@ class SkillService:
                 return self._build_directory_tree(resolved, root, origin)
             raise ValueError("skill tree path must stay below a Skill root")
 
-        packages = self._package_roots()
+        packages, _findings = self._scan_packages()
         children = []
         for child in self._visible_entries(self.root):
             if child.is_dir():
@@ -245,115 +239,107 @@ class SkillService:
                 yield from SkillService._tree_file_paths(node.get("children") or [])
 
     @staticmethod
-    def _legacy_manifest(directory, scripts):
-        skill_md = directory / "SKILL.md"
-        lines = skill_md.read_text(encoding="utf-8").splitlines()
-        metadata = {}
-        for line in lines[1:] if lines and lines[0].strip() == "---" else ():
-            if line.strip() == "---":
-                break
-            key, separator, value = line.partition(":")
-            if separator and key in {"name", "description"}:
-                metadata[key] = value.strip()
-        if not metadata.get("name") or not metadata.get("description"):
-            raise ValueError(f"Skill metadata is incomplete: {directory.name}")
+    def _public_package(directory, origin):
+        try:
+            package = load_package(directory, origin)
+        except SkillPackageIncompatibleError as exc:
+            return {
+                "name": directory.name,
+                "origin": origin,
+                "state": "incompatible",
+                "error": str(exc),
+            }
+        except SkillPackageError as exc:
+            return {
+                "name": directory.name,
+                "origin": origin,
+                "state": "invalid",
+                "error": str(exc),
+            }
         return {
-            "name": metadata["name"],
-            "description": metadata["description"],
-            "scripts": [{"name": script.name} for script in scripts],
+            key: value
+            for key, value in {
+                **package,
+                "origin": origin,
+                "state": "installed",
+            }.items()
+            if key not in {"body", "extension"}
         }
 
-    def _load_manifest(self, directory, origin):
-        skill_md = directory / "SKILL.md"
-        scripts_dir = directory / "scripts"
-        manifest_path = directory / "manifest.json"
-        if (
-            skill_md.is_symlink()
-            or not skill_md.is_file()
-            or scripts_dir.is_symlink()
-            or not scripts_dir.is_dir()
-        ):
-            raise ValueError(f"Skill package is incomplete: {directory.name}")
-        scripts = [
-            script
-            for script in self._visible_entries(scripts_dir)
-            if script.is_file() and script.suffix == ".sh"
+    def list_packages(self):
+        packages, _findings = self._scan_packages()
+        return [
+            self._public_package(directory, origin)
+            for _name, (directory, origin) in sorted(packages.items())
         ]
-        if not scripts:
-            raise ValueError(f"Skill package has no scripts: {directory.name}")
-        if manifest_path.is_symlink():
-            raise ValueError(f"Skill manifest must not be a symlink: {directory.name}")
-        manifest_is_file = manifest_path.is_file()
-        if manifest_is_file:
+
+    def builtin_components(self, component_type):
+        """Return valid installed builtin components without exposing user code."""
+
+        packages, findings = self._scan_packages()
+        components = []
+        for name, (directory, origin) in sorted(packages.items()):
+            if origin != "builtin":
+                continue
             try:
-                manifest = json.loads(
-                    manifest_path.read_text(encoding="utf-8"),
-                    parse_constant=lambda value: (_ for _ in ()).throw(
-                        ValueError(f"invalid JSON constant: {value}")
-                    ),
-                    object_pairs_hook=_reject_duplicate_keys,
+                package = load_package(directory, origin)
+            except SkillPackageIncompatibleError as exc:
+                findings.append(
+                    {
+                        "severity": "warning",
+                        "code": "SKILL_COMPONENT_INCOMPATIBLE",
+                        "skill": name,
+                        "message": str(exc),
+                    }
                 )
-            except (OSError, json.JSONDecodeError, ValueError) as exc:
-                raise ValueError(f"Skill manifest is invalid: {directory.name}: {exc}") from exc
-        elif self.require_manifest_file:
-            raise ValueError(f"Skill manifest.json is missing: {directory.name}")
-        else:
-            manifest = self._legacy_manifest(directory, scripts)
+                continue
+            except SkillPackageError as exc:
+                findings.append(
+                    {
+                        "severity": "warning",
+                        "code": "SKILL_COMPONENT_INVALID",
+                        "skill": name,
+                        "message": str(exc),
+                    }
+                )
+                continue
+            component = package.get("components", {}).get(component_type)
+            if isinstance(component, dict):
+                components.append(
+                    {
+                        "name": name,
+                        "directory": directory,
+                        "component": component,
+                        "package": package,
+                    }
+                )
+        return components, findings
 
-        if not isinstance(manifest, dict) or manifest.get("name") != directory.name:
-            raise ValueError(
-                f"Skill manifest name does not match its directory: {directory.name}"
-            )
-        if self.manifest_validator is not None:
-            self.manifest_validator(manifest)
-        declared = {item.get("name") for item in manifest.get("scripts", [])}
-        actual = {script.name for script in scripts}
-        if declared != actual:
-            raise ValueError(f"Skill manifest script set does not match files: {directory.name}")
-        if origin == "user" and any(
-            item.get("execution_class") != "runner" or item.get("capability") != ""
-            for item in manifest["scripts"]
-        ):
-            raise ValueError(f"User Skill may only use runner execution: {directory.name}")
-        if origin == "builtin":
-            for item in manifest["scripts"]:
-                ref = f"{directory.name}/{Path(item['name']).stem}"
-                expected = HOST_HELPER_CAPABILITIES.get(ref)
-                if "execution_class" not in item:
-                    continue
-                if item["execution_class"] == "host_helper" and (
-                    expected is None or item["capability"] != expected
-                ):
-                    raise ValueError(
-                        f"Built-in host_helper declaration is not allowlisted: {ref}"
-                    )
-                if expected is not None and (
-                    item["execution_class"] != "host_helper"
-                    or item["capability"] != expected
-                ):
-                    raise ValueError(
-                        f"Privileged built-in Skill must use host_helper: {ref}"
-                    )
-        return {**manifest, **({"origin": origin} if manifest_is_file else {})}
+    def builtin_package_names(self):
+        """Return every installed builtin directory, including invalid packages."""
 
-    def list_manifests(self):
-        manifests = []
-        for _name, (directory, origin) in sorted(self._package_roots().items()):
-            manifests.append(self._load_manifest(directory, origin))
-        return manifests
+        packages, _findings = self._scan_packages()
+        return frozenset(
+            name for name, (_directory, origin) in packages.items() if origin == "builtin"
+        )
 
     def list_files(self):
         tree = self.build_tree()
         markdown = []
         scripts = []
-        manifests = []
+        extensions = []
+        references = []
         for node in self._tree_file_paths(tree):
-            if node.get("kind") == "markdown":
+            kind = node.get("kind")
+            if kind == "markdown":
                 markdown.append(node["path"])
-            elif node.get("kind") == "script":
+            elif kind == "script":
                 scripts.append(node["path"])
-            elif node.get("kind") == "manifest":
-                manifests.append(node["path"])
+            elif kind == "extension":
+                extensions.append(node["path"])
+            else:
+                references.append(node["path"])
+        _packages, findings = self._scan_packages()
         return {
             "ok": True,
             "status": "listed",
@@ -361,22 +347,30 @@ class SkillService:
             "tree": tree,
             "markdown_files": sorted(markdown),
             "script_files": sorted(scripts),
-            "manifest_files": sorted(manifests),
-            "manifests": self.list_manifests(),
+            "extension_files": sorted(extensions),
+            "reference_files": sorted(references),
+            "packages": self.list_packages(),
+            "findings": findings,
         }
 
     def read_file(self, relative_path):
         target = self.safe_path(relative_path)
         if not target.is_file():
             return {"ok": False, "status": "not_found", "error": "Skill file not found."}
+        if target.stat().st_size > MAX_READ_BYTES:
+            raise ValueError("Skill file exceeds the Web read limit")
         root, origin = self._root_for_path(Path(relative_path))
+        try:
+            content = target.read_text(encoding="utf-8")
+        except UnicodeDecodeError as exc:
+            raise ValueError("Skill file must be UTF-8") from exc
         return {
             "ok": True,
             "status": "read",
             "path": target.relative_to(root).as_posix(),
             "origin": origin,
             "kind": self._kind(target),
-            "content": target.read_text(encoding="utf-8"),
+            "content": content,
         }
 
     safe_skills_path = safe_path

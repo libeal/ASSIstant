@@ -13,6 +13,7 @@ ExecStart=/usr/bin/python3 /opt/linux-agent/current/lib/runner.py serve
 Environment=HOME=/var/lib/linux-agent-runner
 Environment=LINUX_AGENT_SERVICE_USER=linux-agent
 Environment=LINUX_AGENT_ROOT=/opt/linux-agent/current
+Environment=LINUX_AGENT_BUILTIN_SKILLS_DIR=/opt/linux-agent/skills
 Environment=LINUX_AGENT_DATA_DIR=/opt/linux-agent/data
 Environment=LINUX_AGENT_TMP_ROOT=/opt/linux-agent/data/runner-tmp
 Restart=on-failure

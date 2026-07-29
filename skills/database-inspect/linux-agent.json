@@ -1,0 +1,138 @@
+{
+  "schema_version": 1,
+  "package_version": "1.0.0",
+  "core_api": 1,
+  "category": "database",
+  "tools": [
+    {
+      "name": "instance-discovery",
+      "description": "只读发现标准 PostgreSQL、MySQL/MariaDB socket 与固定客户端。",
+      "entrypoint": "scripts/instance-discovery.sh",
+      "risk": "medium",
+      "approval_scope": "skill_readonly",
+      "execution": {
+        "class": "runner",
+        "capability": "",
+        "dispatch": "always"
+      },
+      "runtime_inputs": [],
+      "guards": []
+    },
+    {
+      "name": "instance-health",
+      "description": "通过专用 credential helper 执行固定数据库健康查询。",
+      "entrypoint": "scripts/instance-health.sh",
+      "risk": "medium",
+      "approval_scope": "skill_readonly",
+      "execution": {
+        "class": "credential_helper",
+        "capability": "database.health",
+        "dispatch": "always",
+        "adapter": "scripts/credential-adapter.py"
+      },
+      "runtime_inputs": [],
+      "guards": []
+    },
+    {
+      "name": "instance-metrics",
+      "description": "通过专用 credential helper 执行固定数据库指标查询。",
+      "entrypoint": "scripts/instance-metrics.sh",
+      "risk": "medium",
+      "approval_scope": "skill_readonly",
+      "execution": {
+        "class": "credential_helper",
+        "capability": "database.metrics",
+        "dispatch": "always",
+        "adapter": "scripts/credential-adapter.py"
+      },
+      "runtime_inputs": [],
+      "guards": []
+    }
+  ],
+  "components": {
+    "credential_helper": {
+      "name": "database-inspector",
+      "client": "scripts/database_inspector.py",
+      "socket_env": "LINUX_AGENT_DATABASE_HELPER_SOCKET",
+      "default_socket": "/run/linux-agent/database-inspector.sock",
+      "service_asset": "assets/systemd/linux-agent-database-inspector.service",
+      "socket_asset": "assets/systemd/linux-agent-database-inspector.socket",
+      "egress_dropin": "20-database-egress.conf",
+      "owned_paths": [
+        {
+          "kind": "directory",
+          "environment": "LINUX_AGENT_DATABASE_PROFILE_ROOT",
+          "default": "/etc/linux-agent/database-profiles.d"
+        }
+      ],
+      "install": {
+        "commands": [
+          {
+            "entrypoint": "scripts/database_profiles.py",
+            "arguments": ["initialize"],
+            "environment": {
+              "LINUX_AGENT_DATABASE_GROUP": "credential_group",
+              "LINUX_AGENT_DATABASE_EGRESS_DROPIN": "component_egress_dropin"
+            }
+          },
+          {
+            "entrypoint": "scripts/database_profiles.py",
+            "arguments": ["list"],
+            "environment": {
+              "LINUX_AGENT_DATABASE_GROUP": "credential_group",
+              "LINUX_AGENT_DATABASE_EGRESS_DROPIN": "component_egress_dropin"
+            }
+          },
+          {
+            "entrypoint": "scripts/database_profiles.py",
+            "arguments": ["refresh-egress"],
+            "environment": {
+              "LINUX_AGENT_DATABASE_GROUP": "credential_group",
+              "LINUX_AGENT_DATABASE_EGRESS_DROPIN": "component_egress_dropin"
+            }
+          }
+        ]
+      },
+      "admin": {
+        "name": "database",
+        "entrypoint": "scripts/database_profiles.py",
+        "environment": {
+          "LINUX_AGENT_DATABASE_GROUP": "credential_group",
+          "LINUX_AGENT_DATABASE_EGRESS_DROPIN": "component_egress_dropin"
+        },
+        "commands": [
+          {"name": "validate", "operands": 0, "stdin": true, "activate_systemd": false},
+          {"name": "install", "operands": 0, "stdin": true, "activate_systemd": true},
+          {"name": "list", "operands": 0, "stdin": false, "activate_systemd": false},
+          {"name": "remove", "operands": 1, "stdin": false, "activate_systemd": true},
+          {"name": "refresh-egress", "operands": 0, "stdin": false, "activate_systemd": true}
+        ]
+      }
+    },
+    "web": {
+      "resource": "database",
+      "backend": "assets/web/database.py",
+      "frontend": "assets/web/view-database.js",
+      "fragment": "assets/web/database.html",
+      "navigation": {
+        "screen": "database",
+        "label": "数据库",
+        "icon": "▤",
+        "key": "4",
+        "order": 40
+      },
+      "routes": [
+        {"method": "GET", "path": "/api/database/profiles", "action": "profiles.list"},
+        {"method": "GET", "path": "/api/database/credentials", "action": "credentials.list"},
+        {"method": "POST", "path": "/api/database/credentials", "action": "credentials.create"},
+        {"method": "POST", "path": "/api/database/credentials/clear", "action": "credentials.clear"}
+      ],
+      "job_actions": ["health", "metrics"],
+      "error_codes": {
+        "database_unreachable": {"retryable": true, "http": 503},
+        "database_query_failed": {"retryable": false, "http": 502},
+        "database_query_cancelled": {"retryable": false, "http": 409}
+      }
+    }
+  }
+}

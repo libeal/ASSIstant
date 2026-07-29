@@ -24,6 +24,7 @@ ALLOWED_TOP_LEVEL = frozenset({"config", "logs", "manifest.json", "policies", "r
 SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 AUDIT_FILE_PATTERN = re.compile(r"^[A-Za-z0-9._-]+\.jsonl(?:\.[1-9][0-9]*)?$")
 POLICY_FILE_PATTERN = re.compile(r"^[a-z0-9][a-z0-9-]*\.json$")
+SKILL_NAME_PATTERN = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?$")
 SENSITIVE_KEY_PATTERN = re.compile(
     r"(api[_-]?key|token|password|passwd|secret|authorization|cookie|credential|private[_-]?key)",
     re.IGNORECASE,
@@ -230,7 +231,7 @@ def build_manifest(
         if len(records) > MAX_MEMBERS:
             raise ArchiveError("backup inventory exceeds the archive member limit")
     payload = {
-        "schema_version": 2,
+        "schema_version": 3,
         "exported_at": exported_at,
         "release_version": release_version,
         "storage_backend": storage_backend,
@@ -259,117 +260,6 @@ def build_manifest(
         output_path.unlink(missing_ok=True)
         raise
     return len(records)
-
-
-def build_user_skill_index(skills_root: Path, output_path: Path) -> int:
-    """Build a portable INDEX.md from only the user Skills in an archive."""
-
-    if skills_root.is_symlink() or not skills_root.is_dir():
-        raise ArchiveError("backup Skill root must be a regular directory")
-    if output_path.parent != skills_root or output_path.name != "INDEX.md":
-        raise ArchiveError("backup Skill index target is outside the Skill root")
-    if output_path.exists() or output_path.is_symlink():
-        raise ArchiveError("backup Skill index target already exists")
-    manifests: list[tuple[str, str, list[str]]] = []
-    for package in sorted(skills_root.iterdir(), key=lambda item: item.name):
-        if package.name.startswith(".") or package.name in {"INDEX.md", "materialized.json"}:
-            continue
-        if package.is_symlink() or not package.is_dir():
-            raise ArchiveError(f"backup Skill package has an unsafe type: {package.name}")
-        manifest_path = package / "manifest.json"
-        if (
-            manifest_path.is_symlink()
-            or not manifest_path.is_file()
-            or manifest_path.stat().st_size > 1_048_576
-        ):
-            raise ArchiveError(f"backup Skill manifest is unavailable: {package.name}")
-        try:
-            manifest = _strict_json_loads(manifest_path.read_text(encoding="utf-8"))
-        except (OSError, UnicodeError, ValueError) as exc:
-            raise ArchiveError(f"backup Skill manifest is invalid: {package.name}") from exc
-        if (
-            not isinstance(manifest, dict)
-            or manifest.get("schema_version") != 1
-            or manifest.get("name") != package.name
-            or not isinstance(manifest.get("description"), str)
-            or not manifest["description"].strip()
-            or not isinstance(manifest.get("scripts"), list)
-            or not manifest["scripts"]
-        ):
-            raise ArchiveError(f"backup Skill manifest contract is invalid: {package.name}")
-        script_names: list[str] = []
-        for entry in manifest["scripts"]:
-            if not isinstance(entry, dict):
-                raise ArchiveError(f"backup Skill script contract is invalid: {package.name}")
-            script_name = entry.get("name")
-            if (
-                not isinstance(script_name, str)
-                or re.fullmatch(r"[a-z0-9][a-z0-9-]*\.sh", script_name) is None
-                or script_name in script_names
-            ):
-                raise ArchiveError(f"backup Skill script name is invalid: {package.name}")
-            if (
-                entry.get("risk") not in {"low", "medium", "high", "critical"}
-                or entry.get("execution_class") != "runner"
-                or entry.get("capability") != ""
-            ):
-                raise ArchiveError(f"backup Skill script contract is invalid: {package.name}")
-            script_names.append(script_name)
-        scripts_root = package / "scripts"
-        if scripts_root.is_symlink() or not scripts_root.is_dir():
-            raise ArchiveError(f"backup Skill scripts are unavailable: {package.name}")
-        actual_scripts = sorted(
-            child.name
-            for child in scripts_root.iterdir()
-            if child.is_file() and not child.is_symlink() and child.suffix == ".sh"
-        )
-        if sorted(script_names) != actual_scripts:
-            raise ArchiveError(f"backup Skill scripts do not match its manifest: {package.name}")
-        skill_markdown = package / "SKILL.md"
-        if (
-            skill_markdown.is_symlink()
-            or not skill_markdown.is_file()
-            or skill_markdown.stat().st_size > 1_048_576
-        ):
-            raise ArchiveError(f"backup Skill documentation is unavailable: {package.name}")
-        documentation = skill_markdown.read_text(encoding="utf-8")
-        for script_name in script_names:
-            reference = f"`{package.name}/{Path(script_name).stem}`"
-            if reference not in documentation:
-                raise ArchiveError(
-                    f"backup Skill documentation omits a manifest script: {reference}"
-                )
-        description = re.sub(r"\s+", " ", manifest["description"].strip()).replace(
-            "`", "'"
-        )
-        manifests.append((package.name, description, script_names))
-
-    lines = [
-        "# User Skill Index",
-        "",
-        "This file is generated from the archived user Skill manifests.",
-        "",
-    ]
-    for name, description, scripts in manifests:
-        lines.extend((f"## {name}", ""))
-        for script_name in scripts:
-            lines.append(f"- `{name}/{Path(script_name).stem}`: {description}")
-        lines.append("")
-    descriptor = os.open(
-        output_path,
-        os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0),
-        0o600,
-    )
-    try:
-        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
-            handle.write("\n".join(lines))
-            handle.flush()
-            os.fsync(handle.fileno())
-        _fsync_directory(skills_root)
-    except Exception:
-        output_path.unlink(missing_ok=True)
-        raise
-    return len(manifests)
 
 
 def _fsync_directory(path: Path) -> None:
@@ -446,8 +336,13 @@ def extract_verified(archive_path: Path, destination: Path) -> dict:
         manifest = _strict_json_loads(manifest_path.read_text(encoding="utf-8"))
     except (OSError, UnicodeError, ValueError) as exc:
         raise ArchiveError(f"runtime archive manifest is invalid: {exc}") from exc
-    if not isinstance(manifest, dict) or manifest.get("schema_version") != 2:
-        raise ArchiveError("runtime archive manifest schema is unsupported")
+    schema_version = manifest.get("schema_version") if isinstance(manifest, dict) else None
+    if schema_version in {1, 2}:
+        raise ArchiveError(
+            "legacy runtime archive is unsupported; migrate it with the previous major version first"
+        )
+    if not isinstance(manifest, dict) or schema_version != 3:
+        raise ArchiveError("runtime archive manifest schema v3 is required")
     if manifest.get("redacted") is not True:
         raise ArchiveError("runtime archive must contain redacted data")
     contents = manifest.get("contents")
@@ -518,10 +413,53 @@ def extract_verified(archive_path: Path, destination: Path) -> dict:
             or POLICY_FILE_PATTERN.fullmatch(path.name) is None
         ):
             raise ArchiveError("runtime archive policy files must be registered JSON names")
-    for required_skill_file in ("INDEX.md", "materialized.json"):
+    for required_skill_file in ("installation-state.json",):
         path = destination / "skills" / required_skill_file
         if not path.is_file() or path.is_symlink():
             raise ArchiveError(f"runtime archive is missing skills/{required_skill_file}")
+    installation_state_path = destination / "skills" / "installation-state.json"
+    try:
+        installation_state = _strict_json_loads(
+            installation_state_path.read_text(encoding="utf-8")
+        )
+    except (OSError, UnicodeError, ValueError) as exc:
+        raise ArchiveError("runtime archive Skill installation state is invalid") from exc
+    if (
+        not isinstance(installation_state, dict)
+        or set(installation_state) != {"schema_version", "builtin"}
+        or installation_state.get("schema_version") != 1
+        or not isinstance(installation_state.get("builtin"), list)
+        or len(installation_state["builtin"]) > 10_000
+    ):
+        raise ArchiveError("runtime archive Skill installation state is invalid")
+    seen_skills: set[str] = set()
+    for item in installation_state["builtin"]:
+        if not isinstance(item, dict):
+            raise ArchiveError("runtime archive Skill installation state is invalid")
+        required = {"name", "installed", "source", "contract_digest"}
+        allowed = required | {"asset_sha256", "release_version"}
+        name = item.get("name")
+        source = item.get("source")
+        if (
+            not required.issubset(item)
+            or set(item) - allowed
+            or not isinstance(name, str)
+            or SKILL_NAME_PATTERN.fullmatch(name) is None
+            or name in seen_skills
+            or not isinstance(item.get("installed"), bool)
+            or source not in {"managed", "remote", "source"}
+            or not isinstance(item.get("contract_digest"), str)
+            or SHA256_PATTERN.fullmatch(item["contract_digest"]) is None
+            or (source == "remote")
+            and (
+                not isinstance(item.get("asset_sha256"), str)
+                or SHA256_PATTERN.fullmatch(item["asset_sha256"]) is None
+                or not isinstance(item.get("release_version"), str)
+                or not item["release_version"]
+            )
+        ):
+            raise ArchiveError("runtime archive Skill installation state is invalid")
+        seen_skills.add(name)
     return manifest
 
 
@@ -862,16 +800,11 @@ def main(argv: list[str]) -> int:
             )
             print(json.dumps({"ok": True, "status": "inventoried", "files": count}))
             return 0
-        if len(argv) == 4 and argv[1] == "build-index":
-            count = build_user_skill_index(Path(argv[2]), Path(argv[3]))
-            print(json.dumps({"ok": True, "status": "indexed", "skills": count}))
-            return 0
         raise ArchiveError(
             "usage: runtime_archive.py extract <archive> <destination> | "
             "merge-config <current> <redacted> <output> | "
             "fingerprint <release> <config> <skills> <policies> | "
-            "build-manifest <stage> <output> <exported-at> <release> <storage> <managed> | "
-            "build-index <skills> <output>"
+            "build-manifest <stage> <output> <exported-at> <release> <storage> <managed>"
         )
     except (ArchiveError, OSError, tarfile.TarError, ValueError) as exc:
         print(json.dumps({"ok": False, "status": "invalid_backup", "error": str(exc)}))

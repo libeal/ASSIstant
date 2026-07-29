@@ -117,6 +117,7 @@
  * @property {Array<Record<string, any>>} mcpTools
  * @property {Array<Record<string, any>>} mcpFindings
  * @property {string} mcpRoot
+ * @property {Array<Record<string, any>>} skillWebComponents
  * @property {string} activeWorkJobId
  * @property {string} activeScriptJobId
  * @property {string} activeTerminalJobId
@@ -202,6 +203,7 @@
  * @property {ViewAction} normalizeExecutionEntries
  * @property {ViewAction} completedExecutionCount
  * @property {ViewAction} normalizeApprovalCard
+ * @property {ViewAction} loadSkillWebComponents
  * @property {ViewAction} primaryOutputObject
  * @property {ViewAction} outputSummaryText
  * @property {ViewAction} renderOutputSection
@@ -305,13 +307,16 @@
  * @property {ViewAction} enableObserverAudit
  * @property {ViewAction} skipObserverAudit
  *
+ * @typedef {object} SkillComponentLoaderContract
+ * @property {ViewAction} loadSkillWebComponents
+ *
  * @typedef {AuditViewContract & Record<string, ViewAction>} AuditView
  * @typedef {ConfigViewContract & Record<string, ViewAction>} ConfigView
  * @typedef {PolicyViewContract & Record<string, ViewAction>} PolicyView
  * @typedef {SkillsViewContract & Record<string, ViewAction>} SkillsView
  * @typedef {WorkbenchViewContract & Record<string, ViewAction>} WorkbenchView
  * @typedef {ObserverBootstrapViewContract & Record<string, ViewAction>} ObserverBootstrapView
- * @typedef {AppContext & AuditViewContract & ConfigViewContract & PolicyViewContract & SkillsViewContract & WorkbenchViewContract & ObserverBootstrapViewContract} ApplicationController
+ * @typedef {AppContext & AuditViewContract & ConfigViewContract & PolicyViewContract & SkillsViewContract & WorkbenchViewContract & ObserverBootstrapViewContract & SkillComponentLoaderContract} ApplicationController
  */
 
 export {};

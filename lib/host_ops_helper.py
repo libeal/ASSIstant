@@ -1,22 +1,20 @@
 #!/usr/bin/env python3
-"""Narrow root helper for firewall and /etc/hosts mutations only."""
+"""Generic root dispatcher for signed builtin Skill host capabilities."""
 
 from __future__ import annotations
 
 import argparse
-import fcntl
 import hashlib
-import ipaddress
+import hmac
+import importlib.util
 import json
 import os
 import re
-import shutil
 import socket
 import stat
-import subprocess
-import tempfile
-from contextlib import contextmanager
+import sys
 from pathlib import Path
+from types import ModuleType
 
 from helper_protocol import (
     PROTOCOL_VERSION,
@@ -31,400 +29,206 @@ from helper_protocol import (
     systemd_listener,
     validate_request,
 )
-
-
-HOSTS_PATH = Path("/etc/hosts")
-HOSTNAME_PATTERN = re.compile(
-    r"^(?=.{1,253}$)(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)(?:\.(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?))*$"
+from skill_package import (
+    contract_digest,
+    validate_builtin_root,
 )
-TOOL_PATHS = {
-    "ufw": ("/usr/sbin/ufw", "/usr/bin/ufw"),
-    "firewall-cmd": ("/usr/bin/firewall-cmd", "/usr/sbin/firewall-cmd"),
-}
+
+
+CAPABILITY_PATTERN = re.compile(
+    r"^[a-z][a-z0-9-]*(?:\.[a-z][a-z0-9-]*)+$"
+)
 
 
 class HostHelperError(ProtocolError):
-    pass
+    """Raised when a package cannot safely register a host capability."""
 
 
-def _trusted_tool(name: str) -> str:
-    for candidate in TOOL_PATHS.get(name, ()):
-        path = Path(candidate)
-        try:
-            resolved = path.resolve(strict=True)
-            metadata = resolved.stat()
-        except OSError:
-            continue
-        if not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != 0:
-            continue
-        if metadata.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
-            continue
-        if os.access(resolved, os.X_OK):
-            return os.fspath(resolved)
-    raise HostHelperError(f"trusted {name} executable is unavailable")
+def _strict_json(path: Path) -> dict[str, object]:
+    def reject_duplicates(pairs):
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError(f"duplicate JSON key: {key}")
+            result[key] = value
+        return result
 
-
-def _firewall_params(params: dict[str, object]) -> tuple[str, list[str], list[str] | None, dict[str, object]]:
-    if set(params) != {"backend", "decision", "protocol", "port", "source"}:
-        raise HostHelperError("firewall.apply params do not match the fixed schema")
-    backend = params.get("backend")
-    decision = params.get("decision")
-    protocol = params.get("protocol")
-    port = params.get("port")
-    source = params.get("source")
-    if backend not in {"ufw", "firewalld"}:
-        raise HostHelperError("firewall backend must be ufw or firewalld")
-    if decision not in {"allow", "deny"} or protocol not in {"tcp", "udp"}:
-        raise HostHelperError("firewall decision or protocol is invalid")
-    if isinstance(port, bool) or not isinstance(port, int) or not 1 <= port <= 65535:
-        raise HostHelperError("firewall port is invalid")
-    if not isinstance(source, str):
-        raise HostHelperError("firewall source is invalid")
-    if source.lower() == "any":
-        normalized_source = "any"
-        network = None
-    else:
-        try:
-            network = ipaddress.ip_network(source, strict=False)
-        except ValueError as exc:
-            raise HostHelperError("firewall source must be an IP address or CIDR") from exc
-        normalized_source = str(network)
-
-    normalized = {
-        "backend": backend,
-        "decision": decision,
-        "protocol": protocol,
-        "port": port,
-        "source": normalized_source,
-    }
-    if backend == "ufw":
-        command = [
-            _trusted_tool("ufw"),
-            decision,
-            "proto",
-            protocol,
-            "from",
-            normalized_source,
-            "to",
-            "any",
-            "port",
-            str(port),
-        ]
-        return backend, command, None, normalized
-
-    family = f' family="ipv{network.version}"' if network else ""
-    source_clause = f' source address="{normalized_source}"' if network else ""
-    action = "accept" if decision == "allow" else "drop"
-    rich_rule = (
-        f'rule{family}{source_clause} port port="{port}" protocol="{protocol}" {action}'
-    )
-    tool = _trusted_tool("firewall-cmd")
-    return (
-        backend,
-        [tool, "--permanent", "--add-rich-rule", rich_rule],
-        [tool, "--reload"],
-        normalized,
-    )
-
-
-def _run_fixed(command: list[str]) -> dict[str, object]:
-    environment = {
-        "PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
-        "HOME": "/root",
-        "LANG": "C.UTF-8",
-    }
     try:
-        completed = subprocess.run(
-            command,
-            stdin=subprocess.DEVNULL,
-            capture_output=True,
-            timeout=20,
-            env=environment,
-            check=False,
+        value = json.loads(
+            path.read_text(encoding="utf-8"),
+            object_pairs_hook=reject_duplicates,
+            parse_constant=lambda item: (_ for _ in ()).throw(ValueError(item)),
         )
-    except subprocess.TimeoutExpired as exc:
-        raise HostHelperError("host operation timed out") from exc
-    return {
-        "ok": completed.returncode == 0,
-        "exit_code": completed.returncode,
-        "stdout": completed.stdout[:65536].decode("utf-8", errors="replace"),
-        "stderr": completed.stderr[:65536].decode("utf-8", errors="replace"),
-    }
+    except (OSError, UnicodeError, ValueError, json.JSONDecodeError) as exc:
+        raise HostHelperError(f"signed release manifest is invalid: {exc}") from exc
+    if not isinstance(value, dict):
+        raise HostHelperError("signed release manifest must be an object")
+    return value
 
 
-def apply_firewall(params: dict[str, object]) -> dict[str, object]:
-    backend, command, reload_command, normalized = _firewall_params(params)
-    result = _run_fixed(command)
-    reload_result = None
-    if result["ok"] and reload_command is not None:
-        reload_result = _run_fixed(reload_command)
-    ok = result["ok"] and (reload_result is None or reload_result["ok"])
-    return {
-        "ok": ok,
-        "status": "applied" if ok else "apply_failed",
-        "operation": "firewall.apply",
-        "backend": backend,
-        "rule": normalized,
-        "command_result": result,
-        "reload_result": reload_result,
-    }
+def _trusted_tree(root: Path) -> None:
+    """Require an immutable tree owned by root in production.
 
+    Source-mode tests run the helper module as an ordinary user, so that user's
+    UID is accepted only when the helper itself is not privileged.
+    """
 
-def _validate_hostname(value: object) -> str:
-    if not isinstance(value, str):
-        raise HostHelperError("hostname must be a string")
-    normalized = value.strip().lower()
-    if HOSTNAME_PATTERN.fullmatch(normalized) is None:
-        raise HostHelperError("hostname is invalid")
-    return normalized
-
-
-def _hosts_lines() -> tuple[bytes, list[str]]:
-    if HOSTS_PATH.is_symlink() or not HOSTS_PATH.is_file():
-        raise HostHelperError("/etc/hosts must be a regular non-symlink file")
-    raw = HOSTS_PATH.read_bytes()
-    if len(raw) > 2 * 1024 * 1024:
-        raise HostHelperError("/etc/hosts exceeds the helper size limit")
-    try:
-        text = raw.decode("utf-8")
-    except UnicodeDecodeError as exc:
-        raise HostHelperError("/etc/hosts must be UTF-8") from exc
-    return raw, text.splitlines()
-
-
-def _hosts_directory() -> Path:
-    """Return the ordinary directory containing the configured hosts file."""
-    directory = HOSTS_PATH.parent
-    try:
-        metadata = directory.lstat()
-    except OSError as exc:
-        raise HostHelperError("hosts parent directory is unavailable") from exc
-    if not stat.S_ISDIR(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode):
-        raise HostHelperError("hosts parent directory must be a non-symlink directory")
-    return directory
-
-
-def _fsync_directory(directory: Path) -> None:
-    descriptor = os.open(os.fspath(directory), os.O_RDONLY | os.O_DIRECTORY)
-    try:
-        os.fsync(descriptor)
-    finally:
-        os.close(descriptor)
-
-
-def _restore_hosts_backup(backup: Path, directory: Path) -> None:
-    descriptor, raw_path = tempfile.mkstemp(
-        prefix=".hosts.linux-agent.rollback.", dir=os.fspath(directory)
-    )
-    rollback = Path(raw_path)
-    try:
-        os.close(descriptor)
-        shutil.copy2(backup, rollback)
-        descriptor = os.open(os.fspath(rollback), os.O_RDONLY)
+    accepted_uid = 0 if os.geteuid() == 0 else os.geteuid()
+    for path in (root, *root.rglob("*")):
         try:
-            os.fsync(descriptor)
-        finally:
-            os.close(descriptor)
-        os.replace(rollback, HOSTS_PATH)
-        _fsync_directory(directory)
-    finally:
-        try:
-            os.close(descriptor)
-        except OSError:
-            pass
-        try:
-            rollback.unlink()
-        except FileNotFoundError:
-            pass
-
-
-@contextmanager
-def _hosts_mutation_lock():
-    """Serialize helper writers for the one permitted hosts target."""
-
-    directory = _hosts_directory()
-    lock_path = directory / ".linux-agent-hosts.lock"
-    flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
-    try:
-        descriptor = os.open(os.fspath(lock_path), flags, 0o600)
-    except OSError as exc:
-        raise HostHelperError("hosts mutation lock is unavailable") from exc
-    try:
-        metadata = os.fstat(descriptor)
-        if not stat.S_ISREG(metadata.st_mode):
-            raise HostHelperError("hosts mutation lock must be a regular file")
-        os.fchmod(descriptor, 0o600)
-        fcntl.flock(descriptor, fcntl.LOCK_EX)
-        yield
-    finally:
-        try:
-            fcntl.flock(descriptor, fcntl.LOCK_UN)
-        finally:
-            os.close(descriptor)
-
-
-def _write_hosts_locked(lines: list[str], expected_sha256: str | None = None) -> str:
-    # The caller reviewed this exact bytestring.  Recheck immediately before
-    # taking the backup and again after the copy so a concurrent writer cannot
-    # be silently overwritten by the final rename.
-    current_raw = HOSTS_PATH.read_bytes()
-    if expected_sha256 and hashlib.sha256(current_raw).hexdigest() != expected_sha256:
-        raise HostHelperError("/etc/hosts changed after the reviewed plan")
-    metadata = HOSTS_PATH.stat()
-    directory_path = _hosts_directory()
-    descriptor, raw_path = tempfile.mkstemp(
-        prefix=".hosts.linux-agent.", dir=os.fspath(directory_path)
-    )
-    temporary = Path(raw_path)
-    backup = None
-    replaced = False
-    try:
-        os.fchmod(descriptor, stat.S_IMODE(metadata.st_mode))
-        payload = ("\n".join(lines) + "\n").encode("utf-8")
-        offset = 0
-        while offset < len(payload):
-            written = os.write(descriptor, payload[offset:])
-            if written <= 0:
-                raise OSError("hosts write made no forward progress")
-            offset += written
-        os.fsync(descriptor)
-        os.close(descriptor)
-        os.chown(temporary, metadata.st_uid, metadata.st_gid)
-        current_raw = HOSTS_PATH.read_bytes()
-        if expected_sha256 and hashlib.sha256(current_raw).hexdigest() != expected_sha256:
-            raise HostHelperError("/etc/hosts changed after the reviewed plan")
-        backup_descriptor, backup_raw_path = tempfile.mkstemp(
-            prefix="hosts.linux-agent.bak.", dir=os.fspath(directory_path)
-        )
-        os.close(backup_descriptor)
-        backup = Path(backup_raw_path)
-        shutil.copy2(HOSTS_PATH, backup)
-        # Copying the backup is an observable window for a concurrent writer;
-        # do one last digest check before replacing the target.
-        current_raw = HOSTS_PATH.read_bytes()
-        if expected_sha256 and hashlib.sha256(current_raw).hexdigest() != expected_sha256:
-            raise HostHelperError("/etc/hosts changed after the reviewed plan")
-        os.replace(temporary, HOSTS_PATH)
-        replaced = True
-        try:
-            _fsync_directory(directory_path)
+            metadata = path.lstat()
         except OSError as exc:
-            try:
-                _restore_hosts_backup(backup, directory_path)
-            except OSError as rollback_exc:
-                raise HostHelperError(
-                    "hosts persistence failed and rollback could not be confirmed; "
-                    f"recovery backup retained at {backup}: {rollback_exc}"
-                ) from exc
-            raise HostHelperError(
-                "hosts persistence failed; previous content was restored and "
-                f"the recovery backup was retained at {backup}"
-            ) from exc
-    except Exception:
-        if backup is not None and not replaced:
-            try:
-                backup.unlink()
-            except OSError:
-                pass
-        raise
+            raise HostHelperError(f"host component path is unavailable: {path}") from exc
+        if stat.S_ISLNK(metadata.st_mode):
+            raise HostHelperError("host component tree cannot contain symbolic links")
+        if not (stat.S_ISDIR(metadata.st_mode) or stat.S_ISREG(metadata.st_mode)):
+            raise HostHelperError("host component tree contains an unsafe file type")
+        if metadata.st_uid != accepted_uid:
+            raise HostHelperError("host component tree has an untrusted owner")
+        if metadata.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+            raise HostHelperError("host component tree must not be group/world writable")
+
+
+def _manifest_contracts() -> tuple[dict[str, object] | None, Path | None]:
+    raw = os.environ.get("LINUX_AGENT_RELEASE_MANIFEST", "").strip()
+    if not raw:
+        return None, None
+    path = Path(raw)
+    if path.is_symlink() or not path.is_file():
+        raise HostHelperError("signed release manifest is unavailable")
+    metadata = path.stat()
+    accepted_uid = 0 if os.geteuid() == 0 else os.geteuid()
+    if metadata.st_uid != accepted_uid or metadata.st_mode & (
+        stat.S_IWGRP | stat.S_IWOTH
+    ):
+        raise HostHelperError("signed release manifest metadata is untrusted")
+    manifest = _strict_json(path)
+    if manifest.get("schema_version") != 2 or not isinstance(
+        manifest.get("skills"), dict
+    ):
+        raise HostHelperError("signed release manifest schema v2 is required")
+    return manifest, path
+
+
+def _verify_contract_digest(
+    package: Path, name: str, manifest: dict[str, object] | None
+) -> None:
+    if manifest is None:
+        return
+    skills = manifest["skills"]
+    entry = skills.get(name) if isinstance(skills, dict) else None
+    expected = entry.get("contract_digest") if isinstance(entry, dict) else None
+    if not isinstance(expected, str) or re.fullmatch(r"[0-9a-f]{64}", expected) is None:
+        raise HostHelperError(f"host Skill {name} has no signed contract digest")
+    if not hmac.compare_digest(contract_digest(package, "builtin"), expected):
+        raise HostHelperError(f"host Skill {name} contract digest mismatch")
+
+
+def _builtin_skills_root() -> Path:
+    configured = os.environ.get("LINUX_AGENT_BUILTIN_SKILLS_DIR", "").strip()
+    if configured:
+        return Path(configured)
+    root = Path(os.environ.get("LINUX_AGENT_ROOT", "/opt/linux-agent/current"))
+    return root / "skills"
+
+
+def _capability_registry() -> dict[str, tuple[Path, str]]:
+    skills_root = _builtin_skills_root()
+    if skills_root.is_symlink() or not skills_root.is_dir():
+        raise HostHelperError("builtin Skill root is unavailable")
+    index_path = skills_root / "INDEX.md"
+    _trusted_tree(index_path)
+    validation = validate_builtin_root(skills_root)
+    release_manifest, _manifest_path = _manifest_contracts()
+    registry: dict[str, tuple[Path, str]] = {}
+    conflicts: set[str] = set()
+    for skill in validation["skills"]:
+        if skill.get("state") != "installed":
+            continue
+        name = skill["name"]
+        package = Path(skill["package"])
+        component = skill["components"].get("host_helper")
+        if not isinstance(component, dict):
+            continue
+        try:
+            _verify_contract_digest(package, name, release_manifest)
+            _trusted_tree(package)
+        except HostHelperError:
+            continue
+        handler = package / component["handler"]
+        for tool in skill["package_tools"]:
+            execution = tool["execution"]
+            if execution["class"] != "host_helper":
+                continue
+            capability = execution["capability"]
+            if capability in conflicts:
+                continue
+            if capability in registry:
+                registry.pop(capability)
+                conflicts.add(capability)
+                continue
+            registry[capability] = (handler, name)
+    return registry
+
+
+def _load_handler(path: Path, package_name: str) -> ModuleType:
+    module_name = (
+        "linux_agent_host_component_"
+        + package_name.replace("-", "_")
+        + "_"
+        + hashlib.sha256(os.fspath(path).encode("utf-8")).hexdigest()[:12]
+    )
+    spec = importlib.util.spec_from_file_location(module_name, path)
+    if spec is None or spec.loader is None:
+        raise HostHelperError("host component loader is unavailable")
+    module = importlib.util.module_from_spec(spec)
+    package_scripts = os.fspath(path.parent)
+    sys.path.insert(0, package_scripts)
+    try:
+        spec.loader.exec_module(module)
+    except Exception as exc:
+        raise HostHelperError("host component could not be loaded") from exc
     finally:
         try:
-            os.close(descriptor)
-        except OSError:
+            sys.path.remove(package_scripts)
+        except ValueError:
             pass
-        try:
-            temporary.unlink()
-        except FileNotFoundError:
-            pass
-    return os.fspath(backup)
+    if not callable(getattr(module, "dispatch", None)):
+        raise HostHelperError("host component has no dispatch function")
+    return module
 
 
-def _write_hosts(lines: list[str], expected_sha256: str | None = None) -> str:
-    # Keep the lock across the final digest check, backup, replace, and
-    # directory fsync.  External writers still cannot be controlled, so the
-    # expected digest checks remain deliberately in the locked implementation.
-    with _hosts_mutation_lock():
-        return _write_hosts_locked(lines, expected_sha256)
+def dispatch_capability(
+    operation: str, params: dict[str, object]
+) -> dict[str, object]:
+    if CAPABILITY_PATTERN.fullmatch(operation) is None:
+        raise HostHelperError("host helper capability is invalid")
+    try:
+        handler_path, package_name = _capability_registry()[operation]
+    except KeyError as exc:
+        raise HostHelperError("unsupported host helper capability") from exc
+    module = _load_handler(handler_path, package_name)
+    response = module.dispatch(operation, params)
+    if (
+        not isinstance(response, dict)
+        or response.get("operation") != operation
+        or not isinstance(response.get("ok"), bool)
+    ):
+        raise HostHelperError("host component returned an invalid result")
+    return response
 
 
-def apply_hosts(params: dict[str, object]) -> dict[str, object]:
-    allowed = {"action", "ip", "hostnames", "hostname", "merge", "expected_sha256"}
-    if set(params) != allowed:
-        raise HostHelperError("hosts.apply params do not match the fixed schema")
-    action = params.get("action")
-    if action not in {"add", "remove"}:
-        raise HostHelperError("hosts action must be add or remove")
-    if not isinstance(params.get("merge"), bool):
-        raise HostHelperError("hosts merge must be boolean")
-    expected_sha = params.get("expected_sha256")
-    if not isinstance(expected_sha, str) or re.fullmatch(r"[0-9a-f]{64}", expected_sha) is None:
-        raise HostHelperError("hosts expected_sha256 is invalid")
-    raw, lines = _hosts_lines()
-    if hashlib.sha256(raw).hexdigest() != expected_sha:
-        return {
-            "ok": False,
-            "status": "target_changed",
-            "code": "helper_rejected",
-            "error": "/etc/hosts changed after the reviewed plan",
-        }
-
-    if action == "add":
-        try:
-            address = str(ipaddress.ip_address(str(params.get("ip") or "")))
-        except ValueError as exc:
-            raise HostHelperError("hosts IP address is invalid") from exc
-        raw_hostnames = params.get("hostnames")
-        if not isinstance(raw_hostnames, list) or not 1 <= len(raw_hostnames) <= 32:
-            raise HostHelperError("hosts hostnames must be a non-empty array")
-        hostnames = [_validate_hostname(item) for item in raw_hostnames]
-        line = f"{address}\t{' '.join(dict.fromkeys(hostnames))}"
-        existing_index = next(
-            (
-                index
-                for index, existing in enumerate(lines)
-                if existing.split("#", 1)[0].split()[:1] == [address]
-            ),
-            None,
-        )
-        if params["merge"] and existing_index is not None:
-            body = lines[existing_index].split("#", 1)[0].split()
-            line = f"{address}\t{' '.join(dict.fromkeys(body[1:] + hostnames))}"
-            lines[existing_index] = line
-        elif not any(existing.split("#", 1)[0].split() == line.split() for existing in lines):
-            lines.append(line)
-        detail = {"action": action, "ip": address, "hostnames": hostnames, "line": line}
-    else:
-        raw_ip = str(params.get("ip") or "").strip()
-        hostname_raw = str(params.get("hostname") or "").strip()
-        if not raw_ip and not hostname_raw:
-            raise HostHelperError("hosts remove requires hostname or ip")
-        address = ""
-        if raw_ip:
-            try:
-                address = str(ipaddress.ip_address(raw_ip))
-            except ValueError as exc:
-                raise HostHelperError("hosts IP address is invalid") from exc
-        hostname = _validate_hostname(hostname_raw) if hostname_raw else ""
-        kept = []
-        removed = []
-        for line in lines:
-            body = line.split("#", 1)[0].split()
-            matches = len(body) >= 2 and (
-                (hostname and hostname in [item.lower() for item in body[1:]])
-                or (address and body[0] == address)
-            )
-            (removed if matches else kept).append(line)
-        lines = kept
-        detail = {"action": action, "ip": address, "hostname": hostname, "removed": removed}
-
-    backup = _write_hosts(lines, expected_sha)
+def _error_response(exc: Exception, request_id: str) -> dict[str, object]:
+    code = getattr(exc, "code", "")
+    if not isinstance(code, str) or re.fullmatch(r"[a-z][a-z0-9_]{0,63}", code) is None:
+        code = "helper_rejected" if isinstance(exc, ProtocolError) else "helper_failed"
     return {
-        "ok": True,
-        "status": "updated",
-        "operation": "hosts.apply",
-        "path": "/etc/hosts",
-        "backup_path": backup,
-        **detail,
+        "ok": False,
+        "status": code,
+        "code": code,
+        "error": str(exc),
+        "protocol_version": PROTOCOL_VERSION,
+        "request_id": request_id,
     }
 
 
@@ -437,34 +241,15 @@ def handle_connection(connection: socket.socket, expected_uid: int) -> None:
         if operation == "ping":
             if params:
                 raise HostHelperError("host helper ping does not accept params")
-            response = {"ok": True, "status": "ready", "helper": "host-ops"}
-        elif operation == "firewall.apply":
-            with runtime_shared_lock():
-                response = apply_firewall(params)
-        elif operation == "hosts.apply":
-            with runtime_shared_lock():
-                response = apply_hosts(params)
+            response = {"ok": True, "status": "ready", "helper": "host-dispatcher"}
         else:
-            raise HostHelperError("unsupported host helper operation")
-        response.update({"protocol_version": PROTOCOL_VERSION, "request_id": request_id})
-    except ProtocolError as exc:
-        response = {
-            "ok": False,
-            "status": "helper_rejected",
-            "code": "helper_rejected",
-            "error": str(exc),
-            "protocol_version": PROTOCOL_VERSION,
-            "request_id": request_id,
-        }
+            with runtime_shared_lock():
+                response = dispatch_capability(operation, params)
+        response.update(
+            {"protocol_version": PROTOCOL_VERSION, "request_id": request_id}
+        )
     except Exception as exc:
-        response = {
-            "ok": False,
-            "status": "helper_failed",
-            "code": "helper_failed",
-            "error": str(exc),
-            "protocol_version": PROTOCOL_VERSION,
-            "request_id": request_id,
-        }
+        response = _error_response(exc, request_id)
     send_json(connection, response)
 
 
@@ -484,20 +269,28 @@ def main() -> int:
     subparsers.add_parser("serve")
     request_parser = subparsers.add_parser("request")
     request_parser.add_argument("--socket", required=True)
-    request_parser.add_argument("operation", choices=("ping", "firewall.apply", "hosts.apply"))
+    request_parser.add_argument("operation")
     request_parser.add_argument("--params", required=True)
     request_parser.add_argument("--summary", required=True)
-    args = parser.parse_args()
-    if args.command == "serve":
+    arguments = parser.parse_args()
+    if arguments.command == "serve":
         if os.geteuid() != 0:
             raise SystemExit("host helper must run as root")
         return serve()
+    if (
+        arguments.operation != "ping"
+        and CAPABILITY_PATTERN.fullmatch(arguments.operation) is None
+    ):
+        print("invalid host helper capability", file=sys.stderr)
+        return 125
     try:
-        params = json.loads(args.params)
-        request = build_request(args.operation, params, summary=args.summary)
-        response = client_request(args.socket, request)
+        params = json.loads(arguments.params)
+        request = build_request(
+            arguments.operation, params, summary=arguments.summary
+        )
+        response = client_request(arguments.socket, request)
     except (OSError, ProtocolError, json.JSONDecodeError) as exc:
-        print(str(exc), file=os.sys.stderr)
+        print(str(exc), file=sys.stderr)
         return 125
     print(json.dumps(response, ensure_ascii=False, separators=(",", ":")))
     return 0 if response.get("ok") else 1

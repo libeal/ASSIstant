@@ -44,6 +44,7 @@ import { createConfigView } from "./modules/view-config.js";
 import { createSkillsView } from "./modules/view-skills.js";
 import { createAuditView } from "./modules/view-audit.js";
 import { createPolicyView } from "./modules/view-policy.js";
+import { createSkillComponentLoader } from "./modules/skill-components.js";
 import { bindApplicationEvents } from "./modules/app-bindings.js";
 import { consumeBootstrapFromLocation } from "./modules/auth.js";
 
@@ -192,6 +193,7 @@ async function connect() {
   await app.loadTools();
   await app.loadSkillTree();
   await app.loadMcpRegistry();
+  await app.loadSkillWebComponents();
   await app.loadAuditList();
   await app.loadPolicies();
   showToast("Connected");
@@ -314,5 +316,6 @@ Object.assign(app, createAuditView(app, {
   showScreen,
 }));
 Object.assign(app, createPolicyView(app));
+Object.assign(app, createSkillComponentLoader(app));
 
 init();

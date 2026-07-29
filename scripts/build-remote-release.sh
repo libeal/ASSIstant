@@ -99,7 +99,10 @@ jq -e '.web.token == "" and (.web.sensitive_edits_enabled == true)' \
 }
 cp -a "${ROOT_DIR}/bin/agent" "${core_stage}/bin/agent"
 cp -a "${ROOT_DIR}/lib/"*.sh "${ROOT_DIR}/lib/"*.py "${core_stage}/lib/"
-cp -a "${ROOT_DIR}/config/config.example.json" "${ROOT_DIR}/config/ai-providers.json" "${core_stage}/config/"
+cp -a \
+    "${ROOT_DIR}/config/config.example.json" \
+    "${ROOT_DIR}/config/ai-providers.json" \
+    "${core_stage}/config/"
 cp -a "${ROOT_DIR}/schema/domain.json" "${core_stage}/schema/domain.json"
 cp -a \
     "${ROOT_DIR}/packaging/linux-agent-web.service" \
@@ -120,6 +123,13 @@ copy_tree_without_cache "${ROOT_DIR}/prompts" "${core_stage}/prompts"
 cp -a "${ROOT_DIR}/skills/INDEX.md" "${core_stage}/skills/INDEX.md"
 create_archive "${core_stage}" "${OUTPUT_DIR}/linux-agent-core.tar.gz"
 
+python3 "${ROOT_DIR}/lib/skill_package.py" validate-root "${ROOT_DIR}/skills" --strict |
+    jq -e '.ok == true and ([.findings[]? | select(.severity == "critical")] | length == 0)' >/dev/null || {
+    printf 'builtin Skill INDEX/package contract validation failed\n' >&2
+    exit 1
+}
+index_json="$(python3 "${ROOT_DIR}/lib/skill_package.py" index "${ROOT_DIR}/skills/INDEX.md")"
+
 web_stage="${tmp_root}/web"
 mkdir -p "${web_stage}/bin"
 cp -a "${ROOT_DIR}/bin/agent-web" "${web_stage}/bin/agent-web"
@@ -133,56 +143,33 @@ while IFS= read -r skill_dir; do
         printf 'invalid skill directory name: %s\n' "${skill_name}" >&2
         exit 1
     }
-    skill_manifest="${skill_dir}/manifest.json"
-    jq -e --arg skill "${skill_name}" '
-        .schema_version == 1 and .name == $skill
-        and (.scripts | type == "array" and length > 0)
-        and all(.scripts[]; . as $script
-            | ($script.name | type == "string" and test("^[a-z0-9][a-z0-9-]*\\.sh$"))
-            and (["low","medium","high","critical"] | index($script.risk)) != null
-            and (["runner","host_helper"] | index($script.execution_class)) != null
-            and ($script.capability | type == "string")
-            and (if $skill == "network-ops-tools" and $script.name == "firewall.sh" then
-                    $script.execution_class == "host_helper" and $script.capability == "firewall.apply"
-                 elif $skill == "network-ops-tools" and $script.name == "hosts-file-editor.sh" then
-                    $script.execution_class == "host_helper" and $script.capability == "hosts.apply"
-                 else
-                    $script.execution_class == "runner" and $script.capability == ""
-                 end))
-    ' "${skill_manifest}" >/dev/null || {
-        printf 'invalid skill manifest.json: %s\n' "${skill_name}" >&2
+    package_json="$(python3 "${ROOT_DIR}/lib/skill_package.py" inspect "${skill_dir}" --origin builtin)" || {
+        printf 'invalid Skill package: %s\n' "${skill_name}" >&2
         exit 1
     }
     skill_stage="${tmp_root}/skill-${skill_name}"
     mkdir -p "${skill_stage}/skills"
     copy_tree_without_cache "${skill_dir}" "${skill_stage}/skills/${skill_name}"
+    rm -rf "${skill_stage}/skills/${skill_name}/tests"
     asset_name="linux-agent-skill-${skill_name}.tar.gz"
     create_archive "${skill_stage}" "${OUTPUT_DIR}/${asset_name}"
 
-    refs='[]'
-    while IFS= read -r index_line; do
-        ref="$(sed -n 's/^- `\([^`]*\)`: .*/\1/p' <<<"${index_line}")"
-        [[ "${ref}" == "${skill_name}/"* ]] || continue
-        ref="${ref%.sh}"
-        description="$(sed -n 's/^- `[^`]*`: \(.*\)$/\1/p' <<<"${index_line}")"
-        script_name="${ref#*/}.sh"
-        script_contract="$(jq -c --arg script "${script_name}" '[.scripts[] | select(.name == $script)][0] // empty' "${skill_manifest}")"
-        [[ -n "${script_contract}" ]] || {
-            printf 'skill index ref is missing from manifest.json: %s\n' "${ref}" >&2
-            exit 1
-        }
-        risk="$(jq -r '.risk' <<<"${script_contract}")"
-        execution_class="$(jq -r '.execution_class' <<<"${script_contract}")"
-        capability="$(jq -r '.capability' <<<"${script_contract}")"
-        refs="$(jq -cn --argjson prior "${refs}" --arg ref "${ref}" --arg description "${description}" \
-            --arg risk "${risk}" --arg execution_class "${execution_class}" --arg capability "${capability}" \
-            '$prior + [{ref:$ref, description:$description, risk:$risk, execution_class:$execution_class, capability:$capability}]')"
-    done <"${ROOT_DIR}/skills/INDEX.md"
-    [[ "$(jq 'length' <<<"${refs}")" -gt 0 ]] || {
-        printf 'skill has no INDEX.md references: %s\n' "${skill_name}" >&2
-        exit 1
-    }
-    skill_description="$(jq -r '.description // empty' "${skill_manifest}")"
+    refs="$(jq -c --arg skill "${skill_name}" '[.tools[] | {
+        ref:($skill + "/" + .name),
+        description,
+        risk,
+        approval_scope,
+        execution_class:.execution.class,
+        capability:.execution.capability,
+        dispatch:.execution.dispatch,
+        runtime_inputs,
+        guards
+    }]' <<<"${package_json}")"
+    skill_description="$(jq -r '.description // empty' <<<"${package_json}")"
+    skill_category="$(jq -r '.category // empty' <<<"${package_json}")"
+    components="$(jq -c '.components // {}' <<<"${package_json}")"
+    contract_digest="$(python3 "${ROOT_DIR}/lib/skill_package.py" digest "${skill_dir}" --origin builtin | jq -r '.contract_digest')"
+    index_section_digest="$(jq -r --arg skill "${skill_name}" '.skills[] | select(.name == $skill) | .section_digest' <<<"${index_json}")"
     [[ -n "${skill_description}" ]] || {
         printf 'skill has no description frontmatter: %s\n' "${skill_name}" >&2
         exit 1
@@ -200,10 +187,14 @@ while IFS= read -r skill_dir; do
         --argjson prior "${skills_json}" \
         --arg skill "${skill_name}" \
         --arg description "${skill_description}" \
+        --arg category "${skill_category}" \
         --arg risk "${skill_risk}" \
+        --arg contract_digest "${contract_digest}" \
+        --arg index_section_digest "${index_section_digest}" \
         --argjson asset "$(asset_json "${asset_name}")" \
         --argjson refs "${refs}" \
-        '$prior + {($skill): {description:$description, risk:$risk, asset:$asset, refs:$refs}}')"
+        --argjson components "${components}" \
+        '$prior + {($skill): {description:$description, category:$category, risk:$risk, asset:$asset, refs:$refs, components:$components, contract_digest:$contract_digest, index_section_digest:$index_section_digest}}')"
 done < <(find "${ROOT_DIR}/skills" -mindepth 1 -maxdepth 1 -type d | sort)
 
 {
@@ -247,6 +238,7 @@ while IFS= read -r name; do
 done < <(find "${OUTPUT_DIR}" -maxdepth 1 -type f -printf '%f\n' | sort)
 
 jq -S -n \
+    --slurpfile domain "${ROOT_DIR}/schema/domain.json" \
     --arg version "${VERSION}" \
     --arg created "${created_at}" \
     --arg namespace "https://github.com/libeal/ASSIstant/releases/download/${VERSION}/sbom.spdx.json" \
@@ -293,7 +285,7 @@ jq -S -n \
     --argjson checksums "$(asset_json SHA256SUMS)" \
     --argjson skills "${skills_json}" \
     '{
-        schema_version:1,
+        schema_version:2,
         version:$version,
         repository:"libeal/ASSIstant",
         assets:{
@@ -305,6 +297,7 @@ jq -S -n \
             sbom:$sbom,
             checksums:$checksums
         },
+        core_contents:{builtin_skill_index:true,builtin_skill_packages:false},
         skills:$skills
     }' >"${OUTPUT_DIR}/release-manifest.json"
 

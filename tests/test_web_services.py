@@ -3,6 +3,7 @@
 import io
 import json
 import os
+import shutil
 import sys
 import tempfile
 import urllib.error
@@ -30,6 +31,7 @@ import provider as provider_module  # noqa: E402
 import pinned_http  # noqa: E402
 from policy import PolicyService  # noqa: E402
 from skills import SkillService  # noqa: E402
+from skill_components import SkillWebComponentError, SkillWebRegistry  # noqa: E402
 
 
 DOMAIN_SCHEMA = {
@@ -56,12 +58,60 @@ class SkillServiceTests(unittest.TestCase):
         (self.root / "README.md").write_text("root docs\n", encoding="utf-8")
         (self.root / "run.sh").write_text("#!/usr/bin/env bash\n", encoding="utf-8")
         (self.root / "nested" / "guide.md").write_text("nested docs\n", encoding="utf-8")
-        (self.root / "ignored.txt").write_text("ignore\n", encoding="utf-8")
+        (self.root / "notes.txt").write_text("reference\n", encoding="utf-8")
+        (self.root / "ignored.bin").write_bytes(b"ignore")
         (self.root / ".hidden" / "secret.md").write_text("hidden\n", encoding="utf-8")
         self.service = SkillService(self.root)
 
     def tearDown(self):
         self.temp.cleanup()
+
+    @staticmethod
+    def _write_package(root, name, *, execution_class="runner", capability=""):
+        package = root / name
+        scripts = package / "scripts"
+        scripts.mkdir(parents=True)
+        (package / "SKILL.md").write_text(
+            f"---\nname: {name}\ndescription: Test package\n---\n\n# Test\n",
+            encoding="utf-8",
+        )
+        (scripts / "inspect.sh").write_text("#!/usr/bin/env bash\n", encoding="utf-8")
+        execution = {
+            "class": execution_class,
+            "capability": capability,
+            "dispatch": "always",
+        }
+        if execution_class != "runner":
+            (scripts / "adapter.py").write_text(
+                "print('{\"ok\":false}')\n",
+                encoding="utf-8",
+            )
+            execution["adapter"] = "scripts/adapter.py"
+        (package / "linux-agent.json").write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "package_version": "1.0.0",
+                    "core_api": 1,
+                    "category": "custom",
+                    "tools": [
+                        {
+                            "name": "inspect",
+                            "description": "Inspect fixture.",
+                            "entrypoint": "scripts/inspect.sh",
+                            "risk": "low",
+                            "approval_scope": "skill_readonly",
+                            "execution": execution,
+                            "runtime_inputs": [],
+                            "guards": [],
+                        }
+                    ],
+                    "components": {},
+                }
+            ),
+            encoding="utf-8",
+        )
+        return package
 
     def test_list_and_read_visible_skill_files(self):
         listing = self.service.list_files()
@@ -69,7 +119,11 @@ class SkillServiceTests(unittest.TestCase):
         self.assertTrue(listing["ok"])
         self.assertEqual(listing["markdown_files"], ["README.md", "nested/guide.md"])
         self.assertEqual(listing["script_files"], ["run.sh"])
-        self.assertEqual([item["type"] for item in listing["tree"]], ["dir", "file", "file"])
+        self.assertEqual(listing["reference_files"], ["notes.txt"])
+        self.assertEqual(
+            [item["type"] for item in listing["tree"]],
+            ["dir", "file", "file", "file"],
+        )
         read = self.service.read_file("nested/guide.md")
         self.assertEqual(read["status"], "read")
         self.assertEqual(read["kind"], "markdown")
@@ -83,88 +137,98 @@ class SkillServiceTests(unittest.TestCase):
         for path in (
             "../outside.md",
             str(outside),
-            "ignored.txt",
+            "ignored.bin",
             ".hidden/secret.md",
             "linked.md",
         ):
             with self.subTest(path=path), self.assertRaises(ValueError):
                 self.service.safe_path(path)
 
-    def test_skill_packages_cross_the_manifest_validation_boundary(self):
-        package = self.root / "ops-basic"
-        scripts = package / "scripts"
-        scripts.mkdir(parents=True)
+    def test_standard_instruction_only_package_is_listed(self):
+        package = self.root / "instruction-only"
+        package.mkdir()
         (package / "SKILL.md").write_text(
-            "---\nname: ops-basic\ndescription: Operations\n---\n",
+            "---\nname: instruction-only\ndescription: Instructions only\n---\n\n# Guide\n",
             encoding="utf-8",
         )
-        (scripts / "inspect.sh").write_text("#!/usr/bin/env bash\n", encoding="utf-8")
-        validated = []
-        service = SkillService(self.root, manifest_validator=validated.append)
 
-        listing = service.list_files()
+        listing = self.service.list_files()
 
-        self.assertEqual(listing["manifests"], validated)
-        self.assertEqual(validated[0]["name"], "ops-basic")
-        self.assertEqual(validated[0]["scripts"], [{"name": "inspect.sh"}])
+        self.assertEqual(listing["packages"][0]["name"], "instruction-only")
+        self.assertEqual(listing["packages"][0]["state"], "installed")
+        self.assertEqual(listing["packages"][0]["tools"], [])
 
-    def test_incomplete_skill_package_fails_closed(self):
+    def test_invalid_and_legacy_packages_are_isolated(self):
         package = self.root / "broken"
-        (package / "scripts").mkdir(parents=True)
-        (package / "scripts" / "run.sh").write_text("#!/usr/bin/env bash\n", encoding="utf-8")
-        with self.assertRaisesRegex(ValueError, "incomplete"):
-            self.service.list_files()
-
-    def test_manifest_name_must_match_its_package_directory(self):
-        package = self.root / "ops-basic"
-        scripts = package / "scripts"
-        scripts.mkdir(parents=True)
+        package.mkdir()
         (package / "SKILL.md").write_text(
-            "---\nname: another-skill\ndescription: Operations\n---\n",
+            "---\nname: another-skill\ndescription: Broken\n---\n",
             encoding="utf-8",
         )
-        (scripts / "inspect.sh").write_text("#!/usr/bin/env bash\n", encoding="utf-8")
-
-        with self.assertRaisesRegex(ValueError, "does not match"):
-            self.service.list_files()
-
-    @staticmethod
-    def _write_manifest_package(root, name, script, execution_class, capability):
-        package = root / name
-        scripts = package / "scripts"
-        scripts.mkdir(parents=True)
-        (package / "SKILL.md").write_text(
-            f"---\nname: {name}\ndescription: Test package\n---\n",
+        legacy = self.root / "legacy"
+        legacy.mkdir()
+        (legacy / "SKILL.md").write_text(
+            "---\nname: legacy\ndescription: Legacy\n---\n",
             encoding="utf-8",
         )
-        (scripts / script).write_text("#!/usr/bin/env bash\n", encoding="utf-8")
-        (package / "manifest.json").write_text(
+        (legacy / "manifest.json").write_text("{}", encoding="utf-8")
+        incompatible = self.root / "future-core"
+        incompatible.mkdir()
+        (incompatible / "SKILL.md").write_text(
+            "---\nname: future-core\ndescription: Future core\n---\n",
+            encoding="utf-8",
+        )
+        (incompatible / "linux-agent.json").write_text(
             json.dumps(
                 {
                     "schema_version": 1,
-                    "name": name,
-                    "description": "Test package",
-                    "scripts": [
-                        {
-                            "name": script,
-                            "risk": "high",
-                            "execution_class": execution_class,
-                            "capability": capability,
-                        }
-                    ],
+                    "package_version": "1.0.0",
+                    "core_api": 2,
+                    "category": "custom",
+                    "tools": [],
+                    "components": {},
                 }
             ),
             encoding="utf-8",
         )
 
-    def test_user_overlay_cannot_override_builtin_package(self):
-        user_root = Path(self.temp.name) / "user-skills"
-        self._write_manifest_package(self.root, "ops-basic", "inspect.sh", "runner", "")
-        self._write_manifest_package(user_root, "ops-basic", "inspect.sh", "runner", "")
-        service = SkillService(self.root, user_skills_root=user_root, require_manifest_file=True)
+        packages = {item["name"]: item for item in self.service.list_files()["packages"]}
 
-        with self.assertRaisesRegex(ValueError, "conflicts with built-in"):
-            service.list_files()
+        self.assertEqual(packages["broken"]["state"], "invalid")
+        self.assertIn("match", packages["broken"]["error"])
+        self.assertEqual(packages["legacy"]["state"], "invalid")
+        self.assertIn("legacy_format_unsupported", packages["legacy"]["error"])
+        self.assertEqual(packages["future-core"]["state"], "incompatible")
+
+    def test_user_overlay_reserved_name_is_disabled_without_breaking_listing(self):
+        user_root = Path(self.temp.name) / "user-skills"
+        self._write_package(user_root, "reserved")
+        (self.root / "INDEX.md").write_text(
+            "# Skill Index\n\n## reserved\n\n> Reserved\n",
+            encoding="utf-8",
+        )
+        service = SkillService(self.root, user_skills_root=user_root)
+
+        listing = service.list_files()
+
+        self.assertTrue(listing["ok"])
+        self.assertNotIn("reserved", {item["name"] for item in listing["packages"]})
+        self.assertEqual(listing["findings"][0]["code"], "SKILL_NAME_RESERVED")
+
+    def test_user_overlay_cannot_declare_privileged_execution(self):
+        user_root = Path(self.temp.name) / "user-skills"
+        self._write_package(
+            user_root,
+            "custom-network",
+            execution_class="host_helper",
+            capability="network.apply",
+        )
+        service = SkillService(self.root, user_skills_root=user_root)
+
+        package = service.list_files()["packages"][0]
+
+        self.assertEqual(package["state"], "invalid")
+        self.assertIn("user Skill tools", package["error"])
 
     def test_user_overlay_root_symlink_is_rejected_before_enumeration(self):
         outside = Path(self.temp.name) / "outside-skills"
@@ -175,32 +239,157 @@ class SkillServiceTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "Skill root"):
             SkillService(self.root, user_skills_root=linked_root)
 
-    def test_user_overlay_cannot_forge_host_helper_capability(self):
-        user_root = Path(self.temp.name) / "user-skills"
-        self._write_manifest_package(
-            user_root,
-            "custom-network",
-            "firewall.sh",
-            "host_helper",
-            "firewall.apply",
+
+class SkillWebRegistryTests(unittest.TestCase):
+    def test_builtin_component_registers_routes_jobs_and_declared_assets(self):
+        registry = SkillWebRegistry(
+            SkillService(ROOT / "skills"),
+            remote_mode=True,
+            managed_execution=False,
         )
-        service = SkillService(self.root, user_skills_root=user_root, require_manifest_file=True)
 
-        with self.assertRaisesRegex(ValueError, "only use runner"):
-            service.list_files()
-
-    def test_builtin_host_helper_allowlist_uses_exact_package_and_ref(self):
-        self._write_manifest_package(
-            self.root,
-            "custom-network",
-            "firewall.sh",
-            "host_helper",
-            "firewall.apply",
+        public = registry.public_components()
+        database = next(item for item in public if item["resource"] == "database")
+        self.assertEqual("database-inspect", database["name"])
+        self.assertTrue(registry.handles_job("database", "health"))
+        self.assertEqual(
+            {"retryable": True, "http": 503},
+            registry.error_spec("database_unreachable"),
         )
-        service = SkillService(self.root, require_manifest_file=True)
+        profiles = registry.handle_web_action("GET", "/api/database/profiles", {})
+        self.assertEqual("remote", profiles["mode"])
+        frontend = registry.asset_path(
+            "database-inspect", "assets/web/view-database.js"
+        )
+        self.assertTrue(frontend.is_file())
+        with self.assertRaises(SkillWebComponentError):
+            registry.asset_path(
+                "database-inspect", "assets/web/database.py"
+            )
 
-        with self.assertRaisesRegex(ValueError, "not allowlisted"):
-            service.list_files()
+    def test_credential_helper_web_component_is_hidden_without_execution_channel(self):
+        registry = SkillWebRegistry(
+            SkillService(ROOT / "skills"),
+            remote_mode=False,
+            managed_execution=False,
+        )
+
+        self.assertNotIn(
+            "database",
+            {component["resource"] for component in registry.public_components()},
+        )
+        self.assertFalse(registry.handles_job("database", "health"))
+        self.assertIsNone(
+            registry.handle_web_action("GET", "/api/database/profiles", {})
+        )
+        self.assertTrue(
+            any(
+                item.get("code") == "SKILL_WEB_COMPONENT_UNAVAILABLE"
+                and item.get("skill") == "database-inspect"
+                for item in registry.findings
+            )
+        )
+
+    def test_reload_preserves_unchanged_component_instance_and_credentials(self):
+        registry = SkillWebRegistry(
+            SkillService(ROOT / "skills"),
+            remote_mode=True,
+            managed_execution=False,
+        )
+        instance = registry.components["database"]["instance"]
+        reference = instance.secret_store.put(
+            "database-user",
+            "database-password",
+            {"mode": "remote"},
+        )
+        self.addCleanup(instance.secret_store.clear)
+
+        registry.reload()
+
+        self.assertIs(instance, registry.components["database"]["instance"])
+        self.assertEqual({"mode": "remote"}, instance.secret_store.metadata(reference))
+
+    def test_zero_and_invalid_skill_sets_leave_the_web_registry_usable(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "skills"
+            root.mkdir()
+            empty = SkillWebRegistry(
+                SkillService(root), remote_mode=False, managed_execution=False
+            )
+            self.assertEqual([], empty.public_components())
+            self.assertEqual(set(), empty.job_refs())
+            self.assertIsNone(empty.handle_web_action("GET", "/api/unknown", {}))
+
+            package = root / "broken"
+            package.mkdir()
+            (package / "SKILL.md").write_text(
+                "---\nname: broken\ndescription: Broken package\n---\n",
+                encoding="utf-8",
+            )
+            (package / "linux-agent.json").write_text("{}", encoding="utf-8")
+            invalid = SkillWebRegistry(
+                SkillService(root), remote_mode=False, managed_execution=False
+            )
+            self.assertEqual([], invalid.public_components())
+            self.assertTrue(
+                any(
+                    item.get("code") == "SKILL_COMPONENT_INVALID"
+                    for item in invalid.findings
+                )
+            )
+
+    def test_remote_route_materializes_only_its_pending_signed_component(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "skills"
+            root.mkdir()
+            source = ROOT / "skills" / "database-inspect"
+            contract = json.loads(
+                (source / "linux-agent.json").read_text(encoding="utf-8")
+            )
+            manifest = Path(temporary) / "release-manifest.json"
+            manifest.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 2,
+                        "skills": {
+                            "database-inspect": {
+                                "components": contract["components"]
+                            },
+                            "instruction-only": {"components": {}},
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            materialized = []
+
+            def materialize(name):
+                materialized.append(name)
+                shutil.copytree(source, root / name)
+                return {"ok": True, "status": "skill_materialized", "skill": name}
+
+            registry = SkillWebRegistry(
+                SkillService(root),
+                remote_mode=True,
+                managed_execution=False,
+                remote_manifest=manifest,
+                materialize=materialize,
+            )
+
+            self.assertEqual([], registry.public_components())
+            self.assertTrue(registry.handles_job("database", "health"))
+            self.assertEqual([], materialized)
+            with self.assertRaises(SkillWebComponentError):
+                registry.asset_path(
+                    "database-inspect", "assets/web/view-database.js"
+                )
+            self.assertEqual([], materialized)
+            profiles = registry.handle_web_action(
+                "GET", "/api/database/profiles", {}
+            )
+            self.assertEqual("remote", profiles["mode"])
+            self.assertEqual(["database-inspect"], materialized)
+            self.assertEqual("database-inspect", registry.public_components()[0]["name"])
 
 
 class ProviderServiceTests(unittest.TestCase):

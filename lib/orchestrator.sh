@@ -125,6 +125,8 @@ linux_agent_build_agent_observation() {
             id:($s.id // null),
             title:($s.title // null),
             executor_type:($s.executor_type // null),
+            skill:($s.skill // null),
+            path:($s.path // null),
             skill_script:($s.skill_script // null),
             mcp_server:($s.mcp_server // null),
             mcp_tool:($s.mcp_tool // null),
@@ -195,6 +197,7 @@ linux_agent_request_agent_reflection() {
     local user_input="$1"
     local iteration="$2"
     local observation_json="$3"
+    local skill_disclosures="${4:-[]}"
     local reflection_context response_json safe_response status result_count
 
     reflection_context="$(jq -cn \
@@ -209,6 +212,7 @@ linux_agent_request_agent_reflection() {
             agent_loop:$agent_loop
         }')"
     reflection_context="$(linux_agent_add_skill_context "${reflection_context}" "work_reflect")"
+    reflection_context="$(linux_agent_add_loaded_skill_context "${reflection_context}" "${skill_disclosures}")"
     reflection_context="$(linux_agent_add_mcp_context "${reflection_context}" "work_reflect")"
 
     status="$(jq -r '.agent_observation.execution.status // "unknown"' <<<"${observation_json}")"
@@ -288,7 +292,7 @@ linux_agent_run_agent_loop() {
     local observation_json reflection_json checkpoint_turns max_iterations auto_executed_count checkpoint_required final_review final_approval_step
     local execution_user sudo_probe all_step_states iteration_records pending_plan_resume
     local iteration_prior_results iteration_prior_step_states iteration_prior_records iteration_step_states iteration_record
-    local resumable_plan loop_resume_state resume_iteration plan_resume_state
+    local resumable_plan loop_resume_state resume_iteration plan_resume_state skill_disclosures
     [[ -n "${resume_state}" ]] || resume_state='{}'
     if ! jq -e 'type == "object"' >/dev/null 2>&1 <<<"${resume_state}"; then
         resume_state='{}'
@@ -296,6 +300,7 @@ linux_agent_run_agent_loop() {
 
     current_plan="${initial_plan}"
     all_results='[]'
+    skill_disclosures='[]'
     all_step_states='[]'
     iteration_records='[]'
     pending_plan_resume='{}'
@@ -318,6 +323,9 @@ linux_agent_run_agent_loop() {
         fi
         iteration=$((resume_iteration - 1))
         all_results="$(jq -c '.loop_prior_results // [] | if type == "array" then . else [] end' <<<"${resume_state}")"
+        if declare -F linux_agent_skill_disclosures_from_results >/dev/null 2>&1; then
+            skill_disclosures="$(linux_agent_skill_disclosures_from_results "${all_results}")"
+        fi
         all_step_states="$(jq -c '.loop_prior_step_states // [] | if type == "array" then . else [] end' <<<"${resume_state}")"
         iteration_records="$(jq -c '.prior_iteration_records // [] | if type == "array" then . else [] end' <<<"${resume_state}")"
         pending_plan_resume="$(jq -c '{
@@ -359,12 +367,19 @@ linux_agent_run_agent_loop() {
             "${user_input}" \
             "${plan_resume_state}" \
             "${iteration}" \
-            "iteration-${iteration}")"
+            "iteration-${iteration}" \
+            "${skill_disclosures}")"
         execution_user="$(jq -r '.execution_user // empty' <<<"${execution_json}" 2>/dev/null || true)"
         sudo_probe="$(jq -r '.sudo_probe // empty' <<<"${execution_json}" 2>/dev/null || true)"
         iteration_results="$(jq -c --argjson iteration "${iteration}" '(.results // []) | map(. + {iteration:$iteration})' <<<"${execution_json}")"
         iteration_step_states="$(jq -c --argjson iteration "${iteration}" '(.step_states // []) | map(. + {iteration:$iteration})' <<<"${execution_json}")"
         all_results="$(printf '%s\n%s\n' "${iteration_prior_results}" "${iteration_results}" | jq -cs '.[0] + .[1]')"
+        if declare -F linux_agent_record_skill_disclosure_files >/dev/null 2>&1; then
+            linux_agent_record_skill_disclosure_files "${execution_json}"
+        fi
+        if declare -F linux_agent_skill_disclosures_from_results >/dev/null 2>&1; then
+            skill_disclosures="$(linux_agent_skill_disclosures_from_results "${all_results}")"
+        fi
         all_step_states="$(printf '%s\n%s\n' "${iteration_prior_step_states}" "${iteration_step_states}" | jq -cs '.[0] + .[1]')"
         status="$(jq -r '.status // "unknown"' <<<"${execution_json}")"
         final_status="${status}"
@@ -425,7 +440,8 @@ linux_agent_run_agent_loop() {
         fi
 
         observation_json="$(linux_agent_build_agent_observation "${user_input}" "${iteration}" "${current_plan}" "${execution_json}" "${environment_context}")"
-        reflection_json="$(linux_agent_request_agent_reflection "${user_input}" "${iteration}" "${observation_json}")"
+        reflection_json="$(linux_agent_request_agent_reflection \
+            "${user_input}" "${iteration}" "${observation_json}" "${skill_disclosures}")"
         iteration_records="$(jq -c --argjson reflection "$(linux_agent_response_without_thinking "${reflection_json}")" '.[-1].reflection = $reflection' <<<"${iteration_records}")"
 
         if [[ "$(jq -r '.response_type' <<<"${reflection_json}")" == "answer" ]]; then
@@ -568,6 +584,7 @@ linux_agent_process_work_request() {
         '{}')"
     used_agent_loop="$(jq -r '.used_agent_loop' <<<"${execution_selection}")"
     execution_json="$(jq -c '.execution' <<<"${execution_selection}")"
+    linux_agent_record_skill_disclosure_files "${execution_json}"
     linux_agent_log_event "executed" "${execution_json}"
     if linux_agent_output_json_enabled; then
         printf '%s\n' "$(linux_agent_compact_execution_result "${execution_json}" | jq .)"
@@ -632,6 +649,7 @@ linux_agent_process_script_request() {
     material="$(printf 'skill_script=%s\narguments=%s\n%s\n' "${ref}" "${arguments_json}" "$(linux_agent_skill_script_content "${ref}")")"
     review="$(linux_agent_policy_review_text "script:${ref}" "${material}")"
     review="$(linux_agent_block_noninteractive_unknown_command_review "${review}")"
+    review="$(linux_agent_review_with_declared_skill_risk "${ref}" "${review}" "${arguments_json}")"
     review="$(linux_agent_backup_policy_review "${ref}" "${arguments_json}" "${review}")"
     linux_agent_log_event "script_policy_checked" "${review}"
     if ! linux_agent_output_json_enabled; then

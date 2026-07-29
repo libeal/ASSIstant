@@ -580,12 +580,15 @@ linux_agent_review_edit_package() {
 direct_edit_skill="observer-direct-should-not-exist"
 direct_edit_json="$(jq -cn --arg skill "${direct_edit_skill}" '{
     response_type:"skill_edit",
+    edit_schema_version:1,
     skill:{name:$skill, description:"strict observer direct edit fixture"},
     scripts:[{
         name:"apply.sh",
         description:"No-argument test script.",
         content:"#!/usr/bin/env bash\nprintf direct-edit-should-not-run\\n"
-    }]
+    }],
+    references:[],
+    assets:[]
 }')"
 direct_edit_blocked="$(linux_agent_apply_skill_edit_package_direct "${direct_edit_json}")"
 jq -e '
@@ -600,12 +603,15 @@ jq -e '
 interactive_edit_skill="observer-interactive-should-not-exist"
 interactive_edit_json="$(jq -cn --arg skill "${interactive_edit_skill}" '{
     response_type:"skill_edit",
+    edit_schema_version:1,
     skill:{name:$skill, description:"strict observer interactive edit fixture"},
     scripts:[{
         name:"apply.sh",
         description:"No-argument test script.",
         content:"#!/usr/bin/env bash\nprintf interactive-edit-should-not-run\\n"
-    }]
+    }],
+    references:[],
+    assets:[]
 }')"
 interactive_edit_blocked="$(linux_agent_apply_skill_edit_package "${interactive_edit_json}")"
 jq -e '

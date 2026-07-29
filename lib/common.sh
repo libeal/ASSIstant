@@ -42,7 +42,11 @@ linux_agent_detect_runtime_layout() {
         LINUX_AGENT_DATA_DIR="${root_dir}/data"
     fi
 
-    LINUX_AGENT_BUILTIN_SKILLS_DIR="${root_dir}/skills"
+    if [[ "${LINUX_AGENT_MANAGED_MODE}" == "1" ]]; then
+        LINUX_AGENT_BUILTIN_SKILLS_DIR="${prefix}/skills"
+    else
+        LINUX_AGENT_BUILTIN_SKILLS_DIR="${root_dir}/skills"
+    fi
     LINUX_AGENT_USER_SKILLS_DIR="${LINUX_AGENT_DATA_DIR}/skills"
     LINUX_AGENT_BUILTIN_POLICIES_DIR="${root_dir}/policies"
     LINUX_AGENT_USER_POLICIES_DIR="${LINUX_AGENT_DATA_DIR}/policies"
@@ -120,6 +124,20 @@ linux_agent_runtime_lock_exclusive_nonblocking() {
         return 1
     fi
     LINUX_AGENT_RUNTIME_LOCK_DEPTH=1
+}
+
+linux_agent_runtime_lock_upgrade_exclusive_nonblocking() {
+    [[ "${LINUX_AGENT_RUNTIME_LOCK_DEPTH:-0}" -eq 1 ]] || return 1
+    [[ "${LINUX_AGENT_RUNTIME_LOCK_INHERITED:-0}" != "1" ]] || return 1
+    [[ -n "${LINUX_AGENT_RUNTIME_LOCK_FD:-}" ]] || return 1
+    flock -xn "${LINUX_AGENT_RUNTIME_LOCK_FD}"
+}
+
+linux_agent_runtime_lock_downgrade_shared() {
+    [[ "${LINUX_AGENT_RUNTIME_LOCK_DEPTH:-0}" -eq 1 ]] || return 1
+    [[ "${LINUX_AGENT_RUNTIME_LOCK_INHERITED:-0}" != "1" ]] || return 1
+    [[ -n "${LINUX_AGENT_RUNTIME_LOCK_FD:-}" ]] || return 1
+    flock -s "${LINUX_AGENT_RUNTIME_LOCK_FD}"
 }
 
 linux_agent_runtime_lock_release() {

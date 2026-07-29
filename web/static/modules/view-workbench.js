@@ -637,7 +637,8 @@ export function createWorkbenchView(app) {
     const observer = findBlockJson(blocks, "observer");
     const review = findBlockJson(blocks, "review");
     const mcpLabel = step.mcp_server && step.mcp_tool ? `${step.mcp_server}/${step.mcp_tool}` : "";
-    const commandLabel = step.skill_script || mcpLabel || step.command || output.command || app.primaryOutputObject(output).command || "";
+    const skillReadLabel = step.skill ? `${step.skill}/${step.path || "SKILL.md"}` : "";
+    const commandLabel = step.skill_script || skillReadLabel || mcpLabel || step.command || output.command || app.primaryOutputObject(output).command || "";
     const subtitle = step.reason || step.expected_effect || turn?.input || "";
     container.className = "step-detail";
     container.innerHTML = `
@@ -670,6 +671,7 @@ export function createWorkbenchView(app) {
             ["原因", step.reason || ""],
             ["预期效果", step.expected_effect || ""],
             ["脚本", step.skill_script || ""],
+            ["Skill 文件", skillReadLabel],
             ["MCP server", step.mcp_server || ""],
             ["MCP tool", step.mcp_tool || ""],
             ["命令", step.command || ""],

@@ -230,40 +230,21 @@ linux_agent_api_health() {
 }
 
 linux_agent_api_tools_list() {
-    local index_text scripts line ref description risk materialization origin
+    local index_text catalog scripts
     index_text="$(linux_agent_skill_index_text 2>/dev/null || true)"
-    scripts='[]'
-    while IFS= read -r line; do
-        ref="$(sed -n 's/^- `\([^`]*\)`: .*/\1/p' <<<"${line}")"
-        [[ -n "${ref}" ]] || continue
-        description="$(sed -n 's/^- `[^`]*`: \(.*\)$/\1/p' <<<"${line}")"
-        ref="${ref%.sh}"
-        risk="$(linux_agent_skill_declared_risk "${ref}")"
-        origin="$(linux_agent_skill_package_origin "${ref%%/*}" 2>/dev/null || true)"
-        if [[ -z "${origin}" ]] && linux_agent_remote_builtin_pending "${ref%%/*}"; then
-            origin="builtin"
-        fi
-        [[ -n "${origin}" ]] || origin="unknown"
-        materialization="local"
-        if linux_agent_remote_mode_enabled; then
-            if [[ "${origin}" == "user" ]] || linux_agent_remote_skill_ready "${ref%%/*}"; then
-                materialization="ready"
-            else
-                materialization="available"
-            fi
-        fi
-        scripts="$(jq -cn \
-            --argjson prior "${scripts}" \
-            --arg ref "${ref}" \
-            --arg skill "${ref%%/*}" \
-            --arg script "${ref#*/}" \
-            --arg description "${description}" \
-            --arg risk "${risk}" \
-            --arg origin "${origin}" \
-            --arg materialization "${materialization}" \
-            '$prior + [{ref:$ref, skill:$skill, script:$script, description:$description, risk:$risk, origin:$origin, materialization:$materialization}]')"
-    done <<<"${index_text}"
-
+    catalog="$(linux_agent_skill_catalog_json)"
+    scripts="$(jq -c '[.tools[]? | {
+        ref,
+        skill,
+        script:.name,
+        description,
+        risk,
+        category,
+        execution_class:(.execution.class // "invalid"),
+        capability:(.execution.capability // ""),
+        origin,
+        materialization:(if .state == "installed" then "ready" else .state end)
+    }]' <<<"${catalog}")"
     jq -cn --arg index_text "${index_text}" --argjson scripts "${scripts}" --argjson remote "$(linux_agent_remote_state_json)" \
         '{ok:true, status:"listed", index_text:$index_text, scripts:$scripts, remote:$remote}'
 }
@@ -583,6 +564,7 @@ linux_agent_api_work_run() {
         "${execution_state_json}")"
     used_agent_loop="$(jq -r '.used_agent_loop' <<<"${execution_selection}")"
     execution_json="$(jq -c '.execution' <<<"${execution_selection}")"
+    linux_agent_record_skill_disclosure_files "${execution_json}"
     linux_agent_log_event "executed" "${execution_json}"
     final_status="$(jq -r '.status // "unknown"' <<<"${execution_json}")"
     linux_agent_log_event "finished" "$(jq -cn --arg status "${final_status}" '{status:$status}')"
@@ -614,23 +596,40 @@ linux_agent_api_work_run() {
         "${response_json}" \
         "$(linux_agent_protocol_for_work "${final_status}" "${response_json}" "${execution_json}")" \
         "${execution_state_json}" |
-        jq -cs --arg status "${final_status}" \
+        jq -cs --arg status "${final_status}" --argjson execution_state "${execution_state_json}" \
             '{
             context:.[0],
             response:.[1],
             protocol:.[2],
             execution_state:.[3]
         } as $input
-        | {
-            ok:($status == "executed" or $status == "answered"),
-            status:$status,
-            context:$input.context,
-            response:$input.response,
-            timeline:$input.protocol.timeline,
-            approval_card:$input.protocol.approval_card,
-            output_blocks:$input.protocol.output_blocks,
-            execution_state:$input.execution_state
-        }'
+        | ([
+            ($execution_state.results // [])[]?
+            | (.result // {})
+            | select(
+                .ok == false
+                and ((.code // .error_code // "") | type) == "string"
+                and ((.code // .error_code // "") | length) > 0
+              )
+          ] | last // {}) as $failure
+        | ({
+              ok:($status == "executed" or $status == "answered"),
+              status:$status,
+              context:$input.context,
+              response:$input.response,
+              timeline:$input.protocol.timeline,
+              approval_card:$input.protocol.approval_card,
+              output_blocks:$input.protocol.output_blocks,
+              execution_state:$input.execution_state
+          }
+          + if ($failure | length) == 0 then {}
+            else {
+                code:($failure.code // $failure.error_code),
+                error_code:($failure.error_code // $failure.code),
+                error:($failure.error // $failure.message // ($failure.code // $failure.error_code)),
+                message:($failure.message // $failure.error // ($failure.code // $failure.error_code))
+            }
+            end)'
 }
 
 linux_agent_api_script_review() {
@@ -648,7 +647,7 @@ linux_agent_api_script_review() {
     fi
     material="$(printf 'skill_script=%s\narguments=%s\n%s\n' "${ref}" "${args}" "$(linux_agent_skill_script_content "${ref}")")"
     review="$(linux_agent_policy_review_text "script:${ref}" "${material}")"
-    review="$(linux_agent_review_with_declared_skill_risk "${ref}" "${review}")"
+    review="$(linux_agent_review_with_declared_skill_risk "${ref}" "${review}" "${args}")"
     review="$(linux_agent_backup_policy_review "${ref}" "${args}" "${review}")"
     jq -cn --arg ref "${ref}" --argjson arguments "${args}" --argjson review "${review}" --argjson output_blocks "$(linux_agent_output_blocks_from_review "${review}")" \
         '{
@@ -877,7 +876,7 @@ linux_agent_api_needs_session() {
     local resource="${1:-}"
     local action="${2:-}"
     case "${resource}:${action}" in
-        work:run | script:run | terminal:run | edit:plan | edit:apply | skills:materialize)
+        work:run | script:run | terminal:run | edit:plan | edit:apply | skills:install | skills:uninstall | skills:materialize)
             printf 'true\n'
             ;;
         *)
@@ -918,6 +917,34 @@ linux_agent_api_dispatch_raw() {
             ;;
         skills:validate)
             jq -cn --argjson validation "$(linux_agent_validate_skills)" '{ok:($validation.ok // false), status:"validated", validation:$validation}'
+            ;;
+        skills:list)
+            linux_agent_skills_list
+            ;;
+        skills:read)
+            linux_agent_skill_read "$(jq -r '.skill // empty' <<<"${payload}")" "$(jq -r '.path // "SKILL.md"' <<<"${payload}")"
+            ;;
+        skills:install)
+            local install_scope install_subject
+            install_scope="$(jq -r '.scope // empty' <<<"${payload}")"
+            if [[ "${install_scope}" == "builtin" ]]; then
+                install_subject="$(jq -r '.skill // empty' <<<"${payload}")"
+            else
+                install_subject="$(jq -r '.source // empty' <<<"${payload}")"
+            fi
+            linux_agent_skill_install "${install_scope}" "${install_subject}"
+            ;;
+        skills:uninstall)
+            local uninstall_scope uninstall_skill purge confirm
+            uninstall_scope="$(jq -r '.scope // empty' <<<"${payload}")"
+            uninstall_skill="$(jq -r '.skill // empty' <<<"${payload}")"
+            purge="$(jq -r '.purge // false' <<<"${payload}")"
+            confirm="$(jq -r '.confirm // empty' <<<"${payload}")"
+            if [[ "${purge}" == "true" && "${confirm}" != "PURGE_SKILL_DATA" ]]; then
+                linux_agent_api_error invalid_action 'purge requires confirm=PURGE_SKILL_DATA'
+            else
+                linux_agent_skill_uninstall "${uninstall_scope}" "${uninstall_skill}" "${purge}" "${confirm}"
+            fi
             ;;
         skills:materialize)
             local skill_name

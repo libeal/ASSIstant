@@ -59,34 +59,6 @@ export const CONFIG_GROUPS = [
         offEffect: "所有 shell 步骤都需要人工确认。",
       },
       {
-        key: "approvals.auto.file_match",
-        label: "文件匹配自动运行",
-        type: "boolean",
-        onEffect: "低风险 file-match 只读匹配自动执行。",
-        offEffect: "file-match 即使低风险也需要人工确认。",
-      },
-      {
-        key: "approvals.auto.file_patch",
-        label: "文件补丁自动运行",
-        type: "boolean",
-        onEffect: "低风险 file-patch 可自动执行字面量补丁。",
-        offEffect: "file-patch 始终需要人工确认。",
-      },
-      {
-        key: "approvals.auto.file_download",
-        label: "文件下载自动运行",
-        type: "boolean",
-        onEffect: "低风险 file-download 可自动下载写入本地文件。",
-        offEffect: "file-download 始终需要人工确认。",
-      },
-      {
-        key: "approvals.auto.local_analyze",
-        label: "本地分析自动运行",
-        type: "boolean",
-        onEffect: "低风险 local-analyze 只读分析自动执行。",
-        offEffect: "local-analyze 即使低风险也需要人工确认。",
-      },
-      {
         key: "approvals.auto.remote_script",
         label: "远程脚本自动运行",
         type: "boolean",
@@ -132,6 +104,40 @@ export const CONFIG_GROUPS = [
     ],
   },
 ];
+
+const APPROVAL_SCOPE_PATTERN = /^[a-z][a-z0-9_]{0,63}$/;
+
+/**
+ * Add approval scopes declared by installed or pending Skill contracts.
+ * Missing values remain false in the server response, so unknown scopes are
+ * always fail-closed until an administrator explicitly enables them.
+ *
+ * @param {Record<string, any>} config
+ * @param {Array<Record<string, any>>} [groups]
+ * @returns {Array<Record<string, any>>}
+ */
+export function syncApprovalScopeFields(config, groups = CONFIG_GROUPS) {
+  const group = groups.find((entry) => entry.title === "自动批准能力");
+  if (!group) return groups;
+  group.fields = group.fields.filter((field) => !field.dynamicApprovalScope);
+  const declared = Array.isArray(config?.approvals?.scope_catalog)
+    ? config.approvals.scope_catalog
+    : Object.keys(config?.approvals?.auto || {});
+  const existing = new Set(group.fields.map((field) => field.key.slice("approvals.auto.".length)));
+  const dynamic = [...new Set(declared)]
+    .filter((scope) => typeof scope === "string" && APPROVAL_SCOPE_PATTERN.test(scope) && !existing.has(scope))
+    .sort()
+    .map((scope) => ({
+      key: `approvals.auto.${scope}`,
+      label: scope.replaceAll("_", " "),
+      type: "boolean",
+      dynamicApprovalScope: true,
+      onEffect: `允许 approval scope ${scope} 的低风险、策略干净步骤自动执行。`,
+      offEffect: `approval scope ${scope} 需要人工确认。`,
+    }));
+  group.fields.push(...dynamic);
+  return groups;
+}
 
 export const CONFIG_READONLY_FIELDS = [
   { key: "api_key_configured", label: "api_key_configured", comment: "只显示是否已配置，避免在浏览器中暴露已有密钥。" },

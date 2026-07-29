@@ -1,0 +1,174 @@
+{
+  "schema_version": 1,
+  "package_version": "1.0.0",
+  "core_api": 1,
+  "category": "system",
+  "tools": [
+    {
+      "name": "config-backup",
+      "description": "在变更或清理前为目标路径生成备份。",
+      "entrypoint": "scripts/config-backup.sh",
+      "risk": "medium",
+      "approval_scope": "skill_readonly",
+      "execution": {
+        "class": "runner",
+        "capability": "",
+        "dispatch": "always"
+      },
+      "runtime_inputs": [],
+      "guards": []
+    },
+    {
+      "name": "disk-hotspots",
+      "description": "采集磁盘热点目录、大文件与日志占用情况。",
+      "entrypoint": "scripts/disk-hotspots.sh",
+      "risk": "low",
+      "approval_scope": "skill_readonly",
+      "execution": {
+        "class": "runner",
+        "capability": "",
+        "dispatch": "always"
+      },
+      "runtime_inputs": [],
+      "guards": []
+    },
+    {
+      "name": "log-cleanup-plan",
+      "description": "扫描 `/var/log` 或 `/tmp` 下的大日志并生成清理建议。",
+      "entrypoint": "scripts/log-cleanup-plan.sh",
+      "risk": "low",
+      "approval_scope": "skill_readonly",
+      "execution": {
+        "class": "runner",
+        "capability": "",
+        "dispatch": "always"
+      },
+      "runtime_inputs": [],
+      "guards": []
+    },
+    {
+      "name": "log-search",
+      "description": "检索 `/var/log` 下的日志文件；默认不读取 journal，可通过参数显式启用。",
+      "entrypoint": "scripts/log-search.sh",
+      "risk": "low",
+      "approval_scope": "skill_readonly",
+      "execution": {
+        "class": "runner",
+        "capability": "",
+        "dispatch": "always"
+      },
+      "runtime_inputs": [],
+      "guards": []
+    },
+    {
+      "name": "process-inspect",
+      "description": "检查进程、僵尸进程与匹配模式进程状态。",
+      "entrypoint": "scripts/process-inspect.sh",
+      "risk": "low",
+      "approval_scope": "skill_readonly",
+      "execution": {
+        "class": "runner",
+        "capability": "",
+        "dispatch": "always"
+      },
+      "runtime_inputs": [],
+      "guards": []
+    },
+    {
+      "name": "resource-inspect",
+      "description": "查看 CPU 负载、内存概况和高 CPU/内存进程。",
+      "entrypoint": "scripts/resource-inspect.sh",
+      "risk": "low",
+      "approval_scope": "skill_readonly",
+      "execution": {
+        "class": "runner",
+        "capability": "",
+        "dispatch": "always"
+      },
+      "runtime_inputs": [],
+      "guards": []
+    },
+    {
+      "name": "safe-log-cleanup",
+      "description": "对允许范围内的非关键日志执行安全截断。",
+      "entrypoint": "scripts/safe-log-cleanup.sh",
+      "risk": "high",
+      "approval_scope": "skill_readonly",
+      "execution": {
+        "class": "runner",
+        "capability": "",
+        "dispatch": "always"
+      },
+      "runtime_inputs": [],
+      "guards": [
+        {
+          "type": "backup_proof",
+          "mode": "required_on_apply",
+          "condition": {
+            "field": "dry_run",
+            "equals": false,
+            "default": true
+          },
+          "proofs": [
+            {
+              "argument": "backup_archive",
+              "validation": "nonempty_string"
+            },
+            {
+              "argument": "backup_sha256",
+              "validation": "sha256"
+            }
+          ],
+          "source": {
+            "tool": "system.config.backup",
+            "target_argument": "path",
+            "target_output": "path",
+            "target_normalization": "realpath_existing",
+            "values": [
+              {
+                "argument": "backup_archive",
+                "output": "archive",
+                "validation": "nonempty_string"
+              },
+              {
+                "argument": "backup_sha256",
+                "output": "source_sha256",
+                "validation": "sha256"
+              }
+            ]
+          },
+          "message": "真实变更必须先完成目标备份，并携带未改变目标的备份凭据。"
+        }
+      ]
+    },
+    {
+      "name": "service-inspect",
+      "description": "查看 systemd 服务状态与失败服务。",
+      "entrypoint": "scripts/service-inspect.sh",
+      "risk": "low",
+      "approval_scope": "skill_readonly",
+      "execution": {
+        "class": "runner",
+        "capability": "",
+        "dispatch": "always"
+      },
+      "runtime_inputs": [],
+      "guards": []
+    },
+    {
+      "name": "service-restart-plan",
+      "description": "生成服务重启前的只读预检计划。",
+      "entrypoint": "scripts/service-restart-plan.sh",
+      "risk": "low",
+      "approval_scope": "skill_readonly",
+      "execution": {
+        "class": "runner",
+        "capability": "",
+        "dispatch": "always"
+      },
+      "runtime_inputs": [],
+      "guards": []
+    }
+  ],
+  "components": {}
+}

@@ -66,14 +66,34 @@ jq -e '
         "runner_uid",
         "degraded_same_uid",
         "host_helper",
+        "credential_helper",
         "unavailable"
     ] | sort)
     and (.helper_status | sort) == (["ready", "unavailable"] | sort)
+    and (.executor_type | index("skill_load") != null)
+    and (.executor_type | index("skill_read") != null)
     and (.result_status | index("degraded") != null)
     and (.provider_normalization.aliases | type == "object")
     and (.provider_normalization.prefix_rules | type == "array")
     and (.job_status | type == "array" and length > 0)
     and (.step_status | type == "array" and length > 0)
+    and .skill_extension_contract.schema_version == 1
+    and .skill_extension_contract.core_api == 1
+    and (.skill_extension_contract.execution_classes | sort) == ([
+        "runner", "host_helper", "credential_helper"
+    ] | sort)
+    and (.skill_extension_contract.dispatch_modes | sort) == ([
+        "always", "apply_only"
+    ] | sort)
+    and (.skill_extension_contract.component_types | sort) == ([
+        "host_helper", "credential_helper", "web"
+    ] | sort)
+    and (.skill_extension_contract.guard_types | sort) == ([
+        "risk_by_value", "runner_fallthrough", "backup_proof"
+    ] | sort)
+    and (has("builtin_skill_contract") | not)
+    and (has("skill_capability") | not)
+    and (has("skill_manifest_version") | not)
     and (.error_codes | type == "object")
     and ([
         "observer_required_unavailable",
@@ -111,9 +131,33 @@ jq -e '
         "ai_circuit_open",
         "ai_failover_exhausted",
         "ai_empty_response",
-        "ai_invalid_json"
+        "ai_invalid_json",
+        "target_changed",
+        "host_operation_not_allowed",
+        "credential_unavailable",
+        "credential_expired",
+        "skill_not_loaded",
+        "skill_package_incompatible",
+        "skill_package_invalid",
+        "skill_digest_mismatch",
+        "skill_download_failed",
+        "skill_component_install_failed",
+        "skill_component_uninstall_failed"
     ] | all(. as $code | ($schema.error_codes[$code].http | type) == "number"))
 ' "${SCHEMA}" >/dev/null
+
+skill_load_plan='{"response_type":"work_plan","summary":"load","continue_decision":{"should_continue":true,"reason":"read instructions"},"steps":[{"id":"load","title":"load","executor_type":"skill_load","skill":"ops-basic","arguments":{},"reason":"read","expected_effect":"loaded","risk_level":"low","rollback_hint":"none"}]}'
+skill_read_plan='{"response_type":"work_plan","summary":"read","continue_decision":{"should_continue":true,"reason":"read reference"},"steps":[{"id":"read","title":"read","executor_type":"skill_read","skill":"ops-basic","path":"references/details.md","arguments":{},"reason":"read","expected_effect":"loaded","risk_level":"low","rollback_hint":"none"}]}'
+linux_agent_validate_work_response "${skill_load_plan}"
+linux_agent_validate_work_response "${skill_read_plan}"
+if linux_agent_validate_work_response "$(jq '.continue_decision.should_continue=false' <<<"${skill_load_plan}")"; then
+    printf 'skill_load plan without reflection unexpectedly passed validation\n' >&2
+    exit 1
+fi
+if linux_agent_validate_work_response "$(jq --arg path '../SKILL.md' '.steps[0].path=$path' <<<"${skill_read_plan}")"; then
+    printf 'unsafe skill_read path unexpectedly passed validation\n' >&2
+    exit 1
+fi
 
 # jq oracle: normalize a provider id straight from the schema rules.
 schema_normalize() {

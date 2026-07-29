@@ -1,0 +1,83 @@
+{
+  "schema_version": 1,
+  "package_version": "1.0.0",
+  "core_api": 1,
+  "category": "file",
+  "tools": [
+    {
+      "name": "file-download",
+      "description": "安全下载 HTTPS 公网文件到本机路径，限制大小并可校验 sha256。",
+      "entrypoint": "scripts/file-download.sh",
+      "risk": "high",
+      "approval_scope": "file_download",
+      "execution": {
+        "class": "runner",
+        "capability": "",
+        "dispatch": "always"
+      },
+      "runtime_inputs": [],
+      "guards": []
+    },
+    {
+      "name": "file-match",
+      "description": "只读匹配目标文件中的字面量文本，返回 SHA-256、出现次数和上下文。",
+      "entrypoint": "scripts/file-match.sh",
+      "risk": "low",
+      "approval_scope": "file_match",
+      "execution": {
+        "class": "runner",
+        "capability": "",
+        "dispatch": "always"
+      },
+      "runtime_inputs": [],
+      "guards": []
+    },
+    {
+      "name": "file-patch",
+      "description": "按 SHA-256 执行事务性多项补丁、幂等 block 追加或排他新建，并兼容旧单项替换调用。",
+      "entrypoint": "scripts/file-patch.sh",
+      "risk": "high",
+      "approval_scope": "file_patch",
+      "execution": {
+        "class": "runner",
+        "capability": "",
+        "dispatch": "always"
+      },
+      "runtime_inputs": [],
+      "guards": [
+        {
+          "type": "backup_proof",
+          "mode": "transactional",
+          "condition": {
+            "field": "apply",
+            "equals": true,
+            "default": true
+          },
+          "proofs": [
+            {
+              "argument": "backup",
+              "validation": "boolean_true",
+              "default": true
+            }
+          ],
+          "message": "真实文件变更必须启用事务性备份。"
+        }
+      ]
+    },
+    {
+      "name": "local-analyze",
+      "description": "对文本或本地文件做只读关键词和错误样本分析。",
+      "entrypoint": "scripts/local-analyze.sh",
+      "risk": "low",
+      "approval_scope": "local_analyze",
+      "execution": {
+        "class": "runner",
+        "capability": "",
+        "dispatch": "always"
+      },
+      "runtime_inputs": [],
+      "guards": []
+    }
+  ],
+  "components": {}
+}

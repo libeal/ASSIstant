@@ -77,8 +77,9 @@ assert_ai_file_manifest() {
     jq -e '
         select(.stage == "request_context_built")
         | .payload.skills
-        | .disclosed_count == 1
-            and ([.disclosed[].name] == ["ops-basic"])
+        | .candidate_count == 1
+            and ([.candidates[].name] == ["ops-basic"])
+            and .loaded_count == 0
     ' "${log_file}" >/dev/null
     jq -se --arg request '查看cpu占用,内存环境' '
         [.[] | select((.payload | tostring) | contains($request)) | .stage]
@@ -93,6 +94,7 @@ assert_ai_file_manifest() {
 assert_thinking_trace() {
     local project="${tmp_root}/thinking-trace"
     local log_file session_id thinking_file thinking_root tmp_config
+    local -a thinking_files=()
     thinking_root="${tmp_root}/thinking-traces"
     copy_project "${project}"
     tmp_config="$(mktemp)"
@@ -103,9 +105,14 @@ assert_thinking_trace() {
         bash bin/agent work "查看cpu继续深入"
     log_file="$(find "${project}/logs" -name '*.jsonl' -print -quit)"
     session_id="$(basename "${log_file}" .jsonl)"
-    thinking_file="${thinking_root}/${session_id}/thinking/iteration-1.txt"
+    mapfile -t thinking_files < <(
+        grep -rl --fixed-strings \
+            '第一轮结果不足以完成测试场景' \
+            "${thinking_root}/${session_id}/thinking" || true
+    )
+    [[ "${#thinking_files[@]}" -eq 1 ]]
+    thinking_file="${thinking_files[0]}"
     [[ -f "${thinking_file}" ]]
-    grep -q '第一轮结果不足以完成测试场景' "${thinking_file}"
     ! grep -R -q '第一轮结果不足以完成测试场景' "${project}/logs"
 }
 
@@ -203,7 +210,10 @@ grep -q '未知命令: plan' <<<"${plan_removed_output}"
 grep -q '脚本执行结果: 成功' <<<"${script_output}"
 grep -q '系统负载' <<<"${script_output}"
 grep -q '"status": "executed"' <<<"${json_output}"
-grep -q '"auto_executed_count": 1' <<<"${json_output}"
+grep -q '"auto_executed_count": 2' <<<"${json_output}"
+jq -e 'any(.results[]?;
+    .step.executor_type == "skill_load"
+    and .step.skill == "ops-basic")' <<<"${json_output}" >/dev/null
 jq -e 'any(.output_blocks[]?; .kind == "json" and .json.tool == "system.resource.inspect")' \
     <<<"${script_json_output}" >/dev/null
 grep -q 'ops-basic/process-inspect' <<<"${tools_output}"

@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import hashlib
+import importlib.util
 import json
 import os
 import signal
@@ -18,9 +19,30 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "lib"))
 
 import helper_protocol  # noqa: E402
-import host_ops_helper  # noqa: E402
+import host_ops_helper as host_dispatcher  # noqa: E402
 import policy_helper  # noqa: E402
 import runner  # noqa: E402
+
+
+def _load_network_host_handler():
+    path = (
+        ROOT
+        / "skills"
+        / "network-ops-tools"
+        / "scripts"
+        / "host_handler.py"
+    )
+    spec = importlib.util.spec_from_file_location(
+        "network_ops_host_handler_test", path
+    )
+    if spec is None or spec.loader is None:
+        raise RuntimeError("network-ops-tools host handler cannot be loaded")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+host_ops_helper = _load_network_host_handler()
 
 
 class MemoryConnection:
@@ -61,6 +83,109 @@ def socket_exchange(handler, request, expected_uid=None, peer_uid=None):
 
 
 class HelperProtocolTests(unittest.TestCase):
+    def test_client_transfers_one_descriptor_with_the_versioned_request(self):
+        with tempfile.TemporaryFile() as credential:
+            credential.write(b"credential-payload")
+            credential.flush()
+            request = helper_protocol.build_request(
+                "database.health",
+                {"profile_id": "primary", "credential_ref": "a" * 32},
+                summary="fixed database query",
+            )
+            response = helper_protocol.canonical_json(
+                {
+                    "ok": True,
+                    "status": "checked",
+                    "protocol_version": helper_protocol.PROTOCOL_VERSION,
+                    "request_id": request["request_id"],
+                }
+            ) + b"\n"
+
+            class ConnectedSocket:
+                def __init__(self):
+                    self.sent = bytearray()
+                    self.ancillary = []
+                    self.response = bytearray(response)
+
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, _kind, _value, _traceback):
+                    return None
+
+                def settimeout(self, _timeout):
+                    return None
+
+                def connect(self, _path):
+                    return None
+
+                def sendmsg(self, buffers, ancillary):
+                    payload = b"".join(buffers)
+                    self.sent.extend(payload)
+                    self.ancillary.extend(ancillary)
+                    return len(payload)
+
+                def sendall(self, payload):
+                    self.sent.extend(payload)
+
+                def shutdown(self, _direction):
+                    return None
+
+                def recv(self, size):
+                    chunk = bytes(self.response[:size])
+                    del self.response[:size]
+                    return chunk
+
+            connection = ConnectedSocket()
+            with mock.patch.object(
+                helper_protocol.socket,
+                "socket",
+                return_value=connection,
+            ):
+                result = helper_protocol.client_request(
+                    "/unused/helper.sock",
+                    request,
+                    descriptor=credential.fileno(),
+                )
+
+            self.assertTrue(result["ok"])
+            self.assertEqual(helper_protocol.canonical_json(request) + b"\n", connection.sent)
+            self.assertEqual(1, len(connection.ancillary))
+            level, kind, rights = connection.ancillary[0]
+            self.assertEqual((socket.SOL_SOCKET, socket.SCM_RIGHTS), (level, kind))
+            (sent_descriptor,) = struct.unpack("i", rights)
+            self.assertEqual(credential.fileno(), sent_descriptor)
+
+            received_descriptor = os.dup(sent_descriptor)
+
+            class DescriptorConnection:
+                calls = 0
+
+                def recvmsg(self, _size, _ancillary_size, _flags):
+                    self.calls += 1
+                    if self.calls == 1:
+                        return (
+                            bytes(connection.sent),
+                            [(level, kind, struct.pack("i", received_descriptor))],
+                            0,
+                            None,
+                        )
+                    return b"", [], 0, None
+
+            received, descriptors = helper_protocol.receive_json_with_descriptors(
+                DescriptorConnection()
+            )
+            try:
+                self.assertEqual(request, received)
+                self.assertEqual(1, len(descriptors))
+                self.assertEqual(b"credential-payload", os.pread(descriptors[0], 4096, 0))
+            finally:
+                for descriptor in descriptors:
+                    os.close(descriptor)
+
+        with self.assertRaises(OSError):
+            os.fstat(received_descriptor)
+
     def test_request_digest_detects_parameter_or_summary_changes(self):
         request = helper_protocol.build_request(
             "ping",
@@ -157,7 +282,7 @@ class HelperProtocolTests(unittest.TestCase):
         wrong_uid = os.getuid() + 1
         for handler in (
             runner.handle_connection,
-            host_ops_helper.handle_connection,
+            host_dispatcher.handle_connection,
             policy_helper.handle_connection,
         ):
             with self.subTest(handler=handler.__module__):
@@ -178,7 +303,7 @@ class HelperProtocolTests(unittest.TestCase):
         request = helper_protocol.build_request("ping", {}, summary="readiness")
         expected = {
             runner.handle_connection: "runner_uid",
-            host_ops_helper.handle_connection: "host-ops",
+            host_dispatcher.handle_connection: "host-dispatcher",
             policy_helper.handle_connection: "policy-writer",
         }
         for handler, marker in expected.items():
@@ -193,31 +318,89 @@ class HelperProtocolTests(unittest.TestCase):
 
 
 class RunnerTests(unittest.TestCase):
-    @staticmethod
-    def _write_skill_manifest(package, script_name="inspect.sh", *, execution_class="runner", capability=""):
+    def _write_skill_package(
+        self,
+        package,
+        script_name="inspect.sh",
+        *,
+        category="system",
+        execution_class="runner",
+        capability="",
+        runtime_inputs=None,
+    ):
         package.mkdir(parents=True, exist_ok=True)
         (package / "SKILL.md").write_text(
             f"---\nname: {package.name}\ndescription: fixture\n---\n",
             encoding="utf-8",
         )
-        (package / "manifest.json").write_text(
+        execution = {
+            "class": execution_class,
+            "capability": capability,
+            "dispatch": "always" if execution_class == "runner" else "apply_only",
+        }
+        guards = []
+        if execution_class != "runner":
+            adapter = package / "scripts" / "fixture-adapter.py"
+            adapter.parent.mkdir(parents=True, exist_ok=True)
+            adapter.write_text("#!/usr/bin/env python3\n", encoding="utf-8")
+            execution["adapter"] = "scripts/fixture-adapter.py"
+            guards = [
+                {
+                    "type": "runner_fallthrough",
+                    "field": "action",
+                    "default": "inspect",
+                    "allowed": ["inspect", "plan"],
+                    "boolean_flag": "apply",
+                }
+            ]
+        origin_is_user = package.is_relative_to(self.data / "skills")
+        (package / "linux-agent.json").write_text(
             json.dumps(
                 {
                     "schema_version": 1,
-                    "name": package.name,
-                    "description": "fixture",
-                    "scripts": [
+                    "package_version": "1.0.0",
+                    "core_api": 1,
+                    "category": category,
+                    "tools": [
                         {
-                            "name": script_name,
+                            "name": script_name.removesuffix(".sh"),
+                            "description": "fixture tool",
+                            "entrypoint": f"scripts/{script_name}",
                             "risk": "low",
-                            "execution_class": execution_class,
-                            "capability": capability,
+                            "approval_scope": (
+                                "skill_readonly" if origin_is_user else "fixture_scope"
+                            ),
+                            "execution": execution,
+                            "runtime_inputs": runtime_inputs or [],
+                            "guards": guards,
                         }
                     ],
+                    "components": {},
                 }
             ),
             encoding="utf-8",
         )
+        if not origin_is_user:
+            self._rewrite_builtin_index(package.parent)
+
+    @staticmethod
+    def _rewrite_builtin_index(skills_root):
+        lines = ["# Builtin Skills", ""]
+        for package in sorted(
+            (path for path in skills_root.iterdir() if path.is_dir()),
+            key=lambda path: path.name,
+        ):
+            extension_path = package / "linux-agent.json"
+            if not extension_path.is_file():
+                continue
+            extension = json.loads(extension_path.read_text(encoding="utf-8"))
+            lines.extend((f"## {package.name}", "", "> fixture", ""))
+            for tool in extension["tools"]:
+                lines.append(
+                    f"- `{package.name}/{tool['name']}`: {tool['description']}"
+                )
+            lines.append("")
+        (skills_root / "INDEX.md").write_text("\n".join(lines), encoding="utf-8")
 
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -242,8 +425,11 @@ class RunnerTests(unittest.TestCase):
             "LINUX_AGENT_TMP_ROOT": str(self.data / "runner-tmp"),
             "LINUX_AGENT_LOG_DIR": str(self.data / "logs"),
         }
-        self._write_skill_manifest(self.root / "skills" / "builtin")
-        self._write_skill_manifest(self.data / "skills" / "user")
+        self._write_skill_package(self.root / "skills" / "builtin")
+        self._write_skill_package(
+            self.data / "skills" / "user",
+            category="custom",
+        )
 
     def tearDown(self):
         self.temp.cleanup()
@@ -306,7 +492,7 @@ class RunnerTests(unittest.TestCase):
         release = install_root / "releases" / "v1"
         current = install_root / "current"
         data = install_root / "data"
-        script = release / "skills" / "builtin" / "scripts" / "inspect.sh"
+        script = release / "skills" / "controlled-tools" / "scripts" / "local-analyze.sh"
         client = release / "lib" / "mcp_client.py"
         manifest = release / "mcp" / "server" / "manifest.json"
         arguments = data / "runner-tmp" / "arguments.json"
@@ -314,7 +500,11 @@ class RunnerTests(unittest.TestCase):
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text("{}\n", encoding="utf-8")
         (data / "skills").mkdir()
-        self._write_skill_manifest(script.parent.parent)
+        self._write_skill_package(
+            script.parent.parent,
+            "local-analyze.sh",
+            category="file",
+        )
         current.symlink_to(release, target_is_directory=True)
         environment = {
             "LINUX_AGENT_ROOT": str(current),
@@ -484,9 +674,11 @@ class RunnerTests(unittest.TestCase):
             "'{ok:true,file:$file,session:$session}'\n",
             encoding="utf-8",
         )
-        self._write_skill_manifest(
+        self._write_skill_package(
             session_skill.parent,
             "last-command-output.sh",
+            category="history",
+            runtime_inputs=["audit_snapshot"],
         )
         snapshot = self.data / "runner-tmp" / "audit-snapshot.fixture.jsonl"
         snapshot.write_text('{"safe":true}\n', encoding="utf-8")
@@ -530,7 +722,9 @@ class RunnerTests(unittest.TestCase):
             runner,
             "_trusted_executable",
             return_value="/usr/bin/bash",
-        ), self.assertRaisesRegex(runner.RunnerRequestError, "restricted"):
+        ), self.assertRaisesRegex(
+            runner.RunnerRequestError, "signed builtin runtime-input"
+        ):
             runner.validate_execution(user_params)
 
     def test_busy_runner_rejects_without_starting_a_process(self):
@@ -574,17 +768,27 @@ class RunnerTests(unittest.TestCase):
             "_trusted_executable",
             return_value="/usr/bin/bash",
         ):
-            manifest = json.loads((package / "manifest.json").read_text(encoding="utf-8"))
-            manifest["scripts"][0]["execution_class"] = "host_helper"
-            manifest["scripts"][0]["capability"] = "firewall.apply"
-            (package / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
-            with self.assertRaisesRegex(runner.RunnerRequestError, "only use runner"):
+            extension_path = package / "linux-agent.json"
+            extension = json.loads(extension_path.read_text(encoding="utf-8"))
+            extension["tools"][0]["execution"]["class"] = "host_helper"
+            extension["tools"][0]["execution"]["capability"] = "firewall.apply"
+            extension["tools"][0]["execution"]["adapter"] = "scripts/inspect.sh"
+            extension_path.write_text(json.dumps(extension), encoding="utf-8")
+            with self.assertRaisesRegex(
+                runner.RunnerRequestError, "unprivileged runner"
+            ):
                 runner.validate_execution(params)
 
-            manifest["scripts"][0]["execution_class"] = "runner"
-            manifest["scripts"][0]["capability"] = ""
-            manifest["scripts"][0]["name"] = "other.sh"
-            (package / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+            extension["tools"][0]["execution"] = {
+                "class": "runner",
+                "capability": "",
+                "dispatch": "always",
+            }
+            extension["tools"][0]["entrypoint"] = "scripts/other.sh"
+            (package / "scripts" / "other.sh").write_text(
+                "#!/usr/bin/env bash\n", encoding="utf-8"
+            )
+            extension_path.write_text(json.dumps(extension), encoding="utf-8")
             with self.assertRaisesRegex(runner.RunnerRequestError, "not declared|does not match"):
                 runner.validate_execution(params)
 
@@ -593,9 +797,10 @@ class RunnerTests(unittest.TestCase):
         script = package / "scripts" / "firewall.sh"
         script.parent.mkdir(parents=True)
         script.write_text("#!/usr/bin/env bash\n", encoding="utf-8")
-        self._write_skill_manifest(
+        self._write_skill_package(
             package,
             "firewall.sh",
+            category="network",
             execution_class="host_helper",
             capability="firewall.apply",
         )
@@ -623,7 +828,9 @@ class RunnerTests(unittest.TestCase):
                     '{"action":"apply","apply":true}',
                 ],
             }
-            with self.assertRaisesRegex(runner.RunnerRequestError, "dedicated host helper"):
+            with self.assertRaisesRegex(
+                runner.RunnerRequestError, "dedicated helper"
+            ):
                 runner.validate_execution(apply_params)
 
             ambiguous_params = {
@@ -663,7 +870,7 @@ class RunnerTests(unittest.TestCase):
                 "#!/usr/bin/env bash\n",
                 encoding="utf-8",
             )
-            self._write_skill_manifest(package)
+            self._write_skill_package(package)
         params = {
             "kind": "skill",
             "argv": ["bash", str(user / "scripts" / "inspect.sh"), "{}"],
@@ -674,7 +881,7 @@ class RunnerTests(unittest.TestCase):
             runner,
             "_trusted_executable",
             return_value="/usr/bin/bash",
-        ), self.assertRaisesRegex(runner.RunnerRequestError, "cannot override"):
+        ), self.assertRaisesRegex(runner.RunnerRequestError, "reserved built-in"):
             runner.validate_execution(params)
 
     def test_execution_caps_output_and_reaps_background_process_group(self):
@@ -772,6 +979,109 @@ class RunnerTests(unittest.TestCase):
                     runner.socket, "socket", return_value=connection
                 ), self.assertRaises(helper_protocol.ProtocolError):
                     runner._stream_request("/run/test.sock", request, 1, 4096)
+
+
+class HostDispatcherTests(unittest.TestCase):
+    def test_dispatch_uses_the_registered_package_handler(self):
+        component = mock.Mock()
+        component.dispatch.return_value = {
+            "ok": True,
+            "status": "applied",
+            "operation": "sample.apply",
+        }
+        handler_path = Path("/trusted/skill/scripts/host_handler.py")
+        with mock.patch.object(
+            host_dispatcher,
+            "_capability_registry",
+            return_value={"sample.apply": (handler_path, "sample-skill")},
+        ), mock.patch.object(
+            host_dispatcher,
+            "_load_handler",
+            return_value=component,
+        ) as loader:
+            result = host_dispatcher.dispatch_capability(
+                "sample.apply", {"value": 1}
+            )
+
+        self.assertTrue(result["ok"])
+        loader.assert_called_once_with(handler_path, "sample-skill")
+        component.dispatch.assert_called_once_with("sample.apply", {"value": 1})
+
+    def test_dispatch_rejects_unknown_capabilities_and_mismatched_results(self):
+        with mock.patch.object(
+            host_dispatcher, "_capability_registry", return_value={}
+        ), self.assertRaisesRegex(
+            host_dispatcher.HostHelperError, "unsupported"
+        ):
+            host_dispatcher.dispatch_capability("sample.apply", {})
+
+        component = mock.Mock()
+        component.dispatch.return_value = {
+            "ok": True,
+            "status": "applied",
+            "operation": "other.apply",
+        }
+        with mock.patch.object(
+            host_dispatcher,
+            "_capability_registry",
+            return_value={"sample.apply": (Path("/handler.py"), "sample")},
+        ), mock.patch.object(
+            host_dispatcher, "_load_handler", return_value=component
+        ), self.assertRaisesRegex(
+            host_dispatcher.HostHelperError, "invalid result"
+        ):
+            host_dispatcher.dispatch_capability("sample.apply", {})
+
+    def test_registry_disables_duplicate_package_capabilities(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "skills"
+            names = ("first-skill", "second-skill")
+            root.mkdir(parents=True)
+            (root / "INDEX.md").write_text("# test catalog\n", encoding="utf-8")
+            for name in names:
+                scripts = root / name / "scripts"
+                scripts.mkdir(parents=True)
+                (scripts / "host_handler.py").write_text(
+                    "def dispatch(operation, params):\n"
+                    "    return {'ok': True, 'operation': operation}\n",
+                    encoding="utf-8",
+                )
+            validation = {
+                "ok": True,
+                "skills": [
+                    {
+                        "name": name,
+                        "state": "installed",
+                        "package": str(root / name),
+                    "components": {
+                        "host_helper": {"handler": "scripts/host_handler.py"}
+                    },
+                        "package_tools": [
+                        {
+                            "name": "apply",
+                            "description": "Apply sample operation.",
+                            "execution": {
+                                "class": "host_helper",
+                                "capability": "sample.apply",
+                            },
+                        }
+                    ],
+                    }
+                    for name in names
+                ],
+                "findings": [],
+            }
+
+            environment = {
+                "LINUX_AGENT_BUILTIN_SKILLS_DIR": str(root),
+                "LINUX_AGENT_RELEASE_MANIFEST": "",
+            }
+            with mock.patch.dict(
+                os.environ, environment, clear=False
+            ), mock.patch.object(
+                host_dispatcher, "validate_builtin_root", return_value=validation
+            ):
+                self.assertEqual({}, host_dispatcher._capability_registry())
 
 
 class HostOpsHelperTests(unittest.TestCase):

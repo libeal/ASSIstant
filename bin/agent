@@ -52,10 +52,6 @@ source "${ROOT_DIR}/lib/orchestrator.sh"
 
 linux_agent_init_env "${ROOT_DIR}"
 linux_agent_load_config
-if ! linux_agent_recover_pending_skill_commit; then
-    linux_agent_print_error "检测到未完成的 Skill 提交事务，恢复失败；已停止启动以避免读取不一致的用户 Skill。"
-    exit 1
-fi
 
 LINUX_AGENT_MAIN_COMMAND=""
 LINUX_AGENT_COMMAND_FINISHED=0
@@ -127,9 +123,17 @@ linux_agent_usage() {
   agent doctor                    检查依赖、配置和 skill 目录
   agent sense <topic>           采集环境信息
   agent tools list              列出可用 skill 脚本索引
-  agent skills validate         校验 skill 目录
+  agent skills list|validate    列出或校验 Skill
+  agent skills read <skill> [path]
+                                读取 SKILL.md 或包内 reference
+  agent skills install --scope user|builtin <source|name>
+                                从本地目录/归档安装用户 Skill，或安装内置 Skill
+  agent skills uninstall --scope user|builtin <name> [--purge --confirm PURGE_SKILL_DATA]
+                                卸载 Skill；purge 不删除 ownership ledger 之外的数据
   agent mcp list|validate|tools 列出、校验或发现 mcp/ 外部 MCP tool
   agent policy validate [file]  校验 policies/ 下策略 JSON 与正则规则
+  agent credentials <component> <action> [operands...]
+                                调用已安装 credential component 声明的管理动作
   agent api <resource> <action> [json]
                                 机器可读 JSON API，供 Web 前端调用
   agent audit <session-id>      查看审计摘要
@@ -202,7 +206,7 @@ linux_agent_interactive() {
             /script)
                 current_mode="script"
                 linux_agent_log_control_event "mode_changed" "${current_mode}" "${user_input}" "script"
-                linux_agent_print_info "已切换到脚本模式。输入形如 ops-basic/process-inspect '{\"pattern\":\"systemd\"}'。"
+                linux_agent_print_info "已切换到脚本模式。输入形如 <skill>/<script> '{\"key\":\"value\"}'。"
                 continue
                 ;;
             /terminal)
@@ -319,12 +323,48 @@ main() {
             ;;
         skills)
             shift || true
-            case "${1:-}" in
+            skill_action="${1:-list}"
+            shift || true
+            case "${skill_action}" in
+                list)
+                    linux_agent_skills_list
+                    ;;
                 validate)
                     linux_agent_validate_skills
                     ;;
+                read)
+                    [[ $# -ge 1 ]] || {
+                        linux_agent_print_error "用法: agent skills read <skill> [SKILL.md|references/path]"
+                        exit 1
+                    }
+                    linux_agent_skill_read "$1" "${2:-SKILL.md}"
+                    ;;
+                install)
+                    [[ "${1:-}" == "--scope" && $# -ge 3 ]] || {
+                        linux_agent_print_error "用法: agent skills install --scope user|builtin <目录|归档|builtin-name>"
+                        exit 1
+                    }
+                    linux_agent_skill_install "$2" "$3"
+                    ;;
+                uninstall)
+                    [[ "${1:-}" == "--scope" && $# -ge 3 ]] || {
+                        linux_agent_print_error "用法: agent skills uninstall --scope user|builtin <name> [--purge --confirm PURGE_SKILL_DATA]"
+                        exit 1
+                    }
+                    skill_purge=false
+                    skill_purge_confirm=""
+                    if [[ $# -gt 3 ]]; then
+                        [[ $# -eq 6 && "$4" == "--purge" && "$5" == "--confirm" ]] || {
+                            linux_agent_print_error "用法: agent skills uninstall --scope user|builtin <name> [--purge --confirm PURGE_SKILL_DATA]"
+                            exit 1
+                        }
+                        skill_purge=true
+                        skill_purge_confirm="$6"
+                    fi
+                    linux_agent_skill_uninstall "$2" "$3" "${skill_purge}" "${skill_purge_confirm}"
+                    ;;
                 *)
-                    linux_agent_print_error "仅支持 'agent skills validate'。"
+                    linux_agent_print_error "仅支持 'agent skills list|validate|read|install|uninstall'。"
                     exit 1
                     ;;
             esac
@@ -358,6 +398,17 @@ main() {
                     exit 1
                     ;;
             esac
+            ;;
+        credentials)
+            shift || true
+            [[ $# -ge 2 ]] || {
+                linux_agent_print_error "用法: agent credentials <component> <action> [operands...]"
+                exit 1
+            }
+            credential_component="$1"
+            credential_action="$2"
+            shift 2
+            linux_agent_credential_admin "${credential_component}" "${credential_action}" "$@"
             ;;
         api)
             shift || true
@@ -416,6 +467,25 @@ main() {
     esac
 }
 
+linux_agent_command_mutates_runtime() {
+    local command="${1:-interactive}"
+    case "${command}" in
+        edit)
+            return 0
+            ;;
+        skills)
+            [[ "${2:-}" == "install" || "${2:-}" == "uninstall" || "${2:-}" == "materialize" ]]
+            ;;
+        api)
+            [[ "${2:-}" == "skills" && ("${3:-}" == "install" || "${3:-}" == "uninstall" || "${3:-}" == "materialize") ]] ||
+                [[ "${2:-}" == "edit" && "${3:-}" == "apply" ]]
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
 linux_agent_run() {
     local command="${1:-interactive}"
     local argument_count="$#"
@@ -428,14 +498,16 @@ linux_agent_run() {
         linux_agent_runtime_lock_release
         return "${audit_status}"
     fi
-    if [[ "${command}" == "api" && "$(linux_agent_api_needs_session "${2:-health}" "${3:-}")" != "true" ]]; then
+    if [[ "${command}" == "api" && "$(linux_agent_api_needs_session "${2:-health}" "${3:-}")" != "true" ]] &&
+        ! linux_agent_command_mutates_runtime "$@"; then
         linux_agent_runtime_lock_shared || return 1
         main "$@"
         local api_status=$?
         linux_agent_runtime_lock_release
         return "${api_status}"
     fi
-    if [[ "${command}" != "interactive" && "${command}" != "restore" ]]; then
+    if [[ "${command}" != "interactive" && "${command}" != "restore" ]] &&
+        ! linux_agent_command_mutates_runtime "$@"; then
         if ! linux_agent_runtime_lock_shared; then
             linux_agent_print_error "runtime 正在恢复或切换版本，请稍后重试。"
             return 1

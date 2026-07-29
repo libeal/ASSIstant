@@ -36,11 +36,17 @@ class DomainContract:
             or ()
         )
         self.risk_levels = frozenset(schema.get("risk_level") or ())
-        self.skill_execution_classes = frozenset(
-            schema.get("skill_execution_class") or {"runner", "host_helper"}
+        skill_extension = (
+            schema.get("skill_extension_contract")
+            if isinstance(schema.get("skill_extension_contract"), dict)
+            else {}
         )
-        self.skill_capabilities = frozenset(
-            schema.get("skill_capability") or {"", "firewall.apply", "hosts.apply"}
+        self.skill_execution_classes = frozenset(
+            skill_extension.get("execution_classes")
+            or {"runner", "host_helper", "credential_helper"}
+        )
+        self.skill_dispatch_modes = frozenset(
+            skill_extension.get("dispatch_modes") or {"always", "apply_only"}
         )
         self.executor_types = frozenset(schema.get("executor_type") or ())
         self.approval_types = frozenset(schema.get("approval_type") or ())
@@ -272,6 +278,8 @@ class DomainContract:
                     f"plan step {index} risk_level is unsupported"
                 )
             executor_fields = {
+                "skill_load": ("skill",),
+                "skill_read": ("skill", "path"),
                 "skill_script": ("skill_script",),
                 "shell": ("command",),
                 "remote_script": ("url", "command"),
@@ -283,16 +291,44 @@ class DomainContract:
                 for name in required_any
                 if isinstance(step.get(name), str) and step[name].strip()
             ]
-            if executor_type == "mcp_tool" and len(present) != 2:
+            if executor_type in {"mcp_tool", "skill_read"} and len(present) != 2:
                 raise DomainValidationError(
-                    f"plan step {index} MCP target is incomplete"
+                    f"plan step {index} executor target is incomplete"
                 )
-            if executor_type != "mcp_tool" and required_any and not present:
+            if executor_type not in {"mcp_tool", "skill_read"} and required_any and not present:
                 raise DomainValidationError(
                     f"plan step {index} executor target is missing"
                 )
+            if executor_type in {"skill_load", "skill_read"}:
+                skill = str(step.get("skill") or "")
+                if re.fullmatch(r"[a-z0-9][a-z0-9-]*", skill) is None:
+                    raise DomainValidationError(
+                        f"plan step {index} Skill name is invalid"
+                    )
+                if step.get("risk_level") != "low":
+                    raise DomainValidationError(
+                        f"plan step {index} Skill read risk must be low"
+                    )
+            if executor_type == "skill_read":
+                path = str(step.get("path") or "")
+                if (
+                    re.fullmatch(r"references/[A-Za-z0-9][A-Za-z0-9._/-]{0,255}", path)
+                    is None
+                    or ".." in path.split("/")
+                    or "//" in path
+                ):
+                    raise DomainValidationError(
+                        f"plan step {index} Skill reference path is invalid"
+                    )
         if len(step_ids) != len(set(step_ids)):
             raise DomainValidationError("plan step ids must be unique")
+        if any(
+            step.get("executor_type") in {"skill_load", "skill_read"}
+            for step in steps
+        ) and not continue_decision["should_continue"]:
+            raise DomainValidationError(
+                "Skill disclosure plans must continue to a reflection turn"
+            )
         return plan
 
     def validate_approval(self, approval):
@@ -358,83 +394,6 @@ class DomainContract:
                 if not isinstance(value, str) or re.fullmatch(r"[0-9a-f]{64}", value) is None:
                     raise DomainValidationError(f"audit_event {name} must be a SHA-256 hex string")
         return event
-
-    def validate_skill_manifest(self, manifest):
-        if not isinstance(manifest, dict):
-            raise DomainValidationError("skill_manifest must be an object")
-        required = list(self._required("skill_manifest"))
-        missing = [field for field in required if field not in manifest]
-        if missing:
-            raise DomainValidationError(
-                f"skill_manifest is missing required fields: {', '.join(missing)}"
-            )
-        schema_version = manifest.get("schema_version")
-        if isinstance(schema_version, bool) or not isinstance(schema_version, int) or schema_version != 1:
-            raise DomainValidationError("skill_manifest schema_version must be 1")
-        if re.fullmatch(r"[a-z0-9][a-z0-9-]*", str(manifest.get("name") or "")) is None:
-            raise DomainValidationError("skill_manifest name is unsupported")
-        for name in ("name", "description"):
-            if not isinstance(manifest.get(name), str) or not manifest[name].strip():
-                raise DomainValidationError(f"skill_manifest {name} must be a non-empty string")
-        scripts = manifest.get("scripts")
-        if (
-            not isinstance(scripts, list)
-            or not scripts
-            or not all(isinstance(script, dict) for script in scripts)
-        ):
-            raise DomainValidationError(
-                "skill_manifest scripts must be a non-empty array of objects"
-            )
-        script_names = []
-        for index, script in enumerate(scripts):
-            script_name = script.get("name")
-            if not isinstance(script_name, str) or re.fullmatch(
-                r"[a-z0-9][a-z0-9-]*\.sh",
-                script_name,
-            ) is None:
-                raise DomainValidationError(
-                    f"skill_manifest script {index} name is unsupported"
-                )
-            script_names.append(script_name)
-            missing_fields = [
-                field
-                for field in ("risk", "execution_class", "capability")
-                if field not in script
-            ]
-            if missing_fields:
-                raise DomainValidationError(
-                    f"skill_manifest script {index} is missing required fields: "
-                    + ", ".join(missing_fields)
-                )
-            risk = script.get("risk")
-            if not isinstance(risk, str) or risk not in self.risk_levels:
-                raise DomainValidationError(
-                    f"skill_manifest script {index} risk is unsupported"
-                )
-            execution_class = script.get("execution_class")
-            if execution_class not in self.skill_execution_classes:
-                raise DomainValidationError(
-                    f"skill_manifest script {index} execution_class is unsupported"
-                )
-            capability = script.get("capability")
-            if not isinstance(capability, str) or capability not in self.skill_capabilities:
-                raise DomainValidationError(
-                    f"skill_manifest script {index} capability is unsupported"
-                )
-            if execution_class == "runner" and capability != "":
-                raise DomainValidationError(
-                    f"skill_manifest script {index} runner capability must be empty"
-                )
-            if execution_class == "host_helper" and capability not in {
-                "firewall.apply",
-                "hosts.apply",
-            }:
-                raise DomainValidationError(
-                    f"skill_manifest script {index} host_helper capability is unsupported"
-                )
-        if len(script_names) != len(set(script_names)):
-            raise DomainValidationError("skill_manifest script names must be unique")
-        return manifest
 
     def validate_turn(self, turn):
         self._require_fields("persisted_turn", turn)

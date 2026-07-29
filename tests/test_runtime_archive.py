@@ -40,8 +40,7 @@ class RuntimeArchiveTests(unittest.TestCase):
             "logs/session.jsonl": '{"seq":1}\n',
             "logs/session.jsonl.1": '{"seq":0}\n',
             "policies/risk-rules.json": '{"blocked_patterns":[]}\n',
-            "skills/INDEX.md": "# User Skill Index\n",
-            "skills/materialized.json": '{"schema_version":1,"materialized":[]}\n',
+            "skills/installation-state.json": '{"schema_version":1,"builtin":[]}\n',
             "skills/custom/SKILL.md": "---\nname: custom\ndescription: test\n---\n",
             "reports/session.verify.json": '{"ok":true}\n',
         }
@@ -61,7 +60,7 @@ class RuntimeArchiveTests(unittest.TestCase):
                     }
                 )
         manifest = {
-            "schema_version": 2,
+            "schema_version": 3,
             "redacted": True,
             "contents": {
                 "user_skills": True,
@@ -90,7 +89,8 @@ class RuntimeArchiveTests(unittest.TestCase):
 
         manifest = runtime_archive.extract_verified(archive, destination)
 
-        self.assertEqual(manifest["schema_version"], 2)
+        self.assertEqual(manifest["schema_version"], 3)
+        self.assertFalse((destination / "skills" / "INDEX.md").exists())
         self.assertEqual(
             (destination / "config" / "config.redacted.json").read_text(encoding="utf-8"),
             '{"web":{"host":"127.0.0.1"}}\n',
@@ -168,7 +168,7 @@ class RuntimeArchiveTests(unittest.TestCase):
         manifest_path = tree / "manifest.json"
         manifest = manifest_path.read_text(encoding="utf-8")
         manifest_path.write_text(
-            manifest[:-1] + ',"schema_version":2}',
+            manifest[:-1] + ',"schema_version":3}',
             encoding="utf-8",
         )
         archive = self.root / "ambiguous-manifest.tar.gz"
@@ -325,45 +325,24 @@ class RuntimeArchiveTests(unittest.TestCase):
         self.assertEqual(count, 100_000)
         self.assertGreater(output.stat().st_size, 100_000)
 
-    def test_user_skill_index_contains_only_archived_runner_manifests(self):
-        skills = self.root / "portable-skills"
-        package = skills / "custom" / "scripts"
-        package.mkdir(parents=True)
-        (skills / "custom" / "SKILL.md").write_text(
-            "---\nname: custom\ndescription: test\n---\n\n- `custom/run`: test\n",
-            encoding="utf-8",
-        )
-        (package / "run.sh").write_text("#!/bin/sh\n", encoding="utf-8")
-        manifest = {
-            "schema_version": 1,
-            "name": "custom",
-            "description": "portable user Skill",
-            "scripts": [
-                {
-                    "name": "run.sh",
-                    "risk": "low",
-                    "execution_class": "runner",
-                    "capability": "",
-                }
-            ],
-        }
-        (skills / "custom" / "manifest.json").write_text(
-            json.dumps(manifest), encoding="utf-8"
-        )
-        output = skills / "INDEX.md"
+    def test_extract_explicitly_rejects_legacy_backup_schemas(self):
+        for schema_version in (1, 2):
+            with self.subTest(schema_version=schema_version):
+                tree = self._make_tree()
+                manifest_path = tree / "manifest.json"
+                manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+                manifest["schema_version"] = schema_version
+                manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+                archive = self.root / f"legacy-v{schema_version}.tar.gz"
+                self._pack(tree, archive)
+                destination = self.root / f"legacy-v{schema_version}"
+                destination.mkdir()
 
-        count = runtime_archive.build_user_skill_index(skills, output)
-
-        self.assertEqual(count, 1)
-        self.assertIn("`custom/run`", output.read_text(encoding="utf-8"))
-        manifest["scripts"][0]["execution_class"] = "host_helper"
-        manifest["scripts"][0]["capability"] = "firewall.apply"
-        (skills / "custom" / "manifest.json").write_text(
-            json.dumps(manifest), encoding="utf-8"
-        )
-        output.unlink()
-        with self.assertRaisesRegex(runtime_archive.ArchiveError, "script contract"):
-            runtime_archive.build_user_skill_index(skills, output)
+                with self.assertRaisesRegex(
+                    runtime_archive.ArchiveError,
+                    "previous major version",
+                ):
+                    runtime_archive.extract_verified(archive, destination)
 
     def test_runtime_fingerprint_separates_release_and_mutable_domains(self):
         release = self.root / "release"

@@ -10,6 +10,7 @@ web_pid=""
 notify_pid=""
 fake_systemd_pidfile=""
 fake_systemd_helper_pidfile=""
+runtime_reader_pid=""
 
 cleanup() {
     if [[ -n "${web_pid}" ]] && kill -0 "${web_pid}" >/dev/null 2>&1; then
@@ -27,6 +28,10 @@ cleanup() {
     if [[ -n "${fake_systemd_helper_pidfile}" && -f "${fake_systemd_helper_pidfile}" ]]; then
         fake_systemd_helper_pid="$(<"${fake_systemd_helper_pidfile}")"
         kill "${fake_systemd_helper_pid}" >/dev/null 2>&1 || true
+    fi
+    if [[ -n "${runtime_reader_pid}" ]] && kill -0 "${runtime_reader_pid}" >/dev/null 2>&1; then
+        kill "${runtime_reader_pid}" >/dev/null 2>&1 || true
+        wait "${runtime_reader_pid}" 2>/dev/null || true
     fi
     rm -rf -- "${tmp_root}"
 }
@@ -127,6 +132,11 @@ grep -q '^CapabilityBoundingSet=CAP_NET_ADMIN CAP_DAC_OVERRIDE CAP_FOWNER CAP_CH
     "${prefix}/current/packaging/linux-agent-host-ops.service"
 grep -q '^CapabilityBoundingSet=CAP_DAC_OVERRIDE CAP_FOWNER CAP_CHOWN$' \
     "${prefix}/current/packaging/linux-agent-policy-writer.service"
+[[ -f "${prefix}/skills/database-inspect/assets/systemd/linux-agent-database-inspector.service" ]]
+[[ -f "${prefix}/skills/database-inspect/assets/systemd/linux-agent-database-inspector.socket" ]]
+[[ -f "${prefix}/skills/ops-change/assets/host-ops-policy.example.json" ]]
+grep -q '^CapabilityBoundingSet=$' \
+    "${prefix}/skills/database-inspect/assets/systemd/linux-agent-database-inspector.service"
 grep -q '^CapabilityBoundingSet=$' \
     "${prefix}/current/packaging/linux-agent-runner.service"
 grep -q '^SocketMode=0660$' "${prefix}/current/packaging/linux-agent-observer-helper.socket"
@@ -142,6 +152,8 @@ for unit in linux-agent-observer-helper.service linux-agent-runner.service \
     grep -q '^Environment=LINUX_AGENT_SERVICE_USER=linux-agent$' \
         "${prefix}/current/packaging/${unit}"
 done
+grep -q '^Environment=LINUX_AGENT_SERVICE_USER=linux-agent$' \
+    "${prefix}/skills/database-inspect/assets/systemd/linux-agent-database-inspector.service"
 grep -q 'InaccessiblePaths=.*observer.sock.*host-ops.sock.*policy-writer.sock' \
     "${prefix}/current/packaging/linux-agent-runner.service"
 grep -q 'InaccessiblePaths=.*data/policies' \
@@ -181,8 +193,8 @@ jq -e '.ok == true and .status == "ok" and .version == "v0.0.0-test"
 skills_json="$(bash "${prefix}/current/bin/agent" api skills validate '{}')"
 jq -e '.ok == true' <<<"${skills_json}" >/dev/null
 while IFS= read -r skill_name; do
-    [[ -f "${prefix}/current/skills/${skill_name}/SKILL.md" ]]
-    [[ -d "${prefix}/current/skills/${skill_name}/scripts" ]]
+    [[ -f "${prefix}/skills/${skill_name}/SKILL.md" ]]
+    [[ -d "${prefix}/skills/${skill_name}/scripts" ]]
 done < <(jq -r '.skills | keys[]' "${dist_one}/release-manifest.json")
 
 printf 'persistent-marker\n' >"${prefix}/data/logs/marker"
@@ -271,7 +283,8 @@ for bad_ref_kind in object number null; do
         printf 'install unexpectedly accepted a %s manifest ref\n' "${bad_ref_kind}" >&2
         exit 1
     fi
-    grep -q 'release manifest 契约无效' "${tmp_root}/bad-ref-${bad_ref_kind}.stderr"
+    grep -Eq 'release manifest( schema v2)? 契约无效' \
+        "${tmp_root}/bad-ref-${bad_ref_kind}.stderr"
 done
 
 tampered_installer="${tmp_root}/tampered-installer.sh"
@@ -361,9 +374,14 @@ if command -v unshare >/dev/null 2>&1 && unshare -Ur true >/dev/null 2>&1; then
     managed_runner_socket="${managed_prefix}/systemd/runner.sock"
     managed_host_socket="${managed_prefix}/systemd/host-ops.sock"
     managed_policy_socket="${managed_prefix}/systemd/policy-writer.sock"
+    managed_database_socket="${managed_prefix}/systemd/database-inspector.sock"
+    managed_host_policy="${managed_prefix}/etc/host-ops-policy.json"
+    managed_database_profiles="${managed_prefix}/etc/database-profiles.d"
+    managed_database_egress="${managed_prefix}/systemd/linux-agent-database-inspector.service.d/20-database-egress.conf"
     export LINUX_AGENT_RUNNER_SOCKET="${managed_runner_socket}"
     export LINUX_AGENT_HOST_HELPER_SOCKET="${managed_host_socket}"
     export LINUX_AGENT_POLICY_HELPER_SOCKET="${managed_policy_socket}"
+    export LINUX_AGENT_DATABASE_HELPER_SOCKET="${managed_database_socket}"
     managed_observer_state="${managed_prefix}/systemd/observer-capabilities.json"
     managed_dist_one="${tmp_root}/managed-dist-one"
     managed_dist_two="${tmp_root}/managed-dist-two"
@@ -410,7 +428,8 @@ stop_service() {
         rm -f -- "${FAKE_SYSTEMD_STATE}/helper.pid"
     fi
     rm -f -- "${LINUX_AGENT_OBSERVER_HELPER_SOCKET}" "${LINUX_AGENT_RUNNER_SOCKET}" \
-        "${LINUX_AGENT_HOST_HELPER_SOCKET}" "${LINUX_AGENT_POLICY_HELPER_SOCKET}"
+        "${LINUX_AGENT_HOST_HELPER_SOCKET}" "${LINUX_AGENT_POLICY_HELPER_SOCKET}" \
+        "${LINUX_AGENT_DATABASE_HELPER_SOCKET}"
 }
 
 start_helper() {
@@ -421,7 +440,8 @@ start_helper() {
     [[ "${FAKE_HELPER_FAIL:-0}" != "1" ]] || return 0
     [[ ! -f "${FAKE_SYSTEMD_PREFIX}/current/FAIL_HELPER" ]] || return 0
     python3 - "${LINUX_AGENT_OBSERVER_HELPER_SOCKET}" "${LINUX_AGENT_RUNNER_SOCKET}" \
-        "${LINUX_AGENT_HOST_HELPER_SOCKET}" "${LINUX_AGENT_POLICY_HELPER_SOCKET}" <<'PY' \
+        "${LINUX_AGENT_HOST_HELPER_SOCKET}" "${LINUX_AGENT_POLICY_HELPER_SOCKET}" \
+        "${LINUX_AGENT_DATABASE_HELPER_SOCKET}" <<'PY' \
         >"${FAKE_SYSTEMD_STATE}/helper.stdout" \
         2>"${FAKE_SYSTEMD_STATE}/helper.stderr" &
 import json
@@ -430,7 +450,10 @@ import select
 import socket
 import sys
 
-socket_kinds = dict(zip(sys.argv[1:], ("observer", "runner", "host-ops", "policy-writer")))
+socket_kinds = dict(zip(
+    sys.argv[1:],
+    ("observer", "runner", "host-ops", "policy-writer", "database-inspector"),
+))
 servers = []
 try:
     for path, kind in socket_kinds.items():
@@ -519,6 +542,9 @@ case "${command_name}" in
         elif [[ " $* " == *" linux-agent-policy-writer.socket "* &&
             -S "${LINUX_AGENT_POLICY_HELPER_SOCKET}" ]]; then
             active=1
+        elif [[ " $* " == *" linux-agent-database-inspector.socket "* &&
+            -S "${LINUX_AGENT_DATABASE_HELPER_SOCKET}" ]]; then
+            active=1
         fi
         if [[ "${active}" -eq 1 ]]; then
             [[ " $* " == *" --quiet "* ]] || printf 'active\n'
@@ -534,14 +560,28 @@ case "${command_name}" in
         fi
         ;;
     disable)
-        rm -f -- "${FAKE_SYSTEMD_STATE}/enabled"
+        if [[ " $* " == *" linux-agent-web.service " ||
+            " $* " == *" linux-agent-observer-helper.socket " ]]; then
+            rm -f -- "${FAKE_SYSTEMD_STATE}/enabled"
+        fi
         if [[ " $* " == *" --now "* ]]; then
             stop_service
         fi
         ;;
     restart) start_service ;;
+    try-restart)
+        if [[ "${FAKE_REJECT_EARLY_SKILL_WEB_RESTART:-0}" == "1" &&
+            ! -f "${FAKE_SYSTEMD_PREFIX}/systemd/linux-agent-database-inspector.service" &&
+            -d "${FAKE_SYSTEMD_PREFIX}/skills/database-inspect" ]]; then
+            printf 'Web restart occurred before the Skill package was removed\n' >&2
+            exit 1
+        fi
+        ;;
     start)
-        if [[ " $* " == *" linux-agent-observer-helper.socket "* &&
+        if [[ " $* " == *" linux-agent-database-inspector.socket "* &&
+            " $* " != *" linux-agent-web.service "* ]]; then
+            [[ -S "${LINUX_AGENT_DATABASE_HELPER_SOCKET}" ]] || start_helper
+        elif [[ " $* " == *" linux-agent-observer-helper.socket "* &&
             " $* " != *" linux-agent-web.service "* ]]; then
             start_helper
         elif [[ " $* " == *" linux-agent-observer-helper.service "* &&
@@ -552,7 +592,14 @@ case "${command_name}" in
             start_service
         fi
         ;;
-    stop) stop_service ;;
+    stop)
+        if [[ " $* " == *" linux-agent-database-inspector."* &&
+            " $* " != *" linux-agent-web.service "* ]]; then
+            rm -f -- "${LINUX_AGENT_DATABASE_HELPER_SOCKET}"
+        else
+            stop_service
+        fi
+        ;;
     *)
         printf 'unsupported fake systemctl command: %s\n' "${command_name}" >&2
         exit 2
@@ -591,12 +638,35 @@ SH
             LINUX_AGENT_RUNNER_SOCKET="${managed_runner_socket}" \
             LINUX_AGENT_HOST_HELPER_SOCKET="${managed_host_socket}" \
             LINUX_AGENT_POLICY_HELPER_SOCKET="${managed_policy_socket}" \
+            LINUX_AGENT_DATABASE_HELPER_SOCKET="${managed_database_socket}" \
+            LINUX_AGENT_HOST_OPS_POLICY_PATH="${managed_host_policy}" \
+            LINUX_AGENT_DATABASE_PROFILE_ROOT="${managed_database_profiles}" \
+            LINUX_AGENT_SYSTEMD_DATABASE_EGRESS_DROPIN_PATH="${managed_database_egress}" \
             LINUX_AGENT_OBSERVER_HELPER_STATE="${managed_observer_state}" \
             LINUX_AGENT_INSTALL_HEALTH_ATTEMPTS=6 \
             LINUX_AGENT_ALLOW_UNSAFE_SYSTEMD_TEST_PREFIX=1 \
             LINUX_AGENT_ALLOW_ROOT_SERVICE_USER_FOR_TESTS=1 \
             bash "${ROOT_DIR}/scripts/install.sh" "$@" \
             --prefix "${managed_prefix}" --service-user root
+    }
+
+    run_managed_agent() {
+        unshare -Ur env \
+            PATH="${fake_systemd_bin}:${PATH}" \
+            FAKE_SYSTEMD_PREFIX="${managed_prefix}" \
+            FAKE_SYSTEMD_STATE="${fake_systemd_dir}" \
+            LINUX_AGENT_SYSTEMD_UNIT_DIR="${managed_prefix}/systemd" \
+            LINUX_AGENT_OBSERVER_HELPER_SOCKET="${managed_observer_socket}" \
+            LINUX_AGENT_RUNNER_SOCKET="${managed_runner_socket}" \
+            LINUX_AGENT_HOST_HELPER_SOCKET="${managed_host_socket}" \
+            LINUX_AGENT_POLICY_HELPER_SOCKET="${managed_policy_socket}" \
+            LINUX_AGENT_DATABASE_HELPER_SOCKET="${managed_database_socket}" \
+            LINUX_AGENT_HOST_OPS_POLICY_PATH="${managed_host_policy}" \
+            LINUX_AGENT_DATABASE_PROFILE_ROOT="${managed_database_profiles}" \
+            LINUX_AGENT_MANAGED_RELEASE_BASE="file://${managed_dist_two}" \
+            LINUX_AGENT_ALLOW_INSECURE_TEST_URL=1 \
+            FAKE_REJECT_EARLY_SKILL_WEB_RESTART=1 \
+            bash "${managed_prefix}/current/bin/agent" "$@"
     }
 
     if run_managed_installer install --version v0.0.0-test --from-dist "${managed_dist_one}" \
@@ -634,11 +704,80 @@ SH
     grep -q '^IPAddressDeny=any$' "${managed_egress_path}"
     grep -q '^IPAddressAllow=localhost$' "${managed_egress_path}"
     grep -q '^IPAddressAllow=127.0.0.1/32$' "${managed_egress_path}"
+    grep -q "^Environment=LINUX_AGENT_BUILTIN_SKILLS_DIR=${managed_prefix}/skills$" \
+        "${managed_prefix}/systemd/linux-agent-runner.service"
+    grep -q "^Environment=LINUX_AGENT_BUILTIN_SKILLS_DIR=${managed_prefix}/skills$" \
+        "${managed_prefix}/systemd/linux-agent-host-ops.service"
+    grep -q "^Environment=LINUX_AGENT_RELEASE_MANIFEST=${managed_prefix}/release-manifest.json$" \
+        "${managed_prefix}/systemd/linux-agent-host-ops.service"
+
+    runtime_reader_ready="${tmp_root}/managed-runtime-reader.ready"
+    runtime_reader_release="${tmp_root}/managed-runtime-reader.release"
+    bash -c '
+        exec 9<>"$1"
+        flock -s 9
+        touch "$2"
+        while [[ ! -f "$3" ]]; do
+            sleep 0.02 9>&-
+        done
+    ' bash "${managed_prefix}/data/.runtime.lock" "${runtime_reader_ready}" \
+        "${runtime_reader_release}" &
+    runtime_reader_pid="$!"
+    for _ in $(seq 1 100); do
+        [[ -f "${runtime_reader_ready}" ]] && break
+        sleep 0.02
+    done
+    [[ -f "${runtime_reader_ready}" ]]
+    managed_skill_result="$(run_managed_agent skills uninstall --scope builtin database-inspect)"
+    jq -e '.ok == false and .status == "runtime_busy" and .code == "runtime_busy"' \
+        <<<"${managed_skill_result}" >/dev/null
+    [[ -d "${managed_prefix}/skills/database-inspect" ]]
+    [[ -f "${managed_prefix}/systemd/linux-agent-database-inspector.service" ]]
+    [[ -f "${managed_prefix}/systemd/linux-agent-database-inspector.socket" ]]
+    jq -e '.skills["database-inspect"].installed == true' \
+        "${managed_prefix}/data/skill-components.json" >/dev/null
+    touch "${runtime_reader_release}"
+    wait "${runtime_reader_pid}"
+    runtime_reader_pid=""
+
     FAKE_SYSTEMD_PREFIX="${managed_prefix}" FAKE_SYSTEMD_STATE="${fake_systemd_dir}" \
         LINUX_AGENT_OBSERVER_HELPER_SOCKET="${managed_observer_socket}" \
-        "${fake_systemd_bin}/systemctl" enable --now \
-        linux-agent-observer-helper.socket linux-agent-web.service
+        "${fake_systemd_bin}/systemctl" start linux-agent-database-inspector.socket
+    managed_skill_result="$(run_managed_agent skills uninstall --scope builtin database-inspect)"
+    if ! jq -e '.ok == true and .status == "uninstalled" and .skill == "database-inspect"
+        and .components.ok == true and .components.record.installed == false' \
+        <<<"${managed_skill_result}" >/dev/null; then
+        printf 'managed Skill uninstall failed: %s\n' "${managed_skill_result}" >&2
+        exit 1
+    fi
+    [[ ! -e "${managed_prefix}/skills/database-inspect" ]]
+    [[ ! -e "${managed_prefix}/systemd/linux-agent-database-inspector.service" ]]
+    [[ ! -e "${managed_prefix}/systemd/linux-agent-database-inspector.socket" ]]
+    [[ -d "${managed_database_profiles}" ]]
+    jq -e '.skills["database-inspect"].installed == false' \
+        "${managed_prefix}/data/skill-components.json" >/dev/null
     run_managed_installer upgrade --version v0.0.1-test --from-dist "${managed_dist_two}"
+    [[ ! -e "${managed_prefix}/skills/database-inspect" ]]
+    [[ ! -e "${managed_prefix}/systemd/linux-agent-database-inspector.service" ]]
+    [[ ! -e "${managed_prefix}/systemd/linux-agent-database-inspector.socket" ]]
+    jq -e '.skills["database-inspect"].installed == false' \
+        "${managed_prefix}/data/skill-components.json" >/dev/null
+    managed_skill_result='{}'
+    for _ in $(seq 1 100); do
+        managed_skill_result="$(run_managed_agent skills install --scope builtin database-inspect)"
+        [[ "$(jq -r '.status // empty' <<<"${managed_skill_result}")" == "runtime_busy" ]] || break
+        sleep 0.02
+    done
+    if ! jq -e '.ok == true and .status == "installed" and .skill == "database-inspect"
+        and .components.ok == true and .components.record.installed == true' \
+        <<<"${managed_skill_result}" >/dev/null; then
+        printf 'managed Skill install failed: %s\n' "${managed_skill_result}" >&2
+        sed -n '1,200p' "${fake_systemd_dir}/commands" >&2 2>/dev/null || true
+        exit 1
+    fi
+    [[ -d "${managed_prefix}/skills/database-inspect" ]]
+    jq -e '.skills["database-inspect"].installed == true' \
+        "${managed_prefix}/data/skill-components.json" >/dev/null
     grep -q '^Environment=LINUX_AGENT_UNIT_MARKER=v2$' "${managed_unit_path}"
     grep -q "^ExecStart=/usr/bin/python3 ${managed_prefix}/current/lib/observer_helper.py serve$" \
         "${managed_prefix}/systemd/linux-agent-observer-helper.service"
@@ -653,17 +792,25 @@ SH
     grep -q '^SocketMode=0660$' "${managed_prefix}/systemd/linux-agent-host-ops.socket"
     grep -q '^SocketGroup=root$' "${managed_prefix}/systemd/linux-agent-policy-writer.socket"
     grep -q '^SocketMode=0660$' "${managed_prefix}/systemd/linux-agent-policy-writer.socket"
+    grep -q '^SocketGroup=root$' "${managed_prefix}/systemd/linux-agent-database-inspector.socket"
+    grep -q '^SocketMode=0660$' "${managed_prefix}/systemd/linux-agent-database-inspector.socket"
     for unit in linux-agent-observer-helper.service linux-agent-runner.service \
-        linux-agent-host-ops.service linux-agent-policy-writer.service; do
+        linux-agent-host-ops.service linux-agent-policy-writer.service \
+        linux-agent-database-inspector.service; do
         grep -q '^Environment=LINUX_AGENT_SERVICE_USER=root$' \
             "${managed_prefix}/systemd/${unit}"
     done
     for helper_socket in "${managed_observer_socket}" "${managed_host_socket}" \
-        "${managed_policy_socket}"; do
+        "${managed_policy_socket}" "${managed_database_socket}"; do
         [[ -S "${helper_socket}" ]]
         [[ "$(stat -c '%a' "${helper_socket}")" == "660" ]]
     done
     [[ -S "${managed_runner_socket}" ]]
+    [[ -f "${managed_host_policy}" ]]
+    [[ "$(stat -c '%a' "${managed_host_policy}")" == "600" ]]
+    [[ -d "${managed_database_profiles}" ]]
+    [[ "$(stat -c '%a' "${managed_database_profiles}")" == "750" ]]
+    grep -q '^IPAddressDeny=any$' "${managed_database_egress}"
     # The fake socket server creates all sockets as 0660; the rendered unit is
     # the authoritative permission assertion in this namespace-only test.
     grep -q '^verify$' "${fake_systemd_dir}/commands"

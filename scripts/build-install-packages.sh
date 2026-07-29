@@ -84,7 +84,7 @@ for distro in debian fedora; do
 
     # A local package only needs assets consumed by install.sh. Keep the
     # package manifest truthful instead of carrying remote-only assets.
-    jq -S '{schema_version, version, repository, assets:{core:.assets.core, web:.assets.web, installer:.assets.installer}, skills}' \
+    jq -S '{schema_version, version, repository, assets:{core:.assets.core, web:.assets.web, installer:.assets.installer}, core_contents, skills}' \
         "${manifest}" >"${stage_root}/release/release-manifest.json"
     copy_manifest_asset "${manifest}" '.assets.core' "${stage_root}/release"
     copy_manifest_asset "${manifest}" '.assets.web' "${stage_root}/release"

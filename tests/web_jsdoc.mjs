@@ -89,6 +89,13 @@ for (const [moduleName, [contextType, returnType]] of Object.entries(viewTypeExp
   assert.doesNotMatch(source, /@param \{(?:any|Record<string, any>)\} app/);
 }
 
+const databaseViewSource = await readFile(
+  new URL("../skills/database-inspect/assets/web/view-database.js", import.meta.url),
+  "utf8",
+);
+assert.match(databaseViewSource, /export function registerSkillWebComponent/);
+assert.match(databaseViewSource, /export function createDatabaseView/);
+
 const forbiddenCrossViewCalls = [
   "configInputId",
   "renderSessionTimeline",

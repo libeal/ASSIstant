@@ -78,6 +78,8 @@ jobs:
             tests/tools.sh \
             tests/context.sh \
             tests/security.sh \
+            tests/skill_lifecycle.sh \
+            tests/skill_stability.sh \
             tests/workflow.sh \
             tests/workflow_unit.sh \
             tests/observer.sh \

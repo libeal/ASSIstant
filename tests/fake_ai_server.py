@@ -66,6 +66,7 @@ def work_plan(summary, steps, should_continue=False, reason="计划执行后无�
 def edit_package():
     return {
         "response_type": "skill_edit",
+        "edit_schema_version": 1,
         "skill": {
             "name": "custom-generated",
             "description": "根据用户需求生成的本地运维辅助 skill。",
@@ -81,6 +82,8 @@ def edit_package():
                 "printf '{\"ok\":true,\"tool\":\"custom-generated/generated\",\"args\":%s,\"note\":\"generated skill placeholder\"}\\n' \"${args}\"\n",
             }
         ],
+        "references": [],
+        "assets": [],
         "notes": "test fixture edit package",
     }
 
@@ -106,7 +109,7 @@ def extract_request(messages):
     return purpose, request_context, current_request
 
 
-def work_plan_response(current_request):
+def _work_plan_response(current_request):
     if "慢速实时" in current_request:
         return work_plan(
             "慢速实时测试：先执行一次资源检查，然后等待反思返回最终回答。",
@@ -202,12 +205,63 @@ def work_plan_response(current_request):
     return answer("测试服务直接返回问答响应。", "已收到请求：" + current_request)
 
 
+def work_plan_response(current_request, request_context=None):
+    response = _work_plan_response(current_request)
+    if response.get("response_type") != "work_plan":
+        return response
+    request_context = request_context if isinstance(request_context, dict) else {}
+    skills = request_context.get("skills")
+    skills = skills if isinstance(skills, dict) else {}
+    loaded = skills.get("loaded")
+    loaded = loaded if isinstance(loaded, list) else []
+    loaded_names = {
+        item.get("name")
+        for item in loaded
+        if isinstance(item, dict) and item.get("path") == "SKILL.md"
+    }
+    required = sorted(
+        {
+            str(item.get("skill_script") or "").split("/", 1)[0]
+            for item in response.get("steps", [])
+            if item.get("executor_type") == "skill_script"
+            and "/" in str(item.get("skill_script") or "")
+        }
+        - loaded_names
+    )
+    if not required:
+        return response
+    return work_plan(
+        "先通过受控读取加载本轮需要的 Skill 说明。",
+        [
+            step(
+                f"load-{name}",
+                f"加载 {name} Skill 说明",
+                "skill_load",
+                "执行前读取完整 SKILL.md，避免猜测参数与安全约束。",
+                "返回该 Skill 的标准说明，供下一轮生成可执行计划。",
+                skill=name,
+            )
+            for name in required
+        ],
+        should_continue=True,
+        reason="读取 Skill 说明后需要进入反思轮次，再依据已加载契约生成执行步骤。",
+    )
+
+
 def reflection_response(request_context):
     observation = request_context.get("environment_context", {}).get("agent_observation", {})
     original_request = str(observation.get("original_request") or request_context.get("current_request") or "")
     status = str(observation.get("execution", {}).get("status") or "executed")
-    iteration = int(observation.get("iteration") or 1)
     serialized = json.dumps(request_context, ensure_ascii=False)
+
+    observed_results = observation.get("execution", {}).get("results", [])
+    if any(
+        isinstance(item, dict)
+        and item.get("step", {}).get("executor_type") in {"skill_load", "skill_read"}
+        and item.get("result", {}).get("ok") is True
+        for item in observed_results
+    ):
+        return work_plan_response(original_request, request_context)
 
     if "慢速实时" in original_request:
         time.sleep(2)
@@ -217,7 +271,12 @@ def reflection_response(request_context):
             reason="已拿到资源检查结果，结束慢速实时测试。",
             thinking_summary="慢速实时测试在反思阶段延迟，便于 Web 轮询读取 partial output。",
         )
-    if "继续深入" in original_request and iteration == 1:
+    if "继续深入" in original_request and any(
+        isinstance(item, dict)
+        and item.get("step", {}).get("executor_type") == "skill_script"
+        and item.get("step", {}).get("id") != "reflect-1"
+        for item in observed_results
+    ):
         return work_plan(
             "继续深入：补充查看 CPU 与内存资源概况。",
             [
@@ -295,7 +354,7 @@ def response_for(messages):
         return repair_response(request_context)
     if purpose == "work_reflect":
         return reflection_response(request_context)
-    return work_plan_response(current_request)
+    return work_plan_response(current_request, request_context)
 
 
 class Handler(BaseHTTPRequestHandler):

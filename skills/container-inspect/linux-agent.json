@@ -1,0 +1,79 @@
+{
+  "schema_version": 1,
+  "package_version": "1.0.0",
+  "core_api": 1,
+  "category": "container",
+  "tools": [
+    {
+      "name": "container-inspect",
+      "description": "脱敏读取单个容器配置、状态、环境键、标签和挂载目标。",
+      "entrypoint": "scripts/container-inspect.sh",
+      "risk": "medium",
+      "approval_scope": "skill_readonly",
+      "execution": {
+        "class": "runner",
+        "capability": "",
+        "dispatch": "always"
+      },
+      "runtime_inputs": [],
+      "guards": []
+    },
+    {
+      "name": "container-list",
+      "description": "通过固定只读 CLI 有界列出容器。",
+      "entrypoint": "scripts/container-list.sh",
+      "risk": "medium",
+      "approval_scope": "skill_readonly",
+      "execution": {
+        "class": "runner",
+        "capability": "",
+        "dispatch": "always"
+      },
+      "runtime_inputs": [],
+      "guards": []
+    },
+    {
+      "name": "image-inventory",
+      "description": "通过固定只读 CLI 有界读取镜像清单。",
+      "entrypoint": "scripts/image-inventory.sh",
+      "risk": "medium",
+      "approval_scope": "skill_readonly",
+      "execution": {
+        "class": "runner",
+        "capability": "",
+        "dispatch": "always"
+      },
+      "runtime_inputs": [],
+      "guards": []
+    },
+    {
+      "name": "resource-snapshot",
+      "description": "对容器执行单次有界资源采样。",
+      "entrypoint": "scripts/resource-snapshot.sh",
+      "risk": "medium",
+      "approval_scope": "skill_readonly",
+      "execution": {
+        "class": "runner",
+        "capability": "",
+        "dispatch": "always"
+      },
+      "runtime_inputs": [],
+      "guards": []
+    },
+    {
+      "name": "runtime-summary",
+      "description": "查看 Docker、Podman 与 CRI 客户端及运行时可达性。",
+      "entrypoint": "scripts/runtime-summary.sh",
+      "risk": "medium",
+      "approval_scope": "skill_readonly",
+      "execution": {
+        "class": "runner",
+        "capability": "",
+        "dispatch": "always"
+      },
+      "runtime_inputs": [],
+      "guards": []
+    }
+  ],
+  "components": {}
+}

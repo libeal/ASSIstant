@@ -7,6 +7,7 @@ arguments_json="${1:-}"
 
 python3 - "${arguments_json}" <<'PY'
 import json
+import hashlib
 import sys
 from pathlib import Path
 
@@ -99,6 +100,7 @@ emit({
     "status": "matched",
     "path": str(path),
     "size_bytes": stat.st_size,
+    "sha256": hashlib.sha256(data).hexdigest(),
     "match_count": len(matches) if text.count(needle) <= max_matches else text.count(needle),
     "shown_count": len(matches),
     "matches": matches,
