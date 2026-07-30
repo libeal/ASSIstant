@@ -1,0 +1,9 @@
+{
+  "license_expression": "MIT",
+  "license_files": [
+    "LICENSE"
+  ],
+  "name": "typing-inspection",
+  "source_wheel": "typing_inspection-0.4.2-py3-none-any.whl",
+  "version": "0.4.2"
+}

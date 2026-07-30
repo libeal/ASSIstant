@@ -63,6 +63,93 @@ class ServerConfigurationTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 store.consume(leave_reference)
 
+    def test_audit_restore_source_rejects_broken_integrity(self):
+        audit_result = {
+            "ok": True,
+            "schema_version": server.DOMAIN_CONTRACT.schema_version,
+            "protocol_version": server.DOMAIN_CONTRACT.protocol_version,
+            "status": "read",
+            "session_id": "session_web_broken",
+            "report": "broken",
+            "integrity": {
+                "ok": False,
+                "status": "integrity_broken",
+                "breaks": [{"line": 2, "reason": "hash_mismatch"}],
+            },
+            "integrity_ok": False,
+            "events": [],
+        }
+        with mock.patch.object(server, "run_agent_api", return_value=audit_result):
+            result = server.audit_restore_source_error(
+                "session_web_broken",
+                request_id="request-audit-restore",
+            )
+
+        self.assertFalse(result["ok"])
+        self.assertEqual("audit_integrity_broken", result["code"])
+        self.assertEqual(
+            [{"line": 2, "reason": "hash_mismatch"}],
+            result["details"]["breaks"],
+        )
+
+    def test_audit_read_does_not_attach_timeline_when_integrity_is_broken(self):
+        audit_result = {
+            "ok": True,
+            "schema_version": server.DOMAIN_CONTRACT.schema_version,
+            "protocol_version": server.DOMAIN_CONTRACT.protocol_version,
+            "status": "read",
+            "session_id": "session_web_broken",
+            "report": "broken",
+            "integrity": {"ok": False, "status": "integrity_broken", "breaks": []},
+            "integrity_ok": False,
+            "events": [],
+        }
+        handler = mock.Mock(request_id="request-audit-read")
+        with mock.patch.object(
+            server.SKILL_WEB_COMPONENTS,
+            "handle_web_action",
+            return_value=None,
+        ), mock.patch.object(
+            server,
+            "run_agent_api",
+            return_value=audit_result,
+        ), mock.patch.object(
+            server.SESSION_STORE,
+            "read_persisted_turns",
+        ) as read_turns, mock.patch.object(server, "json_response") as respond:
+            server.Handler.handle_api_post(
+                handler,
+                "/api/audit/read",
+                {"session_id": "session_web_broken"},
+            )
+
+        response = respond.call_args.args[2]
+        self.assertIsNone(response["web_timeline"])
+        self.assertEqual(
+            "audit_integrity_broken",
+            response["timeline_unavailable_reason"],
+        )
+        read_turns.assert_not_called()
+
+    def test_policy_list_failure_returns_structured_error(self):
+        handler = mock.Mock(request_id="request-policy-list")
+        with mock.patch.object(
+            server.SKILL_WEB_COMPONENTS,
+            "handle_web_action",
+            return_value=None,
+        ), mock.patch.object(
+            server,
+            "list_policy_files",
+            side_effect=ValueError("policy overlay is invalid"),
+        ), mock.patch.object(server, "json_response") as respond:
+            server.Handler.handle_api_get(handler, "/api/policies")
+
+        status, response = respond.call_args.args[1:]
+        self.assertEqual(500, status)
+        self.assertFalse(response["ok"])
+        self.assertEqual("read_failed", response["code"])
+        self.assertEqual("request-policy-list", response["request_id"])
+
     def test_config_update_returns_durable_cleanup_warning(self):
         with mock.patch.object(server, "CONFIG_STORE") as store, mock.patch.object(
             server,
@@ -78,6 +165,55 @@ class ServerConfigurationTests(unittest.TestCase):
         self.assertTrue(result["ok"])
         self.assertEqual("updated", result["status"])
         self.assertEqual("config_cleanup_pending", result["warning"])
+
+    def test_mcp_continuation_restores_trusted_source_job_state(self):
+        source_job_id = "c" * 32
+        source = {
+            "resource": "work",
+            "action": "run",
+            "payload": {"input": "trusted original input"},
+            "result": {
+                "status": "awaiting_mcp_input",
+                "response": {"response_type": "work_plan"},
+                "context": {"topic": "trusted"},
+                "execution_state": {"status": "awaiting_mcp_input"},
+            },
+        }
+        attacker_payload = {
+            "mcp_source_job_id": source_job_id,
+            "input": "replaced input",
+            "response": {"attacker": True},
+            "execution_state": {"attacker": True},
+            "mcp_input_responses": {"email": {"action": "decline"}},
+        }
+        with mock.patch.object(server, "read_job", return_value=source):
+            prepared = server.prepare_mcp_work_job_payload("work", "run", attacker_payload)
+
+        self.assertEqual("trusted original input", prepared["input"])
+        self.assertEqual(source["result"]["response"], prepared["response"])
+        self.assertEqual(source["result"]["execution_state"], prepared["execution_state"])
+        self.assertEqual(source_job_id, prepared["mcp_flow_id"])
+        self.assertEqual(attacker_payload["mcp_input_responses"], prepared["mcp_input_responses"])
+        self.assertNotIn("mcp_source_job_id", prepared)
+
+    def test_mcp_continuation_rejects_unknown_or_completed_source_job(self):
+        source_job_id = "d" * 32
+        with mock.patch.object(server, "read_job", return_value=None):
+            with self.assertRaises(server.McpInputJobError):
+                server.prepare_mcp_work_job_payload(
+                    "work", "run", {"mcp_source_job_id": source_job_id}
+                )
+        completed = {
+            "resource": "work",
+            "action": "run",
+            "payload": {"input": "done"},
+            "result": {"status": "executed", "execution_state": {}},
+        }
+        with mock.patch.object(server, "read_job", return_value=completed):
+            with self.assertRaises(server.McpInputJobError):
+                server.prepare_mcp_work_job_payload(
+                    "work", "run", {"mcp_source_job_id": source_job_id}
+                )
 
     def test_config_write_error_uses_structured_contract(self):
         with mock.patch.object(server, "CONFIG_STORE") as store:

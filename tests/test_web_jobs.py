@@ -21,6 +21,7 @@ if str(WEB_ROOT) not in sys.path:
 from jobs import (  # noqa: E402
     IdempotencyConflict,
     JobCapacityExceeded,
+    JobSourceClaimConflict,
     JobStore,
     JobVersionConflict,
     LegacyJobMigrationError,
@@ -180,6 +181,69 @@ class JobStoreTest(unittest.TestCase):
         capacity_result = next(result for result in results if result[0] == "capacity")
         self.assertEqual(("capacity", 1, 1), capacity_result)
         self.assertEqual(1, self.store.count_active())
+
+    def test_mcp_source_is_claimed_once_with_job_admission(self):
+        source, _ = self.store.create(
+            job_record(
+                "mcp-source",
+                status="succeeded",
+                result={"status": "awaiting_mcp_input"},
+            )
+        )
+        other_store = JobStore(self.db_path)
+        barrier = threading.Barrier(2)
+
+        def claim(store, job_id):
+            barrier.wait(timeout=5)
+            try:
+                admitted, _deduplicated = store.admit_claiming_source(
+                    job_record(job_id),
+                    idempotency_key=f"claim-{job_id}",
+                    max_active=4,
+                    source_job_id="mcp-source",
+                    expected_source_version=source["version"],
+                )
+                return "admitted", admitted["job_id"]
+            except JobSourceClaimConflict:
+                return "claimed", job_id
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            results = list(
+                executor.map(
+                    lambda arguments: claim(*arguments),
+                    ((self.store, "mcp-next-a"), (other_store, "mcp-next-b")),
+                )
+            )
+
+        self.assertEqual(1, sum(result[0] == "admitted" for result in results))
+        self.assertEqual(1, sum(result[0] == "claimed" for result in results))
+        admitted_id = next(result[1] for result in results if result[0] == "admitted")
+        claimed_source = self.store.read("mcp-source")
+        self.assertEqual(admitted_id, claimed_source["mcp_continuation_claimed_by"])
+
+    def test_failed_admission_does_not_claim_mcp_source(self):
+        self.store.create(job_record("active-job"))
+        source, _ = self.store.create(
+            job_record(
+                "capacity-source",
+                status="succeeded",
+                result={"status": "awaiting_mcp_input"},
+            )
+        )
+
+        with self.assertRaises(JobCapacityExceeded):
+            self.store.admit_claiming_source(
+                job_record("capacity-next"),
+                idempotency_key="capacity-next",
+                max_active=1,
+                source_job_id="capacity-source",
+                expected_source_version=source["version"],
+            )
+
+        self.assertNotIn(
+            "mcp_continuation_claimed_by",
+            self.store.read("capacity-source"),
+        )
 
     def test_update_increments_version_only_when_mutated(self):
         created, _ = self.store.create(job_record("c1"))

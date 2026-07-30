@@ -1,7 +1,7 @@
 [Unit]
 Description=Linux Agent unprivileged execution runner
-Requires=linux-agent-runner.socket
-After=linux-agent-runner.socket
+Requires=linux-agent-runner.socket linux-agent-mcp-stdio.socket
+After=linux-agent-runner.socket linux-agent-mcp-stdio.socket
 PartOf=linux-agent-web.service
 
 [Service]
@@ -16,6 +16,7 @@ Environment=LINUX_AGENT_ROOT=/opt/linux-agent/current
 Environment=LINUX_AGENT_BUILTIN_SKILLS_DIR=/opt/linux-agent/skills
 Environment=LINUX_AGENT_DATA_DIR=/opt/linux-agent/data
 Environment=LINUX_AGENT_TMP_ROOT=/opt/linux-agent/data/runner-tmp
+Environment=LINUX_AGENT_MCP_STDIO_SOCKET=/run/linux-agent/mcp-stdio.sock
 Restart=on-failure
 RestartSec=2s
 NoNewPrivileges=yes

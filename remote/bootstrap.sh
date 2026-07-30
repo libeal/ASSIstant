@@ -113,6 +113,7 @@ jq -e --arg repository "${REPOSITORY}" '
     and (.assets.bootstrap_web | type == "object")
     and (.assets.core | type == "object")
     and (.assets.web | type == "object")
+    and (.assets.mcp_sdk | type == "object")
     and .core_contents == {builtin_skill_index:true,builtin_skill_packages:false}
     and (.skills | type == "object")
     and ([.assets[] | valid_asset] | all)
@@ -252,13 +253,20 @@ core_archive="$(download_asset '.assets.core')"
 validate_archive "${core_archive}" || fail 'core archive 安全校验失败'
 tar --no-same-owner --no-same-permissions -xzf "${core_archive}" -C "${agent_root}"
 
+mcp_sdk_archive="$(download_asset '.assets.mcp_sdk')"
+validate_archive "${mcp_sdk_archive}" || fail 'MCP SDK archive 安全校验失败'
+tar --no-same-owner --no-same-permissions -xzf "${mcp_sdk_archive}" -C "${agent_root}"
+
 if [[ "${ENTRYPOINT}" == "web" ]]; then
     web_archive="$(download_asset '.assets.web')"
     validate_archive "${web_archive}" || fail 'web archive 安全校验失败'
     tar --no-same-owner --no-same-permissions -xzf "${web_archive}" -C "${agent_root}"
 fi
 
-validated_assets="$(jq -cn --arg core "$(basename "${core_archive}")" '[$core]')"
+validated_assets="$(jq -cn \
+    --arg core "$(basename "${core_archive}")" \
+    --arg mcp_sdk "$(basename "${mcp_sdk_archive}")" \
+    '[$core, $mcp_sdk]')"
 if [[ "${ENTRYPOINT}" == "web" ]]; then
     validated_assets="$(jq -cn --argjson prior "${validated_assets}" --arg web "$(basename "${web_archive}")" '$prior + [$web]')"
 fi

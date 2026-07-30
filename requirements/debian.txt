@@ -9,6 +9,7 @@ gawk
 grep
 jq
 python3
+python3-venv
 procps
 sed
 tar

@@ -1,0 +1,9 @@
+{
+  "license_expression": "BSD-3-Clause",
+  "license_files": [
+    "LICENSE"
+  ],
+  "name": "pycparser",
+  "source_wheel": "pycparser-3.0-py3-none-any.whl",
+  "version": "3.0"
+}

@@ -36,6 +36,7 @@
     "approved",
     "auto_approved",
     "approval_required",
+    "awaiting_mcp_input",
     "blocked",
     "rejected",
     "running",
@@ -96,18 +97,22 @@
   ],
   "approval_type": [
     "work",
-    "terminal"
+    "terminal",
+    "mcp_input"
   ],
   "approval_action": [
     "approve",
     "reject",
     "skip",
-    "terminate"
+    "terminate",
+    "submit",
+    "cancel"
   ],
   "work_status": [
     "answered",
     "executed",
     "approval_required",
+    "awaiting_mcp_input",
     "blocked",
     "rejected",
     "terminated",
@@ -125,6 +130,7 @@
     "answered",
     "executed",
     "approval_required",
+    "awaiting_mcp_input",
     "blocked",
     "rejected",
     "terminated",
@@ -189,6 +195,7 @@
       "running",
       "queued",
       "approval_required",
+      "awaiting_mcp_input",
       "pending",
       "policy_checked",
       "skipped_user",
@@ -602,6 +609,106 @@
     "mcp_client_unavailable": {
       "retryable": false,
       "http": 503
+    },
+    "mcp_client_error": {
+      "retryable": true,
+      "http": 502
+    },
+    "mcp_client_failed": {
+      "retryable": true,
+      "http": 502
+    },
+    "mcp_client_invalid_output": {
+      "retryable": true,
+      "http": 502
+    },
+    "mcp_authorization_required": {
+      "retryable": false,
+      "http": 401
+    },
+    "mcp_credential_invalid": {
+      "retryable": false,
+      "http": 422
+    },
+    "mcp_credential_unavailable": {
+      "retryable": false,
+      "http": 503
+    },
+    "mcp_header_forbidden": {
+      "retryable": false,
+      "http": 422
+    },
+    "mcp_input_cancelled": {
+      "retryable": false,
+      "http": 409
+    },
+    "mcp_input_expired": {
+      "retryable": false,
+      "http": 410
+    },
+    "mcp_input_invalid": {
+      "retryable": false,
+      "http": 422
+    },
+    "mcp_input_rounds_exceeded": {
+      "retryable": false,
+      "http": 409
+    },
+    "mcp_input_state_unavailable": {
+      "retryable": false,
+      "http": 503
+    },
+    "mcp_input_unsupported": {
+      "retryable": false,
+      "http": 422
+    },
+    "mcp_oauth_registration_forbidden": {
+      "retryable": false,
+      "http": 403
+    },
+    "mcp_oauth_issuer_mismatch": {
+      "retryable": false,
+      "http": 403
+    },
+    "mcp_outcome_unknown": {
+      "retryable": false,
+      "http": 409
+    },
+    "mcp_pagination_invalid": {
+      "retryable": false,
+      "http": 502
+    },
+    "mcp_protocol_unsupported": {
+      "retryable": false,
+      "http": 426
+    },
+    "mcp_resource_limit": {
+      "retryable": false,
+      "http": 413
+    },
+    "mcp_result_invalid": {
+      "retryable": false,
+      "http": 502
+    },
+    "mcp_rpc_error": {
+      "retryable": false,
+      "http": 502
+    },
+    "mcp_schema_invalid": {
+      "retryable": false,
+      "http": 422
+    },
+    "mcp_sdk_unavailable": {
+      "retryable": false,
+      "http": 503
+    },
+    "mcp_tool_invalid": {
+      "retryable": false,
+      "http": 502
+    },
+    "mcp_tool_list_invalid": {
+      "retryable": false,
+      "http": 502
     },
     "server_not_found": {
       "retryable": false,

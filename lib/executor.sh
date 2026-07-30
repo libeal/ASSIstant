@@ -110,9 +110,12 @@ linux_agent_runner_kind_for_command() {
         fi
         return 1
     fi
-    if [[ "${first}" == "python3" && "${second}" == "${LINUX_AGENT_ROOT}/lib/mcp_client.py" && $# -eq 6 ]]; then
-        printf 'mcp\n'
-        return 0
+    if [[ "${first}" == "python3" && "${second}" == "${LINUX_AGENT_ROOT}/lib/mcp_client.py" ]]; then
+        if [[ "${3:-}" == "list-tools" && ($# -eq 4 || $# -eq 5 && "${5:-}" == "--refresh") ]] ||
+            [[ "${3:-}" == "call-tool" && ($# -eq 6 || $# -eq 10) ]]; then
+            printf 'mcp\n'
+            return 0
+        fi
     fi
     return 1
 }
@@ -306,10 +309,11 @@ linux_agent_build_execution_environment() {
         XDG_CONFIG_HOME XDG_CACHE_HOME XDG_DATA_HOME XDG_STATE_HOME
         LC_ALL LC_COLLATE LC_CTYPE LC_MESSAGES LC_MONETARY LC_NUMERIC LC_TIME
         LINUX_AGENT_ROOT LINUX_AGENT_LOG_DIR LINUX_AGENT_SKILLS_DIR
-        LINUX_AGENT_MCP_DIR LINUX_AGENT_TMP_ROOT LINUX_AGENT_TMP_DIR
+        LINUX_AGENT_DATA_DIR LINUX_AGENT_MCP_DIR LINUX_AGENT_TMP_ROOT LINUX_AGENT_TMP_DIR
         LINUX_AGENT_REMOTE_MODE LINUX_AGENT_REMOTE_RELEASE_VERSION
         LINUX_AGENT_REMOTE_STORAGE_BACKEND LINUX_AGENT_SESSION_ID
         LINUX_AGENT_REQUEST_ID LINUX_AGENT_JOB_ID
+        LINUX_AGENT_MCP_FLOW_ID
         LINUX_AGENT_EXECUTION_TIMEOUT_SEC LINUX_AGENT_EXECUTION_MAX_OUTPUT_BYTES
     )
 
@@ -347,6 +351,23 @@ linux_agent_prepare_execution_command() {
     fi
 
     local -a scrub_env
+
+    if [[ "$(linux_agent_runner_kind_for_command "$@" 2>/dev/null || true)" == "mcp" ]]; then
+        local runner_path="${LINUX_AGENT_ROOT}/lib/runner.py"
+        if [[ ! -f "${runner_path}" || -L "${runner_path}" ]]; then
+            LINUX_AGENT_EXECUTION_PREPARE_ERROR_CODE="runner_unavailable"
+            return 1
+        fi
+        LINUX_AGENT_EXECUTION_TIMEOUT_SEC="$(linux_agent_execution_timeout_sec)"
+        LINUX_AGENT_EXECUTION_MAX_OUTPUT_BYTES="$(linux_agent_execution_max_output_bytes)"
+        linux_agent_build_execution_environment scrub_env
+        output_command_ref=(
+            "${scrub_env[@]}"
+            python3 "${runner_path}" local-mcp -- "$@"
+        )
+        LINUX_AGENT_EXECUTION_ISOLATION_STATE="degraded_same_uid"
+        return 0
+    fi
 
     if [[ "${requested_privilege}" != "least" ]] || [[ "$(linux_agent_min_privilege_proxy_enabled)" != "true" ]]; then
         linux_agent_build_execution_environment scrub_env
@@ -705,9 +726,8 @@ linux_agent_should_auto_execute_step() {
             return 0
             ;;
         mcp_tool)
-            linux_agent_mcp_tool_is_available \
-                "$(jq -r '.mcp_server // empty' <<<"${step_json}")" \
-                "$(jq -r '.mcp_tool // empty' <<<"${step_json}")"
+            # MCP annotations and configuration never bypass explicit review.
+            return 1
             ;;
         *)
             return 1
@@ -1724,9 +1744,10 @@ linux_agent_execute_step_command() {
 
 linux_agent_prepare_mcp_arguments_file() {
     local args_json="$1"
+    local directory="${2:-${LINUX_AGENT_RUNNER_TMP_DIR:-${LINUX_AGENT_TMP_DIR}}}"
     local args_file target_user
 
-    args_file="$(mktemp "${LINUX_AGENT_RUNNER_TMP_DIR:-${LINUX_AGENT_TMP_DIR}}/mcp.args.XXXXXX")"
+    args_file="$(mktemp --suffix=.json "${directory}/mcp.args.XXXXXX")"
     if linux_agent_managed_mode_enabled 2>/dev/null; then
         chmod 0640 "${args_file}" 2>/dev/null || true
     else
@@ -1742,10 +1763,291 @@ linux_agent_prepare_mcp_arguments_file() {
     printf '%s\n' "${args_file}"
 }
 
+linux_agent_prepare_mcp_private_json_file() {
+    local prefix="$1"
+    local payload="$2"
+    local directory="${3:-${LINUX_AGENT_RUNNER_TMP_DIR:-${LINUX_AGENT_TMP_DIR}}}"
+    local target_user path
+
+    path="$(mktemp "${directory}/${prefix}.XXXXXX.json")"
+    if linux_agent_managed_mode_enabled 2>/dev/null; then
+        chmod 0640 "${path}"
+    else
+        chmod 0600 "${path}"
+    fi
+    printf '%s\n' "${payload}" >"${path}"
+    if [[ "$(id -u)" -eq 0 && "$(linux_agent_min_privilege_proxy_enabled)" == "true" ]]; then
+        target_user="$(linux_agent_least_privilege_user 2>/dev/null || true)"
+        if [[ -n "${target_user}" ]]; then
+            chown "${target_user}" "${path}"
+        fi
+    fi
+    printf '%s\n' "${path}"
+}
+
+linux_agent_mcp_state_root() {
+    local base root resolved_base resolved_root
+    base="${LINUX_AGENT_RUNNER_TMP_ROOT:-${LINUX_AGENT_TMP_ROOT:-${LINUX_AGENT_ROOT}/tmp}}"
+    root="${base}/.mcp-state"
+    if [[ -L "${root}" ]]; then
+        return 1
+    fi
+    mkdir -p "${root}" || return 1
+    if linux_agent_managed_mode_enabled 2>/dev/null; then
+        chmod 2750 "${root}" 2>/dev/null || return 1
+    else
+        chmod 0700 "${root}" 2>/dev/null || return 1
+    fi
+    resolved_base="$(readlink -f -- "${base}" 2>/dev/null || true)"
+    resolved_root="$(readlink -f -- "${root}" 2>/dev/null || true)"
+    [[ -n "${resolved_base}" && "${resolved_root}" == "${resolved_base}/.mcp-state" ]] || return 1
+    find "${resolved_root}" -maxdepth 1 -type f -name '[0-9a-f]*.json' -mmin +15 -delete 2>/dev/null || true
+    printf '%s\n' "${resolved_root}"
+}
+
+linux_agent_preserve_mcp_continuation() {
+    local result_json="$1"
+    local step_json="$2"
+    local step_key="$3"
+    local source state_root resolved_source runner_root continuation_id target mode size
+    local flow_digest step_digest binding_file binding_temp expires_at
+    source="$(jq -r '.mcp.continuation.file // empty' <<<"${result_json}")"
+    state_root="$(linux_agent_mcp_state_root)" || return 1
+    resolved_source="$(readlink -f -- "${source}" 2>/dev/null || true)"
+    runner_root="$(readlink -f -- "${LINUX_AGENT_RUNNER_TMP_ROOT:-${LINUX_AGENT_TMP_ROOT:-${LINUX_AGENT_ROOT}/tmp}}" 2>/dev/null || true)"
+    [[ -n "${resolved_source}" && -n "${runner_root}" && "${resolved_source}" == "${runner_root}/"* &&
+        -f "${resolved_source}" && ! -L "${source}" ]] || return 1
+    mode="$(stat -c '%a' -- "${resolved_source}" 2>/dev/null || true)"
+    size="$(stat -c '%s' -- "${resolved_source}" 2>/dev/null || true)"
+    [[ "${mode}" == "600" && "${size}" =~ ^[0-9]+$ && "${size}" -le 65536 ]] || return 1
+    continuation_id="$(python3 -c 'import secrets; print(secrets.token_hex(16))')"
+    [[ "${continuation_id}" =~ ^[0-9a-f]{32}$ ]] || return 1
+    target="${state_root}/${continuation_id}.json"
+    binding_file="${state_root}/${continuation_id}.binding.json"
+    [[ ! -e "${target}" && ! -L "${target}" && ! -e "${binding_file}" &&
+        ! -L "${binding_file}" ]] || return 1
+    mv -- "${resolved_source}" "${target}" || return 1
+    flow_digest="$(linux_agent_mcp_flow_digest)" || {
+        rm -f -- "${target}"
+        return 1
+    }
+    step_digest="$(printf '%s' "${step_json}" | jq -cS . | sha256sum | awk '{print $1}')"
+    expires_at="$(jq -r '.mcp.continuation.expires_at // empty' <<<"${result_json}")"
+    [[ "${expires_at}" =~ ^[0-9]+$ ]] || {
+        rm -f -- "${target}"
+        return 1
+    }
+    binding_temp="$(mktemp "${state_root}/.mcp-bind.XXXXXX.json")" || {
+        rm -f -- "${target}"
+        return 1
+    }
+    chmod 0600 "${binding_temp}"
+    if ! jq -cn \
+        --arg flow_digest "${flow_digest}" \
+        --arg step_key "${step_key}" \
+        --arg step_digest "${step_digest}" \
+        --argjson expires_at "${expires_at}" \
+        '{version:1, flow_sha256:$flow_digest, step_key:$step_key, step_sha256:$step_digest, expires_at:$expires_at}' \
+        >"${binding_temp}"; then
+        rm -f -- "${target}" "${binding_temp}"
+        return 1
+    fi
+    size="$(stat -c '%s' -- "${binding_temp}" 2>/dev/null || true)"
+    if [[ ! "${size}" =~ ^[0-9]+$ || "${size}" -gt 4096 ]]; then
+        rm -f -- "${target}" "${binding_temp}"
+        return 1
+    fi
+    if ! mv -- "${binding_temp}" "${binding_file}"; then
+        rm -f -- "${target}" "${binding_temp}"
+        return 1
+    fi
+    jq -c --arg continuation_id "${continuation_id}" '
+        .mcp.continuation = ((.mcp.continuation // {}) + {id:$continuation_id} | del(.file))
+    ' <<<"${result_json}"
+}
+
+linux_agent_mcp_flow_digest() {
+    local flow_id
+    flow_id="${LINUX_AGENT_MCP_FLOW_ID:-${LINUX_AGENT_JOB_ID:-${LINUX_AGENT_SESSION_ID:-}}}"
+    [[ -n "${flow_id}" ]] || return 1
+    printf '%s' "${flow_id}" | sha256sum | awk '{print $1}'
+}
+
+linux_agent_mcp_continuation_matches() {
+    local path="$1"
+    local step_json="$2"
+    local step_key="$3"
+    local flow_digest step_digest now binding_file
+    binding_file="${path%.json}.binding.json"
+    [[ "${binding_file}" != "${path}" && -f "${binding_file}" &&
+        ! -L "${binding_file}" &&
+        "$(stat -c '%a' -- "${binding_file}" 2>/dev/null || true)" == "600" ]] || return 1
+    flow_digest="$(linux_agent_mcp_flow_digest)" || return 1
+    step_digest="$(printf '%s' "${step_json}" | jq -cS . | sha256sum | awk '{print $1}')"
+    now="$(date +%s)"
+    jq -e \
+        --arg flow_digest "${flow_digest}" \
+        --arg step_key "${step_key}" \
+        --arg step_digest "${step_digest}" \
+        --argjson now "${now}" '
+        .version == 1
+        and .flow_sha256 == $flow_digest
+        and .step_key == $step_key
+        and .step_sha256 == $step_digest
+        and (.expires_at | type == "number" and . >= $now)
+    ' "${binding_file}" >/dev/null 2>&1
+}
+
+linux_agent_mcp_continuation_path() {
+    local continuation_id="$1"
+    local state_root path mode size
+    [[ "${continuation_id}" =~ ^[0-9a-f]{32}$ ]] || return 1
+    state_root="$(linux_agent_mcp_state_root)" || return 1
+    path="${state_root}/${continuation_id}.json"
+    [[ -f "${path}" && ! -L "${path}" ]] || return 1
+    mode="$(stat -c '%a' -- "${path}" 2>/dev/null || true)"
+    size="$(stat -c '%s' -- "${path}" 2>/dev/null || true)"
+    [[ "${mode}" == "600" && "${size}" =~ ^[0-9]+$ && "${size}" -le 65536 ]] || return 1
+    printf '%s\n' "${path}"
+}
+
+linux_agent_remove_mcp_continuation() {
+    local continuation_id="$1"
+    local state_root path binding_file
+    [[ "${continuation_id}" =~ ^[0-9a-f]{32}$ ]] || return 0
+    state_root="$(linux_agent_mcp_state_root 2>/dev/null || true)"
+    [[ -n "${state_root}" ]] || return 0
+    path="${state_root}/${continuation_id}.json"
+    binding_file="${state_root}/${continuation_id}.binding.json"
+    [[ ! -L "${path}" && ! -L "${binding_file}" ]] || return 1
+    rm -f -- "${path}" "${binding_file}"
+}
+
+linux_agent_abandon_mcp_resume() {
+    local active="$1"
+    local continuation_id="$2"
+    if [[ "${active}" -eq 1 ]]; then
+        linux_agent_remove_mcp_continuation "${continuation_id}"
+        LINUX_AGENT_MCP_CONTINUATION_FILE=""
+        LINUX_AGENT_MCP_INPUT_RESPONSES_JSON=""
+    fi
+}
+
+linux_agent_mcp_input_review() {
+    local step_json="$1"
+    local responses_json="$2"
+    local material review
+    material="$(linux_agent_step_review_material "${step_json}")"$'\n'"input_responses=${responses_json}"
+    review="$(linux_agent_policy_review_step "${step_json}" "${material}" "mcp")"
+    jq -c '
+        .findings = ([.findings[]? | {
+            severity:(.severity // "medium"),
+            code:(.code // "MCP_INPUT_POLICY_FINDING"),
+            source:(.source // "policy"),
+            category:(.category // "external_input"),
+            action:(.action // "approve"),
+            message:(.message // "MCP input matched an execution policy rule.")
+        }] + [{
+            severity:"medium",
+            code:"MCP_INPUT_REQUIRES_CONFIRMATION",
+            source:"mcp",
+            category:"external_input",
+            action:"approve",
+            message:"MCP continuation input requires an explicit user confirmation."
+        }])
+        | .approval_required = true
+        | .risk_level = (if .risk_level == "critical" then "critical" elif .risk_level == "high" then "high" else "medium" end)
+        | .mcp_input_review = true
+    ' <<<"${review}"
+}
+
+linux_agent_mcp_input_metadata() {
+    local result_json="$1"
+    local step_index="$2"
+    local step_key="$3"
+    local requests sanitized
+    requests="$(jq -c '.mcp.input_requests // {}' <<<"${result_json}")"
+    if declare -F linux_agent_redact_json_full >/dev/null 2>&1; then
+        sanitized="$(linux_agent_redact_json_full "${requests}")"
+    else
+        sanitized="${requests}"
+    fi
+    if ! jq -e 'type == "object"' >/dev/null 2>&1 <<<"${sanitized}"; then
+        sanitized='{}'
+    fi
+    jq -cn \
+        --argjson step_index "${step_index}" \
+        --arg step_key "${step_key}" \
+        --arg server_id "$(jq -r '.mcp.server_id // empty' <<<"${result_json}")" \
+        --arg tool "$(jq -r '.mcp.tool // empty' <<<"${result_json}")" \
+        --arg continuation_id "$(jq -r '.mcp.continuation.id // empty' <<<"${result_json}")" \
+        --arg request_state_digest "$(jq -r '.mcp.continuation.request_state_digest // empty' <<<"${result_json}")" \
+        --argjson round "$(jq '.mcp.continuation.round // 1' <<<"${result_json}")" \
+        --argjson expires_at "$(jq '.mcp.continuation.expires_at // 0' <<<"${result_json}")" \
+        --arg protocol_version "$(jq -r '.mcp.protocol_version // empty' <<<"${result_json}")" \
+        --arg transport "$(jq -r '.mcp.transport // empty' <<<"${result_json}")" \
+        --argjson input_requests "${sanitized}" '
+        {
+            step_index:$step_index,
+            step_key:$step_key,
+            server_id:$server_id,
+            tool:$tool,
+            continuation_id:$continuation_id,
+            request_state_digest:$request_state_digest,
+            round:$round,
+            expires_at:$expires_at,
+            protocol_version:$protocol_version,
+            transport:$transport,
+            input_requests:$input_requests
+        }
+    '
+}
+
+linux_agent_audit_mcp_result() {
+    local step_json="$1"
+    local result_json="$2"
+    local server_id tool protocol_version transport request_digest outcome_known
+    server_id="$(jq -r '.mcp.server_id // empty' <<<"${result_json}")"
+    tool="$(jq -r '.mcp.tool // empty' <<<"${result_json}")"
+    protocol_version="$(jq -r '.mcp.protocol_version // empty' <<<"${result_json}")"
+    transport="$(jq -r '.mcp.transport // empty' <<<"${result_json}")"
+    request_digest="$(linux_agent_step_arguments_json "${step_json}" | sha256sum | awk '{print $1}')"
+    outcome_known="$(jq '.mcp.outcome_known // null' <<<"${result_json}")"
+    if [[ -n "${protocol_version}" ]]; then
+        linux_agent_log_event "mcp_protocol_selected" "$(jq -cn \
+            --arg server_id "${server_id}" \
+            --arg tool "${tool}" \
+            --arg protocol_version "${protocol_version}" \
+            --arg transport "${transport}" \
+            --arg request_digest "${request_digest}" \
+            '{server_id:$server_id, tool:$tool, protocol_version:$protocol_version, transport:$transport, request_digest:$request_digest}')"
+    fi
+    if [[ "$(jq -r '.mcp.fallback_used // false' <<<"${result_json}")" == "true" ]]; then
+        linux_agent_log_event "mcp_protocol_fallback" "$(jq -cn \
+            --arg server_id "${server_id}" \
+            --arg tool "${tool}" \
+            --arg protocol_version "${protocol_version}" \
+            --arg transport "${transport}" \
+            --arg request_digest "${request_digest}" \
+            '{server_id:$server_id, tool:$tool, protocol_version:$protocol_version, transport:$transport, request_digest:$request_digest, fallback_class:"negotiation_failure"}')"
+    fi
+    if [[ "$(jq -r '.status // empty' <<<"${result_json}")" == "mcp_outcome_unknown" || "${outcome_known}" == "false" ]]; then
+        linux_agent_log_event "mcp_outcome_unknown" "$(jq -cn \
+            --arg server_id "${server_id}" \
+            --arg tool "${tool}" \
+            --arg protocol_version "${protocol_version}" \
+            --arg transport "${transport}" \
+            --arg request_digest "${request_digest}" \
+            '{server_id:$server_id, tool:$tool, protocol_version:$protocol_version, transport:$transport, request_digest:$request_digest, outcome_known:false, status:"mcp_outcome_unknown"}')"
+    fi
+}
+
 linux_agent_execute_mcp_tool_step() {
     local step_json="$1"
     local review_json="${2:-}"
     local server_id tool_name args manifest_path client subject args_file observed
+    local continuation_file input_responses_json responses_file staging_directory output_directory
+    local -a client_command
     [[ -n "${review_json}" ]] || review_json='{}'
 
     server_id="$(jq -r '.mcp_server // empty' <<<"${step_json}")"
@@ -1762,13 +2064,46 @@ linux_agent_execute_mcp_tool_step() {
         return 0
     fi
 
-    args_file="$(linux_agent_prepare_mcp_arguments_file "${args}")"
+    continuation_file="${LINUX_AGENT_MCP_CONTINUATION_FILE:-}"
+    input_responses_json="${LINUX_AGENT_MCP_INPUT_RESPONSES_JSON:-}"
+    responses_file=""
+    staging_directory="${LINUX_AGENT_RUNNER_TMP_DIR:-${LINUX_AGENT_TMP_DIR}}"
+    output_directory="${staging_directory}/.mcp-output"
+    [[ ! -L "${output_directory}" ]] || return 1
+    mkdir -p -- "${output_directory}"
+    if linux_agent_managed_mode_enabled 2>/dev/null; then
+        chmod 0730 "${output_directory}"
+    else
+        chmod 0700 "${output_directory}"
+    fi
+    args_file="$(linux_agent_prepare_mcp_arguments_file "${args}" "${staging_directory}")"
+    client_command=(python3 "${client}" call-tool "${manifest_path}" "${tool_name}" "${args_file}")
+    if [[ -n "${continuation_file}" || -n "${input_responses_json}" ]]; then
+        if [[ -z "${continuation_file}" || -z "${input_responses_json}" ]] ||
+            ! jq -e 'type == "object"' >/dev/null 2>&1 <<<"${input_responses_json}"; then
+            rm -f "${args_file}"
+            jq -cn '{
+                ok:false,
+                status:"mcp_input_invalid",
+                code:"mcp_input_invalid",
+                error_code:"mcp_input_invalid",
+                exit_code:2,
+                output:{error:"MCP input continuation is invalid."}
+            }'
+            return 0
+        fi
+        responses_file="$(linux_agent_prepare_mcp_private_json_file "mcp.responses" "${input_responses_json}" "${staging_directory}")"
+        client_command+=(
+            --continuation "${continuation_file}"
+            --input-responses "${responses_file}"
+        )
+    fi
     subject="$(jq -cn --argjson step "${step_json}" '{kind:"work_step", external:"mcp", step:$step}')"
     observed="$(
         LINUX_AGENT_EXECUTION_PRIVILEGE="$(linux_agent_execution_privilege_from_review "${review_json}")" \
-            linux_agent_execute_observed_command_output "step_mcp_tool" "${subject}" -- python3 "${client}" call-tool "${manifest_path}" "${tool_name}" "${args_file}"
+            linux_agent_execute_observed_command_output "step_mcp_tool" "${subject}" -- "${client_command[@]}"
     )"
-    rm -f "${args_file}"
+    rm -f "${args_file}" "${responses_file}"
 
     # The observer gate is an execution-layer result, not an MCP helper payload.
     # Preserve its status/error code verbatim so the work-plan caller can mark
@@ -1790,6 +2125,18 @@ linux_agent_execute_mcp_tool_step() {
                 if (($observed.ok // false) and (($helper.ok // false) == true)) then ($helper.status // "executed")
                 else ($helper.status // "failed") end
             ),
+            code:(
+                if (($observed.ok // false) and (($helper.ok // false) == true)) then null
+                else ($helper.code // $helper.error_code // $helper.status // $observed.code // "mcp_client_failed") end
+            ),
+            error_code:(
+                if (($observed.ok // false) and (($helper.ok // false) == true)) then null
+                else ($helper.error_code // $helper.code // $helper.status // $observed.code // "mcp_client_failed") end
+            ),
+            error:(
+                if (($observed.ok // false) and (($helper.ok // false) == true)) then null
+                else ($helper.error // $observed.error // "MCP tool execution failed.") end
+            ),
             exit_code:($observed.exit_code // null),
             output:(
                 if ($helper.output | type) == "object" then $helper.output
@@ -1804,8 +2151,21 @@ linux_agent_execute_mcp_tool_step() {
                 server_id:$server_id,
                 tool:$tool,
                 transport:($helper.transport // null),
-                result:($helper.result // null),
-                status:($helper.status // null)
+                result:(if ($helper.status // "") == "mcp_input_required" then null else ($helper.result // null) end),
+                status:($helper.status // null),
+                protocol_version:($helper.protocol_version // null),
+                fallback_used:($helper.fallback_used // false),
+                fallback_reason:($helper.fallback_reason // ""),
+                outcome_known:($helper.outcome_known // null),
+                input_requests:($helper.inputRequests // null),
+                continuation:(
+                    if ($helper.status // "") == "mcp_input_required" then {
+                        file:($helper.continuation_file // null),
+                        request_state_digest:($helper.request_state_digest // null),
+                        round:($helper.round // null),
+                        expires_at:($helper.expires_at // null)
+                    } else null end
+                )
             },
             observer:($observed.observer // null),
             execution_proxy:($observed.execution_proxy // null)
@@ -2022,7 +2382,7 @@ linux_agent_restore_step_states_from_results() {
         def result_status($result):
             if (($result.output.action // "") == "skipped_by_user") or (($result.status // "") == "skipped_user") then "skipped_user"
             elif ($result.ok // false) then "succeeded"
-            elif (["blocked", "rejected", "terminated", "approval_required"] | index($result.status // "")) != null then $result.status
+            elif (["blocked", "rejected", "terminated", "approval_required", "awaiting_mcp_input"] | index($result.status // "")) != null then $result.status
             else "failed" end;
         .[0] as $states
         | .[1] as $results
@@ -2070,7 +2430,7 @@ linux_agent_finalize_work_plan_execution() {
             current_step_states:$current_step_states,
             results:($prior_results + $current_results),
             step_states:($prior_step_states + $current_step_states),
-            resume_state:{
+            resume_state:({
                 current_plan:$plan,
                 iteration:$iteration,
                 step_scope:$scope,
@@ -2079,7 +2439,7 @@ linux_agent_finalize_work_plan_execution() {
                 step_states:$current_step_states,
                 prior_results:$prior_results,
                 prior_step_states:$prior_step_states
-            }
+            } + (if ($execution.mcp_input | type) == "object" then {mcp_input:$execution.mcp_input} else {} end))
         }
     '
 }
@@ -2227,6 +2587,7 @@ linux_agent_execute_work_plan() {
     local skill_disclosures="${6:-[]}"
     local execution_user sudo_probe step_count results executed_steps status step_states
     local prior_results prior_step_states resume_index restored_result_count execution_result
+    local mcp_input_state mcp_input_responses mcp_input_present mcp_input_confirmed mcp_input_cancelled
     [[ -n "${resume_state}" ]] || resume_state='{}'
     if ! jq -e 'type == "array"' <<<"${skill_disclosures}" >/dev/null 2>&1; then
         skill_disclosures='[]'
@@ -2279,16 +2640,105 @@ linux_agent_execute_work_plan() {
             --arg scope "${step_scope}" \
             '{next_step_index:$next_step_index, restored_result_count:$restored_result_count, scope:$scope}')"
     fi
+    mcp_input_state="$(jq -c '.mcp_input // null' <<<"${resume_state}")"
+    mcp_input_responses="${LINUX_AGENT_MCP_INPUT_RESPONSES_JSON:-}"
+    [[ -n "${mcp_input_responses}" ]] || mcp_input_responses='{}'
+    mcp_input_present="${LINUX_AGENT_MCP_INPUT_RESPONSES_PRESENT:-false}"
+    mcp_input_confirmed="${LINUX_AGENT_MCP_INPUT_CONFIRMED:-false}"
+    mcp_input_cancelled="${LINUX_AGENT_MCP_INPUT_CANCELLED:-false}"
 
     linux_agent_print_work_plan "${plan_json}" >&2
 
     local i="${resume_index}"
     while [[ "${i}" -lt "${step_count}" ]]; do
         local step step_review_text review result skipped prepared step_decision revision_request auto_approved disclosure_block
+        local mcp_resuming continuation_id continuation_path step_key
         step="$(jq -c --argjson index "${i}" '.steps[$index]' <<<"${plan_json}")"
         auto_approved=0
+        mcp_resuming=0
+        continuation_id=""
+        continuation_path=""
+        step_key="$(jq -r --argjson index "${i}" '.[$index].key' <<<"${step_states}")"
+        if jq -e --argjson index "${i}" 'type == "object" and .step_index == $index' >/dev/null 2>&1 <<<"${mcp_input_state}"; then
+            continuation_id="$(jq -r '.continuation_id // empty' <<<"${mcp_input_state}")"
+            if [[ "${mcp_input_cancelled}" == "true" ]]; then
+                linux_agent_remove_mcp_continuation "${continuation_id}"
+                result="$(jq -cn '{
+                    ok:false,
+                    status:"mcp_input_cancelled",
+                    code:"mcp_input_cancelled",
+                    error_code:"mcp_input_cancelled",
+                    exit_code:1,
+                    output:{error:"MCP input was cancelled by the user."}
+                }')"
+                results="$(jq -c --argjson index "${i}" '.[:$index]' <<<"${results}")"
+                results="$(jq -cn \
+                    --argjson prior "${results}" \
+                    --arg step_key "${step_key}" \
+                    --argjson step_index "${i}" \
+                    --argjson iteration "${iteration}" \
+                    --arg scope "${step_scope}" \
+                    --argjson step "${step}" \
+                    --argjson result "${result}" \
+                    '$prior + [{step_key:$step_key, step_index:$step_index, iteration:$iteration, scope:$scope, step:$step, result:$result}]')"
+                step_states="$(linux_agent_update_step_state "${step_states}" "${i}" "failed" "${result}")"
+                step_states="$(linux_agent_skip_remaining_step_states "${step_states}" "${i}")"
+                linux_agent_log_step_status "${step}" "failed" "${result}"
+                execution_result="$(jq -cn --arg execution_user "${execution_user}" --arg sudo_probe "${sudo_probe}" --argjson results "${results}" \
+                    '{status:"failed", execution_user:$execution_user, sudo_probe:$sudo_probe, results:$results}')"
+                linux_agent_finalize_work_plan_execution "${execution_result}" "${plan_json}" "${step_states}" "${iteration}" "${step_scope}" "${i}" "${prior_results}" "${prior_step_states}"
+                return 0
+            fi
+            if [[ "${mcp_input_present}" != "true" || "${mcp_input_confirmed}" != "true" ]]; then
+                execution_result="$(jq -cn \
+                    --arg execution_user "${execution_user}" \
+                    --arg sudo_probe "${sudo_probe}" \
+                    --argjson results "${results}" \
+                    --argjson mcp_input "${mcp_input_state}" '
+                    {status:"awaiting_mcp_input", execution_user:$execution_user, sudo_probe:$sudo_probe, results:$results, mcp_input:$mcp_input}
+                ')"
+                linux_agent_finalize_work_plan_execution "${execution_result}" "${plan_json}" "${step_states}" "${iteration}" "${step_scope}" "${i}" "${prior_results}" "${prior_step_states}"
+                return 0
+            fi
+            if ! jq -e 'type == "object"' >/dev/null 2>&1 <<<"${mcp_input_responses}" ||
+                ! continuation_path="$(linux_agent_mcp_continuation_path "${continuation_id}")" ||
+                ! linux_agent_mcp_continuation_matches "${continuation_path}" "${step}" "${step_key}"; then
+                linux_agent_remove_mcp_continuation "${continuation_id}"
+                result="$(jq -cn '{
+                    ok:false,
+                    status:"mcp_input_expired",
+                    code:"mcp_input_expired",
+                    error_code:"mcp_input_expired",
+                    exit_code:1,
+                    output:{error:"MCP input continuation is unavailable or expired."}
+                }')"
+                results="$(jq -c --argjson index "${i}" '.[:$index]' <<<"${results}")"
+                results="$(jq -cn \
+                    --argjson prior "${results}" \
+                    --arg step_key "${step_key}" \
+                    --argjson step_index "${i}" \
+                    --argjson iteration "${iteration}" \
+                    --arg scope "${step_scope}" \
+                    --argjson step "${step}" \
+                    --argjson result "${result}" \
+                    '$prior + [{step_key:$step_key, step_index:$step_index, iteration:$iteration, scope:$scope, step:$step, result:$result}]')"
+                step_states="$(linux_agent_update_step_state "${step_states}" "${i}" "failed" "${result}")"
+                step_states="$(linux_agent_skip_remaining_step_states "${step_states}" "${i}")"
+                linux_agent_log_step_status "${step}" "failed" "${result}"
+                execution_result="$(jq -cn --arg execution_user "${execution_user}" --arg sudo_probe "${sudo_probe}" --argjson results "${results}" \
+                    '{status:"failed", execution_user:$execution_user, sudo_probe:$sudo_probe, results:$results}')"
+                linux_agent_finalize_work_plan_execution "${execution_result}" "${plan_json}" "${step_states}" "${iteration}" "${step_scope}" "${i}" "${prior_results}" "${prior_step_states}"
+                return 0
+            fi
+            results="$(jq -c --argjson index "${i}" '.[:$index]' <<<"${results}")"
+            executed_steps="$(jq -c '[.[] | select(.result.ok == true)]' <<<"${results}")"
+            LINUX_AGENT_MCP_CONTINUATION_FILE="${continuation_path}"
+            LINUX_AGENT_MCP_INPUT_RESPONSES_JSON="${mcp_input_responses}"
+            mcp_resuming=1
+        fi
         step_states="$(linux_agent_update_step_state "${step_states}" "${i}" "pending" 'null')"
         if ! result="$(linux_agent_require_step_status_event "${step}" "pending")"; then
+            linux_agent_abandon_mcp_resume "${mcp_resuming}" "${continuation_id}"
             linux_agent_finalize_work_precondition_block \
                 "${result}" "${step}" "${plan_json}" "${step_states}" "${i}" \
                 "${iteration}" "${step_scope}" "${results}" "${prior_results}" \
@@ -2367,6 +2817,7 @@ linux_agent_execute_work_plan() {
             done < <(jq -c '.[]' <<<"${skipped_steps}")
             execution_result="$(jq -cn --arg execution_user "${execution_user}" --arg sudo_probe "${sudo_probe}" --argjson findings "$(jq '.findings' <<<"${blocked_detail}")" --argjson results "${results}" \
                 '{status:"blocked", execution_user:$execution_user, sudo_probe:$sudo_probe, findings:$findings, results:$results}')"
+            linux_agent_abandon_mcp_resume "${mcp_resuming}" "${continuation_id}"
             linux_agent_finalize_work_plan_execution "${execution_result}" "${plan_json}" "${step_states}" "${iteration}" "${step_scope}" "${i}" "${prior_results}" "${prior_step_states}"
             return 0
         fi
@@ -2388,8 +2839,12 @@ linux_agent_execute_work_plan() {
             linux_agent_finalize_work_plan_execution "${execution_result}" "${plan_json}" "${step_states}" "${iteration}" "${step_scope}" "${i}" "${prior_results}" "${prior_step_states}"
             return 0
         fi
-        step_review_text="$(linux_agent_step_review_material "${step}")"
-        review="$(linux_agent_policy_review_step "${step}" "${step_review_text}" "$(case "$(jq -r '.executor_type' <<<"${step}")" in remote_script) printf 'remote' ;; mcp_tool) printf 'mcp' ;; *) printf 'local' ;; esac)")"
+        if [[ "${mcp_resuming}" -eq 1 ]]; then
+            review="$(linux_agent_mcp_input_review "${step}" "${mcp_input_responses}")"
+        else
+            step_review_text="$(linux_agent_step_review_material "${step}")"
+            review="$(linux_agent_policy_review_step "${step}" "${step_review_text}" "$(case "$(jq -r '.executor_type' <<<"${step}")" in remote_script) printf 'remote' ;; mcp_tool) printf 'mcp' ;; *) printf 'local' ;; esac)")"
+        fi
         case "$(jq -r '.executor_type' <<<"${step}")" in
             shell | skill_script | remote_script)
                 # These step types all execute shell source. Unknown static
@@ -2401,6 +2856,7 @@ linux_agent_execute_work_plan() {
             review="$(linux_agent_backup_policy_review "$(jq -r '.skill_script // empty' <<<"${step}")" "$(linux_agent_step_arguments_json "${step}")" "${review}")"
         fi
         if ! result="$(linux_agent_require_step_status_event "${step}" "policy_checked" "${review}")"; then
+            linux_agent_abandon_mcp_resume "${mcp_resuming}" "${continuation_id}"
             linux_agent_finalize_work_precondition_block \
                 "${result}" "${step}" "${plan_json}" "${step_states}" "${i}" \
                 "${iteration}" "${step_scope}" "${results}" "${prior_results}" \
@@ -2418,6 +2874,7 @@ linux_agent_execute_work_plan() {
             done < <(jq -c '.[]' <<<"${skipped}")
             execution_result="$(jq -cn --arg execution_user "${execution_user}" --arg sudo_probe "${sudo_probe}" --argjson findings "$(jq '.findings' <<<"${review}")" --argjson results "${results}" \
                 '{status:"blocked", execution_user:$execution_user, sudo_probe:$sudo_probe, findings:$findings, results:$results}')"
+            linux_agent_abandon_mcp_resume "${mcp_resuming}" "${continuation_id}"
             linux_agent_finalize_work_plan_execution "${execution_result}" "${plan_json}" "${step_states}" "${iteration}" "${step_scope}" "${i}" "${prior_results}" "${prior_step_states}"
             return 0
         fi
@@ -2425,7 +2882,9 @@ linux_agent_execute_work_plan() {
         if [[ "$(jq -r '.approval_required' <<<"${review}")" == "true" ]]; then
             printf '审查风险: %s，发现项: %s\n' "$(jq -r '.risk_level' <<<"${review}")" "$(jq '.findings | length' <<<"${review}")" >&2
         fi
-        if linux_agent_should_auto_execute_step "${step}" "${review}"; then
+        if [[ "${mcp_resuming}" -eq 1 ]]; then
+            step_decision="approve"
+        elif linux_agent_should_auto_execute_step "${step}" "${review}"; then
             step_decision="approve"
             auto_approved=1
             linux_agent_log_step_status "${step}" "auto_approved" "${review}"
@@ -2539,11 +2998,21 @@ linux_agent_execute_work_plan() {
         esac
 
         if ! result="$(linux_agent_require_step_status_event "${step}" "approved" "${review}")"; then
+            linux_agent_abandon_mcp_resume "${mcp_resuming}" "${continuation_id}"
             linux_agent_finalize_work_precondition_block \
                 "${result}" "${step}" "${plan_json}" "${step_states}" "${i}" \
                 "${iteration}" "${step_scope}" "${results}" "${prior_results}" \
                 "${prior_step_states}" "${execution_user}" "${sudo_probe}"
             return 0
+        fi
+        if [[ "${mcp_resuming}" -eq 1 ]]; then
+            linux_agent_log_event "mcp_input_resumed" "$(jq -cn \
+                --arg server_id "$(jq -r '.server_id // empty' <<<"${mcp_input_state}")" \
+                --arg tool "$(jq -r '.tool // empty' <<<"${mcp_input_state}")" \
+                --arg request_state_digest "$(jq -r '.request_state_digest // empty' <<<"${mcp_input_state}")" \
+                --argjson round "$(jq '.round // 1' <<<"${mcp_input_state}")" \
+                --argjson response_count "$(jq 'length' <<<"${mcp_input_responses}")" \
+                '{server_id:$server_id, tool:$tool, request_state_digest:$request_state_digest, round:$round, response_count:$response_count}')"
         fi
         local observer_scope observer_subject
         observer_scope="step_$(jq -r '.executor_type' <<<"${step}")"
@@ -2553,6 +3022,7 @@ linux_agent_execute_work_plan() {
             :
         else
             if ! result="$(linux_agent_require_step_status_event "${step}" "running" "${review}")"; then
+                linux_agent_abandon_mcp_resume "${mcp_resuming}" "${continuation_id}"
                 linux_agent_finalize_work_precondition_block \
                     "${result}" "${step}" "${plan_json}" "${step_states}" "${i}" \
                     "${iteration}" "${step_scope}" "${results}" "${prior_results}" \
@@ -2561,8 +3031,36 @@ linux_agent_execute_work_plan() {
             fi
             result="$(linux_agent_execute_step_command "${step}" "${review}")"
         fi
+        linux_agent_abandon_mcp_resume "${mcp_resuming}" "${continuation_id}"
+        result="$(jq -c 'walk(if type == "object" then del(.inputResponses, .input_responses, .requestState, .request_state) else . end)' <<<"${result}")"
+        if [[ "$(jq -r '.executor_type // empty' <<<"${step}")" == "mcp_tool" ]]; then
+            linux_agent_audit_mcp_result "${step}" "${result}"
+        fi
         if [[ "${auto_approved}" -eq 1 ]]; then
             result="$(jq -c '. + {auto_approved:true}' <<<"${result}")"
+        fi
+        if [[ "$(jq -r '.status // empty' <<<"${result}")" == "mcp_input_required" ]]; then
+            if result="$(linux_agent_preserve_mcp_continuation "${result}" "${step}" "${step_key}")"; then
+                result="$(jq -c '
+                    .status = "awaiting_mcp_input"
+                    | .mcp.input_requests = (.mcp.input_requests // {})
+                    | .output = {message:"MCP tool requires user input before it can continue."}
+                ' <<<"${result}")"
+                local sanitized_requests
+                sanitized_requests="$(linux_agent_mcp_input_metadata "${result}" "${i}" "${step_key}")"
+                result="$(jq -c --argjson requests "$(jq '.input_requests' <<<"${sanitized_requests}")" '.mcp.input_requests = $requests' <<<"${result}")"
+                mcp_input_state="${sanitized_requests}"
+            else
+                result="$(jq -cn '{
+                    ok:false,
+                    status:"mcp_input_state_unavailable",
+                    code:"mcp_input_state_unavailable",
+                    error_code:"mcp_input_state_unavailable",
+                    exit_code:1,
+                    output:{error:"MCP input continuation could not be preserved safely."}
+                }')"
+                mcp_input_state='null'
+            fi
         fi
         results="$(jq -cn \
             --argjson prior "${results}" \
@@ -2573,6 +3071,61 @@ linux_agent_execute_work_plan() {
             --argjson step "${step}" \
             --argjson result "${result}" \
             '$prior + [{step_key:$step_key, step_index:$step_index, iteration:$iteration, scope:$scope, step:$step, result:$result}]')"
+
+        if [[ "$(jq -r '.status // empty' <<<"${result}")" == "awaiting_mcp_input" ]]; then
+            step_states="$(linux_agent_update_step_state "${step_states}" "${i}" "awaiting_mcp_input" "${result}")"
+            linux_agent_log_step_status "${step}" "awaiting_mcp_input" "${result}"
+            linux_agent_log_event "mcp_input_required" "$(jq -c '
+                {
+                    server_id,
+                    tool,
+                    protocol_version,
+                    transport,
+                    request_state_digest,
+                    round,
+                    expires_at,
+                    input_request_count:(.input_requests | length)
+                }
+            ' <<<"${mcp_input_state}")"
+            if [[ "${LINUX_AGENT_API_MODE:-0}" == "1" ]]; then
+                execution_result="$(jq -cn \
+                    --arg execution_user "${execution_user}" \
+                    --arg sudo_probe "${sudo_probe}" \
+                    --argjson results "${results}" \
+                    --argjson mcp_input "${mcp_input_state}" '
+                    {status:"awaiting_mcp_input", execution_user:$execution_user, sudo_probe:$sudo_probe, results:$results, mcp_input:$mcp_input}
+                ')"
+                linux_agent_finalize_work_plan_execution "${execution_result}" "${plan_json}" "${step_states}" "${iteration}" "${step_scope}" "${i}" "${prior_results}" "${prior_step_states}"
+                return 0
+            fi
+
+            printf 'MCP 需要用户输入：\n%s\n' "$(jq '.input_requests' <<<"${mcp_input_state}")" >&2
+            while true; do
+                printf '请输入 inputResponses JSON（直接回车取消）: ' >&2
+                IFS= read -r mcp_input_responses || mcp_input_responses=""
+                if [[ -z "${mcp_input_responses}" ]]; then
+                    mcp_input_cancelled=true
+                    break
+                fi
+                if [[ "$(printf '%s' "${mcp_input_responses}" | wc -c)" -le 65536 ]] &&
+                    jq -e --argjson requests "$(jq '.input_requests' <<<"${mcp_input_state}")" '
+                        type == "object" and (keys | sort) == ($requests | keys | sort)
+                    ' >/dev/null 2>&1 <<<"${mcp_input_responses}"; then
+                    break
+                fi
+                printf 'inputResponses 必须是与请求 key 完全匹配且不超过 64 KiB 的 JSON object。\n' >&2
+            done
+            if [[ "${mcp_input_cancelled}" != "true" ]]; then
+                if linux_agent_confirm_execution "确认将这些输入发送给 MCP server？"; then
+                    mcp_input_present=true
+                    mcp_input_confirmed=true
+                else
+                    mcp_input_cancelled=true
+                fi
+            fi
+            results="$(jq -c --argjson index "${i}" '.[:$index]' <<<"${results}")"
+            continue
+        fi
 
         if [[ "$(jq -r '.ok' <<<"${result}")" == "true" ]]; then
             step_states="$(linux_agent_update_step_state "${step_states}" "${i}" "succeeded" "${result}")"

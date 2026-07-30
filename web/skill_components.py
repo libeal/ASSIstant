@@ -260,19 +260,6 @@ class SkillWebRegistry:
                 credential = entry["package"].get("components", {}).get(
                     "credential_helper", {}
                 )
-                if credential and not (self.remote_mode or self.managed_execution):
-                    findings.append(
-                        {
-                            "severity": "warning",
-                            "code": "SKILL_WEB_COMPONENT_UNAVAILABLE",
-                            "skill": name,
-                            "message": (
-                                "Skill Web component requires remote or managed "
-                                "credential-helper execution."
-                            ),
-                        }
-                    )
-                    continue
                 socket_env = credential.get("socket_env", "")
                 default_socket = credential.get("default_socket", "")
                 helper_socket = (

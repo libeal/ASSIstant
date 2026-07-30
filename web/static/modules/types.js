@@ -59,6 +59,10 @@
  * @property {Record<string, any>} [context]
  * @property {Record<string, any>} [review]
  * @property {Record<string, any>} [executionState]
+ * @property {string} [sourceJobId]
+ * @property {Record<string, any>} [input_requests]
+ * @property {number} [round]
+ * @property {number} [expires_at]
  * @property {ApprovalCard} [card]
  * @property {number} [index]
  *
@@ -138,6 +142,7 @@
  * @property {Array<Record<string, any>>} auditSessions
  * @property {AuditEvent[]} auditEvents
  * @property {Record<string, any>|null} auditWebTimeline
+ * @property {boolean|null} auditIntegrityOk
  * @property {string} auditTimelineUnavailableReason
  * @property {string} currentAuditSession
  * @property {ConfigSnapshot|null} configSnapshot

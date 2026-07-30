@@ -1,8 +1,12 @@
 {
+  "manifest_version": 2,
   "id": "context7",
   "name": "Context7",
   "description": "Up-to-date library documentation through the Context7 MCP server.",
   "enabled": true,
   "transport": "streamable_http",
-  "url": "https://mcp.context7.com/mcp"
+  "url": "https://mcp.context7.com/mcp",
+  "protocol": {
+    "mode": "modern_then_legacy"
+  }
 }

@@ -121,8 +121,8 @@ export function createJobClient(deps) {
       }
       const resultStatus = job.result?.status || job.status;
       const kind =
-        resultStatus === "approval_required"
-          ? "approval_required"
+        ["approval_required", "awaiting_mcp_input"].includes(resultStatus)
+          ? resultStatus
           : job.status === "succeeded"
             ? "ok"
             : "failed";

@@ -1,0 +1,267 @@
+[
+  {
+    "license_expression": "MIT",
+    "license_files": [
+      "LICENSE"
+    ],
+    "name": "annotated-types",
+    "source_wheel": "annotated_types-0.8.0-py3-none-any.whl",
+    "version": "0.8.0"
+  },
+  {
+    "license_expression": "MIT",
+    "license_files": [
+      "LICENSE"
+    ],
+    "name": "anyio",
+    "source_wheel": "anyio-4.14.2-py3-none-any.whl",
+    "version": "4.14.2"
+  },
+  {
+    "license_expression": "MIT",
+    "license_files": [
+      "LICENSE"
+    ],
+    "name": "attrs",
+    "source_wheel": "attrs-26.1.0-py3-none-any.whl",
+    "version": "26.1.0"
+  },
+  {
+    "license_expression": "BSD-3-Clause",
+    "license_files": [
+      "LICENSE.txt"
+    ],
+    "name": "click",
+    "source_wheel": "click-8.4.2-py3-none-any.whl",
+    "version": "8.4.2"
+  },
+  {
+    "license_expression": "MIT",
+    "license_files": [
+      "LICENSE.txt"
+    ],
+    "name": "h11",
+    "source_wheel": "h11-0.16.0-py3-none-any.whl",
+    "version": "0.16.0"
+  },
+  {
+    "license_expression": "BSD-3-Clause",
+    "license_files": [
+      "LICENSE.md"
+    ],
+    "name": "httpcore2",
+    "source_wheel": "httpcore2-2.9.1-py3-none-any.whl",
+    "version": "2.9.1"
+  },
+  {
+    "license_expression": "BSD-3-Clause",
+    "license_files": [
+      "LICENSE.md"
+    ],
+    "name": "httpx2",
+    "source_wheel": "httpx2-2.9.1-py3-none-any.whl",
+    "version": "2.9.1"
+  },
+  {
+    "license_expression": "BSD-3-Clause",
+    "license_files": [
+      "LICENSE.md"
+    ],
+    "name": "idna",
+    "source_wheel": "idna-3.18-py3-none-any.whl",
+    "version": "3.18"
+  },
+  {
+    "license_expression": "MIT",
+    "license_files": [
+      "COPYING"
+    ],
+    "name": "jsonschema",
+    "source_wheel": "jsonschema-4.26.0-py3-none-any.whl",
+    "version": "4.26.0"
+  },
+  {
+    "license_expression": "MIT",
+    "license_files": [
+      "COPYING"
+    ],
+    "name": "jsonschema-specifications",
+    "source_wheel": "jsonschema_specifications-2025.9.1-py3-none-any.whl",
+    "version": "2025.9.1"
+  },
+  {
+    "license_expression": "MIT",
+    "license_files": [
+      "LICENSE"
+    ],
+    "name": "mcp",
+    "source_wheel": "mcp-2.0.0-py3-none-any.whl",
+    "version": "2.0.0"
+  },
+  {
+    "license_expression": "MIT",
+    "license_files": [
+      "LICENSE"
+    ],
+    "name": "mcp-types",
+    "source_wheel": "mcp_types-2.0.0-py3-none-any.whl",
+    "version": "2.0.0"
+  },
+  {
+    "license_expression": "Apache-2.0",
+    "license_files": [
+      "LICENSE"
+    ],
+    "name": "opentelemetry-api",
+    "source_wheel": "opentelemetry_api-1.44.0-py3-none-any.whl",
+    "version": "1.44.0"
+  },
+  {
+    "license_expression": "BSD-3-Clause",
+    "license_files": [
+      "LICENSE"
+    ],
+    "name": "pycparser",
+    "source_wheel": "pycparser-3.0-py3-none-any.whl",
+    "version": "3.0"
+  },
+  {
+    "license_expression": "MIT",
+    "license_files": [
+      "LICENSE"
+    ],
+    "name": "pydantic",
+    "source_wheel": "pydantic-2.13.4-py3-none-any.whl",
+    "version": "2.13.4"
+  },
+  {
+    "license_expression": "MIT",
+    "license_files": [
+      "AUTHORS.rst",
+      "LICENSE"
+    ],
+    "name": "PyJWT",
+    "source_wheel": "pyjwt-2.13.0-py3-none-any.whl",
+    "version": "2.13.0"
+  },
+  {
+    "license_expression": "Apache-2.0",
+    "license_files": [
+      "LICENSE.txt"
+    ],
+    "name": "python-multipart",
+    "source_wheel": "python_multipart-0.0.32-py3-none-any.whl",
+    "version": "0.0.32"
+  },
+  {
+    "license_expression": "MIT",
+    "license_files": [
+      "COPYING"
+    ],
+    "name": "referencing",
+    "source_wheel": "referencing-0.37.0-py3-none-any.whl",
+    "version": "0.37.0"
+  },
+  {
+    "license_expression": "BSD-3-Clause",
+    "license_files": [
+      "AUTHORS",
+      "LICENSE"
+    ],
+    "name": "sse-starlette",
+    "source_wheel": "sse_starlette-3.4.6-py3-none-any.whl",
+    "version": "3.4.6"
+  },
+  {
+    "license_expression": "BSD-3-Clause",
+    "license_files": [
+      "LICENSE.md"
+    ],
+    "name": "starlette",
+    "source_wheel": "starlette-1.3.1-py3-none-any.whl",
+    "version": "1.3.1"
+  },
+  {
+    "license_expression": "MIT",
+    "license_files": [
+      "LICENSE"
+    ],
+    "name": "truststore",
+    "source_wheel": "truststore-0.10.4-py3-none-any.whl",
+    "version": "0.10.4"
+  },
+  {
+    "license_expression": "PSF-2.0",
+    "license_files": [
+      "LICENSE"
+    ],
+    "name": "typing_extensions",
+    "source_wheel": "typing_extensions-4.16.0-py3-none-any.whl",
+    "version": "4.16.0"
+  },
+  {
+    "license_expression": "MIT",
+    "license_files": [
+      "LICENSE"
+    ],
+    "name": "typing-inspection",
+    "source_wheel": "typing_inspection-0.4.2-py3-none-any.whl",
+    "version": "0.4.2"
+  },
+  {
+    "license_expression": "BSD-3-Clause",
+    "license_files": [
+      "LICENSE.md"
+    ],
+    "name": "uvicorn",
+    "source_wheel": "uvicorn-0.52.0-py3-none-any.whl",
+    "version": "0.52.0"
+  },
+  {
+    "license_expression": "MIT-0",
+    "license_files": [
+      "LICENSE"
+    ],
+    "name": "cffi",
+    "source_wheel": "cffi-2.1.0-cp310-cp310-manylinux2014_aarch64.manylinux_2_17_aarch64.whl",
+    "version": "2.1.0"
+  },
+  {
+    "license_expression": "Apache-2.0 OR BSD-3-Clause",
+    "license_files": [
+      "LICENSE",
+      "LICENSE.APACHE",
+      "LICENSE.BSD"
+    ],
+    "name": "cryptography",
+    "source_wheel": "cryptography-49.0.0-cp311-abi3-manylinux2014_aarch64.manylinux_2_17_aarch64.whl",
+    "version": "49.0.0"
+  },
+  {
+    "license_expression": "MIT",
+    "license_files": [
+      "LICENSE"
+    ],
+    "name": "pydantic_core",
+    "source_wheel": "pydantic_core-2.46.4-cp310-cp310-manylinux_2_17_aarch64.manylinux2014_aarch64.whl",
+    "version": "2.46.4"
+  },
+  {
+    "license_expression": "MIT",
+    "license_files": [
+      "LICENSE"
+    ],
+    "name": "rpds-py",
+    "source_wheel": "rpds_py-0.30.0-cp310-cp310-manylinux_2_17_aarch64.manylinux2014_aarch64.whl",
+    "version": "0.30.0"
+  },
+  {
+    "license_expression": "MIT",
+    "license_files": [
+      "LICENSE"
+    ],
+    "name": "rpds-py",
+    "source_wheel": "rpds_py-2026.6.3-cp314-cp314-manylinux_2_17_aarch64.manylinux2014_aarch64.whl",
+    "version": "2026.6.3"
+  }
+]

@@ -97,6 +97,16 @@ class JobVersionConflict(RuntimeError):
         )
 
 
+class JobSourceClaimConflict(RuntimeError):
+    """Raised when an MCP continuation source was already claimed or changed."""
+
+    def __init__(self, source_job_id):
+        self.source_job_id = str(source_job_id)
+        super().__init__(
+            f"MCP continuation source {self.source_job_id} is no longer claimable"
+        )
+
+
 class LegacyJobMigrationError(RuntimeError):
     """Raised when the former file-per-Job store cannot be migrated safely."""
 
@@ -725,6 +735,79 @@ class JobStore:
                 key,
                 max_active=max_active,
             )
+
+    def admit_claiming_source(
+        self,
+        record,
+        idempotency_key,
+        max_active,
+        source_job_id,
+        expected_source_version,
+    ):
+        """Claim one continuation source and admit its next Job atomically."""
+
+        if isinstance(max_active, bool) or not isinstance(max_active, (int, str)):
+            raise ValueError("max_active must be a non-negative integer")
+        if isinstance(max_active, str):
+            max_active = max_active.strip()
+            if not max_active.isdecimal():
+                raise ValueError("max_active must be a non-negative integer")
+        max_active = int(max_active)
+        if max_active < 0:
+            raise ValueError("max_active must be a non-negative integer")
+        if isinstance(expected_source_version, bool):
+            raise ValueError("expected_source_version must be a non-negative integer")
+        try:
+            expected_source_version = int(expected_source_version)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "expected_source_version must be a non-negative integer"
+            ) from exc
+        if expected_source_version < 0:
+            raise ValueError("expected_source_version must be a non-negative integer")
+
+        normalized, key = self._normalize_new_record(record, idempotency_key)
+        source_job_id = str(source_job_id)
+        with self._immediate_transaction() as conn:
+            existing = self._existing_idempotent_request(conn, normalized, key)
+            if existing is not None:
+                return existing, True
+            if normalized.get("status") in JOB_ACTIVE_STATUSES:
+                active = self._count_active_in_connection(conn)
+                if active >= max_active:
+                    raise JobCapacityExceeded(active, max_active)
+            source = self._select_one(conn, "job_id = ?", (source_job_id,))
+            if (
+                source is None
+                or int(source.get("version", 0)) != expected_source_version
+                or source.get("mcp_continuation_claimed_by")
+            ):
+                raise JobSourceClaimConflict(source_job_id)
+            source["mcp_continuation_claimed_by"] = normalized["job_id"]
+            source["mcp_continuation_claimed_at"] = now_iso()
+            source["version"] = int(source.get("version", 0)) + 1
+            source["updated_at"] = now_iso()
+            self._update_row(conn, source)
+            self._insert_row(conn, normalized)
+            return normalized, False
+
+    def release_source_claim(self, source_job_id, claimed_by):
+        """Release a claim only when its admitted Job never started."""
+
+        source_job_id = str(source_job_id)
+        claimed_by = str(claimed_by)
+        with self._immediate_transaction() as conn:
+            source = self._select_one(conn, "job_id = ?", (source_job_id,))
+            if source is None:
+                return None
+            if source.get("mcp_continuation_claimed_by") != claimed_by:
+                return source
+            source.pop("mcp_continuation_claimed_by", None)
+            source.pop("mcp_continuation_claimed_at", None)
+            source["version"] = int(source.get("version", 0)) + 1
+            source["updated_at"] = now_iso()
+            self._update_row(conn, source)
+            return source
 
     def read(self, job_id):
         with self._connection() as conn:

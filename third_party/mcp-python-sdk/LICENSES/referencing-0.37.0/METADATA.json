@@ -1,0 +1,9 @@
+{
+  "license_expression": "MIT",
+  "license_files": [
+    "COPYING"
+  ],
+  "name": "referencing",
+  "source_wheel": "referencing-0.37.0-py3-none-any.whl",
+  "version": "0.37.0"
+}

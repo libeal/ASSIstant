@@ -23,7 +23,7 @@ SOURCE_DATE_EPOCH=0 bash "${ROOT_DIR}/scripts/build-remote-release.sh" v0.0.0-te
 # Build from an isolated source snapshot with only the project-level INDEX.
 # This proves that a release does not require at least one Skill package.
 mkdir -p "${zero_source}"
-for source_entry in bin config lib mcp packaging policies prompts remote schema scripts web; do
+for source_entry in bin config lib mcp packaging policies prompts remote schema scripts third_party web; do
     cp -a "${ROOT_DIR}/${source_entry}" "${zero_source}/${source_entry}"
 done
 mkdir -p "${zero_source}/skills"
@@ -51,6 +51,7 @@ required_assets=(
     linux-agent-web.sh
     linux-agent-core.tar.gz
     linux-agent-web.tar.gz
+    linux-agent-mcp-sdk.tar.gz
     linux-agent-install.sh
     release-manifest.json
     sbom.spdx.json
@@ -72,6 +73,7 @@ jq -e '
     and (.assets.bootstrap_web.name == "linux-agent-web.sh")
     and (.assets.core.name == "linux-agent-core.tar.gz")
     and (.assets.web.name == "linux-agent-web.tar.gz")
+    and (.assets.mcp_sdk.name == "linux-agent-mcp-sdk.tar.gz")
     and (.assets.installer.name == "linux-agent-install.sh")
     and (.assets.sbom.name == "sbom.spdx.json")
     and (.assets.checksums.name == "SHA256SUMS")
@@ -110,7 +112,8 @@ jq -e '
     | .spdxVersion == "SPDX-2.3"
     and .SPDXID == "SPDXRef-DOCUMENT"
     and .creationInfo.created == "1970-01-01T00:00:00Z"
-    and ([.packages[].name] | sort == ["bash", "curl", "jq", "linux-agent", "python3", "util-linux"])
+    and ([.packages[] | select(.name == "mcp" and .versionInfo == "2.0.0")] | length == 1)
+    and ([.packages[] | select(.name == "mcp-types" and .versionInfo == "2.0.0")] | length == 1)
     and ([.relationships[] | select(
         .spdxElementId == "SPDXRef-Package-linux-agent"
         and .relationshipType == "DEPENDS_ON"
@@ -131,8 +134,19 @@ fi
 grep -qx 'skills/INDEX.md' <<<"${core_listing}"
 grep -qx 'packaging/linux-agent-observer-helper.service' <<<"${core_listing}"
 grep -qx 'packaging/linux-agent-observer-helper.socket' <<<"${core_listing}"
+grep -qx 'packaging/linux-agent-mcp-stdio.service' <<<"${core_listing}"
+grep -qx 'packaging/linux-agent-mcp-stdio.socket' <<<"${core_listing}"
 grep -qx 'packaging/dropins/10-provider-egress.conf.example' <<<"${core_listing}"
 grep -qx 'lib/observer_helper.py' <<<"${core_listing}"
+grep -qx 'schema/mcp-manifest.json' <<<"${core_listing}"
+grep -qx 'schema/mcp-credential-profile.json' <<<"${core_listing}"
+
+mcp_sdk_listing="$(tar -tzf "${first}/linux-agent-mcp-sdk.tar.gz")"
+grep -qx 'third_party/mcp-python-sdk/VERSION' <<<"${mcp_sdk_listing}"
+grep -qx 'third_party/mcp-python-sdk/requirements.lock' <<<"${mcp_sdk_listing}"
+grep -qx 'third_party/mcp-python-sdk/SHA256SUMS' <<<"${mcp_sdk_listing}"
+grep -q '^third_party/mcp-python-sdk/wheels/common/mcp-2.0.0-' <<<"${mcp_sdk_listing}"
+grep -q '^third_party/mcp-python-sdk/LICENSES/' <<<"${mcp_sdk_listing}"
 
 web_listing="$(tar -tzf "${first}/linux-agent-web.tar.gz")"
 grep -qx 'web/package.json' <<<"${web_listing}"
@@ -188,6 +202,8 @@ coverage_step_index = quality_job.index("      - name: Report optional Python co
 required_regression = quality_job[quality_job.index("      - name: Run regression suite\n"):coverage_step_index]
 coverage_step = quality_job[coverage_step_index:]
 assert "coverage" not in quality_install
+assert "@modelcontextprotocol/conformance@0.2.0-alpha.10" in quality_install
+assert "bash tests/mcp_conformance.sh" in quality_job
 assert "python3 -m coverage" not in required_regression
 assert coverage_step.index("        continue-on-error: true\n") < coverage_step.index("python3 -m coverage run")
 assert "-p 'test_web_*.py'" in coverage_step

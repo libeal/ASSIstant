@@ -1,0 +1,9 @@
+{
+  "license_expression": "Apache-2.0",
+  "license_files": [
+    "LICENSE"
+  ],
+  "name": "opentelemetry-api",
+  "source_wheel": "opentelemetry_api-1.44.0-py3-none-any.whl",
+  "version": "1.44.0"
+}

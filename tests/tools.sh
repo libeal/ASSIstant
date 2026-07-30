@@ -214,6 +214,10 @@ run_registered_skill_for_test() {
 
 doctor_json="$(linux_agent_doctor)"
 grep -q '"skills_ok": true' <<<"$(jq . <<<"${doctor_json}")"
+jq -e '.mcp_ok == true
+    and .mcp_runtime.available == true
+    and .mcp_runtime.sdk_version == "2.0.0"
+    and .mcp_runtime.protocol_version == "2026-07-28"' <<<"${doctor_json}" >/dev/null
 skills_json="$(linux_agent_validate_skills)"
 grep -q '"ok": true' <<<"$(jq . <<<"${skills_json}")"
 disk_skill_context="$(linux_agent_skill_context_json "检查磁盘和日志占用" work)"

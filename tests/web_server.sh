@@ -36,6 +36,7 @@ copy_project() {
         "${ROOT_DIR}/skills" \
         "${ROOT_DIR}/mcp" \
         "${ROOT_DIR}/schema" \
+        "${ROOT_DIR}/third_party" \
         "${ROOT_DIR}/web" \
         "${target}/"
     if [[ -f "${target}/mcp/context7/mcp.json" ]]; then
@@ -556,6 +557,11 @@ jq -e '.ok == true and (.markdown_files | index("INDEX.md")) and (.script_files 
 skills_validate="$(curl --noproxy '*' -sS -H "Authorization: Bearer ${token}" "${base_url}/api/skills/validate")"
 jq -e '.ok == true and .status == "validated" and .validation.ok == true' <<<"${skills_validate}" >/dev/null
 
+skill_components="$(curl --noproxy '*' -sS -H "Authorization: Bearer ${token}" "${base_url}/api/skill-components")"
+jq -e '.ok == true and .status == "listed"
+    and any(.components[]?; .name == "database-inspect" and .resource == "database"
+        and .navigation.screen == "database" and .navigation.key == "4")' <<<"${skill_components}" >/dev/null
+
 mcp_state="$(curl --noproxy '*' -sS -H "Authorization: Bearer ${token}" "${base_url}/api/mcp")"
 jq -e '.ok == true and .status == "listed"
     and ([.servers[].id] | index("stdio-web"))
@@ -1056,8 +1062,8 @@ jq -e --arg session_id "${slow_work_session_id}" --arg job_id "${slow_work_job_i
 jq -e 'type == "array"' "${project}/tmp/web/jobs/${work_job_one_id}.history.json" >/dev/null
 jq -e 'type == "array"' "${project}/tmp/web/jobs/${work_job_two_id}.history.json" >/dev/null
 
-# A legacy audit file remains readable as evidence but cannot be reconstructed
-# into protocol state or restored into the workbench.
+# A legacy unchained audit file remains readable as evidence, but its failed
+# integrity check takes precedence over timeline reconstruction and restore.
 legacy_session_id="session_web_legacy_readonly"
 legacy_log="${project}/logs/${legacy_session_id}.jsonl"
 printf '%s\n' \
@@ -1068,8 +1074,9 @@ legacy_audit="$(read_audit_session "${legacy_session_id}")"
 jq -e '
     .ok == true
     and (.events | length) == 2
+    and .integrity_ok == false
     and .web_timeline == null
-    and .timeline_unavailable_reason == "legacy_session_no_persisted_turns"
+    and .timeline_unavailable_reason == "audit_integrity_broken"
 ' <<<"${legacy_audit}" >/dev/null
 legacy_restore_payload="$(jq -cn --arg session_id "${legacy_session_id}" '{session_id:$session_id}')"
 legacy_restore="$(curl --noproxy '*' -sS \
@@ -1077,7 +1084,7 @@ legacy_restore="$(curl --noproxy '*' -sS \
     -H "Content-Type: application/json" \
     -d "${legacy_restore_payload}" \
     "${base_url}/api/session/restore")"
-jq -e '.ok == false and .status == "legacy_session_no_persisted_turns"' <<<"${legacy_restore}" >/dev/null
+jq -e '.ok == false and .status == "audit_integrity_broken"' <<<"${legacy_restore}" >/dev/null
 
 # Restoring a new session copies persisted turns/history; no audit replay is used.
 workspace_restore_payload="$(jq -cn --arg session_id "${workspace_session_id}" '{session_id:$session_id}')"

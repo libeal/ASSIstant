@@ -1,0 +1,169 @@
+{
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "$id": "https://linux-agent.local/schema/mcp-manifest.json",
+    "title": "Linux Agent MCP server manifest",
+    "type": "object",
+    "required": ["id", "transport"],
+    "additionalProperties": false,
+    "properties": {
+        "manifest_version": {
+            "type": "integer",
+            "enum": [1, 2],
+            "default": 1
+        },
+        "id": {
+            "type": "string",
+            "pattern": "^[a-z0-9][a-z0-9_.-]*$",
+            "maxLength": 128
+        },
+        "name": {
+            "type": "string",
+            "maxLength": 256
+        },
+        "description": {
+            "type": "string",
+            "maxLength": 65536
+        },
+        "enabled": {
+            "type": "boolean",
+            "default": true
+        },
+        "transport": {
+            "type": "string",
+            "enum": ["stdio", "streamable_http", "sse"]
+        },
+        "command": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 4096
+        },
+        "args": {
+            "type": "array",
+            "maxItems": 256,
+            "items": {
+                "type": "string",
+                "maxLength": 65536
+            }
+        },
+        "env": {
+            "type": "object",
+            "maxProperties": 128,
+            "propertyNames": {
+                "type": "string",
+                "pattern": "^[A-Za-z_][A-Za-z0-9_]*$"
+            },
+            "additionalProperties": {
+                "type": "string",
+                "maxLength": 65536
+            }
+        },
+        "cwd": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 4096
+        },
+        "url": {
+            "type": "string",
+            "format": "mcp-http-url",
+            "maxLength": 8192
+        },
+        "message_url": {
+            "type": "string",
+            "format": "mcp-http-url",
+            "maxLength": 8192
+        },
+        "headers": {
+            "type": "object",
+            "maxProperties": 64,
+            "propertyNames": {
+                "type": "string",
+                "format": "mcp-header-name"
+            },
+            "additionalProperties": {
+                "type": "string",
+                "maxLength": 65536,
+                "pattern": "^[^\\r\\n]*$"
+            }
+        },
+        "timeout_sec": {
+            "type": "number",
+            "minimum": 1,
+            "maximum": 120
+        },
+        "protocol": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "mode": {
+                    "type": "string",
+                    "enum": ["modern_then_legacy", "modern_only", "legacy_only"],
+                    "default": "modern_then_legacy"
+                },
+                "require_modern": {
+                    "type": "boolean",
+                    "default": false
+                }
+            }
+        },
+        "compatibility": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "allow_legacy_sse": {
+                    "type": "boolean",
+                    "default": false
+                }
+            }
+        },
+        "credential_profile": {
+            "type": "string",
+            "pattern": "^[a-z0-9][a-z0-9_.-]*$",
+            "maxLength": 128
+        }
+    },
+    "allOf": [
+        {
+            "if": {
+                "properties": {
+                    "transport": {"const": "stdio"}
+                },
+                "required": ["transport"]
+            },
+            "then": {
+                "required": ["command"]
+            }
+        },
+        {
+            "if": {
+                "properties": {
+                    "transport": {"enum": ["streamable_http", "sse"]}
+                },
+                "required": ["transport"]
+            },
+            "then": {
+                "required": ["url"]
+            }
+        },
+        {
+            "if": {
+                "properties": {
+                    "manifest_version": {"const": 2},
+                    "transport": {"const": "sse"}
+                },
+                "required": ["manifest_version", "transport"]
+            },
+            "then": {
+                "properties": {
+                    "compatibility": {
+                        "type": "object",
+                        "properties": {
+                            "allow_legacy_sse": {"const": true}
+                        },
+                        "required": ["allow_legacy_sse"]
+                    }
+                },
+                "required": ["compatibility"]
+            }
+        }
+    ]
+}

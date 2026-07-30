@@ -86,13 +86,28 @@ export function createAuditView(app, hooks) {
     const query = String($("auditSessionFilter")?.value || "").trim();
     const limit = Math.max(1, Math.min(200, Number($("auditLimitInput")?.value || 40)));
     const data = await app.api("/api/audit/list", { method: "POST", body: { limit, query } });
+    if (data.ok !== true) {
+      state.auditSessions = [];
+      state.auditEvents = [];
+      state.auditWebTimeline = null;
+      state.auditIntegrityOk = null;
+      state.auditTimelineUnavailableReason = data.code || data.status || "read_failed";
+      state.currentAuditSession = "";
+      renderAuditSessionList();
+      resetAuditSummary();
+      $("auditOutput").textContent = renderAuditReadableReport(data);
+      showToast(data.message || data.error || "审计会话列表读取失败");
+      return data;
+    }
     state.auditSessions = data.sessions || [];
     state.auditEvents = [];
     state.auditWebTimeline = null;
+    state.auditIntegrityOk = null;
     state.auditTimelineUnavailableReason = "";
     state.currentAuditSession = "";
     renderAuditSessionList();
     resetAuditSummary();
+    return data;
   }
 
   function scheduleAuditListReload() {
@@ -175,8 +190,22 @@ export function createAuditView(app, hooks) {
   async function readAudit(sessionId) {
     const data = await app.api("/api/audit/read", { method: "POST", body: { session_id: sessionId } });
     state.currentAuditSession = sessionId;
+    if (data.ok !== true) {
+      state.auditEvents = [];
+      state.auditWebTimeline = null;
+      state.auditIntegrityOk = null;
+      state.auditTimelineUnavailableReason = data.code || data.status || "read_failed";
+      renderAuditEventTimeline();
+      renderAuditObserverSummary();
+      updateAuditMetrics();
+      $("auditOutput").textContent = renderAuditReadableReport(data);
+      if ($("auditRestoreTimelineBtn")) $("auditRestoreTimelineBtn").disabled = true;
+      showToast(data.message || data.error || "审计会话读取失败");
+      return data;
+    }
     state.auditEvents = Array.isArray(data.events) ? data.events : [];
-    state.auditWebTimeline = data.web_timeline || null;
+    state.auditIntegrityOk = data.integrity_ok === true;
+    state.auditWebTimeline = state.auditIntegrityOk ? data.web_timeline || null : null;
     state.auditTimelineUnavailableReason = data.timeline_unavailable_reason || "";
     renderAuditEventTimeline();
     renderAuditObserverSummary();
@@ -184,10 +213,13 @@ export function createAuditView(app, hooks) {
     $("auditOutput").textContent = renderAuditReadableReport(data);
     if ($("auditRestoreTimelineBtn")) {
       $("auditRestoreTimelineBtn").disabled = !(
-        state.auditWebTimeline?.timeline?.length ||
-        state.auditWebTimeline?.turns?.length
+        state.auditIntegrityOk && (
+          state.auditWebTimeline?.timeline?.length ||
+          state.auditWebTimeline?.turns?.length
+        )
       );
     }
+    return data;
   }
 
   function renderAuditEventTimeline() {
@@ -247,6 +279,13 @@ export function createAuditView(app, hooks) {
   }
 
   function renderAuditReadableReport(data) {
+    if (data?.ok === false) {
+      return [
+        `Session: ${data.session_id || state.currentAuditSession || "--"}`,
+        `状态: ${data.status || data.code || "read_failed"}`,
+        `读取失败: ${data.message || data.error || "审计会话无法读取"}`,
+      ].join("\n");
+    }
     const events = Array.isArray(data.events) ? data.events : [];
     const restored = data.web_timeline || {};
     const selectedSession = (state.auditSessions || []).find((session) => session.session_id === data.session_id) || {};
@@ -353,6 +392,7 @@ export function createAuditView(app, hooks) {
     if (observer) observer.innerHTML = '<tr><td colspan="3">尚未选择 session。</td></tr>';
     setText("auditOutput", "等待选择审计 session。");
     state.auditWebTimeline = null;
+    state.auditIntegrityOk = null;
     if ($("auditRestoreTimelineBtn")) $("auditRestoreTimelineBtn").disabled = true;
   }
 
@@ -415,6 +455,9 @@ export function createAuditView(app, hooks) {
   }
 
   async function restoreAuditTimelineToWorkbench() {
+    if (state.auditIntegrityOk !== true) {
+      return showToast("审计完整性未通过，不能恢复到工作台");
+    }
     const preview = state.auditWebTimeline;
     if (!preview?.timeline?.length && !preview?.turns?.length) {
       return showToast("当前审计 session 没有可恢复的工作时间线");

@@ -1,0 +1,9 @@
+{
+  "license_expression": "BSD-3-Clause",
+  "license_files": [
+    "LICENSE.txt"
+  ],
+  "name": "click",
+  "source_wheel": "click-8.4.2-py3-none-any.whl",
+  "version": "8.4.2"
+}

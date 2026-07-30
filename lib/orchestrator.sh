@@ -336,7 +336,8 @@ linux_agent_run_agent_loop() {
             results:(.results // []),
             step_states:(.step_states // []),
             prior_results:(.prior_results // []),
-            prior_step_states:(.prior_step_states // [])
+            prior_step_states:(.prior_step_states // []),
+            mcp_input:(.mcp_input // null)
         }' <<<"${resume_state}")"
     fi
     checkpoint_turns="$(linux_agent_agent_checkpoint_turns)"

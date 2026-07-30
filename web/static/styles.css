@@ -624,7 +624,21 @@ label.small { display: block; }
 .approval-actions { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; margin-top: 12px; }
 body.terminal-approval .approval-revision,
 body.terminal-approval #approvalSkipBtn,
-body.terminal-approval #approvalTerminateBtn { display: none; }
+body.terminal-approval #approvalTerminateBtn,
+body.mcp-input-approval .approval-revision,
+body.mcp-input-approval #approvalSkipBtn,
+body.mcp-input-approval #approvalTerminateBtn { display: none; }
+.mcp-input-requests { display: grid; gap: 10px; }
+.mcp-input-request { display: grid; gap: 9px; padding: 10px 0; border-bottom: 1px solid var(--line-soft); }
+.mcp-input-request:last-child { border-bottom: 0; }
+.mcp-input-fields { display: grid; gap: 9px; }
+.mcp-input-field { display: grid; gap: 6px; }
+.mcp-input-field small { color: var(--muted); }
+.mcp-input-action { display: grid; grid-template-columns: minmax(72px, auto) minmax(0, 1fr); gap: 8px; align-items: center; }
+.mcp-array-input { min-height: 64px; }
+.mcp-input-url { color: var(--blue); overflow-wrap: anywhere; }
+.mcp-input-confirm { display: flex; gap: 8px; align-items: flex-start; color: var(--text-2); font-size: 13px; }
+.mcp-input-confirm input { margin-top: 2px; flex: 0 0 auto; }
 
 .observer-dialog {
   width: min(540px, calc(100vw - 28px));

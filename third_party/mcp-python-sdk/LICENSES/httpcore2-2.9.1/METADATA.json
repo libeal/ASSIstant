@@ -1,0 +1,9 @@
+{
+  "license_expression": "BSD-3-Clause",
+  "license_files": [
+    "LICENSE.md"
+  ],
+  "name": "httpcore2",
+  "source_wheel": "httpcore2-2.9.1-py3-none-any.whl",
+  "version": "2.9.1"
+}

@@ -14,7 +14,7 @@ Linux 运维 Agent 是一个以 Bash CLI 为核心的本机运维助手。它把
 | Edit | `bash bin/agent edit "<需求>"` | 生成或修改用户 skill，打开 `$EDITOR` 或 `vi` 让用户确认脚本内容，再写入当前形态的用户 overlay。 |
 | Script | `bash bin/agent script <skill>/<script> [json]` | 执行已登记 skill 脚本，执行前校验登记、参数和策略。 |
 | Terminal | `bash bin/agent terminal "<命令>"` | 对本机 shell 命令做策略审查；低风险命令是否自动执行由 `approvals.auto.shell_readonly` 控制，高风险或提权命令请求确认。 |
-| Doctor | `bash bin/agent doctor` | 检查依赖、配置 JSON、skill 目录和基础运行环境。 |
+| Doctor | `bash bin/agent doctor` | 检查依赖、配置 JSON、skill 目录、MCP 离线 wheelhouse/专用 venv 和基础运行环境。 |
 | Sense | `bash bin/agent sense <topic>` | 按主题采集环境信息，支持 `all`、`disk`、`resource`、`process`、`network`、`service`、`logs`、`privilege`、`minimal`。 |
 | Tools | `bash bin/agent tools list` | 输出 `skills/INDEX.md` 中登记的可执行 skill 索引。 |
 | Skills | `bash bin/agent skills validate` | 校验 skill 目录、`SKILL.md`、脚本和索引登记一致性。 |
@@ -35,7 +35,7 @@ Web 视图包括：
 
 - Work 工作台：自然语言任务、terminal 命令、执行时间线、审批抽屉、环境主题刷新。
 - Skill 库：script 运行、script 审查、edit 生成、edit 审查、保存、skill 树、Markdown 预览、`skills validate`。
-- MCP：读取 `mcp/<id>/mcp.json` 外部 MCP server manifest，校验 stdio、legacy SSE 和 Streamable HTTP 三种传输配置，并在 work/edit 上下文暴露可用 tools。
+- MCP：读取 `mcp/<id>/mcp.json` 外部 MCP server manifest；默认使用官方 Python SDK `2.0.0` 和 MCP 协议 `2026-07-28`，校验 stdio、冻结的 legacy SSE 和 Streamable HTTP 配置，并在 work/edit 上下文暴露可用 tools。
 - Policy：以运维视角查看命令安全检查、校验和编辑已登记的 JSON 策略文件（含风险规则、审计边界和文件保险箱）；关闭 `web.sensitive_edits_enabled` 时仍可读取、编辑草稿和校验，但保存与 command guard 切换由后端拒绝。Web 不收集 sudo 密码。
 - Audit：查看 JSONL 审计 session、完整性结果、事件筛选、指标统计和报告导出。新会话可从持久化的权威 protocol turns 恢复工作台；没有 turns 的旧会话只显示只读事件，不再从审计事件推导业务状态。
 - Config：读取和保存白名单配置项，运行 Doctor，展示运行时配置快照。
@@ -92,7 +92,7 @@ curl -fsSL https://github.com/libeal/ASSIstant/releases/download/vX.Y.Z/linux-ag
 curl -fsSL https://github.com/libeal/ASSIstant/releases/latest/download/linux-agent-cli.sh | bash
 ```
 
-两条命令都只从同一个 GitHub Release 获取 manifest 和已登记资产。Bootstrap 不保存到本机；core、Web 和按需加载的完整 skill 包优先物化到 `$XDG_RUNTIME_DIR` 或 `/dev/shm`，必要时回退权限为 `0700` 的 `/tmp` 子目录，并在退出或收到信号时清理。
+两条命令都只从同一个 GitHub Release 获取 manifest 和已登记资产。Bootstrap 不保存到本机；core、Web、独立的 `linux-agent-mcp-sdk.tar.gz` 和按需加载的完整 skill 包优先物化到 `$XDG_RUNTIME_DIR` 或 `/dev/shm`，必要时回退权限为 `0700` 的 `/tmp` 子目录，并在退出或收到信号时清理。MCP 专用 venv 仅在首次现代 MCP 调用时从已验证 wheelhouse 离线创建。
 
 Remote 主机必须预先提供 `flock`（通常由 `util-linux` 包提供）；bootstrap 会在任何下载前检查，缺失时直接给出安装提示，不自动修改系统包。
 
@@ -148,6 +148,7 @@ sudo bash linux-agent-install.sh install --version "${version}" --require-signat
   --provider-cidr 203.0.113.0/24 --provider-cidr 2001:db8:1234::/48
 # 安装健康检查会临时启动后自动停止；配置完成后再显式长期启动
 sudo systemctl enable --now linux-agent-observer-helper.socket linux-agent-runner.socket \
+  linux-agent-mcp-stdio.socket \
   linux-agent-host-ops.socket linux-agent-policy-writer.socket \
   linux-agent-database-inspector.socket linux-agent-web.service
 sudo bash linux-agent-install.sh upgrade --version vX.Y.NEW --require-signature
@@ -341,7 +342,10 @@ Linux 运维 Agent
 │  │  ├─ skills.sh           Skill resolver、生命周期、渐进披露和执行登记
 │  │  ├─ skill_package.py    SKILL.md frontmatter、linux-agent.json 与 INDEX 的统一安全解析器
 │  │  ├─ skill_lifecycle.py  用户/内置包 staging、原子安装、读取和卸载
-│  │  ├─ mcp.sh              MCP manifest 发现、脱敏和校验
+│  │  ├─ mcp.sh              MCP manifest 发现、脱敏和目录聚合
+│  │  ├─ mcp_manifest.py     manifest/credential 共享 JSON Schema 校验器
+│  │  ├─ mcp_runtime.py      MCP SDK wheelhouse、平台与隔离 venv 管理
+│  │  ├─ mcp_credentials.py  0600 profile 校验与 sealed memfd 传递
 │  │  ├─ policy.sh           风险规则审查
 │  │  └─ file_vault.py       文件保险箱静态访问分类器（读取/修改/未知）
 │  ├─ AI 与编排
@@ -353,7 +357,8 @@ Linux 运维 Agent
 │  │  ├─ editor.sh           skill edit/staging/提交
 │  │  ├─ observer.sh         auditd observer 和降级记录
 │  │  ├─ api.sh              机器可读 API
-│  │  ├─ mcp_client.py       MCP stdio/SSE/Streamable HTTP 客户端
+│  │  ├─ mcp_client.py       SDK 2.0 modern-first 稳定 JSON adapter
+│  │  ├─ mcp_legacy_client.py 冻结的旧协议兼容客户端
 │  │  ├─ provider_security.py Provider URL 校验、SSRF 防护与地址解析
 │  │  ├─ pinned_http.py       固定解析 IP、保持 Host/SNI 的 HTTPS 客户端
 │  │  ├─ runner.py            独立 UID 普通执行 Unix socket 服务
@@ -400,8 +405,12 @@ Linux 运维 Agent
 │  └─ database-inspect/      数据库检查及动态 Web/credential component
 ├─ MCP 能力层 mcp/
 │  └─ <server-id>/mcp.json    外部 MCP server manifest，支持 stdio、sse、streamable_http
+├─ MCP SDK 供应链 third_party/mcp-python-sdk/
+│  └─ VERSION、requirements.lock、SHA256SUMS、LICENSES 和双架构离线 wheels
 ├─ 领域契约 schema/
-│  └─ domain.json             API、Job、turn、步骤和错误状态的共享 JSON schema
+│  ├─ domain.json             API、Job、turn、步骤和错误状态的共享 JSON schema
+│  ├─ mcp-manifest.json       MCP manifest v1/v2 契约
+│  └─ mcp-credential-profile.json 外部凭据 profile 契约
 ├─ 配置层
 │  ├─ config/config.example.json 模板配置
 │  ├─ config/ai-providers.json AI 厂商预设、鉴权方式和模型列表规则
@@ -456,13 +465,23 @@ Remote runtime 首次只加载索引与 Release manifest 元数据，执行前�
 
 `mcp/` 是外部 MCP server manifest 目录，推荐形态是 `mcp/<server-id>/mcp.json`。registry 负责发现、校验、脱敏展示和 `tools/list` 目录生成；实际 `tools/call` 不提供独立 CLI/Web 任意调用入口，只能由 work 模式计划生成 `executor_type:"mcp_tool"` 的步骤后，经 policy、人工审批、observer 和 audit 执行。edit 模式只能看到 MCP 目录作为生成 skill 的参考，不能直接执行 MCP。
 
+这里有两个不同的版本概念：协议版本是 `2026-07-28`，固定的官方 Python SDK 版本是 `mcp==2.0.0`。默认 `protocol.mode=modern_then_legacy`：SDK 先执行 `server/discover` 与完整分页 `tools/list`；只有在工具调用发送前发生兼容性错误时，才在新连接上进入冻结旧客户端。`tools/call` 一旦发送就不重试、不降级；断流且结果未知时返回 `mcp_outcome_unknown`。`modern_only` 可强制新协议，`legacy_only` 只用于紧急回滚。
+
 支持的 manifest transport：
 
 - `stdio`：本地子进程 stdin/stdout JSON-RPC。
 - `sse`：兼容旧版 HTTP + Server-Sent Events 双端点模式。
 - `streamable_http`：新版单一 HTTP endpoint，响应可为 JSON 或 SSE stream。
 
-Web MCP 页和 `agent api mcp list|validate|tools` 会隐藏 Authorization、token、secret、password、api_key 等敏感字段。MCP tool 调用默认标记为需要人工审批，不随配置中心的自动审批开关静默执行。
+Streamable HTTP 可在 manifest 中只保存 `credential_profile` id。实际 profile 位于运行时 `data/mcp/credentials/<id>.json`（目录 `0700`、文件 `0600`；systemd 模式由专用 Runner 用户持有），绑定精确 `server_id`/`server_url`；OAuth 再绑定 `authorization_server_issuer`。支持静态 headers、authorization code 和 client credentials。SDK 原生校验 RFC 9207 `iss` 并优先 CIMD；DCR 仅在服务器不支持 CIMD且管理员显式允许时启用，issuer 变化会丢弃旧 DCR client info 与 token。受保护的 `tools/list` 与 `tools/call` 都经过 Runner 的固定 adapter 合约；profile 通过只读 sealed memfd 传入，SDK 更新后的 token/DCR client info 通过另一个有界匿名 memfd 返回，Runner 校验 issuer 与原始 profile 摘要后以 `0600` 原子写回，并在并发变化时拒绝覆盖。凭据不进入 manifest、argv、普通环境值、Job、审计或临时参数文件。
+
+现代工具返回 `InputRequiredResult` 时进入 `awaiting_mcp_input`：只有用户可以响应，并再次经过 policy review 与确认。opaque continuation 以 `0600` 保存，绑定 flow/server/tool/arguments，15 分钟过期，最多 3 轮、每轮 16 项、总响应 64 KiB；取消会删除 continuation。Web 不信任浏览器提交的 plan/state，只使用服务端 Job 绑定状态。
+
+Web MCP 页和 `agent api mcp list|validate|tools` 会隐藏 Authorization、token、secret、password、api_key、OAuth token 和 request state。MCP tool 调用固定要求人工审批，不随配置中心的自动审批开关静默执行。
+
+SDK 与全部传递依赖保存在 `third_party/mcp-python-sdk/`，以 `--no-index --require-hashes` 离线安装。源码 venv 位于 `tmp/.shared/mcp-venvs/<identity>`；受管安装为 `releases/<version>/.mcp-venv`，随 `current` 原子升级/回滚；Remote 为 `<verified-runtime>/agent/.mcp-venv`，按需创建。发布清单中的 `linux-agent-mcp-sdk.tar.gz` 是独立资产，SBOM 列出全部 wheels 和许可证。
+
+CI 固定使用官方 `@modelcontextprotocol/conformance@0.2.0-alpha.10` 验证 `2026-07-28` 的 request metadata、标准 HTTP headers、工具调用和网络 `$ref` 不自动解析。安装该固定版本后可本地运行 `bash tests/mcp_conformance.sh`。
 
 ### 核心调用关系
 
@@ -682,6 +701,7 @@ GitHub Actions 会构建确定性资产与 SPDX 2.3 SBOM，使用 GitHub OIDC �
 - `/api/metrics` 默认开启但同样需要 Bearer token；指标只使用低基数 route/status 标签，不记录 token、API key 或 Job ID。
 - systemd Web 通过独立 socket 激活 Runner、observer、host、policy 与包声明的 credential helper；host-ops 只接受已安装签名包 adapter 产生的登记 capability，policy-writer 只允许 `policy.write`/`command_guard.set`，Runner 不可读取配置、API key 或特权 socket。helper 失败不回退 sudo；`observer.require=true` 时未观察到真实执行即阻断。
 - Web、Runner、Terminal、Skill 与 MCP 子进程从空环境按白名单构造，不继承父进程中的云凭据、访问令牌或凭据代理；API key 只进入 AI Provider 路径，执行步骤会再次清空环境。
+- MCP OAuth profile 与 token 绑定精确 server/issuer/redirect；issuer、metadata endpoint 或资源边界不匹配时，在发送 client secret、authorization code、refresh token 或 DCR registration 之前失败关闭。
 - Bash 与 Web 执行层都在读取期间限制 stdout/stderr。Runner `1.2.0` 将最大 64 KiB 原始块编码为按序 NDJSON 帧，客户端断开、Web 取消或父进程死亡会终止并 reap 整个进程组后才释放 slot。超限固定返回 exit 125/`output_limit_exceeded` 和准确截断计数；丢帧、乱序或缺 final 帧返回 `invalid_output`/`output_integrity_unknown`，不会静默成功。
 - Web 策略编辑只允许当前 release 登记的 JSON 策略，保存前做现有 validator 校验，再由 policy-writer helper 原子写入 `data/policies/`；`web.sensitive_edits_enabled=false` 时只允许草稿、diff、review 和 validate。
 - 用户 Skill 写入 `data/skills/`，同名内置 Skill 冲突即拒绝；唯一必需文件为标准 `SKILL.md`，可选 `linux-agent.json` tool 强制使用 `runner`、空 capability 和无 privileged/Web component。
@@ -836,6 +856,8 @@ bash scripts/lint.sh
 | --- | --- |
 | `mcp/README.md` | MCP manifest registry 的格式、传输方式和安全边界说明。 |
 | `mcp/<server-id>/mcp.json` | 外部 MCP server 的 manifest；支持 stdio、legacy SSE 和 Streamable HTTP。 |
+| `schema/mcp-manifest.json` / `schema/mcp-credential-profile.json` | MCP manifest v1/v2 与外部 credential profile 的共享契约。 |
+| `third_party/mcp-python-sdk/` | 固定 SDK 2.0.0 的离线 lock、wheel、摘要和许可证；不使用在线 pip。 |
 | `schema/domain.json` | CLI、Web/API 和前端共享的领域契约、状态展示、错误码及可编辑配置 schema。 |
 
 ### `packaging/`、`remote/` 与 `scripts/`
@@ -845,6 +867,7 @@ bash scripts/lint.sh
 | `packaging/linux-agent-web.service` | 生产 Web systemd 单元，包含非 root 身份、只读代码、可写数据目录和资源沙箱。 |
 | `packaging/linux-agent-observer-helper.service` / `.socket` | 仅持有 audit capability 的 root observer helper 与 Web 组可访问的 `0660` Unix socket。 |
 | `packaging/linux-agent-runner.service` / `.socket` | 独立 Runner UID 的普通执行服务；socket 为 `0600`，只允许 Web 服务用户连接。 |
+| `packaging/linux-agent-mcp-stdio.service` / `.socket` | 用 `DynamicUser` 启动不可信 STDIO MCP server；socket 只允许 Runner 连接，服务不可访问持久数据。 |
 | `packaging/linux-agent-host-ops.service` / `.socket` | 仅允许 firewall/hosts 固定操作的 root helper 与 Web 组可访问的 `0660` Unix socket。 |
 | `packaging/linux-agent-policy-writer.service` / `.socket` | 仅允许策略/command guard 固定操作的 root helper 与 Web 组可访问的 `0660` Unix socket。 |
 | `packaging/dropins/10-provider-egress.conf.example` | 默认拒绝网络出口、按 Provider CIDR 显式放行的 systemd drop-in 模板。 |

@@ -1,0 +1,15 @@
+[Unit]
+Description=Linux Agent isolated MCP stdio server relay socket
+PartOf=linux-agent-web.service
+
+[Socket]
+ListenStream=/run/linux-agent/mcp-stdio.sock
+Service=linux-agent-mcp-stdio.service
+SocketUser=root
+SocketGroup=linux-agent-runner
+SocketMode=0660
+DirectoryMode=0755
+RemoveOnStop=yes
+
+[Install]
+WantedBy=sockets.target

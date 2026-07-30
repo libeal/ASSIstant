@@ -19,7 +19,8 @@ linux_agent_doctor() {
     local optional_missing='[]'
     local config_ok="false"
     local skills_ok="false"
-    local command_result remote_json
+    local mcp_ok="false"
+    local command_result remote_json mcp_runtime_json mcp_runtime_status
 
     while IFS= read -r command_name; do
         required_results="$(jq -cn \
@@ -51,6 +52,15 @@ linux_agent_doctor() {
     fi
 
     remote_json="$(linux_agent_remote_state_json)"
+    mcp_runtime_json="$(python3 "${LINUX_AGENT_ROOT}/lib/mcp_runtime.py" status 2>/dev/null || true)"
+    if ! jq -e 'type == "object" and (.status | type == "string")' \
+        >/dev/null 2>&1 <<<"${mcp_runtime_json}"; then
+        mcp_runtime_json='{"ok":false,"available":false,"runtime_ready":false,"status":"unavailable","error":"MCP runtime check returned invalid output"}'
+    fi
+    mcp_runtime_status="$(jq -r '.status' <<<"${mcp_runtime_json}")"
+    if [[ "${mcp_runtime_status}" == "ready" || "${mcp_runtime_status}" == "not_installed" ]]; then
+        mcp_ok="true"
+    fi
 
     jq -cn \
         --argjson required "${required_results}" \
@@ -58,16 +68,20 @@ linux_agent_doctor() {
         --argjson optional_missing "${optional_missing}" \
         --argjson config_ok "${config_ok}" \
         --argjson skills_ok "${skills_ok}" \
+        --argjson mcp_ok "${mcp_ok}" \
+        --argjson mcp_runtime "${mcp_runtime_json}" \
         --argjson remote "${remote_json}" \
         --arg root "${LINUX_AGENT_ROOT}" \
         '{
-            ok:(($required | map(.ok) | all) and $config_ok and $skills_ok),
+            ok:(($required | map(.ok) | all) and $config_ok and $skills_ok and $mcp_ok),
             root:$root,
             remote:$remote,
             required_commands:$required,
             optional_available:$optional_available,
             optional_missing:$optional_missing,
             config_ok:$config_ok,
-            skills_ok:$skills_ok
+            skills_ok:$skills_ok,
+            mcp_ok:$mcp_ok,
+            mcp_runtime:$mcp_runtime
         }'
 }

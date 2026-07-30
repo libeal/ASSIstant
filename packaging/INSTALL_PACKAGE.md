@@ -30,10 +30,11 @@ sudo bash install.sh --provider-cidr 203.0.113.0/24
 
 安装器会要求 Bash 4.3+、Python 3.10+ 和 GNU coreutils/findutils/tar，并在启动前用 `systemd-analyze verify` 检查 unit。SELinux 已启用时会对安装目录、unit 和 helper runtime 执行 `restorecon`；Enforcing 模式缺少 `restorecon` 时安装失败，而不是留下只在服务启动后才暴露的 EACCES。安装包不是原生 `.rpm`，升级、回滚和卸载都使用包内 `release/linux-agent-install.sh`。
 
-安装器默认安装到 `/opt/linux-agent` 并写入 Web、Runner、observer、host-ops、policy-writer 全部 systemd unit。安装期间会先停止遗留实例，再临时启动新版本完成健康检查，检查结束后自动停止这些服务。安装器不会修改原有开机启用状态；全新安装默认未启用。Runner socket 为 `0600`，三个特权 helper socket 为 `0660` 且只允许 Web 服务组访问。需要正式运行时显式执行：
+安装器默认安装到 `/opt/linux-agent` 并写入 Web、Runner、MCP stdio relay、observer、host-ops、policy-writer 全部 systemd unit。安装期间会先停止遗留实例，再临时启动新版本完成健康检查，检查结束后自动停止这些服务。安装器不会修改原有开机启用状态；全新安装默认未启用。Runner socket 为 `0600`，MCP stdio relay socket 为 `0660` 且只允许 Runner 组连接，三个特权 helper socket 为 `0660` 且只允许 Web 服务组访问。需要正式运行时显式执行：
 
 ```bash
 sudo systemctl enable --now linux-agent-observer-helper.socket linux-agent-runner.socket \
+  linux-agent-mcp-stdio.socket \
   linux-agent-host-ops.socket linux-agent-policy-writer.socket \
   linux-agent-database-inspector.socket linux-agent-web.service
 ```

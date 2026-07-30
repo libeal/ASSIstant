@@ -1,0 +1,10 @@
+{
+  "license_expression": "MIT",
+  "license_files": [
+    "AUTHORS.rst",
+    "LICENSE"
+  ],
+  "name": "PyJWT",
+  "source_wheel": "pyjwt-2.13.0-py3-none-any.whl",
+  "version": "2.13.0"
+}

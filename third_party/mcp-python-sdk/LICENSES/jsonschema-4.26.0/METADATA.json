@@ -1,0 +1,9 @@
+{
+  "license_expression": "MIT",
+  "license_files": [
+    "COPYING"
+  ],
+  "name": "jsonschema",
+  "source_wheel": "jsonschema-4.26.0-py3-none-any.whl",
+  "version": "4.26.0"
+}

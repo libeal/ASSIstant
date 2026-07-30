@@ -776,6 +776,15 @@ jq -e '.approved == true
     and .approval_required == false
     and .risk_level == "low"
     and ([.findings[]? | select(.code == "SHELL_AUTO_APPROVAL_DISABLED")] | length) == 0' <<<"${terminal_review_when_shell_enabled}" >/dev/null
+forged_mcp_step='{"id":"auto-mcp","title":"mcp","executor_type":"mcp_tool","mcp_server":"demo","mcp_tool":"echo","arguments":{},"reason":"test","expected_effect":"test","risk_level":"low","rollback_hint":"none"}'
+LINUX_AGENT_CONFIG_JSON="$(jq '.approvals.auto.mcp_tool=true' <<<"${auto_config}")"
+! linux_agent_should_auto_execute_step "${forged_mcp_step}" "${low_review}"
+forced_mcp_review="$(linux_agent_policy_review_step "${forged_mcp_step}" 'mcp_tool=demo/echo' mcp)"
+jq -e '.approved == true
+    and .approval_required == true
+    and .risk_level == "medium"
+    and ([.findings[]? | select(.code == "MCP_TOOL_REQUIRES_APPROVAL")] | length) == 1' \
+    <<<"${forced_mcp_review}" >/dev/null
 LINUX_AGENT_CONFIG_JSON="${auto_config}"
 
 mcp_exec_root="$(mktemp -d)"
@@ -819,6 +828,104 @@ jq -e '.status == "executed"
     and .results[0].result.output.tool == "mcp.stdio-tools.echo"
     and .results[0].result.output.structuredContent.echo == "hello"' <<<"${mcp_execution}" >/dev/null
 
+mkdir -p "${mcp_exec_root}/input-tools"
+cat >"${mcp_exec_root}/input-tools/mcp.json" <<JSON
+{
+  "manifest_version": 2,
+  "id": "input-tools",
+  "name": "Fake MCP input tools",
+  "enabled": true,
+  "transport": "stdio",
+  "command": "python3",
+  "args": ["${ROOT_DIR}/tests/fake_mcp_server.py", "stdio"],
+  "env": {"FAKE_MCP_BEHAVIOR": "input_required"},
+  "protocol": {"mode": "modern_only"}
+}
+JSON
+mcp_input_plan="$(jq -cn '{
+    response_type:"work_plan",
+    summary:"mcp input continuation",
+    continue_decision:{should_continue:false, reason:"test"},
+    steps:[{
+        id:"mcp-input-1",
+        title:"call fake MCP input tool",
+        executor_type:"mcp_tool",
+        mcp_server:"input-tools",
+        mcp_tool:"echo",
+        arguments:{text:"hello"},
+        reason:"test MCP input continuation",
+        expected_effect:"pauses and resumes once",
+        risk_level:"low",
+        rollback_hint:"read-only fake tool"
+    }]
+}')"
+LINUX_AGENT_API_INPUT_JSON='["y"]'
+mcp_input_first="$(linux_agent_execute_work_plan "${mcp_input_plan}" "call MCP input tool" "{}")"
+jq -e '.status == "awaiting_mcp_input"
+    and .next_step_index == 0
+    and (.results | length) == 1
+    and .results[0].result.status == "awaiting_mcp_input"
+    and .step_states[0].status == "awaiting_mcp_input"
+    and (.resume_state.mcp_input.input_requests.email.params.mode == "form")
+    and (.resume_state.mcp_input.continuation_id | test("^[0-9a-f]{32}$"))
+    and ((tostring | contains("requestState")) | not)
+    and ((tostring | contains("continuation_file")) | not)
+    and ((tostring | contains("mcp-state.")) | not)' <<<"${mcp_input_first}" >/dev/null
+mcp_input_continuation_id="$(jq -r '.resume_state.mcp_input.continuation_id' <<<"${mcp_input_first}")"
+mcp_input_continuation_path="$(linux_agent_mcp_continuation_path "${mcp_input_continuation_id}")"
+[[ -f "${mcp_input_continuation_path}" && "$(stat -c '%a' "${mcp_input_continuation_path}")" == "600" ]]
+mcp_input_binding_path="${mcp_input_continuation_path%.json}.binding.json"
+[[ -f "${mcp_input_binding_path}" && "$(stat -c '%a' "${mcp_input_binding_path}")" == "600" ]]
+mcp_input_secret='MCP_PRIVATE_RESPONSE_7f6a1d9b'
+mcp_input_review="$(linux_agent_mcp_input_review \
+    "$(jq -c '.steps[0]' <<<"${mcp_input_plan}")" \
+    "$(jq -cn --arg secret "${mcp_input_secret}" '{email:{action:"accept",content:{email:$secret}}}')")"
+! grep -Fq "${mcp_input_secret}" <<<"${mcp_input_review}"
+mcp_input_audit_payload="$(LINUX_AGENT_CONFIG_JSON="$(jq '.audit_mode="redacted_verbose"' <<<"${LINUX_AGENT_CONFIG_JSON}")" \
+    linux_agent_audit_payload step_policy_checked \
+    "$(jq -cn --argjson step "$(jq -c '.steps[0]' <<<"${mcp_input_plan}")" --argjson detail "${mcp_input_review}" \
+        '{status:"policy_checked",step:$step,detail:$detail}')")"
+! grep -Fq "${mcp_input_secret}" <<<"${mcp_input_audit_payload}"
+LINUX_AGENT_API_INPUT_JSON='[]'
+mcp_input_resumed="$(
+    LINUX_AGENT_MCP_INPUT_RESPONSES_JSON='{"email":{"action":"accept","content":{"email":"user@example.test"}}}' \
+        LINUX_AGENT_MCP_INPUT_RESPONSES_PRESENT=true \
+        LINUX_AGENT_MCP_INPUT_CONFIRMED=true \
+        LINUX_AGENT_MCP_INPUT_CANCELLED=false \
+        linux_agent_execute_work_plan \
+        "${mcp_input_plan}" \
+        "call MCP input tool" \
+        "$(jq -c '.resume_state' <<<"${mcp_input_first}")"
+)"
+jq -e '.status == "executed"
+    and .next_step_index == 1
+    and (.results | length) == 1
+    and .results[0].result.ok == true
+    and .results[0].result.status == "executed"
+    and ((tostring | contains("user@example.test")) | not)
+    and ((tostring | contains("inputResponses")) | not)' <<<"${mcp_input_resumed}" >/dev/null
+[[ ! -e "${mcp_input_continuation_path}" ]]
+[[ ! -e "${mcp_input_binding_path}" ]]
+
+LINUX_AGENT_API_INPUT_JSON='["y"]'
+mcp_input_cancel_first="$(linux_agent_execute_work_plan "${mcp_input_plan}" "cancel MCP input tool" "{}")"
+mcp_input_cancel_id="$(jq -r '.resume_state.mcp_input.continuation_id' <<<"${mcp_input_cancel_first}")"
+mcp_input_cancel_path="$(linux_agent_mcp_continuation_path "${mcp_input_cancel_id}")"
+[[ -f "${mcp_input_cancel_path}" ]]
+mcp_input_cancelled="$(
+    LINUX_AGENT_MCP_INPUT_RESPONSES_PRESENT=false \
+        LINUX_AGENT_MCP_INPUT_CONFIRMED=false \
+        LINUX_AGENT_MCP_INPUT_CANCELLED=true \
+        linux_agent_execute_work_plan \
+        "${mcp_input_plan}" \
+        "cancel MCP input tool" \
+        "$(jq -c '.resume_state' <<<"${mcp_input_cancel_first}")"
+)"
+jq -e '.status == "failed"
+    and .results[0].result.status == "mcp_input_cancelled"
+    and .results[0].result.error_code == "mcp_input_cancelled"' \
+    <<<"${mcp_input_cancelled}" >/dev/null
+[[ ! -e "${mcp_input_cancel_path}" ]]
 unknown_remote_execution="$(
     linux_agent_download_remote_script() {
         printf '#!/usr/bin/env bash\nvendor-diagnostic --status\n' >"$2"

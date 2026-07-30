@@ -1,0 +1,9 @@
+{
+  "license_expression": "MIT",
+  "license_files": [
+    "LICENSE"
+  ],
+  "name": "attrs",
+  "source_wheel": "attrs-26.1.0-py3-none-any.whl",
+  "version": "26.1.0"
+}

@@ -38,7 +38,8 @@ project="${tmp_root}/project"
 mkdir -p "${project}"
 cp -a "${ROOT_DIR}/bin" "${ROOT_DIR}/config" "${ROOT_DIR}/lib" \
     "${ROOT_DIR}/mcp" "${ROOT_DIR}/policies" "${ROOT_DIR}/prompts" \
-    "${ROOT_DIR}/schema" "${ROOT_DIR}/web" "${project}/"
+    "${ROOT_DIR}/schema" "${ROOT_DIR}/third_party" "${ROOT_DIR}/web" \
+    "${project}/"
 mkdir -p "${project}/skills" "${project}/logs" "${project}/tmp"
 printf '# Skill Index\n' >"${project}/skills/INDEX.md"
 jq --arg url "http://127.0.0.1:${fake_port}/v1/chat/completions" \

@@ -18,6 +18,7 @@ import threading
 import time
 from pathlib import Path
 
+import mcp_credentials
 from skill_package import SkillPackageError, load_index, load_package
 from helper_protocol import (
     MAX_REQUEST_BYTES,
@@ -126,6 +127,33 @@ def _trusted_directory(path: Path, label: str) -> Path:
     if metadata.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
         raise RunnerRequestError(f"{label} must not be group/world writable")
     return path.resolve(strict=True)
+
+
+def _writable_exchange_directory(path: Path, root: Path) -> Path:
+    if path.is_symlink():
+        raise RunnerRequestError("MCP continuation output directory cannot be a symlink")
+    if not path.exists():
+        try:
+            path.mkdir(mode=0o700)
+        except OSError as exc:
+            raise RunnerRequestError(
+                "MCP continuation output directory is unavailable"
+            ) from exc
+    try:
+        resolved = path.resolve(strict=True)
+        resolved.relative_to(root.resolve(strict=True))
+        metadata = resolved.stat()
+    except (OSError, ValueError) as exc:
+        raise RunnerRequestError("MCP continuation output directory is unavailable") from exc
+    if (
+        not stat.S_ISDIR(metadata.st_mode)
+        or metadata.st_mode & stat.S_IWOTH
+        or not os.access(resolved, os.W_OK | os.X_OK)
+    ):
+        raise RunnerRequestError(
+            "MCP continuation output directory permissions are unsafe"
+        )
+    return resolved
 
 
 def _reject_json_constant(value: str) -> object:
@@ -304,6 +332,7 @@ def _runtime_roots() -> dict[str, Path]:
     )
     return {
         "root": root,
+        "data": data,
         "builtin_skills": Path(
             os.environ.get("LINUX_AGENT_BUILTIN_SKILLS_DIR", root / "skills")
         ),
@@ -311,6 +340,7 @@ def _runtime_roots() -> dict[str, Path]:
             os.environ.get("LINUX_AGENT_USER_SKILLS_DIR", data / "skills")
         ),
         "mcp": Path(os.environ.get("LINUX_AGENT_MCP_DIR", root / "mcp")).resolve(),
+        "mcp_credentials": data / "mcp" / "credentials",
         "tmp": Path(
             os.path.abspath(os.environ.get("LINUX_AGENT_TMP_ROOT", data / "runner-tmp"))
         ),
@@ -327,6 +357,7 @@ def validate_execution(
         "max_output_bytes",
         "audit_snapshot",
         "audit_snapshot_session",
+        "mcp_flow_id",
     }
     if set(params) - allowed_fields:
         raise RunnerRequestError("runner execute params contain unsupported fields")
@@ -351,6 +382,7 @@ def validate_execution(
     environment_overrides: dict[str, str] = {}
     audit_snapshot = params.get("audit_snapshot")
     audit_snapshot_session = params.get("audit_snapshot_session")
+    mcp_flow_id = params.get("mcp_flow_id")
     if (audit_snapshot is None) != (audit_snapshot_session is None):
         raise RunnerRequestError("audit snapshot path and session must be provided together")
 
@@ -424,25 +456,138 @@ def validate_execution(
         _json_object(argv[2], "remote script arguments")
         command = [_trusted_executable("bash"), script, argv[2]]
     else:
-        if len(argv) != 6 or argv[0] != "python3" or argv[2] != "call-tool":
+        if len(argv) < 4 or argv[0] != "python3":
             raise RunnerRequestError("MCP requests do not match the fixed client contract")
         client = _safe_regular_path(argv[1], (roots["root"] / "lib",), ".py")
         if Path(client).name != "mcp_client.py":
             raise RunnerRequestError("MCP client path is not allowlisted")
+        operation = argv[2]
+        if operation == "list-tools":
+            if len(argv) not in {4, 5} or len(argv) == 5 and argv[4] != "--refresh":
+                raise RunnerRequestError(
+                    "MCP tools/list requests do not match the fixed client contract"
+                )
+        elif operation == "call-tool":
+            if len(argv) not in {6, 10}:
+                raise RunnerRequestError(
+                    "MCP tools/call requests do not match the fixed client contract"
+                )
+        else:
+            raise RunnerRequestError("MCP client subcommand is not allowlisted")
         manifest = _safe_regular_path(argv[3], (roots["mcp"],), ".json")
-        if SAFE_ID_PATTERN.fullmatch(argv[4]) is None or not argv[4]:
-            raise RunnerRequestError("MCP tool name is invalid")
-        arguments = _safe_regular_path(argv[5], (roots["tmp"],), ".json")
+        try:
+            manifest_payload = json.loads(Path(manifest).read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise RunnerRequestError("MCP manifest cannot be read") from exc
+        if not isinstance(manifest_payload, dict):
+            raise RunnerRequestError("MCP manifest must be an object")
+        credential_id = manifest_payload.get("credential_profile")
+        if credential_id is not None:
+            if not isinstance(credential_id, str) or mcp_credentials.PROFILE_ID_PATTERN.fullmatch(credential_id) is None:
+                raise RunnerRequestError("MCP credential profile id is invalid")
+            credential_root = _trusted_directory(
+                roots["mcp_credentials"],
+                "MCP credential root",
+            )
+            expected_path = credential_root / f"{credential_id}.json"
+            credential_path = _safe_regular_path(
+                os.fspath(expected_path),
+                (credential_root,),
+                ".json",
+            )
+            if Path(credential_path).stat().st_mode & 0o077:
+                raise RunnerRequestError("MCP credential profile permissions must be 0600")
+            try:
+                credential_profile = mcp_credentials.load_profile(
+                    Path(credential_path), credential_id
+                )
+                manifest_server_id = manifest_payload.get("id")
+                manifest_server_url = manifest_payload.get("url")
+                if not isinstance(manifest_server_id, str) or not isinstance(
+                    manifest_server_url, str
+                ):
+                    raise mcp_credentials.McpCredentialError(
+                        "credential profiles require a Streamable HTTP MCP server"
+                    )
+                mcp_credentials.validate_binding(
+                    credential_profile, manifest_server_id, manifest_server_url
+                )
+            except mcp_credentials.McpCredentialError as exc:
+                raise RunnerRequestError(str(exc)) from exc
+            environment_overrides["__LINUX_AGENT_MCP_CREDENTIAL_PATH"] = credential_path
+            environment_overrides["__LINUX_AGENT_MCP_CREDENTIAL_ID"] = credential_id
         command = [
             _trusted_executable("python3"),
             client,
-            "call-tool",
+            operation,
             manifest,
-            argv[4],
-            arguments,
         ]
+        if operation == "list-tools":
+            if len(argv) == 5:
+                command.append("--refresh")
+            if mcp_flow_id is not None:
+                raise RunnerRequestError(
+                    "MCP flow ids are only valid for tools/call execution"
+                )
+        else:
+            if SAFE_ID_PATTERN.fullmatch(argv[4]) is None or not argv[4]:
+                raise RunnerRequestError("MCP tool name is invalid")
+            arguments = _safe_regular_path(argv[5], (roots["tmp"],), ".json")
+            command.extend([argv[4], arguments])
+            output_directory = _writable_exchange_directory(
+                Path(arguments).parent / ".mcp-output",
+                roots["tmp"],
+            )
+            environment_overrides["LINUX_AGENT_MCP_STATE_DIR"] = os.fspath(
+                output_directory
+            )
+            if len(argv) == 10:
+                if argv[6] != "--continuation" or argv[8] != "--input-responses":
+                    raise RunnerRequestError("MCP continuation arguments are invalid")
+                continuation = _safe_regular_path(
+                    argv[7], (roots["tmp"],), ".json"
+                )
+                responses = _safe_regular_path(
+                    argv[9], (roots["tmp"],), ".json"
+                )
+                if Path(responses).parent != Path(arguments).parent:
+                    raise RunnerRequestError(
+                        "MCP response files must share the argument staging directory"
+                    )
+                continuation_mode = stat.S_IMODE(Path(continuation).stat().st_mode)
+                responses_mode = stat.S_IMODE(Path(responses).stat().st_mode)
+                if continuation_mode != 0o600 or responses_mode not in {
+                    0o600,
+                    0o640,
+                }:
+                    raise RunnerRequestError(
+                        "MCP continuation exchange permissions are invalid"
+                    )
+                command.extend(
+                    [
+                        "--continuation",
+                        continuation,
+                        "--input-responses",
+                        responses,
+                    ]
+                )
+                environment_overrides["LINUX_AGENT_MCP_CONTINUATION_ROOT"] = os.fspath(
+                    Path(continuation).parent
+                )
+        if operation == "call-tool" and mcp_flow_id is not None:
+            if (
+                not isinstance(mcp_flow_id, str)
+                or not mcp_flow_id
+                or len(mcp_flow_id) > 128
+                or re.fullmatch(r"[A-Za-z0-9_.:-]+", mcp_flow_id) is None
+            ):
+                raise RunnerRequestError("MCP flow id is invalid")
+            environment_overrides["LINUX_AGENT_MCP_FLOW_ID"] = mcp_flow_id
+        environment_overrides["__LINUX_AGENT_MCP_OPERATION"] = operation
     if kind != "skill" and audit_snapshot is not None:
         raise RunnerRequestError("audit snapshots are only valid for Skill execution")
+    if kind != "mcp" and mcp_flow_id is not None:
+        raise RunnerRequestError("MCP flow ids are only valid for MCP execution")
     return str(kind), command, timeout_sec, max_output, environment_overrides
 
 
@@ -459,9 +604,13 @@ def runner_environment() -> dict[str, str]:
         "LINUX_AGENT_BUILTIN_SKILLS_DIR": os.fspath(roots["builtin_skills"]),
         "LINUX_AGENT_USER_SKILLS_DIR": os.fspath(roots["user_skills"]),
         "LINUX_AGENT_MCP_DIR": os.fspath(roots["mcp"]),
+        "LINUX_AGENT_DATA_DIR": os.fspath(roots["data"]),
         "LINUX_AGENT_TMP_ROOT": os.fspath(roots["tmp"]),
         "LINUX_AGENT_EXECUTION_ISOLATION": "runner_uid",
     }
+    stdio_socket = os.environ.get("LINUX_AGENT_MCP_STDIO_SOCKET", "")
+    if stdio_socket:
+        environment["LINUX_AGENT_MCP_STDIO_SOCKET"] = stdio_socket
     return environment
 
 
@@ -521,23 +670,68 @@ def execute(
     peer_disconnected=None,
 ) -> dict[str, object]:
     environment = runner_environment()
+    credential_path = None
+    credential_id = None
+    mcp_operation = None
     if environment_overrides:
-        environment.update(environment_overrides)
-    process = subprocess.Popen(
-        command,
-        cwd=os.fspath(_runtime_roots()["root"]),
-        env=environment,
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        start_new_session=True,
-    )
+        clean_overrides = dict(environment_overrides)
+        credential_path = clean_overrides.pop("__LINUX_AGENT_MCP_CREDENTIAL_PATH", None)
+        credential_id = clean_overrides.pop("__LINUX_AGENT_MCP_CREDENTIAL_ID", None)
+        mcp_operation = clean_overrides.pop("__LINUX_AGENT_MCP_OPERATION", None)
+        environment.update(clean_overrides)
+    credential_fd = None
+    credential_update_fd = None
+    credential_baseline = None
+    credential_baseline_sha256 = None
+    try:
+        pass_fds: tuple[int, ...] = ()
+        if credential_path is not None or credential_id is not None:
+            if not isinstance(credential_path, str) or not isinstance(credential_id, str):
+                raise RunnerRequestError("MCP credential transfer metadata is invalid")
+            (
+                credential_baseline,
+                credential_baseline_sha256,
+            ) = mcp_credentials.load_profile_snapshot(
+                Path(credential_path), credential_id
+            )
+            credential_fd = mcp_credentials.sealed_profile_payload_fd(
+                credential_baseline, credential_id
+            )
+            environment["LINUX_AGENT_MCP_CREDENTIAL_FD"] = str(credential_fd)
+            pass_fds = (credential_fd,)
+            if credential_baseline.get("type") in {
+                "oauth_authorization_code",
+                "oauth_client_credentials",
+            }:
+                credential_update_fd = mcp_credentials.oauth_update_memfd()
+                environment["LINUX_AGENT_MCP_CREDENTIAL_UPDATE_FD"] = str(
+                    credential_update_fd
+                )
+                pass_fds = (credential_fd, credential_update_fd)
+        process = subprocess.Popen(
+            command,
+            cwd=os.fspath(_runtime_roots()["root"]),
+            env=environment,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            start_new_session=True,
+            pass_fds=pass_fds,
+        )
+    except Exception:
+        if credential_update_fd is not None:
+            os.close(credential_update_fd)
+        raise
+    finally:
+        if credential_fd is not None:
+            os.close(credential_fd)
     retained: dict[str, list[bytes]] = {"stdout": [], "stderr": []}
 
     def collect(stream_name: str, chunk: bytes) -> None:
         retained[stream_name].append(chunk)
 
-    consumer = chunk_consumer or collect
+    defer_output = credential_update_fd is not None and chunk_consumer is not None
+    consumer = collect if chunk_consumer is None or defer_output else chunk_consumer
     stdout_total = [0]
     stderr_total = [0]
     overflow = threading.Event()
@@ -610,6 +804,67 @@ def execute(
         stderr_thread.join(timeout=5)
     if stdout_thread.is_alive() or stderr_thread.is_alive():
         raise RunnerRequestError("runner could not reap command output pipes")
+
+    credential_update_error = False
+    if credential_update_fd is not None:
+        try:
+            update = mcp_credentials.read_oauth_update(credential_update_fd)
+            if update is not None:
+                if (
+                    not isinstance(credential_path, str)
+                    or not isinstance(credential_id, str)
+                    or not isinstance(credential_baseline, dict)
+                ):
+                    raise RunnerRequestError(
+                        "MCP credential transfer metadata is invalid"
+                    )
+                mcp_credentials.persist_oauth_update(
+                    Path(credential_path),
+                    credential_id,
+                    credential_baseline,
+                    update,
+                    credential_baseline_sha256,
+                )
+        except (OSError, mcp_credentials.McpCredentialError, RunnerRequestError):
+            credential_update_error = True
+        finally:
+            os.close(credential_update_fd)
+
+    if credential_update_error:
+        outcome_known = True
+        if mcp_operation == "call-tool":
+            try:
+                child_payload = json.loads(
+                    b"".join(retained["stdout"]).decode("utf-8")
+                )
+                if isinstance(child_payload, dict):
+                    outcome_known = child_payload.get("outcome_known") is not False
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                pass
+        failure = json.dumps(
+            {
+                "ok": False,
+                "status": "mcp_credential_invalid",
+                "error": "MCP OAuth state could not be persisted by the Runner",
+                "outcome_known": outcome_known,
+                "fallback_used": False,
+                "fallback_reason": "",
+            },
+            ensure_ascii=True,
+            separators=(",", ":"),
+        ).encode("utf-8") + b"\n"
+        retained = {"stdout": [failure], "stderr": []}
+        stdout_total[0] = len(failure)
+        stderr_total[0] = 0
+        return_code = 1
+
+    if defer_output and chunk_consumer is not None:
+        try:
+            for stream_name in ("stdout", "stderr"):
+                for chunk in retained[stream_name]:
+                    chunk_consumer(stream_name, chunk)
+        except (OSError, ProtocolError):
+            transport_failed.set()
     if return_code < 0:
         return_code = 128 + abs(return_code)
     output_capped = overflow.is_set()
@@ -992,6 +1247,14 @@ def request(
     if audit_snapshot or audit_snapshot_session:
         params["audit_snapshot"] = audit_snapshot
         params["audit_snapshot_session"] = audit_snapshot_session
+    if kind == "mcp" and len(argv) >= 3 and argv[2] == "call-tool":
+        flow_id = os.environ.get("LINUX_AGENT_MCP_FLOW_ID", "")
+        if not flow_id:
+            flow_id = os.environ.get("LINUX_AGENT_JOB_ID", "") or os.environ.get(
+                "LINUX_AGENT_SESSION_ID", ""
+            )
+        if flow_id:
+            params["mcp_flow_id"] = flow_id
     payload = build_request(
         "execute",
         params,
@@ -1033,6 +1296,55 @@ def request(
     return max(0, min(255, exit_code))
 
 
+def local_mcp(argv: list[str]) -> int:
+    """Run only the fixed MCP contract without a systemd Runner socket."""
+
+    try:
+        timeout_sec = int(
+            os.environ.get("LINUX_AGENT_EXECUTION_TIMEOUT_SEC", "300")
+        )
+        max_output = int(
+            os.environ.get("LINUX_AGENT_EXECUTION_MAX_OUTPUT_BYTES", "1048576")
+        )
+        params: dict[str, object] = {
+            "kind": "mcp",
+            "argv": argv,
+            "timeout_sec": timeout_sec,
+            "max_output_bytes": max_output,
+        }
+        if len(argv) >= 3 and argv[2] == "call-tool":
+            flow_id = os.environ.get("LINUX_AGENT_MCP_FLOW_ID", "")
+            if not flow_id:
+                flow_id = os.environ.get(
+                    "LINUX_AGENT_JOB_ID", ""
+                ) or os.environ.get("LINUX_AGENT_SESSION_ID", "")
+            if flow_id:
+                params["mcp_flow_id"] = flow_id
+        _kind, command, timeout_sec, max_output, overrides = validate_execution(
+            params
+        )
+        response = execute(command, timeout_sec, max_output, overrides)
+    except RunnerRequestError as exc:
+        print(f"local MCP runner rejected request: {exc}", file=sys.stderr)
+        return 126
+    except (OSError, ValueError, mcp_credentials.McpCredentialError) as exc:
+        print(f"local MCP runner failed: {exc}", file=sys.stderr)
+        return 125
+
+    stdout = response.get("stdout", "")
+    stderr = response.get("stderr", "")
+    if isinstance(stdout, str) and stdout:
+        sys.stdout.write(stdout)
+        sys.stdout.flush()
+    if isinstance(stderr, str) and stderr:
+        sys.stderr.write(stderr)
+        sys.stderr.flush()
+    exit_code = response.get("exit_code", 0 if response.get("ok") else 125)
+    if isinstance(exit_code, bool) or not isinstance(exit_code, int):
+        return 125
+    return max(0, min(255, exit_code))
+
+
 def ping(socket_path: str) -> int:
     try:
         response = client_request(
@@ -1051,6 +1363,8 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     subparsers = parser.add_subparsers(dest="command", required=True)
     subparsers.add_parser("serve")
+    local_mcp_parser = subparsers.add_parser("local-mcp")
+    local_mcp_parser.add_argument("argv", nargs=argparse.REMAINDER)
     request_parser = subparsers.add_parser("request")
     request_parser.add_argument("--socket", default=os.environ.get("LINUX_AGENT_RUNNER_SOCKET", DEFAULT_SOCKET))
     request_parser.add_argument("--kind", choices=sorted(EXECUTION_KINDS), required=True)
@@ -1065,6 +1379,11 @@ def main() -> int:
         return serve()
     if args.command == "ping":
         return ping(args.socket)
+    if args.command == "local-mcp":
+        argv = list(args.argv)
+        if argv and argv[0] == "--":
+            argv.pop(0)
+        return local_mcp(argv)
     argv = list(args.argv)
     if argv and argv[0] == "--":
         argv.pop(0)

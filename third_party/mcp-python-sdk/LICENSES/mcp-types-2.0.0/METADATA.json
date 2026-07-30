@@ -1,0 +1,9 @@
+{
+  "license_expression": "MIT",
+  "license_files": [
+    "LICENSE"
+  ],
+  "name": "mcp-types",
+  "source_wheel": "mcp_types-2.0.0-py3-none-any.whl",
+  "version": "2.0.0"
+}

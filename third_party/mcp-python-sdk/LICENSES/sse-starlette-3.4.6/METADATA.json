@@ -1,0 +1,10 @@
+{
+  "license_expression": "BSD-3-Clause",
+  "license_files": [
+    "AUTHORS",
+    "LICENSE"
+  ],
+  "name": "sse-starlette",
+  "source_wheel": "sse_starlette-3.4.6-py3-none-any.whl",
+  "version": "3.4.6"
+}

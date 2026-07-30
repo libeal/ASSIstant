@@ -1,0 +1,9 @@
+{
+  "license_expression": "MIT",
+  "license_files": [
+    "LICENSE"
+  ],
+  "name": "pydantic_core",
+  "source_wheel": "pydantic_core-2.46.4-cp310-cp310-manylinux_2_17_aarch64.manylinux2014_aarch64.whl",
+  "version": "2.46.4"
+}

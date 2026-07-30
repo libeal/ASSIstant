@@ -1,0 +1,9 @@
+{
+  "license_expression": "MIT",
+  "license_files": [
+    "LICENSE"
+  ],
+  "name": "anyio",
+  "source_wheel": "anyio-4.14.2-py3-none-any.whl",
+  "version": "4.14.2"
+}

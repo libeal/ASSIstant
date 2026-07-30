@@ -289,6 +289,41 @@ class ExecutionServiceTest(unittest.TestCase):
         self.assertFalse(result["cancelled"])
         self.assertNotIn("timeout", self.registry)
 
+    def test_mcp_input_responses_use_private_staging_and_leave_argv(self):
+        secret_response = "private-user-response"
+        payload = {
+            "fixture": "json",
+            "mcp_input_responses": {
+                "request": {
+                    "action": "accept",
+                    "content": {"value": secret_response},
+                }
+            },
+            "mcp_input_confirmed": True,
+        }
+        context = self.job_context("mcpinput")
+
+        staged, path = self.service._stage_mcp_input_payload(payload, context)
+
+        self.assertIsNotNone(path)
+        self.assertNotIn("mcp_input_responses", staged)
+        self.assertNotIn(secret_response, json.dumps(staged, sort_keys=True))
+        self.assertEqual(0o600, path.stat().st_mode & 0o777)
+        self.assertIn(secret_response, path.read_text(encoding="utf-8"))
+        path.unlink()
+
+        result = self.service.run_job(
+            "work",
+            "run",
+            payload,
+            context=context,
+            timeout=2,
+        )
+
+        self.assertTrue(result["ok"])
+        self.assertNotIn(secret_response, json.dumps(result, sort_keys=True))
+        self.assertFalse(list(self.tmp_dir.glob("mcp-input-responses.*.json")))
+
     def test_ignore_term_job_is_killed_and_reaped(self):
         pid_file = self.root / "ignore-term.pid"
         context = self.job_context("ignoreterm")

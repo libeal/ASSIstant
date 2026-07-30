@@ -103,13 +103,15 @@ cp -a \
     "${ROOT_DIR}/config/config.example.json" \
     "${ROOT_DIR}/config/ai-providers.json" \
     "${core_stage}/config/"
-cp -a "${ROOT_DIR}/schema/domain.json" "${core_stage}/schema/domain.json"
+cp -a "${ROOT_DIR}/schema/"*.json "${core_stage}/schema/"
 cp -a \
     "${ROOT_DIR}/packaging/linux-agent-web.service" \
     "${ROOT_DIR}/packaging/linux-agent-observer-helper.service" \
     "${ROOT_DIR}/packaging/linux-agent-observer-helper.socket" \
     "${ROOT_DIR}/packaging/linux-agent-runner.service" \
     "${ROOT_DIR}/packaging/linux-agent-runner.socket" \
+    "${ROOT_DIR}/packaging/linux-agent-mcp-stdio.service" \
+    "${ROOT_DIR}/packaging/linux-agent-mcp-stdio.socket" \
     "${ROOT_DIR}/packaging/linux-agent-host-ops.service" \
     "${ROOT_DIR}/packaging/linux-agent-host-ops.socket" \
     "${ROOT_DIR}/packaging/linux-agent-policy-writer.service" \
@@ -135,6 +137,14 @@ mkdir -p "${web_stage}/bin"
 cp -a "${ROOT_DIR}/bin/agent-web" "${web_stage}/bin/agent-web"
 copy_tree_without_cache "${ROOT_DIR}/web" "${web_stage}/web"
 create_archive "${web_stage}" "${OUTPUT_DIR}/linux-agent-web.tar.gz"
+
+mcp_sdk_stage="${tmp_root}/mcp-sdk"
+mkdir -p "${mcp_sdk_stage}/third_party"
+copy_tree_without_cache \
+    "${ROOT_DIR}/third_party/mcp-python-sdk" \
+    "${mcp_sdk_stage}/third_party/mcp-python-sdk"
+python3 "${ROOT_DIR}/scripts/update-mcp-wheelhouse.py" check >/dev/null
+create_archive "${mcp_sdk_stage}" "${OUTPUT_DIR}/linux-agent-mcp-sdk.tar.gz"
 
 skills_json='{}'
 while IFS= read -r skill_dir; do
@@ -222,6 +232,23 @@ sbom_relationships='[
     {"spdxElementId":"SPDXRef-Package-linux-agent","relationshipType":"DEPENDS_ON","relatedSpdxElement":"SPDXRef-Package-python3"},
     {"spdxElementId":"SPDXRef-Package-linux-agent","relationshipType":"DEPENDS_ON","relatedSpdxElement":"SPDXRef-Package-util-linux"}
 ]'
+mcp_sdk_packages="$(jq -c '[.[] | {
+    name,
+    SPDXID:("SPDXRef-Package-mcp-sdk-" + (.name | gsub("[^A-Za-z0-9.-]"; "-")) + "-" + (.version | gsub("[^A-Za-z0-9.-]"; "-"))),
+    versionInfo:.version,
+    downloadLocation:"NOASSERTION",
+    filesAnalyzed:false,
+    licenseConcluded:(.license_expression // "NOASSERTION"),
+    licenseDeclared:(.license_expression // "NOASSERTION"),
+    copyrightText:"NOASSERTION",
+    comment:("Pinned offline MCP SDK dependency from " + .source_wheel)
+}]' "${ROOT_DIR}/third_party/mcp-python-sdk/LICENSES/INDEX.json")"
+mcp_sdk_relationships="$(jq -c '[.[] | {
+    spdxElementId:"SPDXRef-Package-linux-agent",
+    relationshipType:"DEPENDS_ON",
+    relatedSpdxElement:("SPDXRef-Package-mcp-sdk-" + (.name | gsub("[^A-Za-z0-9.-]"; "-")) + "-" + (.version | gsub("[^A-Za-z0-9.-]"; "-")))
+}]' "${ROOT_DIR}/third_party/mcp-python-sdk/LICENSES/INDEX.json")"
+sbom_relationships="$(jq -cn --argjson base "${sbom_relationships}" --argjson mcp "${mcp_sdk_relationships}" '$base + $mcp')"
 while IFS= read -r name; do
     file_sha="$(sha256sum "${OUTPUT_DIR}/${name}" | awk '{print $1}')"
     file_id="SPDXRef-File-${file_sha}"
@@ -244,6 +271,7 @@ jq -S -n \
     --arg namespace "https://github.com/libeal/ASSIstant/releases/download/${VERSION}/sbom.spdx.json" \
     --argjson files "${sbom_files}" \
     --argjson relationships "${sbom_relationships}" \
+    --argjson mcp_sdk_packages "${mcp_sdk_packages}" \
     '{
         spdxVersion:"SPDX-2.3",
         dataLicense:"CC0-1.0",
@@ -251,14 +279,14 @@ jq -S -n \
         name:("linux-agent-" + $version),
         documentNamespace:$namespace,
         creationInfo:{created:$created, creators:["Tool: linux-agent-release-builder"]},
-        packages:[
-            {name:"linux-agent", SPDXID:"SPDXRef-Package-linux-agent", versionInfo:$version, downloadLocation:$namespace, filesAnalyzed:false, licenseConcluded:"NOASSERTION", licenseDeclared:"NOASSERTION", copyrightText:"NOASSERTION", comment:"Linux 运维 Agent 发布物；运行时零 npm/pip 依赖。"},
+        packages:([
+            {name:"linux-agent", SPDXID:"SPDXRef-Package-linux-agent", versionInfo:$version, downloadLocation:$namespace, filesAnalyzed:false, licenseConcluded:"NOASSERTION", licenseDeclared:"NOASSERTION", copyrightText:"NOASSERTION", comment:"Linux 运维 Agent 发布物；MCP Python SDK 依赖由签名离线 wheelhouse 提供。"},
             {name:"bash", SPDXID:"SPDXRef-Package-bash", downloadLocation:"NOASSERTION", filesAnalyzed:false, licenseConcluded:"NOASSERTION", licenseDeclared:"NOASSERTION", copyrightText:"NOASSERTION", comment:"系统运行时依赖"},
             {name:"curl", SPDXID:"SPDXRef-Package-curl", downloadLocation:"NOASSERTION", filesAnalyzed:false, licenseConcluded:"NOASSERTION", licenseDeclared:"NOASSERTION", copyrightText:"NOASSERTION", comment:"系统运行时依赖"},
             {name:"jq", SPDXID:"SPDXRef-Package-jq", downloadLocation:"NOASSERTION", filesAnalyzed:false, licenseConcluded:"NOASSERTION", licenseDeclared:"NOASSERTION", copyrightText:"NOASSERTION", comment:"系统运行时依赖"},
             {name:"python3", SPDXID:"SPDXRef-Package-python3", downloadLocation:"NOASSERTION", filesAnalyzed:false, licenseConcluded:"NOASSERTION", licenseDeclared:"NOASSERTION", copyrightText:"NOASSERTION", comment:"系统运行时依赖"},
             {name:"util-linux", SPDXID:"SPDXRef-Package-util-linux", downloadLocation:"NOASSERTION", filesAnalyzed:false, licenseConcluded:"NOASSERTION", licenseDeclared:"NOASSERTION", copyrightText:"NOASSERTION", comment:"提供 flock 的系统运行时依赖"}
-        ],
+        ] + $mcp_sdk_packages),
         files:$files,
         relationships:$relationships
     }' >"${OUTPUT_DIR}/sbom.spdx.json"
@@ -280,6 +308,7 @@ jq -S -n \
     --argjson bootstrap_web "$(asset_json linux-agent-web.sh)" \
     --argjson core "$(asset_json linux-agent-core.tar.gz)" \
     --argjson web "$(asset_json linux-agent-web.tar.gz)" \
+    --argjson mcp_sdk "$(asset_json linux-agent-mcp-sdk.tar.gz)" \
     --argjson installer "$(asset_json linux-agent-install.sh)" \
     --argjson sbom "$(asset_json sbom.spdx.json)" \
     --argjson checksums "$(asset_json SHA256SUMS)" \
@@ -293,6 +322,7 @@ jq -S -n \
             bootstrap_web:$bootstrap_web,
             core:$core,
             web:$web,
+            mcp_sdk:$mcp_sdk,
             installer:$installer,
             sbom:$sbom,
             checksums:$checksums

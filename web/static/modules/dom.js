@@ -28,7 +28,7 @@ export function setText(id, value) {
 /** @param {string} kind @returns {string} */
 export function pillKind(kind) {
   if (["ok", "low", "succeeded", "completed", "read", "saved"].includes(kind)) return "low";
-  if (["warn", "medium", "running", "queued", "approval_required", "planning", "review"].includes(kind)) return "medium";
+  if (["warn", "medium", "running", "queued", "approval_required", "awaiting_mcp_input", "planning", "review"].includes(kind)) return "medium";
   if (["err", "error", "failed", "high", "critical"].includes(kind)) return "high";
   return "";
 }

@@ -1,0 +1,9 @@
+{
+  "license_expression": "MIT",
+  "license_files": [
+    "LICENSE"
+  ],
+  "name": "annotated-types",
+  "source_wheel": "annotated_types-0.8.0-py3-none-any.whl",
+  "version": "0.8.0"
+}

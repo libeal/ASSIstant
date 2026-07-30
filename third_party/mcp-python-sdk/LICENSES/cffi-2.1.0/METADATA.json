@@ -1,0 +1,9 @@
+{
+  "license_expression": "MIT-0",
+  "license_files": [
+    "LICENSE"
+  ],
+  "name": "cffi",
+  "source_wheel": "cffi-2.1.0-cp310-cp310-manylinux2014_aarch64.manylinux_2_17_aarch64.whl",
+  "version": "2.1.0"
+}

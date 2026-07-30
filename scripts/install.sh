@@ -38,6 +38,8 @@ SYSTEMD_HELPER_SERVICE_PATH="${LINUX_AGENT_SYSTEMD_HELPER_SERVICE_PATH:-${SYSTEM
 SYSTEMD_HELPER_SOCKET_PATH="${LINUX_AGENT_SYSTEMD_HELPER_SOCKET_PATH:-${SYSTEMD_UNIT_DIR}/linux-agent-observer-helper.socket}"
 SYSTEMD_RUNNER_SERVICE_PATH="${LINUX_AGENT_SYSTEMD_RUNNER_SERVICE_PATH:-${SYSTEMD_UNIT_DIR}/linux-agent-runner.service}"
 SYSTEMD_RUNNER_SOCKET_PATH="${LINUX_AGENT_SYSTEMD_RUNNER_SOCKET_PATH:-${SYSTEMD_UNIT_DIR}/linux-agent-runner.socket}"
+SYSTEMD_MCP_STDIO_SERVICE_PATH="${LINUX_AGENT_SYSTEMD_MCP_STDIO_SERVICE_PATH:-${SYSTEMD_UNIT_DIR}/linux-agent-mcp-stdio.service}"
+SYSTEMD_MCP_STDIO_SOCKET_PATH="${LINUX_AGENT_SYSTEMD_MCP_STDIO_SOCKET_PATH:-${SYSTEMD_UNIT_DIR}/linux-agent-mcp-stdio.socket}"
 SYSTEMD_HOST_SERVICE_PATH="${LINUX_AGENT_SYSTEMD_HOST_SERVICE_PATH:-${SYSTEMD_UNIT_DIR}/linux-agent-host-ops.service}"
 SYSTEMD_HOST_SOCKET_PATH="${LINUX_AGENT_SYSTEMD_HOST_SOCKET_PATH:-${SYSTEMD_UNIT_DIR}/linux-agent-host-ops.socket}"
 SYSTEMD_POLICY_SERVICE_PATH="${LINUX_AGENT_SYSTEMD_POLICY_SERVICE_PATH:-${SYSTEMD_UNIT_DIR}/linux-agent-policy-writer.service}"
@@ -851,6 +853,8 @@ EOF
     done <<EOF
 ${SYSTEMD_RUNNER_SERVICE_PATH}	linux-agent-runner.service
 ${SYSTEMD_RUNNER_SOCKET_PATH}	linux-agent-runner.socket
+${SYSTEMD_MCP_STDIO_SERVICE_PATH}	linux-agent-mcp-stdio.service
+${SYSTEMD_MCP_STDIO_SOCKET_PATH}	linux-agent-mcp-stdio.socket
 ${SYSTEMD_HOST_SERVICE_PATH}	linux-agent-host-ops.service
 ${SYSTEMD_HOST_SOCKET_PATH}	linux-agent-host-ops.socket
 ${SYSTEMD_POLICY_SERVICE_PATH}	linux-agent-policy-writer.service
@@ -877,7 +881,8 @@ EOF
         fi
     done < <(transaction_credential_file_rows)
     : >"${TRANSACTION_BACKUP_DIR}/systemd-extra/runtime.tsv"
-    for unit in linux-agent-runner.socket linux-agent-host-ops.socket linux-agent-policy-writer.socket; do
+    for unit in linux-agent-runner.socket linux-agent-mcp-stdio.socket \
+        linux-agent-host-ops.socket linux-agent-policy-writer.socket; do
         enabled=0
         active=0
         systemctl is-enabled --quiet "${unit}" >/dev/null 2>&1 && enabled=1
@@ -919,6 +924,7 @@ stop_transaction_services() {
         linux-agent-web.service \
         linux-agent-observer-helper.service linux-agent-observer-helper.socket \
         linux-agent-runner.service linux-agent-runner.socket \
+        linux-agent-mcp-stdio.service linux-agent-mcp-stdio.socket \
         linux-agent-host-ops.service linux-agent-host-ops.socket \
         linux-agent-policy-writer.service linux-agent-policy-writer.socket; do
         if systemctl is-active --quiet "${unit}" >/dev/null 2>&1; then
@@ -1092,6 +1098,7 @@ rollback_transaction() {
         "${current_target}" == "releases/${TRANSACTION_TARGET_VERSION}" ]]; then
         systemctl stop linux-agent-web.service >/dev/null 2>&1 || true
         systemctl stop linux-agent-observer-helper.socket linux-agent-runner.socket \
+            linux-agent-mcp-stdio.socket \
             linux-agent-host-ops.socket linux-agent-policy-writer.socket >/dev/null 2>&1 || true
         while IFS=$'\t' read -r _package _component _client _socket_env _socket_path \
             _service_asset socket_asset _egress_dropin; do
@@ -1288,6 +1295,7 @@ validate_manifest() {
         and (.assets | type == "object")
         and (.assets.core | valid_asset)
         and (.assets.web | valid_asset)
+        and (.assets.mcp_sdk | valid_asset)
         and (.assets.installer | valid_asset)
         and ([.assets[] | valid_asset] | all)
         and (.assets.installer.name == "linux-agent-install.sh")
@@ -1504,7 +1512,7 @@ PY
 
 prepare_release() {
     local release_dir="${PREFIX}/releases/${VERSION}"
-    local manifest base_url core_archive web_archive skill_name skill_archive selector
+    local manifest base_url core_archive web_archive mcp_sdk_archive skill_name skill_archive selector
     local expected_contract actual_contract expected_index actual_index index_json validation
     local expected_components actual_components
     local -a skill_names=()
@@ -1530,9 +1538,12 @@ prepare_release() {
 
     core_archive="$(obtain_asset "${manifest}" '.assets.core' "${base_url}")"
     web_archive="$(obtain_asset "${manifest}" '.assets.web' "${base_url}")"
+    mcp_sdk_archive="$(obtain_asset "${manifest}" '.assets.mcp_sdk' "${base_url}")"
     mkdir -p "${WORK_DIR}/release"
     extract_archive_safely "${core_archive}" "${WORK_DIR}/release" || fail 'core archive 安全解包失败'
     extract_archive_safely "${web_archive}" "${WORK_DIR}/release" || fail 'web archive 安全解包失败'
+    extract_archive_safely "${mcp_sdk_archive}" "${WORK_DIR}/release" ||
+        fail 'MCP SDK archive 安全解包失败'
     [[ -f "${WORK_DIR}/release/skills/INDEX.md" &&
         ! -L "${WORK_DIR}/release/skills/INDEX.md" ]] ||
         fail 'core archive 缺少 skills/INDEX.md'
@@ -1599,16 +1610,24 @@ prepare_release() {
     [[ -x "${WORK_DIR}/release/bin/agent" && -x "${WORK_DIR}/release/bin/agent-web" ]] ||
         fail '发布物缺少可执行入口'
     [[ -f "${WORK_DIR}/release/config/config.example.json" &&
+        -f "${WORK_DIR}/release/third_party/mcp-python-sdk/SHA256SUMS" &&
         -f "${WORK_DIR}/release/packaging/linux-agent-web.service" &&
         -f "${WORK_DIR}/release/packaging/linux-agent-observer-helper.service" &&
         -f "${WORK_DIR}/release/packaging/linux-agent-observer-helper.socket" &&
         -f "${WORK_DIR}/release/packaging/linux-agent-runner.service" &&
         -f "${WORK_DIR}/release/packaging/linux-agent-runner.socket" &&
+        -f "${WORK_DIR}/release/packaging/linux-agent-mcp-stdio.service" &&
+        -f "${WORK_DIR}/release/packaging/linux-agent-mcp-stdio.socket" &&
         -f "${WORK_DIR}/release/packaging/linux-agent-host-ops.service" &&
         -f "${WORK_DIR}/release/packaging/linux-agent-host-ops.socket" &&
         -f "${WORK_DIR}/release/packaging/linux-agent-policy-writer.service" &&
         -f "${WORK_DIR}/release/packaging/linux-agent-policy-writer.socket" ]] ||
         fail '发布物缺少配置或 systemd unit'
+    LINUX_AGENT_ROOT="${WORK_DIR}/release" \
+        LINUX_AGENT_MCP_SDK_ROOT="${WORK_DIR}/release/third_party/mcp-python-sdk" \
+        LINUX_AGENT_MCP_VENV="${WORK_DIR}/release/.mcp-venv" \
+        python3 "${WORK_DIR}/release/lib/mcp_runtime.py" ensure >/dev/null ||
+        fail '无法从离线 wheelhouse 创建 release MCP SDK runtime'
     rm -rf -- "${WORK_DIR}/release/logs" "${WORK_DIR}/release/tmp"
 
     mkdir -p "${WORK_DIR}/persistent-config"
@@ -1635,12 +1654,13 @@ prepare_persistent_layout() {
         -f "${config_source}/ai-providers.json" &&
         ! -L "${config_source}/ai-providers.json" ]] ||
         fail '安装 staging 缺少持久配置模板'
-    for path in data data/config data/logs data/tmp data/skills data/policies data/runner-tmp; do
+    for path in data data/config data/logs data/tmp data/skills data/policies data/runner-tmp data/mcp data/mcp/credentials; do
         assert_plain_directory "${PREFIX}/${path}" ||
             fail "持久数据路径必须是普通目录且不能是符号链接: ${PREFIX}/${path}"
     done
     mkdir -p "${PREFIX}/data/config" "${PREFIX}/data/logs" "${PREFIX}/data/tmp" \
-        "${PREFIX}/data/skills" "${PREFIX}/data/policies" "${PREFIX}/data/runner-tmp"
+        "${PREFIX}/data/skills" "${PREFIX}/data/policies" "${PREFIX}/data/runner-tmp" \
+        "${PREFIX}/data/mcp/credentials"
     target="${PREFIX}/data/.runtime.lock"
     assert_plain_file "${target}" || fail "runtime 事务锁必须是普通文件且不能是符号链接: ${target}"
     if [[ ! -e "${target}" ]]; then
@@ -1666,7 +1686,8 @@ prepare_persistent_layout() {
     if [[ "${NO_SYSTEMD}" -eq 1 ]]; then
         chmod 0700 "${PREFIX}/data" "${PREFIX}/data/config" "${PREFIX}/data/logs" \
             "${PREFIX}/data/tmp" "${PREFIX}/data/skills" "${PREFIX}/data/policies" \
-            "${PREFIX}/data/runner-tmp"
+            "${PREFIX}/data/runner-tmp" "${PREFIX}/data/mcp" \
+            "${PREFIX}/data/mcp/credentials"
         chmod 0600 "${PREFIX}/data/.runtime.lock"
     fi
 }
@@ -1832,6 +1853,7 @@ configure_managed_data_permissions() {
     [[ "${NO_SYSTEMD}" -eq 0 ]] || return 0
     mkdir -p -- "${PREFIX}/data/config" "${PREFIX}/data/logs" "${PREFIX}/data/tmp" \
         "${PREFIX}/data/skills" "${PREFIX}/data/policies" "${PREFIX}/data/runner-tmp" \
+        "${PREFIX}/data/mcp/credentials" \
         "${PREFIX}/data/migration-reports" "${PREFIX}/data/migration-conflicts"
     chown root:root "${PREFIX}/data"
     chmod 0755 "${PREFIX}/data"
@@ -1844,6 +1866,9 @@ configure_managed_data_permissions() {
     chmod 0640 "${PREFIX}/data/.runtime.lock"
     find "${PREFIX}/data/skills" "${PREFIX}/data/runner-tmp" -type d -exec chmod 2750 -- {} +
     find "${PREFIX}/data/skills" -type f -exec chmod 0640 -- {} +
+    chown -R "${RUNNER_USER}:${RUNNER_GROUP}" "${PREFIX}/data/mcp"
+    find "${PREFIX}/data/mcp" -type d -exec chmod 0700 -- {} +
+    find "${PREFIX}/data/mcp/credentials" -type f -exec chmod 0600 -- {} +
     chown -R "root:${SERVICE_GROUP}" "${PREFIX}/data/policies"
     find "${PREFIX}/data/policies" -type d -exec chmod 0750 -- {} +
     find "${PREFIX}/data/policies" -type f -exec chmod 0640 -- {} +
@@ -2002,9 +2027,10 @@ PY
 
 verify_runner_runtime_access() {
     local probe="${PREFIX}/data/runner-tmp/.runner-permission-probe.$$"
+    local credential_probe="${PREFIX}/data/mcp/credentials/.runner-credential-probe.$$"
     local -a command=(python3 - "${probe}" "${PREFIX}/data/skills"
         "${PREFIX}/data/config/config.json" "${PREFIX}/data/logs"
-        "${PREFIX}/data/policies")
+        "${PREFIX}/data/policies" "${credential_probe}")
     [[ "${NO_SYSTEMD}" -eq 0 ]] || return 0
     printf 'runner-permission-probe\n' >"${probe}"
     chown "${SERVICE_USER}:${RUNNER_GROUP}" "${probe}"
@@ -2020,7 +2046,7 @@ import os
 import sys
 from pathlib import Path
 
-probe, skills, config, logs, policies = map(Path, sys.argv[1:])
+probe, skills, config, logs, policies, credential_probe = map(Path, sys.argv[1:])
 if probe.read_text(encoding="utf-8") != "runner-permission-probe\n":
     raise SystemExit("runner cannot read shared execution staging")
 if not skills.is_dir() or not os.access(skills, os.R_OK | os.X_OK):
@@ -2035,11 +2061,22 @@ if os.environ.get("LINUX_AGENT_TEST_RUNNER_IS_ROOT") != "1":
     for protected in (config.parent, logs, policies):
         if os.access(protected, os.R_OK | os.X_OK):
             raise SystemExit(f"runner can traverse protected Agent data: {protected}")
+descriptor = os.open(
+    credential_probe,
+    os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+    0o600,
+)
+try:
+    os.write(descriptor, b"credential-probe\n")
+    os.fsync(descriptor)
+finally:
+    os.close(descriptor)
+credential_probe.unlink()
 PY
-        rm -f -- "${probe}"
+        rm -f -- "${probe}" "${credential_probe}"
         fail "Runner 用户 ${RUNNER_USER} 的隔离权限检查失败"
     fi
-    rm -f -- "${probe}"
+    rm -f -- "${probe}" "${credential_probe}"
 }
 
 verify_systemd_unit_files() {
@@ -2049,6 +2086,7 @@ verify_systemd_unit_files() {
         "${SYSTEMD_UNIT_PATH}" "${SYSTEMD_HELPER_SERVICE_PATH}"
         "${SYSTEMD_HELPER_SOCKET_PATH}"
         "${SYSTEMD_RUNNER_SERVICE_PATH}" "${SYSTEMD_RUNNER_SOCKET_PATH}"
+        "${SYSTEMD_MCP_STDIO_SERVICE_PATH}" "${SYSTEMD_MCP_STDIO_SOCKET_PATH}"
         "${SYSTEMD_HOST_SERVICE_PATH}" "${SYSTEMD_HOST_SOCKET_PATH}"
         "${SYSTEMD_POLICY_SERVICE_PATH}" "${SYSTEMD_POLICY_SOCKET_PATH}"
     )
@@ -2072,6 +2110,13 @@ verify_systemd_unit_files() {
         grep -Fxq "SocketGroup=${SERVICE_GROUP}" "${SYSTEMD_RUNNER_SOCKET_PATH}" &&
         grep -Fxq 'SocketMode=0600' "${SYSTEMD_RUNNER_SOCKET_PATH}" ||
         fail 'Runner unit 未落实独立 UID 或仅 Web 可连接的 socket 边界'
+    grep -Fxq 'DynamicUser=yes' "${SYSTEMD_MCP_STDIO_SERVICE_PATH}" &&
+        grep -Fxq "Environment=LINUX_AGENT_SERVICE_USER=${RUNNER_USER}" \
+            "${SYSTEMD_MCP_STDIO_SERVICE_PATH}" &&
+        grep -Fxq 'SocketUser=root' "${SYSTEMD_MCP_STDIO_SOCKET_PATH}" &&
+        grep -Fxq "SocketGroup=${RUNNER_GROUP}" "${SYSTEMD_MCP_STDIO_SOCKET_PATH}" &&
+        grep -Fxq 'SocketMode=0660' "${SYSTEMD_MCP_STDIO_SOCKET_PATH}" ||
+        fail 'MCP stdio relay 未落实 DynamicUser 与仅 Runner 可连接的 socket 边界'
     for output_file in "${SYSTEMD_HELPER_SOCKET_PATH}" "${SYSTEMD_HOST_SOCKET_PATH}" \
         "${SYSTEMD_POLICY_SOCKET_PATH}"; do
         grep -Fxq 'SocketUser=root' "${output_file}" &&
@@ -2393,6 +2438,9 @@ replacements = {
     "Environment=LINUX_AGENT_SERVICE_USER=linux-agent": (
         f"Environment=LINUX_AGENT_SERVICE_USER={web_user}"
     ),
+    "Environment=LINUX_AGENT_SERVICE_USER=linux-agent-runner": (
+        f"Environment=LINUX_AGENT_SERVICE_USER={runner_user}"
+    ),
     "Environment=LINUX_AGENT_HOST_OPS_POLICY_PATH=/etc/linux-agent/host-ops-policy.json": (
         f"Environment=LINUX_AGENT_HOST_OPS_POLICY_PATH={host_ops_policy}"
     ),
@@ -2429,6 +2477,8 @@ ${PREFIX}/current/packaging/linux-agent-observer-helper.service	${SYSTEMD_HELPER
 ${PREFIX}/current/packaging/linux-agent-observer-helper.socket	${SYSTEMD_HELPER_SOCKET_PATH}
 ${PREFIX}/current/packaging/linux-agent-runner.service	${SYSTEMD_RUNNER_SERVICE_PATH}
 ${PREFIX}/current/packaging/linux-agent-runner.socket	${SYSTEMD_RUNNER_SOCKET_PATH}
+${PREFIX}/current/packaging/linux-agent-mcp-stdio.service	${SYSTEMD_MCP_STDIO_SERVICE_PATH}
+${PREFIX}/current/packaging/linux-agent-mcp-stdio.socket	${SYSTEMD_MCP_STDIO_SOCKET_PATH}
 ${PREFIX}/current/packaging/linux-agent-host-ops.service	${SYSTEMD_HOST_SERVICE_PATH}
 ${PREFIX}/current/packaging/linux-agent-host-ops.socket	${SYSTEMD_HOST_SOCKET_PATH}
 ${PREFIX}/current/packaging/linux-agent-policy-writer.service	${SYSTEMD_POLICY_SERVICE_PATH}
@@ -2737,6 +2787,7 @@ restart_and_check() {
     local -a credential_units=()
     local -a units=(
         linux-agent-observer-helper.socket linux-agent-runner.socket
+        linux-agent-mcp-stdio.socket
         linux-agent-host-ops.socket linux-agent-policy-writer.socket
     )
     [[ "${NO_SYSTEMD}" -eq 0 ]] || return 0
@@ -2754,6 +2805,8 @@ run_install_health_check() {
         linux-agent-observer-helper.socket
         linux-agent-runner.service
         linux-agent-runner.socket
+        linux-agent-mcp-stdio.service
+        linux-agent-mcp-stdio.socket
         linux-agent-host-ops.service
         linux-agent-host-ops.socket
         linux-agent-policy-writer.service
@@ -2762,6 +2815,7 @@ run_install_health_check() {
     local -a credential_units=()
     local -a start_units=(
         linux-agent-observer-helper.socket linux-agent-runner.socket
+        linux-agent-mcp-stdio.socket
         linux-agent-host-ops.socket linux-agent-policy-writer.socket
     )
     mapfile -t credential_units < <(installed_credential_unit_names)
@@ -2814,6 +2868,8 @@ report_install_health_failure() {
         linux-agent-observer-helper.socket
         linux-agent-runner.service
         linux-agent-runner.socket
+        linux-agent-mcp-stdio.service
+        linux-agent-mcp-stdio.socket
         linux-agent-host-ops.service
         linux-agent-host-ops.socket
         linux-agent-policy-writer.service
@@ -2833,6 +2889,7 @@ report_install_health_failure() {
             -u linux-agent-observer-helper.service
             -u linux-agent-observer-helper.socket
             -u linux-agent-runner.service
+            -u linux-agent-mcp-stdio.service
             -u linux-agent-host-ops.service
             -u linux-agent-policy-writer.service
         )
@@ -2886,6 +2943,7 @@ do_install() {
     local release_dir install_health_status=0
     local -a enable_units=(
         linux-agent-observer-helper.socket linux-agent-runner.socket
+        linux-agent-mcp-stdio.socket
         linux-agent-host-ops.socket linux-agent-policy-writer.socket
     )
     local -a credential_sockets=()
@@ -3604,6 +3662,8 @@ do_uninstall() {
         stop_and_disable_unit linux-agent-observer-helper.service
         stop_and_disable_unit linux-agent-runner.socket
         stop_and_disable_unit linux-agent-runner.service
+        stop_and_disable_unit linux-agent-mcp-stdio.socket
+        stop_and_disable_unit linux-agent-mcp-stdio.service
         stop_and_disable_unit linux-agent-host-ops.socket
         stop_and_disable_unit linux-agent-host-ops.service
         stop_and_disable_unit linux-agent-policy-writer.socket
@@ -3613,6 +3673,7 @@ do_uninstall() {
         done
         rm -f -- "${SYSTEMD_UNIT_PATH}" "${SYSTEMD_HELPER_SERVICE_PATH}" "${SYSTEMD_HELPER_SOCKET_PATH}" \
             "${SYSTEMD_RUNNER_SERVICE_PATH}" "${SYSTEMD_RUNNER_SOCKET_PATH}" \
+            "${SYSTEMD_MCP_STDIO_SERVICE_PATH}" "${SYSTEMD_MCP_STDIO_SOCKET_PATH}" \
             "${SYSTEMD_HOST_SERVICE_PATH}" "${SYSTEMD_HOST_SOCKET_PATH}" \
             "${SYSTEMD_POLICY_SERVICE_PATH}" "${SYSTEMD_POLICY_SOCKET_PATH}" \
             "${SYSTEMD_EGRESS_DROPIN_PATH}" "${HOST_OPS_POLICY_PATH}"

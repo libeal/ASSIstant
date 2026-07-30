@@ -40,6 +40,7 @@ export function createInitialState() {
     auditSessions: [],
     auditEvents: [],
     auditWebTimeline: null,
+    auditIntegrityOk: null,
     auditTimelineUnavailableReason: "",
     currentAuditSession: "",
     configSnapshot: null,

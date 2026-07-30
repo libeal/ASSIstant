@@ -22,7 +22,7 @@ linux_agent_protocol_step_statuses() {
     fi
     # Schema-unavailable fallback: only lifecycle states required to render a
     # safe, minimal protocol envelope.
-    printf '%s\n' '["pending","running","succeeded","failed","blocked","approval_required","skipped_unexecuted","terminated"]'
+    printf '%s\n' '["pending","running","succeeded","failed","blocked","approval_required","awaiting_mcp_input","skipped_unexecuted","terminated"]'
 }
 
 linux_agent_protocol_error_codes() {
@@ -289,7 +289,7 @@ linux_agent_timeline_step_projection() {
         | if $approval == null then . else
             map(
                 if item_key == ($approval.step.id // $approval.id // "") then
-                    .status = "approval_required"
+                    .status = ($approval.status // "approval_required")
                     | .approval = $approval
                 else . end
             )
@@ -305,8 +305,28 @@ linux_agent_approval_card_for_work() {
         .[0] as $response
         | .[1] as $execution
         |
-        if ($execution.status // "") != "approval_required" then null
-        else
+        if ($execution.status // "") == "awaiting_mcp_input" then
+            ($execution.mcp_input // $execution.resume_state.mcp_input // null) as $mcp_input
+            | ($execution.current_plan.steps[$mcp_input.step_index] // null) as $step
+            | {
+                id:("mcp-input-" + ($mcp_input.step_key // ($mcp_input.step_index | tostring))),
+                step_key:($mcp_input.step_key // null),
+                type:"mcp_input",
+                status:"awaiting_mcp_input",
+                subject:($step.title // $mcp_input.tool // "MCP input"),
+                title:($step.title // "MCP input required"),
+                risk_level:"medium",
+                step:$step,
+                server_id:($mcp_input.server_id // null),
+                tool:($mcp_input.tool // null),
+                protocol_version:($mcp_input.protocol_version // null),
+                transport:($mcp_input.transport // null),
+                round:($mcp_input.round // 1),
+                expires_at:($mcp_input.expires_at // null),
+                input_requests:($mcp_input.input_requests // {}),
+                actions:["submit","cancel"]
+            }
+        elif ($execution.status // "") == "approval_required" then
             ($execution.approval_step // null) as $step
             | {
                 id:($step.id // "work-approval"),
@@ -319,6 +339,7 @@ linux_agent_approval_card_for_work() {
                 review:($execution.review // null),
                 actions:["approve","reject","skip","terminate"]
             }
+        else null
         end
     '
 }

@@ -463,9 +463,41 @@ linux_agent_api_work_prepare_response() {
     linux_agent_prepare_work_request "$@"
 }
 
+linux_agent_api_load_mcp_input_responses() {
+    local payload="$1"
+    local path resolved expected_root owner mode size responses
+
+    LINUX_AGENT_MCP_INPUT_RESPONSES_JSON='{}'
+    LINUX_AGENT_MCP_INPUT_RESPONSES_PRESENT=false
+    # shellcheck disable=SC2034  # Consumed by executor.sh after both files are sourced.
+    LINUX_AGENT_MCP_INPUT_CONFIRMED="$(jq -r '(.mcp_input_confirmed // false) == true' <<<"${payload}")"
+    LINUX_AGENT_MCP_INPUT_CANCELLED="$(jq -r '(.mcp_input_cancelled // false) == true' <<<"${payload}")"
+    if jq -e 'has("mcp_input_responses")' >/dev/null 2>&1 <<<"${payload}"; then
+        return 1
+    fi
+    path="$(jq -r '.mcp_input_responses_file // empty' <<<"${payload}")"
+    [[ -n "${path}" ]] || return 0
+    resolved="$(readlink -f -- "${path}" 2>/dev/null || true)"
+    expected_root="$(readlink -f -- "${LINUX_AGENT_TMP_DIR:-}" 2>/dev/null || true)"
+    [[ -n "${resolved}" && -n "${expected_root}" && "${resolved}" == "${expected_root}/"* &&
+        -f "${resolved}" && ! -L "${path}" ]] || return 1
+    owner="$(stat -c '%u' -- "${resolved}" 2>/dev/null || true)"
+    mode="$(stat -c '%a' -- "${resolved}" 2>/dev/null || true)"
+    size="$(stat -c '%s' -- "${resolved}" 2>/dev/null || true)"
+    [[ "${owner}" == "$(id -u)" && "${mode}" == "600" && "${size}" =~ ^[0-9]+$ &&
+    "${size}" -le 65536 ]] || return 1
+    responses="$(<"${resolved}")"
+    rm -f -- "${resolved}"
+    jq -e 'type == "object"' >/dev/null 2>&1 <<<"${responses}" || return 1
+    # shellcheck disable=SC2034  # Consumed by executor.sh after both files are sourced.
+    LINUX_AGENT_MCP_INPUT_RESPONSES_JSON="$(jq -c . <<<"${responses}")"
+    LINUX_AGENT_MCP_INPUT_RESPONSES_PRESENT=true
+    return 0
+}
+
 linux_agent_api_work_run() {
     local payload="$1"
-    local user_input prepared response_json execution_plan_json context_json response_type execution_json final_status answer used_agent_loop execution_state_json execution_selection error_code error_source
+    local user_input prepared response_json execution_plan_json context_json response_type execution_json final_status answer used_agent_loop execution_state_json execution_selection error_code error_source mcp_flow_id
     user_input="$(jq -r '.input // .request // empty' <<<"${payload}")"
     if [[ -z "${user_input}" ]]; then
         linux_agent_api_execution_error "invalid" "missing_input" "input is required."
@@ -473,8 +505,24 @@ linux_agent_api_work_run() {
     fi
 
     LINUX_AGENT_OUTPUT_JSON=1
+    mcp_flow_id="$(jq -r '.mcp_flow_id // empty' <<<"${payload}")"
+    if [[ -n "${mcp_flow_id}" && ! "${mcp_flow_id}" =~ ^[A-Za-z0-9_.:-]{1,128}$ ]]; then
+        linux_agent_api_execution_error "invalid" "mcp_input_invalid" "MCP flow binding is invalid."
+        return 0
+    fi
+    # shellcheck disable=SC2034  # Propagated to executor/Runner after all libraries are sourced.
+    LINUX_AGENT_MCP_FLOW_ID="${mcp_flow_id}"
     linux_agent_api_set_decision_lines "${payload}"
     execution_state_json="$(jq -c '.execution_state // {} | if type == "object" then . else {} end' <<<"${payload}")"
+    if ! linux_agent_api_load_mcp_input_responses "${payload}"; then
+        linux_agent_api_execution_error "invalid" "mcp_input_invalid" "MCP input responses must use the private Web/CLI staging contract."
+        return 0
+    fi
+    if [[ "${LINUX_AGENT_MCP_INPUT_RESPONSES_PRESENT}" == "true" || "${LINUX_AGENT_MCP_INPUT_CANCELLED}" == "true" ]] &&
+        [[ "$(jq -r '.status // empty' <<<"${execution_state_json}")" != "awaiting_mcp_input" ]]; then
+        linux_agent_api_execution_error "invalid" "mcp_input_invalid" "MCP input responses do not match an awaiting execution."
+        return 0
+    fi
 
     if jq -e '(.response? // .plan?) | type == "object"' <<<"${payload}" >/dev/null; then
         response_json="$(jq -c '.response // .plan' <<<"${payload}")"
@@ -958,7 +1006,7 @@ linux_agent_api_dispatch_raw() {
             jq -cn --argjson validation "$(linux_agent_validate_mcp)" '{ok:($validation.ok // false), status:"validated", validation:$validation}'
             ;;
         mcp:tools)
-            linux_agent_mcp_tool_catalog
+            linux_agent_mcp_tool_catalog "$(jq -r '.refresh // false' <<<"${payload}")"
             ;;
         policy:validate)
             jq -cn --argjson validation "$(linux_agent_api_policy_validate "${payload}")" '{ok:($validation.ok // false), status:($validation.status // "invalid"), validation:$validation}'

@@ -1,0 +1,43 @@
+[Unit]
+Description=Linux Agent isolated MCP stdio server relay
+Requires=linux-agent-mcp-stdio.socket
+After=linux-agent-mcp-stdio.socket
+PartOf=linux-agent-web.service
+
+[Service]
+Type=simple
+DynamicUser=yes
+WorkingDirectory=/opt/linux-agent/current
+ExecStart=/usr/bin/python3 /opt/linux-agent/current/lib/mcp_stdio_guard.py serve
+Environment=HOME=/nonexistent
+Environment=LINUX_AGENT_SERVICE_USER=linux-agent-runner
+Environment=LINUX_AGENT_ROOT=/opt/linux-agent/current
+Environment=LINUX_AGENT_MCP_DIR=/opt/linux-agent/current/mcp
+Restart=on-failure
+RestartSec=2s
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectControlGroups=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectKernelLogs=yes
+ProtectClock=yes
+PrivateDevices=yes
+LockPersonality=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources @mount @swap @reboot @raw-io
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+InaccessiblePaths=/opt/linux-agent/data /run/linux-agent/runner.sock /run/linux-agent/observer.sock /run/linux-agent/host-ops.sock /run/linux-agent/policy-writer.sock
+CPUQuota=200%
+MemoryMax=1G
+TasksMax=256
+StandardOutput=journal
+StandardError=journal

@@ -204,6 +204,15 @@ linux_agent_init_env() {
         linux_agent_print_error "无法创建运行目录；检查 ${root_dir} 及 config/logs/tmp 的所有权和权限。"
         return 1
     fi
+    if ! linux_agent_managed_mode_enabled; then
+        mkdir -p \
+            "${LINUX_AGENT_USER_SKILLS_DIR}" \
+            "${LINUX_AGENT_DATA_DIR}/mcp/credentials" || return 1
+        chmod 0700 \
+            "${LINUX_AGENT_USER_SKILLS_DIR}" \
+            "${LINUX_AGENT_DATA_DIR}/mcp" \
+            "${LINUX_AGENT_DATA_DIR}/mcp/credentials" || return 1
+    fi
     local runtime_lock
     runtime_lock="$(linux_agent_runtime_lock_path)"
     if [[ ! -e "${runtime_lock}" && ! -L "${runtime_lock}" ]]; then
@@ -286,7 +295,7 @@ linux_agent_cleanup_tmp_dir() {
 
     if [[ "${resolved_tmp}" == "${resolved_root}" ]]; then
         mkdir -p "${resolved_tmp}"
-        find "${resolved_tmp}" -mindepth 1 -maxdepth 1 ! -name '.shared' -exec rm -rf -- {} + 2>/dev/null || true
+        find "${resolved_tmp}" -mindepth 1 -maxdepth 1 ! -name '.shared' ! -name '.mcp-state' -exec rm -rf -- {} + 2>/dev/null || true
     else
         rm -rf -- "${resolved_tmp}" 2>/dev/null || true
     fi

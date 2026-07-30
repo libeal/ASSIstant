@@ -49,6 +49,7 @@ if str(WEB_ROOT) not in sys.path:
 from jobs import (  # noqa: E402
     IdempotencyConflict,
     JobCapacityExceeded,
+    JobSourceClaimConflict,
     JobStore,
     JobVersionConflict,
 )
@@ -192,6 +193,10 @@ def web_host_is_loopback(value):
 
 class RequestBodyTooLarge(ValueError):
     """Raised when an inbound request body exceeds MAX_REQUEST_BODY_BYTES."""
+
+
+class McpInputJobError(ValueError):
+    """A Web MCP continuation is not bound to an awaiting source Job."""
 
 
 SERVER_RUN_ID = uuid.uuid4().hex
@@ -1293,6 +1298,36 @@ def reconcile_pending_job_audits():
     return reconciled
 
 
+def audit_restore_source_error(session_id, request_id=""):
+    result = run_agent_api(
+        "audit",
+        "read",
+        {"session_id": session_id},
+        timeout=180,
+        request_id=request_id,
+    )
+    try:
+        validate_agent_api_response(result, "audit_read")
+    except DomainValidationError as exc:
+        return domain_error(
+            "invalid_agent_output",
+            str(exc),
+            request_id=request_id,
+        )
+    if result.get("ok") is not True:
+        return result
+    if result.get("integrity_ok") is True:
+        return None
+    integrity = result.get("integrity")
+    breaks = integrity.get("breaks") if isinstance(integrity, dict) else []
+    return domain_error(
+        "audit_integrity_broken",
+        "Audit integrity verification failed; the workspace was not restored.",
+        request_id=request_id,
+        details={"breaks": breaks[:20] if isinstance(breaks, list) else []},
+    )
+
+
 def restore_web_agent_session(session_id):
     # Lock order is admission -> session everywhere. This makes the active-Job
     # check and workspace rotation one atomic decision with Job snapshot/admit.
@@ -1531,7 +1566,7 @@ def cancelled_job_result(record=None):
 def terminal_job_status(result):
     if result.get("status") == "cancelled":
         return "cancelled"
-    if result.get("ok") or result.get("status") == "approval_required":
+    if result.get("ok") or result.get("status") in {"approval_required", "awaiting_mcp_input"}:
         return "succeeded"
     return "failed"
 
@@ -1685,6 +1720,47 @@ def count_active_jobs():
     return JOB_STORE.count_active()
 
 
+def _prepare_mcp_work_job_payload(resource, action, payload):
+    prepared = dict(payload)
+    if resource != "work" or action != "run":
+        return prepared, None, None
+    source_job_id = str(prepared.pop("mcp_source_job_id", "") or "")
+    if not source_job_id:
+        return prepared, None, None
+    if not re.fullmatch(r"[0-9a-f]{32}", source_job_id):
+        raise McpInputJobError("mcp_source_job_id is invalid")
+    source_job = read_job(source_job_id)
+    source_result = source_job.get("result") if isinstance(source_job, dict) else None
+    source_payload = source_job.get("payload") if isinstance(source_job, dict) else None
+    if (
+        not isinstance(source_job, dict)
+        or source_job.get("resource") != "work"
+        or source_job.get("action") != "run"
+        or not isinstance(source_result, dict)
+        or source_result.get("status") != "awaiting_mcp_input"
+        or not isinstance(source_result.get("execution_state"), dict)
+        or not isinstance(source_payload, dict)
+        or source_job.get("mcp_continuation_claimed_by")
+    ):
+        raise McpInputJobError("MCP input source Job is not awaiting input")
+    source_version = source_job.get("version", 0)
+    if isinstance(source_version, bool) or not isinstance(source_version, int):
+        raise McpInputJobError("MCP input source Job version is invalid")
+    prepared["input"] = source_payload.get("input", "")
+    prepared["response"] = source_result.get("response", {})
+    prepared["context"] = source_result.get("context", {})
+    prepared["execution_state"] = source_result["execution_state"]
+    prepared["mcp_flow_id"] = source_job_id
+    return prepared, source_job_id, source_version
+
+
+def prepare_mcp_work_job_payload(resource, action, payload):
+    prepared, _source_job_id, _source_version = _prepare_mcp_work_job_payload(
+        resource, action, payload
+    )
+    return prepared
+
+
 def start_job(
     resource,
     action,
@@ -1697,11 +1773,23 @@ def start_job(
     max_attempts=None,
 ):
     cleanup_jobs()
-    now = now_iso()
+    claimed_source_job_id = None
     with JOB_ADMISSION_LOCK:
+        payload, source_job_id, source_version = _prepare_mcp_work_job_payload(
+            resource, action, payload
+        )
+        now = now_iso()
         job_id = uuid.uuid4().hex
         effective_request_id = str(request_id or uuid.uuid4().hex)
         effective_max_attempts = max(int(max_attempts or MAX_JOB_ATTEMPTS), int(attempt), 1)
+        if resource == "work" and action == "run" and "mcp_flow_id" not in payload:
+            payload["mcp_flow_id"] = job_id
+        durable_payload = dict(payload)
+        durable_payload.pop("mcp_flow_id", None)
+        if resource == "work" and action == "run" and "mcp_input_responses" in durable_payload:
+            durable_payload.pop("mcp_input_responses", None)
+            durable_payload["mcp_input_responses_present"] = True
+        durable_payload.pop("mcp_input_responses_file", None)
         job = {
             "ok": True,
             "schema_version": int(DOMAIN_SCHEMA.get("schema_version", 1) or 1),
@@ -1717,7 +1805,7 @@ def start_job(
             "updated_at": now,
             "request_id": effective_request_id,
             "session_id": f"job_{job_id}",
-            "payload": payload,
+            "payload": durable_payload,
             "partial_output": None,
             "result": None,
             "result_ok": None,
@@ -1726,12 +1814,25 @@ def start_job(
         if retry_of:
             job["retry_of"] = str(retry_of)
             job["root_job_id"] = str(root_job_id or retry_of)
+        if source_job_id is not None:
+            job["mcp_source_job_id"] = source_job_id
         try:
-            stored, deduplicated = JOB_STORE.admit(
-                job,
-                idempotency_key=idempotency_key,
-                max_active=MAX_ACTIVE_JOBS,
-            )
+            if source_job_id is None:
+                stored, deduplicated = JOB_STORE.admit(
+                    job,
+                    idempotency_key=idempotency_key,
+                    max_active=MAX_ACTIVE_JOBS,
+                )
+            else:
+                stored, deduplicated = JOB_STORE.admit_claiming_source(
+                    job,
+                    idempotency_key=idempotency_key,
+                    max_active=MAX_ACTIVE_JOBS,
+                    source_job_id=source_job_id,
+                    expected_source_version=source_version,
+                )
+                if not deduplicated:
+                    claimed_source_job_id = source_job_id
         except JobCapacityExceeded as exc:
             return domain_error(
                 "too_many_jobs",
@@ -1739,6 +1840,10 @@ def start_job(
                 active_jobs=exc.active,
                 active_limit=exc.max_active,
             )
+        except JobSourceClaimConflict as exc:
+            raise McpInputJobError(
+                "MCP input source Job was already consumed"
+            ) from exc
         if deduplicated:
             result = dict(stored)
             result["deduplicated"] = True
@@ -1764,7 +1869,11 @@ def start_job(
                 record["result_status"] = "job_start_failed"
                 return None
 
-            update_job(job_id, mark_context_failed)
+            try:
+                update_job(job_id, mark_context_failed)
+            finally:
+                if claimed_source_job_id is not None:
+                    JOB_STORE.release_source_claim(claimed_source_job_id, job_id)
             raise
         with JOB_CONTEXTS_LOCK:
             JOB_CONTEXTS[job_id] = job_context
@@ -1796,7 +1905,11 @@ def start_job(
             record["result_status"] = "job_start_failed"
             return None
 
-        update_job(job_id, mark_start_failed)
+        try:
+            update_job(job_id, mark_start_failed)
+        finally:
+            if claimed_source_job_id is not None:
+                JOB_STORE.release_source_claim(claimed_source_job_id, job_id)
         raise
     return job
 
@@ -2225,14 +2338,25 @@ class Handler(SimpleHTTPRequestHandler):
             send_runtime_backup(self)
             return
         if path == "/api/policies":
+            try:
+                files = list_policy_files()
+                orphaned = list_orphaned_policy_files()
+            except (OSError, ValueError) as exc:
+                json_domain_error(
+                    self,
+                    "read_failed",
+                    str(exc),
+                    default=HTTPStatus.INTERNAL_SERVER_ERROR,
+                )
+                return
             json_response(
                 self,
                 HTTPStatus.OK,
                 {
                     "ok": True,
                     "status": "listed",
-                    "files": list_policy_files(),
-                    "orphaned": list_orphaned_policy_files(),
+                    "files": files,
+                    "orphaned": orphaned,
                     "authorization": "web_bearer",
                 },
             )
@@ -2400,7 +2524,14 @@ class Handler(SimpleHTTPRequestHandler):
                     default=HTTPStatus.BAD_GATEWAY,
                 )
                 return
-            if isinstance(result, dict) and isinstance(result.get("events"), list):
+            if (
+                isinstance(result, dict)
+                and isinstance(result.get("events"), list)
+                and result.get("integrity_ok") is not True
+            ):
+                result["web_timeline"] = None
+                result["timeline_unavailable_reason"] = "audit_integrity_broken"
+            elif isinstance(result, dict) and isinstance(result.get("events"), list):
                 audit_session_id = str(body.get("session_id") or result.get("session_id") or "")
                 try:
                     persisted = SESSION_STORE.read_persisted_turns(audit_session_id)
@@ -2479,7 +2610,13 @@ class Handler(SimpleHTTPRequestHandler):
             json_response(self, HTTPStatus.OK, result)
             return
         if path == "/api/session/restore":
-            result = restore_web_agent_session(str(body.get("session_id") or ""))
+            restore_session_id = str(body.get("session_id") or "")
+            result = audit_restore_source_error(
+                restore_session_id,
+                request_id=self.request_id,
+            )
+            if result is None:
+                result = restore_web_agent_session(restore_session_id)
             status = (
                 HTTPStatus.OK
                 if result.get("ok")
@@ -2649,6 +2786,14 @@ class Handler(SimpleHTTPRequestHandler):
                     idempotency_key=idempotency_key or None,
                     request_id=self.request_id,
                 )
+            except McpInputJobError as exc:
+                json_domain_error(
+                    self,
+                    "mcp_input_invalid",
+                    str(exc),
+                    default=HTTPStatus.UNPROCESSABLE_ENTITY,
+                )
+                return
             except IdempotencyConflict as exc:
                 json_domain_error(
                     self,

@@ -130,7 +130,8 @@ linux_agent_usage() {
                                 从本地目录/归档安装用户 Skill，或安装内置 Skill
   agent skills uninstall --scope user|builtin <name> [--purge --confirm PURGE_SKILL_DATA]
                                 卸载 Skill；purge 不删除 ownership ledger 之外的数据
-  agent mcp list|validate|tools 列出、校验或发现 mcp/ 外部 MCP tool
+  agent mcp list|validate|tools [--refresh]
+                                列出、校验或发现 mcp/ 外部 MCP tool；显式刷新目录
   agent policy validate [file]  校验 policies/ 下策略 JSON 与正则规则
   agent credentials <component> <action> [operands...]
                                 调用已安装 credential component 声明的管理动作
@@ -379,7 +380,14 @@ main() {
                     linux_agent_validate_mcp
                     ;;
                 tools)
-                    linux_agent_mcp_tool_catalog
+                    if [[ "${2:-}" == "--refresh" ]]; then
+                        linux_agent_mcp_tool_catalog true
+                    elif [[ -z "${2:-}" ]]; then
+                        linux_agent_mcp_tool_catalog
+                    else
+                        linux_agent_print_error "用法: agent mcp tools [--refresh]"
+                        exit 1
+                    fi
                     ;;
                 *)
                     linux_agent_print_error "仅支持 'agent mcp list|validate|tools'。"

@@ -1,0 +1,9 @@
+{
+  "license_expression": "PSF-2.0",
+  "license_files": [
+    "LICENSE"
+  ],
+  "name": "typing_extensions",
+  "source_wheel": "typing_extensions-4.16.0-py3-none-any.whl",
+  "version": "4.16.0"
+}

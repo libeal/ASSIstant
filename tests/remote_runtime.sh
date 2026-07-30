@@ -89,6 +89,9 @@ jq -e '
     and .remote.enabled == true
     and .remote.release_version == "v0.0.0-test"
     and ([.required_commands[] | select(.name == "flock" and .ok == true)] | length == 1)
+    and .mcp_ok == true
+    and .mcp_runtime.available == true
+    and .mcp_runtime.sdk_version == "2.0.0"
 ' <<<"${doctor_json}" >/dev/null
 grep -q '浮动 latest' "${latest_stderr}"
 [[ -z "$(find "${runtime_base}" -mindepth 1 -maxdepth 1 -print -quit)" ]]

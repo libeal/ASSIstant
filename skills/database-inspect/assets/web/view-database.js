@@ -24,6 +24,22 @@ export function createDatabaseView(app) {
     return state.databaseProfiles.find((profile) => profile.id === id) || null;
   }
 
+  function credentialMatchesSelectedProfile(credential) {
+    if (remoteMode()) return credential.mode === "remote";
+    const profileId = selectedProfile()?.id || "";
+    return credential.mode === "managed" && credential.profile_id === profileId;
+  }
+
+  function syncDatabaseJobControls() {
+    const busy = state.databaseJobSubmitting || Boolean(state.activeDatabaseJobId);
+    for (const id of ["databaseHealthBtn", "databaseMetricsBtn"]) {
+      const button = $(id);
+      if (button instanceof HTMLButtonElement) button.disabled = busy;
+    }
+    const cancel = $("databaseCancelBtn");
+    if (cancel instanceof HTMLButtonElement) cancel.disabled = !state.activeDatabaseJobId;
+  }
+
   function syncProfileControls() {
     const profile = selectedProfile();
     const stored = $("databaseUseStored");
@@ -83,19 +99,21 @@ export function createDatabaseView(app) {
     select.innerHTML = "";
     select.appendChild(new Option("未选择", ""));
     list.innerHTML = "";
+    const selectableCredentials = state.databaseCredentials.filter(credentialMatchesSelectedProfile);
     for (const credential of state.databaseCredentials) {
       const reference = String(credential.credential_ref || "");
       const label = `${credential.profile_id || credential.engine || "database"} · ${credential.username_hint || "user"} · ${reference.slice(0, 8)}`;
-      select.appendChild(new Option(label, reference));
+      if (selectableCredentials.includes(credential)) select.appendChild(new Option(label, reference));
       const item = document.createElement("div");
       item.className = "item";
       item.innerHTML = `<div class="item-head"><h4>${app.escapeHtml(credential.profile_id || credential.engine || "database")}</h4><span class="pill">${app.escapeHtml(credential.mode || "temporary")}</span></div><p>${app.escapeHtml(credential.username_hint || "user")} · <span class="mono">${app.escapeHtml(reference.slice(0, 8))}</span></p>`;
       list.appendChild(item);
     }
-    if (state.databaseCredentials.some((credential) => credential.credential_ref === previous)) {
+    if (selectableCredentials.some((credential) => credential.credential_ref === previous)) {
       select.value = previous;
       state.databaseCredentialRef = previous;
     } else {
+      select.value = "";
       state.databaseCredentialRef = "";
     }
     if (!state.databaseCredentials.length) list.appendChild(app.emptyItem("暂无临时凭据。"));
@@ -172,27 +190,36 @@ export function createDatabaseView(app) {
   }
 
   async function runDatabaseInspect(action) {
-    const profileId = remoteMode() ? "" : value("databaseProfileSelect");
-    const useStored = !remoteMode() && checked("databaseUseStored");
-    const credentialRef = useStored ? "" : value("databaseCredentialSelect");
-    const job = await app.createJob("database", action, {
-      profile_id: profileId,
-      credential_ref: credentialRef,
-    });
-    if (!job.ok || !job.job_id) {
-      app.printOutput("databaseOutput", job);
+    if (state.databaseJobSubmitting || state.activeDatabaseJobId) {
+      app.showToast("已有数据库巡检正在运行");
       return;
     }
-    state.activeDatabaseJobId = job.job_id;
-    const cancel = $("databaseCancelBtn");
-    if (cancel instanceof HTMLButtonElement) cancel.disabled = false;
+    state.databaseJobSubmitting = true;
+    syncDatabaseJobControls();
+    let jobId = "";
     try {
-      const completed = await app.pollJob(job.job_id, "databaseJobStatus", "databaseOutput");
+      const profileId = remoteMode() ? "" : value("databaseProfileSelect");
+      const useStored = !remoteMode() && checked("databaseUseStored");
+      const credentialRef = useStored ? "" : value("databaseCredentialSelect");
+      const job = await app.createJob("database", action, {
+        profile_id: profileId,
+        credential_ref: credentialRef,
+      });
+      if (!job.ok || !job.job_id) {
+        app.printOutput("databaseOutput", job);
+        return;
+      }
+      jobId = job.job_id;
+      state.activeDatabaseJobId = jobId;
+      state.databaseJobSubmitting = false;
+      syncDatabaseJobControls();
+      const completed = await app.pollJob(jobId, "databaseJobStatus", "databaseOutput");
       app.printOutput("databaseOutput", completed.result || completed);
     } finally {
-      state.activeDatabaseJobId = "";
-      if (cancel instanceof HTMLButtonElement) cancel.disabled = true;
-      await loadDatabaseCredentials();
+      if (!jobId || state.activeDatabaseJobId === jobId) state.activeDatabaseJobId = "";
+      state.databaseJobSubmitting = false;
+      syncDatabaseJobControls();
+      if (jobId) await loadDatabaseCredentials();
     }
   }
 
@@ -203,6 +230,7 @@ export function createDatabaseView(app) {
   }
 
   function databaseProfileChanged() {
+    renderCredentials();
     syncProfileControls();
   }
 
@@ -237,6 +265,7 @@ export function registerSkillWebComponent(app) {
     databaseCredentials: [],
     databaseCredentialRef: "",
     activeDatabaseJobId: "",
+    databaseJobSubmitting: false,
   });
   Object.assign(app, createDatabaseView(app));
   const safe = (function_) => app.safeAction(function_);

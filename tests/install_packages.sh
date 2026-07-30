@@ -64,6 +64,9 @@ for distro in debian fedora; do
             grep -qx 'util-linux' "${package_root}/requirements/fedora.txt"
             ;;
     esac
+    if [[ "${distro}" == "debian" ]]; then
+        grep -qx 'python3-venv' "${package_root}/requirements/debian.txt"
+    fi
 
     manifest_assets="$(jq -r '[.assets[].name, .skills[].asset.name] | sort | .[]' \
         "${package_root}/release/release-manifest.json")"
@@ -82,6 +85,12 @@ for distro in debian fedora; do
     bash "${package_root}/install.sh" --skip-dependencies --no-systemd --prefix "${prefix}" >/dev/null
     bash "${prefix}/current/bin/agent" api health |
         jq -e '.ok == true and .version == "v0.0.0-test"' >/dev/null
+    mcp_runtime_status="$(LINUX_AGENT_ROOT="${prefix}/current" \
+        python3 "${prefix}/current/lib/mcp_runtime.py" status)"
+    jq -e '.ok == true and .runtime_ready == true and .sdk_version == "2.0.0"' \
+        <<<"${mcp_runtime_status}" >/dev/null
+    [[ -d "${prefix}/current/third_party/mcp-python-sdk" ]]
+    [[ -x "${prefix}/current/.mcp-venv/bin/python" ]]
 
     jq -e '.schema_version == 1 and .installed == true and .no_systemd == true' \
         "${prefix}/.install-state.json" >/dev/null
@@ -89,6 +98,8 @@ for distro in debian fedora; do
         "${prefix}/.install-state.json" >/dev/null
     [[ "$(stat -c '%u:%g' "${prefix}")" == "$(id -u):$(id -g)" ]]
     [[ "$(stat -c '%u:%g' "${prefix}/data")" == "$(id -u):$(id -g)" ]]
+    [[ "$(stat -c '%a' "${prefix}/data/mcp")" == "700" ]]
+    [[ "$(stat -c '%a' "${prefix}/data/mcp/credentials")" == "700" ]]
     missing_checksum_root="${tmp_root}/missing-checksum-${distro}"
     cp -a "${package_root}" "${missing_checksum_root}"
     rm -f -- "${missing_checksum_root}/PACKAGE-SHA256SUMS"

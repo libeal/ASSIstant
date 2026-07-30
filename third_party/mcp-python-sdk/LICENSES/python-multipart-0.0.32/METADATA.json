@@ -1,0 +1,9 @@
+{
+  "license_expression": "Apache-2.0",
+  "license_files": [
+    "LICENSE.txt"
+  ],
+  "name": "python-multipart",
+  "source_wheel": "python_multipart-0.0.32-py3-none-any.whl",
+  "version": "0.0.32"
+}

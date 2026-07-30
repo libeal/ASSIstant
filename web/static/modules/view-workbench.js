@@ -158,14 +158,166 @@ export function createWorkbenchView(app) {
     state.pendingApproval = null;
     state.awaitingWorkApproval = false;
     document.body.classList.remove("terminal-approval");
+    document.body.classList.remove("mcp-input-approval");
     const drawer = $("approvalDrawer");
     if (drawer) drawer.hidden = true;
+    const approveButton = $("approvalApproveBtn");
+    const rejectButton = $("approvalRejectBtn");
+    if (approveButton) approveButton.textContent = "批准执行";
+    if (rejectButton) rejectButton.textContent = "拒绝";
     updateWorkActionLabel();
     updateTerminalActionState();
   }
 
+  function mcpInputControl(requestKey, propertyName, schema, required) {
+    const encodedRequest = encodeURIComponent(requestKey);
+    const encodedProperty = encodeURIComponent(propertyName);
+    const label = schema?.title || propertyName;
+    const description = schema?.description || "";
+    const attributes = `data-mcp-request-key="${escapeHtml(encodedRequest)}" data-mcp-property="${escapeHtml(encodedProperty)}"`;
+    const requiredAttribute = required ? " required" : "";
+    let control = "";
+    if (Array.isArray(schema?.enum) && schema.enum.length) {
+      const options = schema.enum.map((value) => {
+        const encoded = encodeURIComponent(JSON.stringify(value));
+        return `<option value="${escapeHtml(encoded)}">${escapeHtml(String(value))}</option>`;
+      }).join("");
+      control = `<select class="select" ${attributes} data-mcp-value-kind="enum"${requiredAttribute}>${options}</select>`;
+    } else if (schema?.type === "boolean") {
+      control = `<input type="checkbox" ${attributes} data-mcp-value-kind="boolean">`;
+    } else if (schema?.type === "integer" || schema?.type === "number") {
+      const step = schema.type === "integer" ? "1" : "any";
+      const min = Number.isFinite(schema.minimum) ? ` min="${escapeHtml(schema.minimum)}"` : "";
+      const max = Number.isFinite(schema.maximum) ? ` max="${escapeHtml(schema.maximum)}"` : "";
+      control = `<input class="field" type="number" step="${step}" ${attributes} data-mcp-value-kind="${schema.type}"${min}${max}${requiredAttribute}>`;
+    } else if (schema?.type === "array" && schema?.items?.type === "string") {
+      control = `<textarea class="textarea mcp-array-input" ${attributes} data-mcp-value-kind="string-array"${requiredAttribute}></textarea>`;
+    } else {
+      const format = schema?.format === "email" ? "email" : schema?.format === "uri" ? "url" : "text";
+      const min = Number.isInteger(schema?.minLength) ? ` minlength="${schema.minLength}"` : "";
+      const max = Number.isInteger(schema?.maxLength) ? ` maxlength="${schema.maxLength}"` : "";
+      control = `<input class="field" type="${format}" ${attributes} data-mcp-value-kind="string"${min}${max}${requiredAttribute}>`;
+    }
+    return `<label class="small mcp-input-field"><span>${escapeHtml(label)}${required ? " *" : ""}</span>${control}${description ? `<small>${escapeHtml(description)}</small>` : ""}</label>`;
+  }
+
+  function mcpInputRequestHtml(requestKey, request) {
+    const params = request?.params && typeof request.params === "object" ? request.params : {};
+    const mode = params.mode || "form";
+    const message = params.message || requestKey;
+    const encodedRequest = encodeURIComponent(requestKey);
+    const action = `
+      <label class="small mcp-input-action"><span>响应</span>
+        <select class="select" data-mcp-action="${escapeHtml(encodedRequest)}">
+          <option value="accept">accept</option>
+          <option value="decline">decline</option>
+          <option value="cancel">cancel</option>
+        </select>
+      </label>`;
+    if (mode === "url") {
+      const url = String(params.url || "");
+      const safeUrl = /^https?:\/\//i.test(url);
+      return `<section class="mcp-input-request" data-mcp-request="${escapeHtml(encodedRequest)}" data-mcp-mode="url">
+        <strong>${escapeHtml(message)}</strong>
+        ${safeUrl ? `<a class="mcp-input-url" href="${escapeHtml(url)}" target="_blank" rel="noopener noreferrer">${escapeHtml(url)}</a>` : `<code class="mcp-input-url">${escapeHtml(url)}</code>`}
+        ${action}
+      </section>`;
+    }
+    const schema = params.requestedSchema || params.requested_schema || {};
+    const properties = schema?.properties && typeof schema.properties === "object" ? schema.properties : null;
+    const required = new Set(Array.isArray(schema?.required) ? schema.required : []);
+    const controls = properties
+      ? Object.entries(properties).map(([name, propertySchema]) => mcpInputControl(requestKey, name, propertySchema, required.has(name))).join("")
+      : `<label class="small mcp-input-field"><span>JSON content</span><textarea class="textarea" data-mcp-content-json="${escapeHtml(encodedRequest)}" required>{}</textarea></label>`;
+    return `<section class="mcp-input-request" data-mcp-request="${escapeHtml(encodedRequest)}" data-mcp-mode="form">
+      <strong>${escapeHtml(message)}</strong>
+      ${action}
+      <div class="mcp-input-fields">${controls}</div>
+    </section>`;
+  }
+
+  function openMcpInputDrawer(result, input, card) {
+    const response = result.response || state.workPlan || {};
+    const requests = card?.input_requests && typeof card.input_requests === "object" ? card.input_requests : {};
+    state.pendingApproval = {
+      type: "mcp_input",
+      input,
+      response,
+      context: result.context || state.workContext || {},
+      card,
+      step: card?.step || {},
+      executionState: result.execution_state || {},
+      sourceJobId: result.source_job_id || "",
+    };
+    state.approvalDrawerOpen = true;
+    state.awaitingWorkApproval = true;
+    document.body.classList.add("mcp-input-approval");
+    setText("approvalTitle", card?.title || "MCP input required");
+    setStatus("approvalRisk", "awaiting_mcp_input", "medium");
+    const body = $("approvalBody");
+    if (body) {
+      body.innerHTML = `
+        <div class="approval-meta">${app.renderMetaRows([
+          ["MCP server", card?.server_id || ""],
+          ["MCP tool", card?.tool || ""],
+          ["协议", card?.protocol_version || ""],
+          ["轮次", card?.round || 1],
+        ])}</div>
+        <div class="mcp-input-requests">${Object.entries(requests).map(([key, request]) => mcpInputRequestHtml(key, request)).join("")}</div>
+        <label class="mcp-input-confirm"><input id="mcpInputConfirm" type="checkbox"> <span>确认将这些响应发送到 MCP server</span></label>
+      `;
+    }
+    const approveButton = $("approvalApproveBtn");
+    const rejectButton = $("approvalRejectBtn");
+    if (approveButton) approveButton.textContent = "确认并继续";
+    if (rejectButton) rejectButton.textContent = "取消请求";
+    const drawer = $("approvalDrawer");
+    if (drawer) drawer.hidden = false;
+    updateWorkActionLabel();
+  }
+
+  function collectMcpInputResponses() {
+    const body = $("approvalBody");
+    if (!body) throw new Error("MCP input form is unavailable");
+    const responses = {};
+    body.querySelectorAll("[data-mcp-request]").forEach((requestElement) => {
+      const requestKey = decodeURIComponent(requestElement.dataset.mcpRequest || "");
+      const actionSelect = body.querySelector(`[data-mcp-action="${CSS.escape(encodeURIComponent(requestKey))}"]`);
+      const action = actionSelect?.value || "cancel";
+      const response = { action };
+      if (action === "accept" && requestElement.dataset.mcpMode === "form") {
+        const jsonControl = requestElement.querySelector("[data-mcp-content-json]");
+        if (jsonControl) {
+          const parsed = JSON.parse(jsonControl.value || "{}");
+          if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error(`${requestKey}: content must be a JSON object`);
+          response.content = parsed;
+        } else {
+          const content = {};
+          requestElement.querySelectorAll("[data-mcp-property]").forEach((control) => {
+            if (!control.reportValidity()) throw new Error(`${requestKey}: form value is invalid`);
+            const property = decodeURIComponent(control.dataset.mcpProperty || "");
+            const kind = control.dataset.mcpValueKind || "string";
+            if (kind === "boolean") content[property] = Boolean(control.checked);
+            else if (kind === "integer") content[property] = Number.parseInt(control.value, 10);
+            else if (kind === "number") content[property] = Number(control.value);
+            else if (kind === "string-array") content[property] = control.value.split(/[\n,]/).map((item) => item.trim()).filter(Boolean);
+            else if (kind === "enum") content[property] = JSON.parse(decodeURIComponent(control.value));
+            else content[property] = control.value;
+          });
+          response.content = content;
+        }
+      }
+      responses[requestKey] = response;
+    });
+    return responses;
+  }
+
   function openApprovalDrawer(result, input) {
     const card = normalizeApprovalCard(result);
+    if (card?.type === "mcp_input") {
+      openMcpInputDrawer(result, input, card);
+      return;
+    }
     const response = result.response || state.workPlan || {};
     const steps = response.steps || [];
     const step = card?.step || steps[completedExecutionCount(result)] || steps.find((candidate) => candidate.risk_level !== "low") || steps[0] || {};
@@ -278,9 +430,27 @@ export function createWorkbenchView(app) {
       response: pendingApproval.response,
       context: pendingApproval.context,
       execution_state: pendingApproval.executionState || {},
-      decisions: [decision],
     };
-    if (decision === "s") payload.decisions.push($("approvalRevision")?.value || "");
+    if (pendingApproval.type === "mcp_input") {
+      if (!pendingApproval.sourceJobId) return showToast("MCP source Job is unavailable");
+      payload.mcp_source_job_id = pendingApproval.sourceJobId;
+      if (decision === "n") {
+        payload.mcp_input_cancelled = true;
+      } else if (decision === "y") {
+        if (!$("mcpInputConfirm")?.checked) return showToast("请先确认 MCP 输入");
+        try {
+          payload.mcp_input_responses = collectMcpInputResponses();
+        } catch (error) {
+          return showToast(error instanceof Error ? error.message : "MCP input is invalid");
+        }
+        payload.mcp_input_confirmed = true;
+      } else {
+        return;
+      }
+    } else {
+      payload.decisions = [decision];
+      if (decision === "s") payload.decisions.push($("approvalRevision")?.value || "");
+    }
     closeApprovalDrawer();
     if (state.activeWorkJobId || state.workSubmitting) return showToast("Work job is already running.");
     state.workSubmitting = true;
@@ -372,7 +542,7 @@ export function createWorkbenchView(app) {
       jobId: options.jobId || result?.job_id || "",
       result: result || {},
       entries: app.normalizedTurnEntries(title, result || {}),
-      contextEligible: options.contextEligible ?? (mode === "work" && status !== "approval_required"),
+      contextEligible: options.contextEligible ?? (mode === "work" && !["approval_required", "awaiting_mcp_input"].includes(status)),
     };
   }
 
@@ -820,8 +990,8 @@ export function createWorkbenchView(app) {
     renderThinkingSummary();
     updateWorkActionLabel();
     if (result.response) {
-      renderWorkPlan(result.response, input, result.context || null, result.status === "approval_required");
-    } else if (result.status !== "approval_required") {
+      renderWorkPlan(result.response, input, result.context || null, ["approval_required", "awaiting_mcp_input"].includes(result.status));
+    } else if (!["approval_required", "awaiting_mcp_input"].includes(result.status)) {
       state.awaitingWorkApproval = false;
       closeApprovalDrawer();
       updateWorkActionLabel();
@@ -830,7 +1000,7 @@ export function createWorkbenchView(app) {
       result.response ||
         Array.isArray(result.timeline) ||
         Array.isArray(result.output_blocks) ||
-        ["approval_required", "executed", "answered", "failed", "cancelled"].includes(result.status)
+        ["approval_required", "awaiting_mcp_input", "executed", "answered", "failed", "cancelled"].includes(result.status)
     );
     if (hasWorkbenchResult) {
       const sharedText = app.renderSharedExecutionOutput(result.status || "work_return", result);
@@ -840,9 +1010,9 @@ export function createWorkbenchView(app) {
     // Job record.  Reload it instead of assigning browser-local IDs/timestamps
     // or merging approval continuations differently from the backend.
     await loadSessionState();
-    if (result.status === "approval_required") {
-      openApprovalDrawer(result, input);
-      showToast("需要审批后继续");
+    if (["approval_required", "awaiting_mcp_input"].includes(result.status)) {
+      openApprovalDrawer({ ...result, source_job_id: completed.job_id || "" }, input);
+      showToast(result.status === "awaiting_mcp_input" ? "需要 MCP 输入后继续" : "需要审批后继续");
     } else {
       closeApprovalDrawer();
     }

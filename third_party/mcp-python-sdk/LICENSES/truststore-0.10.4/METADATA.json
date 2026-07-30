@@ -1,0 +1,9 @@
+{
+  "license_expression": "MIT",
+  "license_files": [
+    "LICENSE"
+  ],
+  "name": "truststore",
+  "source_wheel": "truststore-0.10.4-py3-none-any.whl",
+  "version": "0.10.4"
+}

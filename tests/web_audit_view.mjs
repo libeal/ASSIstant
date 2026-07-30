@@ -82,6 +82,12 @@ const controls = {
   auditObserverSummary: observerSummary,
   auditEventFilter: { value: "" },
   auditLimitInput: { value: "40" },
+  auditOutput: { textContent: "" },
+  auditRestoreTimelineBtn: { disabled: true },
+  auditMetricEvents: { textContent: "" },
+  auditMetricDecisions: { textContent: "" },
+  auditMetricCommands: { textContent: "" },
+  auditMetricObserver: { textContent: "" },
 };
 const frames = [];
 globalThis.window = {
@@ -101,6 +107,9 @@ globalThis.document = {
 const state = {
   auditEvents: largeTimeline,
   auditSessions: [],
+  auditWebTimeline: null,
+  auditIntegrityOk: null,
+  auditTimelineUnavailableReason: "",
   currentAuditSession: "large",
 };
 const auditProtocol = {
@@ -113,10 +122,19 @@ const auditProtocol = {
   auditEventSummary(event) { return event.stage; },
   compactAuditTime() { return "--"; },
 };
+let auditResponse = null;
+const apiCalls = [];
+const toasts = [];
 const view = createAuditView({
   state,
   request() {},
+  async api(path) {
+    apiCalls.push(path);
+    return auditResponse;
+  },
   $(id) { return controls[id] || null; },
+  setText(id, text) { if (controls[id]) controls[id].textContent = text; },
+  showToast(message) { toasts.push(message); },
   pretty: JSON.stringify,
   escapeHtml: String,
   emptyEvent(message) { return { message }; },
@@ -158,5 +176,49 @@ const brokenReport = view.renderAuditReadableReport({
 });
 assert.match(brokenReport, /完整性: 失败/);
 assert.match(brokenReport, /2:hash_mismatch/);
+
+auditResponse = {
+  ok: false,
+  status: "read_failed",
+  code: "read_failed",
+  message: "Audit session list could not be read.",
+};
+await view.loadAuditList();
+assert.deepEqual(state.auditSessions, []);
+assert.equal(state.currentAuditSession, "");
+assert.match(controls.auditOutput.textContent, /读取失败: Audit session list could not be read\./);
+assert.equal(toasts.at(-1), "Audit session list could not be read.");
+
+auditResponse = {
+  ok: false,
+  status: "not_found",
+  code: "not_found",
+  message: "Audit session not found.",
+};
+await view.readAudit("missing");
+assert.equal(state.auditEvents.length, 0);
+assert.equal(state.auditWebTimeline, null);
+assert.equal(state.auditIntegrityOk, null);
+assert.equal(controls.auditRestoreTimelineBtn.disabled, true);
+assert.match(controls.auditOutput.textContent, /读取失败: Audit session not found\./);
+assert.equal(toasts.at(-1), "Audit session not found.");
+
+auditResponse = {
+  ok: true,
+  status: "read",
+  session_id: "broken",
+  events: [],
+  integrity_ok: false,
+  integrity: { ok: false, breaks: [{ line: 3, reason: "previous_hash_mismatch" }] },
+  web_timeline: { turns: [{ id: "must-not-restore" }] },
+  timeline_unavailable_reason: "audit_integrity_broken",
+};
+await view.readAudit("broken");
+assert.equal(state.auditIntegrityOk, false);
+assert.equal(state.auditWebTimeline, null);
+assert.equal(controls.auditRestoreTimelineBtn.disabled, true);
+await view.restoreAuditTimelineToWorkbench();
+assert.equal(toasts.at(-1), "审计完整性未通过，不能恢复到工作台");
+assert.equal(apiCalls.filter((path) => path === "/api/session/restore").length, 0);
 
 console.log("web_audit_view: ok");

@@ -1,0 +1,9 @@
+{
+  "license_expression": "BSD-3-Clause",
+  "license_files": [
+    "LICENSE.md"
+  ],
+  "name": "uvicorn",
+  "source_wheel": "uvicorn-0.52.0-py3-none-any.whl",
+  "version": "0.52.0"
+}

@@ -267,27 +267,23 @@ class SkillWebRegistryTests(unittest.TestCase):
                 "database-inspect", "assets/web/database.py"
             )
 
-    def test_credential_helper_web_component_is_hidden_without_execution_channel(self):
+    def test_credential_helper_web_component_is_visible_in_source_mode(self):
         registry = SkillWebRegistry(
             SkillService(ROOT / "skills"),
             remote_mode=False,
             managed_execution=False,
         )
 
-        self.assertNotIn(
-            "database",
-            {component["resource"] for component in registry.public_components()},
+        database = next(
+            component
+            for component in registry.public_components()
+            if component["resource"] == "database"
         )
-        self.assertFalse(registry.handles_job("database", "health"))
-        self.assertIsNone(
-            registry.handle_web_action("GET", "/api/database/profiles", {})
-        )
-        self.assertTrue(
-            any(
-                item.get("code") == "SKILL_WEB_COMPONENT_UNAVAILABLE"
-                and item.get("skill") == "database-inspect"
-                for item in registry.findings
-            )
+        self.assertEqual("database-inspect", database["name"])
+        self.assertTrue(registry.handles_job("database", "health"))
+        self.assertFalse(registry.components["database"]["context"]["remote_mode"])
+        self.assertFalse(
+            registry.components["database"]["context"]["managed_execution"]
         )
 
     def test_reload_preserves_unchanged_component_instance_and_credentials(self):

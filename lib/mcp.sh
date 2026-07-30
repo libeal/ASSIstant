@@ -75,102 +75,41 @@ linux_agent_mcp_public_manifest() {
     ' <<<"${manifest_json}"
 }
 
-linux_agent_mcp_http_url_valid() {
-    local value="$1"
-    [[ "${value}" =~ ^https?://[^[:space:]/?#]+([^[:space:]]*)?$ ]]
-}
-
 linux_agent_mcp_validate_manifest_path() {
     local path="$1"
-    local mcp_dir rel payload payload_type findings server_id transport enabled url message_url
+    local mcp_dir rel validator schema output
     mcp_dir="$(linux_agent_mcp_dir)"
     rel="${path#${mcp_dir%/}/}"
-    findings='[]'
-
-    if ! payload="$(jq -c . "${path}" 2>/dev/null)"; then
-        findings="$(linux_agent_mcp_append_finding "${findings}" "critical" "MCP_MANIFEST_INVALID_JSON" "${rel}" "mcp.json 不是合法 JSON。")"
-        jq -cn --arg path "${rel}" --argjson ok false --argjson findings "${findings}" '{ok:$ok, path:$path, findings:$findings}'
-        return 0
+    validator="${LINUX_AGENT_ROOT}/lib/mcp_manifest.py"
+    schema="${LINUX_AGENT_ROOT}/schema/mcp-manifest.json"
+    if [[ ! -f "${validator}" ]]; then
+        validator="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/mcp_manifest.py"
     fi
-
-    payload_type="$(jq -r 'type' <<<"${payload}")"
-    if [[ "${payload_type}" != "object" ]]; then
-        findings="$(linux_agent_mcp_append_finding "${findings}" "critical" "MCP_MANIFEST_NOT_OBJECT" "${rel}" "mcp.json 必须是 JSON object。")"
+    if [[ ! -f "${schema}" ]]; then
+        schema="$(cd "$(dirname "${validator}")/.." && pwd)/schema/mcp-manifest.json"
+    fi
+    output="$(python3 "${validator}" "${path}" --schema "${schema}" 2>/dev/null || true)"
+    if ! jq -e 'type == "object" and (.findings | type) == "array"' >/dev/null 2>&1 <<<"${output}"; then
         jq -cn \
             --arg path "${rel}" \
-            --arg id "" \
-            --arg transport "" \
-            --argjson findings "${findings}" \
-            '{ok:false, path:$path, id:$id, transport:$transport, findings:$findings}'
+            '{
+                ok:false,
+                path:$path,
+                id:"",
+                transport:"",
+                findings:[{
+                    severity:"critical",
+                    code:"MCP_MANIFEST_VALIDATOR_FAILED",
+                    path:$path,
+                    message:"MCP manifest validator failed."
+                }]
+            }'
         return 0
     fi
-
-    server_id="$(jq -r 'if (.id | type) == "string" then .id else "" end' <<<"${payload}")"
-    if ! jq -e '(.id | type) == "string"' <<<"${payload}" >/dev/null || [[ ! "${server_id}" =~ ^[a-z0-9][a-z0-9_.-]*$ ]]; then
-        findings="$(linux_agent_mcp_append_finding "${findings}" "critical" "MCP_ID_INVALID" "${rel}" "MCP server id 必须是字符串，且匹配 ^[a-z0-9][a-z0-9_.-]*$。" "${server_id}")"
-    fi
-
-    transport="$(jq -r 'if (.transport | type) == "string" then .transport else "" end' <<<"${payload}")"
-    case "${transport}" in
-        stdio | sse | streamable_http) ;;
-        *)
-            findings="$(linux_agent_mcp_append_finding "${findings}" "critical" "MCP_TRANSPORT_INVALID" "${rel}" "transport 必须是字符串 stdio、sse 或 streamable_http。" "${server_id}")"
-            ;;
-    esac
-
-    enabled="$(jq -r 'if has("enabled") then (.enabled | type) else "missing" end' <<<"${payload}")"
-    if [[ "${enabled}" != "missing" && "${enabled}" != "boolean" ]]; then
-        findings="$(linux_agent_mcp_append_finding "${findings}" "critical" "MCP_ENABLED_INVALID" "${rel}" "enabled 必须是 boolean。" "${server_id}")"
-    fi
-
-    case "${transport}" in
-        stdio)
-            if ! jq -e '(.command | type) == "string" and (.command | length) > 0' <<<"${payload}" >/dev/null; then
-                findings="$(linux_agent_mcp_append_finding "${findings}" "critical" "MCP_STDIO_COMMAND_MISSING" "${rel}" "stdio transport 必须配置非空字符串 command。" "${server_id}")"
-            fi
-            if ! jq -e '(.args == null) or ((.args | type) == "array" and all(.args[]; type == "string"))' <<<"${payload}" >/dev/null; then
-                findings="$(linux_agent_mcp_append_finding "${findings}" "critical" "MCP_STDIO_ARGS_INVALID" "${rel}" "stdio args 必须是字符串数组。" "${server_id}")"
-            fi
-            if ! jq -e '(.env == null) or ((.env | type) == "object" and all(.env[]; type == "string"))' <<<"${payload}" >/dev/null; then
-                findings="$(linux_agent_mcp_append_finding "${findings}" "critical" "MCP_STDIO_ENV_INVALID" "${rel}" "stdio env 必须是字符串值 object。" "${server_id}")"
-            fi
-            ;;
-        sse)
-            url="$(jq -r '.url // empty' <<<"${payload}")"
-            if ! linux_agent_mcp_http_url_valid "${url}"; then
-                findings="$(linux_agent_mcp_append_finding "${findings}" "critical" "MCP_SSE_URL_INVALID" "${rel}" "sse transport 必须配置 http(s) url。" "${server_id}")"
-            fi
-            message_url="$(jq -r '.message_url // empty' <<<"${payload}")"
-            if [[ -n "${message_url}" ]] && ! linux_agent_mcp_http_url_valid "${message_url}"; then
-                findings="$(linux_agent_mcp_append_finding "${findings}" "critical" "MCP_SSE_MESSAGE_URL_INVALID" "${rel}" "sse message_url 必须是 http(s) URL。" "${server_id}")"
-            fi
-            if ! jq -e '(.headers == null) or ((.headers | type) == "object" and all(.headers[]; type == "string"))' <<<"${payload}" >/dev/null; then
-                findings="$(linux_agent_mcp_append_finding "${findings}" "critical" "MCP_HTTP_HEADERS_INVALID" "${rel}" "headers 必须是字符串值 object。" "${server_id}")"
-            fi
-            ;;
-        streamable_http)
-            url="$(jq -r '.url // empty' <<<"${payload}")"
-            if ! linux_agent_mcp_http_url_valid "${url}"; then
-                findings="$(linux_agent_mcp_append_finding "${findings}" "critical" "MCP_STREAMABLE_HTTP_URL_INVALID" "${rel}" "streamable_http transport 必须配置单一 http(s) MCP endpoint。" "${server_id}")"
-            fi
-            if ! jq -e '(.headers == null) or ((.headers | type) == "object" and all(.headers[]; type == "string"))' <<<"${payload}" >/dev/null; then
-                findings="$(linux_agent_mcp_append_finding "${findings}" "critical" "MCP_HTTP_HEADERS_INVALID" "${rel}" "headers 必须是字符串值 object。" "${server_id}")"
-            fi
-            ;;
-    esac
-
-    jq -cn \
+    jq -c \
         --arg path "${rel}" \
-        --arg id "${server_id}" \
-        --arg transport "${transport}" \
-        --argjson findings "${findings}" \
-        '{
-            ok:(($findings | length) == 0),
-            path:$path,
-            id:$id,
-            transport:$transport,
-            findings:$findings
-        }'
+        '.path = $path | .findings = [.findings[] | .path = $path]' \
+        <<<"${output}"
 }
 
 linux_agent_mcp_server_summary() {
@@ -282,9 +221,64 @@ linux_agent_mcp_python_client_error() {
         '{ok:false, status:$status, error:$raw}'
 }
 
+linux_agent_mcp_runner_path() {
+    local path="${LINUX_AGENT_ROOT}/lib/runner.py"
+    if [[ -f "${path}" && ! -L "${path}" ]]; then
+        printf '%s\n' "${path}"
+        return 0
+    fi
+    path="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/runner.py"
+    [[ -f "${path}" && ! -L "${path}" ]] || return 1
+    printf '%s\n' "${path}"
+}
+
+linux_agent_mcp_run_fixed_client() {
+    local output_var="$1"
+    shift
+    local -n output_ref="${output_var}"
+    local runner socket_path status=0 name value
+    local -a scrub_env runner_command
+    runner="$(linux_agent_mcp_runner_path)" || return 125
+    scrub_env=(env -i --)
+    for name in \
+        PATH HOME USER LOGNAME LANG LC_ALL TZ \
+        LINUX_AGENT_ROOT LINUX_AGENT_DATA_DIR LINUX_AGENT_MCP_DIR \
+        LINUX_AGENT_TMP_ROOT LINUX_AGENT_TMP_DIR \
+        LINUX_AGENT_USER_SKILLS_DIR LINUX_AGENT_BUILTIN_SKILLS_DIR \
+        LINUX_AGENT_MCP_SELECTION_CACHE_DIR \
+        LINUX_AGENT_EXECUTION_TIMEOUT_SEC LINUX_AGENT_EXECUTION_MAX_OUTPUT_BYTES; do
+        [[ -v "${name}" ]] || continue
+        value="${!name}"
+        [[ -n "${value}" ]] || continue
+        scrub_env+=("${name}=${value}")
+    done
+    if linux_agent_managed_execution_enabled 2>/dev/null; then
+        socket_path="${LINUX_AGENT_RUNNER_SOCKET:-/run/linux-agent/runner.sock}"
+        [[ -S "${socket_path}" ]] || return 125
+        runner_command=(
+            "${scrub_env[@]}"
+            python3 "${runner}" request
+            --socket "${socket_path}"
+            --kind mcp
+            -- "$@"
+        )
+    else
+        runner_command=(
+            "${scrub_env[@]}"
+            python3 "${runner}" local-mcp -- "$@"
+        )
+    fi
+    # The nameref assignment populates the caller's output variable.
+    # shellcheck disable=SC2034
+    output_ref="$("${runner_command[@]}" 2>&1)" || status=$?
+    return "${status}"
+}
+
 linux_agent_mcp_server_tools_from_path() {
     local path="$1"
+    local refresh="${2:-false}"
     local validation output client
+    local -a client_command
 
     validation="$(linux_agent_mcp_validate_manifest_path "${path}")"
     if [[ "$(jq -r '.ok // false' <<<"${validation}")" != "true" ]]; then
@@ -296,7 +290,11 @@ linux_agent_mcp_server_tools_from_path() {
         jq -cn '{ok:false, status:"mcp_client_unavailable", error:"lib/mcp_client.py 不存在。", tools:[]}'
         return 0
     fi
-    if output="$(python3 "${client}" list-tools "${path}" 2>&1)"; then
+    client_command=(python3 "${client}" list-tools "${path}")
+    if [[ "${refresh}" == "true" ]]; then
+        client_command+=(--refresh)
+    fi
+    if linux_agent_mcp_run_fixed_client output "${client_command[@]}"; then
         if jq -e 'type == "object"' >/dev/null 2>&1 <<<"${output}"; then
             printf '%s\n' "${output}"
         else
@@ -325,7 +323,9 @@ linux_agent_mcp_tool_list_finding() {
         "${server_id}"
 }
 
+# shellcheck disable=SC2120 # refresh is passed by bin/agent and lib/api.sh.
 linux_agent_mcp_tool_catalog() {
+    local refresh="${1:-false}"
     local mcp_dir servers tools findings path server enabled valid tools_result server_tools server_info error
     mcp_dir="$(linux_agent_mcp_dir)"
     mkdir -p "${mcp_dir}"
@@ -346,7 +346,7 @@ linux_agent_mcp_tool_catalog() {
         server_info='{}'
 
         if [[ "${enabled}" == "true" && "${valid}" == "true" ]]; then
-            tools_result="$(linux_agent_mcp_server_tools_from_path "${path}")"
+            tools_result="$(linux_agent_mcp_server_tools_from_path "${path}" "${refresh}")"
             if [[ "$(jq -r '.ok // false' <<<"${tools_result}")" == "true" ]]; then
                 server_tools="$(jq -c '.tools // [] | if type == "array" then . else [] end' <<<"${tools_result}")"
                 server_tools="$(linux_agent_mcp_public_manifest "${server_tools}")"
@@ -390,6 +390,7 @@ linux_agent_mcp_tool_catalog() {
     done < <(linux_agent_mcp_manifest_paths)
 
     findings="$(jq -c 'unique_by([.code, (.server_id // ""), (.path // ""), (.message // "")])' <<<"${findings}")"
+    tools="$(jq -c 'sort_by([(.server_id // ""), (.name // "")])' <<<"${tools}")"
     jq -cn \
         --arg root "${mcp_dir}" \
         --argjson servers "${servers}" \
@@ -434,7 +435,14 @@ linux_agent_mcp_tool_metadata() {
         | if $found == null then
             {ok:false, status:"tool_not_found", server_id:$server_id, tool:$tool}
           else
-            {ok:true, status:"found", server_id:$server_id, tool:$tool, metadata:$found}
+            {
+                ok:true,
+                status:"found",
+                server_id:$server_id,
+                tool:$tool,
+                transport:($result.transport // ""),
+                metadata:$found
+            }
           end'
 }
 
@@ -476,11 +484,13 @@ linux_agent_mcp_call_tool() {
 
     tmp_dir="${LINUX_AGENT_TMP_DIR:-/tmp}"
     mkdir -p "${tmp_dir}"
-    args_file="$(mktemp "${tmp_dir}/mcp.args.XXXXXX")"
+    args_file="$(mktemp --suffix=.json "${tmp_dir}/mcp.args.XXXXXX")"
     chmod 600 "${args_file}" 2>/dev/null || true
     printf '%s\n' "${args}" >"${args_file}"
     status=0
-    output="$(python3 "${client}" call-tool "${path}" "${tool_name}" "${args_file}" 2>&1)" || status=$?
+    linux_agent_mcp_run_fixed_client \
+        output \
+        python3 "${client}" call-tool "${path}" "${tool_name}" "${args_file}" || status=$?
     rm -f "${args_file}"
     if [[ "${status}" -eq 0 || "$(jq -r '.ok // false' <<<"${output}" 2>/dev/null || printf false)" == "false" ]]; then
         if jq -e 'type == "object"' >/dev/null 2>&1 <<<"${output}"; then
@@ -506,7 +516,39 @@ linux_agent_mcp_step_review_material() {
         --arg tool "${tool_name}" \
         --argjson arguments "${args}" \
         --argjson metadata "${metadata}" \
-        '"mcp_tool=\($server_id)/\($tool)\narguments=\($arguments | tojson)\nmetadata=\($metadata | tojson)"'
+        '
+        def derived_headers($schema; $value; $path):
+            [
+                ($schema.properties // {} | to_entries[]) as $property
+                | ($path + [$property.key]) as $next_path
+                | (if ($value | type) == "object" then $value[$property.key] else null end) as $argument
+                | (
+                    if (($property.value["x-mcp-header"] // null) | type) == "string"
+                        and $argument != null
+                    then
+                        ($property.value["x-mcp-header"]) as $header
+                        | {
+                            name:("Mcp-Param-" + $header),
+                            source:($next_path | join(".")),
+                            value:(
+                                if (($header + " " + ($next_path | join(".")))
+                                    | test("(?i)(authorization|cookie|token|secret|password|passwd|api[_-]?key|credential|private[_-]?key)"))
+                                then "[REDACTED]"
+                                else $argument
+                                end
+                            )
+                        }
+                    else empty
+                    end
+                ),
+                derived_headers($property.value; $argument; $next_path)[]
+            ];
+        (if ($metadata.transport // "") == "streamable_http"
+         then ($metadata.metadata.inputSchema // {})
+         else {}
+         end) as $schema
+        | derived_headers($schema; $arguments; []) as $headers
+        | "mcp_tool=\($server_id)/\($tool)\narguments=\($arguments | tojson)\nderived_headers=\($headers | tojson)\nmetadata=\($metadata | tojson)"'
 }
 
 linux_agent_mcp_context_json() {

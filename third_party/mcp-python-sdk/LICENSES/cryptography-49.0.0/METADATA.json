@@ -1,0 +1,11 @@
+{
+  "license_expression": "Apache-2.0 OR BSD-3-Clause",
+  "license_files": [
+    "LICENSE",
+    "LICENSE.APACHE",
+    "LICENSE.BSD"
+  ],
+  "name": "cryptography",
+  "source_wheel": "cryptography-49.0.0-cp311-abi3-manylinux2014_aarch64.manylinux_2_17_aarch64.whl",
+  "version": "49.0.0"
+}

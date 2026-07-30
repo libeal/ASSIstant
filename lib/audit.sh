@@ -918,6 +918,21 @@ linux_agent_audit_safe_summary() {
                 skipped_step:step_summary(.skipped_step),
                 remaining_step_count:(if (.remaining_steps? | type) == "array" then (.remaining_steps | length) else 0 end)
             }
+        elif ($stage | startswith("mcp_")) then
+            {
+                server_id:(.server_id // null),
+                tool:(.tool // null),
+                protocol_version:(.protocol_version // null),
+                transport:(.transport // null),
+                request_digest:(.request_digest // null),
+                request_state_digest:(.request_state_digest // null),
+                fallback_class:(.fallback_class // null),
+                outcome_known:(.outcome_known // null),
+                round:(.round // null),
+                input_request_count:(.input_request_count // null),
+                response_count:(.response_count // null),
+                status:(.status // null)
+            } | with_entries(select(.value != null))
         elif $stage == "edit_planned" then
             {
                 response_type:(.response_type // null),
@@ -1021,7 +1036,21 @@ linux_agent_audit_payload() {
     # Thinking summaries belong only in the explicitly enabled, owner-only
     # thinking trace. Keep them out of both compact and verbose audit streams,
     # including when they are nested in resume state or execution results.
-    if filtered="$(jq -c 'del(.. | .thinking_summary?)' <<<"${payload}" 2>/dev/null)"; then
+    if filtered="$(jq -c '
+        walk(
+            if type == "object" then
+                del(
+                    .thinking_summary,
+                    .requestState,
+                    .request_state,
+                    .inputResponses,
+                    .input_responses,
+                    .mcp_input_responses,
+                    .mcp_input_responses_file
+                )
+            else . end
+        )
+    ' <<<"${payload}" 2>/dev/null)"; then
         payload="${filtered}"
     fi
 

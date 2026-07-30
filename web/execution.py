@@ -297,6 +297,42 @@ class ExecutionService:
         )
         return command
 
+    @staticmethod
+    def _stage_mcp_input_payload(payload, context):
+        if not isinstance(payload, dict) or "mcp_input_responses" not in payload:
+            return payload, None
+        if not context.is_job or context.tmp_dir is None:
+            raise ValueError("MCP input responses require a private Job context")
+        if "mcp_input_responses_file" in payload:
+            raise ValueError("MCP input response file paths are internal")
+        responses = payload.get("mcp_input_responses")
+        if not isinstance(responses, dict):
+            raise ValueError("mcp_input_responses must be an object")
+        encoded = json.dumps(
+            responses,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+        if len(encoded) > 65_536:
+            raise ValueError("mcp_input_responses exceeds 64 KiB")
+        target = context.tmp_dir / f"mcp-input-responses.{uuid.uuid4().hex}.json"
+        descriptor = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        try:
+            with os.fdopen(descriptor, "wb") as handle:
+                handle.write(encoded)
+                handle.write(b"\n")
+        except BaseException:
+            try:
+                target.unlink()
+            except FileNotFoundError:
+                pass
+            raise
+        staged_payload = dict(payload)
+        staged_payload.pop("mcp_input_responses", None)
+        staged_payload["mcp_input_responses_file"] = os.fspath(target)
+        return staged_payload, target
+
     def _environment(self, resource, action, context):
         include_api_key = (str(resource), str(action or "")) in API_KEY_ACTIONS
         built = self.env_builder(include_api_key=include_api_key)
@@ -350,13 +386,21 @@ class ExecutionService:
         normalized_timeout = self.default_job_timeout
         if timeout is not None:
             normalized_timeout = self._positive_timeout(timeout, "timeout", allow_none=False)
-        outcome = self._execute(
-            self._command(resource, action, payload),
-            self._environment(resource, action, request_context),
-            request_context,
-            str(resource),
-            normalized_timeout,
-        )
+        staged_payload, staged_path = self._stage_mcp_input_payload(payload, request_context)
+        try:
+            outcome = self._execute(
+                self._command(resource, action, staged_payload),
+                self._environment(resource, action, request_context),
+                request_context,
+                str(resource),
+                normalized_timeout,
+            )
+        finally:
+            if staged_path is not None:
+                try:
+                    staged_path.unlink()
+                except FileNotFoundError:
+                    pass
         return self._result_envelope(outcome, str(resource), normalized_timeout)
 
     def run_external_sync(

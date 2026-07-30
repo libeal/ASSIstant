@@ -21,6 +21,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y shellcheck shfmt python3-pyflakes
           npm install --global 'typescript@5.7.3'
+          npm install --global '@modelcontextprotocol/conformance@0.2.0-alpha.10'
           command -v shfmt
           shfmt -version
           command -v tsc
@@ -42,6 +43,9 @@ jobs:
 
       - name: Frontend unit tests
         run: bash tests/web_frontend.sh
+
+      - name: MCP 2026-07-28 conformance
+        run: bash tests/mcp_conformance.sh
 
       - name: Shell regressions
         run: |

@@ -128,8 +128,21 @@ export function createPolicyView(app) {
 
   async function loadPolicies() {
     const data = await app.api("/api/policies");
-    state.policyFiles = data.files || [];
     const select = $("policyFileSelect");
+    if (!data.ok) {
+      state.policyFiles = [];
+      state.currentPolicyPath = "";
+      select.innerHTML = "";
+      $("policyEditor").value = "";
+      updatePolicyEditState();
+      app.printOutput("policyOutput", data);
+      renderRiskRules(null);
+      renderAuditBoundaries(null);
+      renderFileVault(null);
+      showToast(data.message || data.error || "策略列表读取失败");
+      return data;
+    }
+    state.policyFiles = data.files || [];
     select.innerHTML = "";
     for (const file of state.policyFiles) {
       const option = document.createElement("option");
@@ -145,7 +158,7 @@ export function createPolicyView(app) {
       renderRiskRules(null);
       renderAuditBoundaries(null);
       renderFileVault(null);
-      return;
+      return data;
     }
     const paths = state.policyFiles.map((file) => file.path);
     const preferred = paths.includes(state.currentPolicyPath)
@@ -154,6 +167,7 @@ export function createPolicyView(app) {
     select.value = preferred;
     await readPolicy(preferred);
     await loadPolicySummaries(preferred);
+    return data;
   }
 
   async function loadPolicySummaries(currentPath) {

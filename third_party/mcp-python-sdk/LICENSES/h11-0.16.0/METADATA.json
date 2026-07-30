@@ -1,0 +1,9 @@
+{
+  "license_expression": "MIT",
+  "license_files": [
+    "LICENSE.txt"
+  ],
+  "name": "h11",
+  "source_wheel": "h11-0.16.0-py3-none-any.whl",
+  "version": "0.16.0"
+}

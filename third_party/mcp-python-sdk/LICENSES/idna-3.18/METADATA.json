@@ -1,0 +1,9 @@
+{
+  "license_expression": "BSD-3-Clause",
+  "license_files": [
+    "LICENSE.md"
+  ],
+  "name": "idna",
+  "source_wheel": "idna-3.18-py3-none-any.whl",
+  "version": "3.18"
+}

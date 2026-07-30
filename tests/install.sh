@@ -119,11 +119,29 @@ repack_core_for_test() {
     rm -rf -- "${stage}"
 }
 
+assert_mcp_release_ready() {
+    local release_root
+    local runtime_status
+    release_root="$(readlink -f -- "$1")"
+    [[ -d "${release_root}/third_party/mcp-python-sdk" ]]
+    [[ -x "${release_root}/.mcp-venv/bin/python" ]]
+    runtime_status="$(LINUX_AGENT_ROOT="${release_root}" \
+        python3 "${release_root}/lib/mcp_runtime.py" status)"
+    jq -e --arg venv "${release_root}/.mcp-venv" '
+        .ok == true
+        and .status == "ready"
+        and .runtime_ready == true
+        and .sdk_version == "2.0.0"
+        and .venv == $venv
+    ' <<<"${runtime_status}" >/dev/null
+}
+
 prefix="${tmp_root}/prefix"
 bash "${ROOT_DIR}/scripts/install.sh" install \
     --version v0.0.0-test --from-dist "${dist_one}" --prefix "${prefix}" --no-systemd
 [[ "$(readlink "${prefix}/current")" == "releases/v0.0.0-test" ]]
 [[ -x "${prefix}/current/bin/agent" && -x "${prefix}/current/bin/agent-web" ]]
+assert_mcp_release_ready "${prefix}/releases/v0.0.0-test"
 grep -q '^Type=notify$' "${prefix}/current/packaging/linux-agent-web.service"
 grep -q '^ReadWritePaths=/opt/linux-agent/data$' "${prefix}/current/packaging/linux-agent-web.service"
 grep -q '^CapabilityBoundingSet=CAP_AUDIT_CONTROL CAP_AUDIT_READ CAP_DAC_READ_SEARCH$' \
@@ -139,6 +157,14 @@ grep -q '^CapabilityBoundingSet=$' \
     "${prefix}/skills/database-inspect/assets/systemd/linux-agent-database-inspector.service"
 grep -q '^CapabilityBoundingSet=$' \
     "${prefix}/current/packaging/linux-agent-runner.service"
+grep -q '^DynamicUser=yes$' \
+    "${prefix}/current/packaging/linux-agent-mcp-stdio.service"
+grep -q '^InaccessiblePaths=/opt/linux-agent/data ' \
+    "${prefix}/current/packaging/linux-agent-mcp-stdio.service"
+grep -q '^SocketGroup=linux-agent-runner$' \
+    "${prefix}/current/packaging/linux-agent-mcp-stdio.socket"
+grep -q '^SocketMode=0660$' \
+    "${prefix}/current/packaging/linux-agent-mcp-stdio.socket"
 grep -q '^SocketMode=0660$' "${prefix}/current/packaging/linux-agent-observer-helper.socket"
 grep -q '^DirectoryMode=0755$' "${prefix}/current/packaging/linux-agent-observer-helper.socket"
 grep -q '^CPUQuota=200%$' "${prefix}/current/packaging/linux-agent-runner.service"
@@ -152,6 +178,8 @@ for unit in linux-agent-observer-helper.service linux-agent-runner.service \
     grep -q '^Environment=LINUX_AGENT_SERVICE_USER=linux-agent$' \
         "${prefix}/current/packaging/${unit}"
 done
+grep -q '^Environment=LINUX_AGENT_SERVICE_USER=linux-agent-runner$' \
+    "${prefix}/current/packaging/linux-agent-mcp-stdio.service"
 grep -q '^Environment=LINUX_AGENT_SERVICE_USER=linux-agent$' \
     "${prefix}/skills/database-inspect/assets/systemd/linux-agent-database-inspector.service"
 grep -q 'InaccessiblePaths=.*observer.sock.*host-ops.sock.*policy-writer.sock' \
@@ -162,6 +190,8 @@ grep -q '^IPAddressDeny=any$' "${prefix}/current/packaging/dropins/10-provider-e
 [[ "$(readlink "${prefix}/releases/v0.0.0-test/config")" == "../../data/config" ]]
 [[ "$(stat -c '%a' "${prefix}/data/config/config.json")" == "600" ]]
 [[ "$(stat -c '%a' "${prefix}/data/.runtime.lock")" == "600" ]]
+[[ "$(stat -c '%a' "${prefix}/data/mcp")" == "700" ]]
+[[ "$(stat -c '%a' "${prefix}/data/mcp/credentials")" == "700" ]]
 expected_runtime_user="$(id -un)"
 expected_runtime_uid="$(id -u)"
 expected_runtime_gid="$(id -g)"
@@ -201,11 +231,16 @@ printf 'persistent-marker\n' >"${prefix}/data/logs/marker"
 bash "${ROOT_DIR}/scripts/install.sh" upgrade \
     --version v0.0.1-test --from-dist "${dist_two}" --prefix "${prefix}" --no-systemd
 [[ "$(readlink "${prefix}/current")" == "releases/v0.0.1-test" ]]
+assert_mcp_release_ready "${prefix}/releases/v0.0.1-test"
+# An upgrade must retain the previous release as one complete rollback unit,
+# including its independently usable offline MCP runtime.
+assert_mcp_release_ready "${prefix}/releases/v0.0.0-test"
 grep -qx 'persistent-marker' "${prefix}/data/logs/marker"
 jq -e '.remote.release_version == "v0.0.1-test"' "${prefix}/data/config/config.json" >/dev/null
 
 bash "${ROOT_DIR}/scripts/install.sh" rollback --prefix "${prefix}" --no-systemd
 [[ "$(readlink "${prefix}/current")" == "releases/v0.0.0-test" ]]
+assert_mcp_release_ready "${prefix}/current"
 jq -e '.remote.release_version == "v0.0.0-test"' "${prefix}/data/config/config.json" >/dev/null
 
 bash "${ROOT_DIR}/scripts/install.sh" upgrade \
@@ -700,6 +735,8 @@ SH
     fi
     [[ "$(stat -c '%a' "${managed_prefix}/data/.runtime.lock")" == "640" ]]
     [[ "$(stat -c '%u:%g' "${managed_prefix}/data/.runtime.lock")" == "$(id -u):$(id -g)" ]]
+    [[ "$(stat -c '%a' "${managed_prefix}/data/mcp")" == "700" ]]
+    [[ "$(stat -c '%a' "${managed_prefix}/data/mcp/credentials")" == "700" ]]
     managed_egress_path="${managed_prefix}/systemd/linux-agent-web.service.d/10-provider-egress.conf"
     grep -q '^IPAddressDeny=any$' "${managed_egress_path}"
     grep -q '^IPAddressAllow=localhost$' "${managed_egress_path}"
@@ -788,6 +825,13 @@ SH
     grep -q '^SocketUser=root$' "${managed_prefix}/systemd/linux-agent-runner.socket"
     grep -q '^SocketGroup=root$' "${managed_prefix}/systemd/linux-agent-runner.socket"
     grep -q '^SocketMode=0600$' "${managed_prefix}/systemd/linux-agent-runner.socket"
+    grep -q '^DynamicUser=yes$' \
+        "${managed_prefix}/systemd/linux-agent-mcp-stdio.service"
+    grep -q '^Environment=LINUX_AGENT_SERVICE_USER=root$' \
+        "${managed_prefix}/systemd/linux-agent-mcp-stdio.service"
+    grep -q '^SocketUser=root$' "${managed_prefix}/systemd/linux-agent-mcp-stdio.socket"
+    grep -q '^SocketGroup=root$' "${managed_prefix}/systemd/linux-agent-mcp-stdio.socket"
+    grep -q '^SocketMode=0660$' "${managed_prefix}/systemd/linux-agent-mcp-stdio.socket"
     grep -q '^SocketGroup=root$' "${managed_prefix}/systemd/linux-agent-host-ops.socket"
     grep -q '^SocketMode=0660$' "${managed_prefix}/systemd/linux-agent-host-ops.socket"
     grep -q '^SocketGroup=root$' "${managed_prefix}/systemd/linux-agent-policy-writer.socket"
