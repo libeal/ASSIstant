@@ -135,7 +135,10 @@ jq -e '.ok == true and .status == "executed"
     and any(.timeline[]?;
         .kind == "execution"
         and .original_step_id == "load-ops-basic"
-        and .result.status == "read")
+        and .status == "succeeded"
+        and any(.output_blocks[]?;
+            .kind == "json"
+            and .json.status == "read"))
     and ([.timeline[]? | select(.kind == "execution") | .output_blocks[]? | select(.kind == "meta" and .title == "执行代理") | .json.requested_privilege] | first) == "least"' <<<"${work_run}" >/dev/null
 jq -e '([.timeline[]? | select(.kind == "execution") | .output_blocks[]? | select(.kind == "json") | .json
     | select(.tool == "system.resource.inspect" and (.top_processes | length > 0))] | length) > 0' <<<"${work_run}" >/dev/null
@@ -151,7 +154,10 @@ jq -e '.ok == true and .status == "executed"
     and any(.timeline[]?;
         .kind == "execution"
         and .original_step_id == "load-ops-basic"
-        and .result.status == "read")' <<<"${continue_answer}" >/dev/null
+        and .status == "succeeded"
+        and any(.output_blocks[]?;
+            .kind == "json"
+            and .json.status == "read"))' <<<"${continue_answer}" >/dev/null
 
 loop_run="$(
     linux_agent_test_capture "API iterative work" 150 "${project_work}" discard \
@@ -190,7 +196,10 @@ jq -e '.ok == true and .status == "executed" and .response.response_type == "wor
     and any(.timeline[]?;
         .kind == "execution"
         and .original_step_id == "load-ops-basic"
-        and .result.status == "read")' <<<"${approval_second}" >/dev/null
+        and .status == "succeeded"
+        and any(.output_blocks[]?;
+            .kind == "json"
+            and .json.status == "read"))' <<<"${approval_second}" >/dev/null
 
 network_steps="$(jq -cn '[
     {id:"net-ip-scanner", title:"IP scanner", executor_type:"skill_script", skill_script:"network-ops-tools/ip-scanner", arguments:{cidr:"127.0.0.1/32", ports:[1], timeout_ms:200}, reason:"regression", expected_effect:"scan loopback IP", risk_level:"low", rollback_hint:"none"},
