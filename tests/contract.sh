@@ -315,7 +315,8 @@ jq -e '
     and .timeline[0].status == "failed"
 ' <<<"${unknown_state_protocol}" >/dev/null
 
-# 3b) MCP tool results get their own authoritative output block, so the console# never has to guess a type from an arbitrary JSON shape. Media and embedded
+# 3b) MCP tool results get their own authoritative output block, so the console
+# never has to guess a type from an arbitrary JSON shape. Media and embedded
 # resources are reduced to MIME + size: no base64 payload may reach the client.
 mcp_result_blocks="$(linux_agent_output_blocks_from_result '{
     "ok": true,
@@ -330,7 +331,9 @@ mcp_result_blocks="$(linux_agent_output_blocks_from_result '{
             {"type": "image", "mimeType": "image/png", "data": "aGVsbG8gd29ybGQh"},
             {"type": "resource_link", "uri": "https://example.test/x"},
             {"type": "resource", "resource": {"uri": "file:///tmp/a.txt", "mimeType": "text/plain", "text": "inline"}},
-            {"type": "resource", "resource": {"uri": "file:///tmp/b.bin", "blob": "QUJDRA=="}}
+            {"type": "resource", "resource": {"uri": "file:///tmp/b.bin", "blob": "QUJDRA=="}},
+            42,
+            {"type": "text", "text": {"unexpected": true}}
         ],
         "structuredContent": {"rows": 2},
         "isError": false
@@ -355,21 +358,84 @@ jq -e '
     and $block.mcp.fallback_reason == "streamable_http 405"
     and $block.mcp.is_error == false
     and $block.mcp.structured_content.rows == 2
-    and ($block.mcp.content | length) == 5
+    and ($block.mcp.content | length) == 7
     and ($block.mcp.content[0] | .type == "text" and .text == "hello" and .size_bytes == 5)
     and ($block.mcp.content[1] | .type == "image" and .mime_type == "image/png" and .size_bytes == 12)
     and ($block.mcp.content[2] | .type == "resource_link" and .uri == "https://example.test/x")
     and ($block.mcp.content[3] | .type == "resource" and .text == "inline" and .size_bytes == 6)
     and ($block.mcp.content[4] | .type == "resource" and .text == null and .size_bytes == 4)
+    and ($block.mcp.content[5] | .type == "unknown")
+    and ($block.mcp.content[6] | .type == "text" and .text == "" and .size_bytes == 0)
 ' <<<"${mcp_result_blocks}" >/dev/null
 if grep -qE 'aGVsbG8gd29ybGQh|QUJDRA==' <<<"${mcp_result_blocks}"; then
     printf 'mcp_result block leaked raw base64 payload\n' >&2
     exit 1
 fi
+# A malformed legacy server may return a non-array content value. The protocol
+# projection must keep the result usable and expose an empty content list.
+jq -e '([.[] | select(.kind == "mcp_result")] | first).mcp.content == []' \
+    <<<"$(linux_agent_output_blocks_from_result '{"ok":true,"status":"executed","output":{"content":{"type":"text","text":"not-an-array"}},"mcp":{"server_id":"legacy","tool":"bad"}}')" >/dev/null
 # A non-MCP result must keep the previous generic projection.
 jq -e '([.[] | select(.kind == "mcp_result")] | length) == 0
     and ([.[] | select(.kind == "json" and .title == "执行输出")] | length) == 1' \
     <<<"$(linux_agent_output_blocks_from_result '{"ok":true,"status":"executed","output":{"tool":"fixture.tool"}}')" >/dev/null
+
+# Both Work timeline implementations must use the same MCP projection. The
+# step-state path must also omit its former raw result field, which exposed the
+# original content[].data/resource.blob payload through the Web protocol.
+work_mcp_response='{"response_type":"work_plan","steps":[{"id":"mcp-step","title":"MCP step"}]}'
+work_mcp_state_protocol="$(linux_agent_protocol_for_work 'executed' \
+    "${work_mcp_response}" \
+    '{
+        "status":"executed",
+        "step_states":[{
+            "key":"iteration-1:0:mcp-step","step_id":"mcp-step","step_index":0,
+            "iteration":1,"scope":"iteration-1","step":{"id":"mcp-step","title":"MCP step"},
+            "status":"succeeded"
+        }],
+        "results":[{
+            "step_key":"iteration-1:0:mcp-step","step_index":0,"iteration":1,
+            "step":{"id":"mcp-step","title":"MCP step"},
+            "result":{
+                "ok":true,"status":"executed",
+                "output":{"content":[{"type":"image","mimeType":"image/png","data":"U1RBVEVfU0VDUkVU"}],"isError":false},
+                "mcp":{"server_id":"state-files","tool":"read","transport":"stdio"}
+            }
+        }]
+    }')"
+work_mcp_legacy_protocol="$(linux_agent_protocol_for_work 'executed' \
+    "${work_mcp_response}" \
+    '{
+        "status":"executed",
+        "results":[{
+            "step":{"id":"mcp-step","title":"MCP step"},
+            "result":{
+                "ok":true,"status":"executed",
+                "output":{"content":[{"type":"resource","resource":{"uri":"file:///tmp/legacy.bin","blob":"TEVHQUNZX1NFQ1JFVA=="}}],"isError":false},
+                "mcp":{"server_id":"legacy-files","tool":"read","transport":"stdio"}
+            }
+        }]
+    }')"
+for work_mcp_protocol in "${work_mcp_state_protocol}" "${work_mcp_legacy_protocol}"; do
+    jq -e '
+        .timeline_semantics == "step_projection"
+        and (.timeline | length) == 1
+        and (.timeline[0] | has("result") | not)
+        and any(.timeline[0].output_blocks[]?; .kind == "mcp_result")
+        and all(.timeline[0].output_blocks[]?; .kind != "json" or .title != "执行输出")
+    ' <<<"${work_mcp_protocol}" >/dev/null
+done
+jq -e '([.timeline[0].output_blocks[] | select(.kind == "mcp_result")] | first).mcp.content[0]
+    | .type == "image" and .mime_type == "image/png" and .size_bytes > 0 and (has("data") | not)' \
+    <<<"${work_mcp_state_protocol}" >/dev/null
+jq -e '([.timeline[0].output_blocks[] | select(.kind == "mcp_result")] | first).mcp.content[0]
+    | .type == "resource" and .uri == "file:///tmp/legacy.bin" and .size_bytes > 0 and (has("blob") | not)' \
+    <<<"${work_mcp_legacy_protocol}" >/dev/null
+if grep -qE 'U1RBVEVfU0VDUkVU|TEVHQUNZX1NFQ1JFVA==' \
+    <<<"${work_mcp_state_protocol}${work_mcp_legacy_protocol}"; then
+    printf 'Work protocol leaked raw MCP base64 payload\n' >&2
+    exit 1
+fi
 
 # 3c) The approval card carries the MCP metadata snapshot taken at review time,
 # so the console never has to re-query its own /api/mcp/tools cache.

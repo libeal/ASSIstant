@@ -322,7 +322,7 @@ rm -rf "${remote_missing_index_root}"
 mcp_root="$(mktemp -d)"
 original_mcp_dir="${LINUX_AGENT_MCP_DIR}"
 LINUX_AGENT_MCP_DIR="${mcp_root}"
-mkdir -p "${mcp_root}/stdio-sample" "${mcp_root}/streamable-sample" "${mcp_root}/sse-sample" "${mcp_root}/broken-sample" "${mcp_root}/array-sample" "${mcp_root}/stdio-tools" "${mcp_root}/v2-sample"
+mkdir -p "${mcp_root}/stdio-sample" "${mcp_root}/streamable-sample" "${mcp_root}/sse-sample" "${mcp_root}/broken-sample" "${mcp_root}/array-sample" "${mcp_root}/stdio-tools" "${mcp_root}/stdio-legacy-tools" "${mcp_root}/v2-sample"
 cat >"${mcp_root}/stdio-sample/mcp.json" <<'JSON'
 {
   "id": "stdio-sample",
@@ -386,6 +386,17 @@ cat >"${mcp_root}/stdio-tools/mcp.json" <<JSON
   "args": ["${ROOT_DIR}/tests/fake_mcp_server.py", "stdio"]
 }
 JSON
+cat >"${mcp_root}/stdio-legacy-tools/mcp.json" <<JSON
+{
+  "manifest_version": 2,
+  "id": "stdio-legacy-tools",
+  "name": "Fake legacy stdio tools",
+  "transport": "stdio",
+  "command": "python3",
+  "args": ["${ROOT_DIR}/tests/fake_mcp_server.py", "stdio"],
+  "protocol": {"mode": "legacy_only"}
+}
+JSON
 mcp_list="$(linux_agent_mcp_list)"
 jq -e '.ok == true
     and .status == "listed"
@@ -437,12 +448,41 @@ jq -e '[.servers[] | select(.id == "stdio-tools")] | first
     and (.protocol_version | type) == "string"
     and (.server_capabilities | type) == "object"
     and .fallback_used == false
-    and .fallback_reason == ""' <<<"${mcp_tools}" >/dev/null
+    and .fallback_reason == ""
+    and .protocol_family == "modern"' <<<"${mcp_tools}" >/dev/null
+# An intentional legacy_only connection is legacy even though no fallback
+# happened and the legacy server may report a protocol version.
+jq -e '[.servers[] | select(.id == "stdio-legacy-tools")] | first
+    | .contacted == true
+    and .fallback_used == false
+    and .protocol_family == "legacy"
+    and ([.tools[].name] | index("echo"))' <<<"${mcp_tools}" >/dev/null
 # A server that was never contacted must say so rather than look "not modern".
 jq -e '[.servers[] | select(.id == "broken-sample")] | first
     | .contacted == false and .protocol_version == null' <<<"${mcp_tools}" >/dev/null
 if grep -q 'should-not-leak' <<<"${mcp_tools}"; then
     printf 'mcp catalog leaked secret material\n' >&2
+    exit 1
+fi
+# Tool schemas describe parameters; property names such as password and api_key
+# are not credential values and must survive public projection intact.
+mcp_public_tool_data="$(linux_agent_mcp_public_tool_data '[{
+    "name": "schema-probe",
+    "inputSchema": {"type": "object", "properties": {
+        "password": {"type": "string", "default": "must-not-leak"},
+        "api_key": {"type": "string", "enum": ["must-not-leak"]}
+    }, "$defs": {"private_token": {"type": "string", "default": "must-not-leak"}}},
+    "annotations": {"token": "must-redact"}
+}]')"
+jq -e '.[0].inputSchema.properties.password.type == "string"
+    and .[0].inputSchema.properties.api_key.type == "string"
+    and (.[0].inputSchema.properties.password | has("default") | not)
+    and (.[0].inputSchema.properties.api_key | has("enum") | not)
+    and .[0].inputSchema["$defs"].private_token.type == "string"
+    and (.[0].inputSchema["$defs"].private_token | has("default") | not)
+    and .[0].annotations.token == "[REDACTED]"' <<<"${mcp_public_tool_data}" >/dev/null
+if grep -q 'must-not-leak' <<<"${mcp_public_tool_data}"; then
+    printf 'mcp tool schema projection leaked a secret default or enum value\n' >&2
     exit 1
 fi
 # The approval-card snapshot is redacted and carries the structure the review
@@ -456,6 +496,31 @@ jq -e '.available == true
     and (.annotations | type) == "object"' <<<"${mcp_approval_metadata}" >/dev/null
 jq -e '.available == false and .status == "tool_not_found"' \
     <<<"$(linux_agent_mcp_tool_approval_metadata "stdio-tools" "no-such-tool")" >/dev/null
+# Passing the review-time snapshot must avoid a second lookup and preserve its
+# schemas while still redacting actual metadata values.
+mcp_review_snapshot='{
+    "ok": true,
+    "status": "found",
+    "server_id": "snapshot-server",
+    "tool": "snapshot-tool",
+    "transport": "stdio",
+    "metadata": {
+        "name": "snapshot-tool",
+        "description": "snapshot-description",
+        "inputSchema": {"type": "object", "properties": {
+            "password": {"type": "string"},
+            "api_key": {"type": "string"}
+        }},
+        "annotations": {"token": "must-redact"}
+    }
+}'
+mcp_snapshot_approval="$(linux_agent_mcp_tool_approval_metadata \
+    "snapshot-server" "snapshot-tool" "${mcp_review_snapshot}")"
+jq -e '.available == true
+    and .description == "snapshot-description"
+    and .input_schema.properties.password.type == "string"
+    and .input_schema.properties.api_key.type == "string"
+    and .annotations.token == "[REDACTED]"' <<<"${mcp_snapshot_approval}" >/dev/null
 mcp_call="$(linux_agent_mcp_call_tool "stdio-tools" "echo" '{"text":"hello"}')"
 jq -e '.ok == true
     and .status == "executed"

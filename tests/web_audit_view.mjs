@@ -111,6 +111,7 @@ const state = {
   auditSessions: [],
   auditWebTimeline: null,
   auditIntegrityOk: null,
+  auditIntegrity: null,
   auditTimelineUnavailableReason: "",
   currentAuditSession: "large",
 };
@@ -247,5 +248,13 @@ assert.equal(controls.auditRestoreTimelineBtn.disabled, true);
 await view.restoreAuditTimelineToWorkbench();
 assert.equal(toasts.at(-1), "审计完整性未通过，不能恢复到工作台");
 assert.equal(apiCalls.filter((path) => path === "/api/session/restore").length, 0);
+
+// Clearing the selected session must also clear the visible integrity state;
+// otherwise a failed session leaves a stale failure pill on the empty view.
+auditResponse = { ok: true, status: "listed", sessions: [] };
+await view.loadAuditList();
+assert.equal(state.currentAuditSession, "");
+assert.equal(state.auditIntegrity.state, "unknown");
+assert.deepEqual(statusCalls.at(-1), ["auditIntegrityPill", "integrity: unknown", "medium"]);
 
 console.log("web_audit_view: ok");

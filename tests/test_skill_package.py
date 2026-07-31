@@ -19,6 +19,7 @@ from skill_lifecycle import LifecycleError, install, uninstall  # noqa: E402
 from skill_package import (  # noqa: E402
     SkillPackageError,
     SkillPackageIncompatibleError,
+    _normalize_input_schema,
     catalog,
     discover_catalog,
     load_index,
@@ -555,6 +556,33 @@ class InputSchemaSubsetTest(unittest.TestCase):
     def test_boolean_is_not_accepted_as_an_integer_default(self) -> None:
         with self.assertRaises(SkillPackageError):
             self._load({"type": "object", "properties": {"a": {"type": "integer", "default": True}}})
+
+    def test_nonfinite_number_values_are_rejected(self) -> None:
+        for label, value in (
+            ("NaN", float("nan")),
+            ("Infinity", float("inf")),
+            ("negative Infinity", float("-inf")),
+        ):
+            with self.subTest(label):
+                with self.assertRaisesRegex(SkillPackageError, "non-finite JSON number"):
+                    self._load(
+                        {
+                            "type": "object",
+                            "properties": {"a": {"type": "number", "default": value}},
+                        }
+                    )
+
+        overflow = json.loads("1e400")
+        for constraint in ({"default": overflow}, {"enum": [overflow]}):
+            with self.subTest(constraint=next(iter(constraint))):
+                with self.assertRaises(SkillPackageError):
+                    _normalize_input_schema(
+                        {
+                            "type": "object",
+                            "properties": {"a": {"type": "number", **constraint}},
+                        },
+                        "probe",
+                    )
 
 
 if __name__ == "__main__":

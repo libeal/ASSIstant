@@ -17,6 +17,7 @@ import {
   mcpDestructiveWarning,
   mcpSchemaPrecheck,
 } from "./mcp-approval.js";
+import { schemaFormValues } from "./schema-form.js";
 
 /** @typedef {import("./types.js").AppContext} AppContext */
 /** @typedef {import("./types.js").WorkbenchView} WorkbenchView */
@@ -282,19 +283,10 @@ export function createWorkbenchView(app) {
           if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error(`${requestKey}: content must be a JSON object`);
           response.content = parsed;
         } else {
-          const content = {};
-          requestElement.querySelectorAll("[data-mcp-property]").forEach((control) => {
-            if (!control.reportValidity()) throw new Error(`${requestKey}: form value is invalid`);
-            const property = decodeURIComponent(control.dataset.mcpProperty || "");
-            const kind = control.dataset.mcpValueKind || "string";
-            if (kind === "boolean") content[property] = Boolean(control.checked);
-            else if (kind === "integer") content[property] = Number.parseInt(control.value, 10);
-            else if (kind === "number") content[property] = Number(control.value);
-            else if (kind === "string-array") content[property] = control.value.split(/[\n,]/).map((item) => item.trim()).filter(Boolean);
-            else if (kind === "enum") content[property] = JSON.parse(decodeURIComponent(control.value));
-            else content[property] = control.value;
-          });
-          response.content = content;
+          response.content = schemaFormValues(
+            requestElement.querySelectorAll("[data-mcp-property]"),
+            `${requestKey}: form value is invalid`,
+          );
         }
       }
       responses[requestKey] = response;

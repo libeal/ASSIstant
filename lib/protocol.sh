@@ -62,33 +62,33 @@ linux_agent_protocol_normalize_step_status() {
         jq -r '.[0].status'
 }
 
-linux_agent_output_blocks_from_result() {
-    local result_json="$1"
-    jq -c '
-        def present:
+linux_agent_output_blocks_jq() {
+    printf '%s\n' '
+        def linux_agent_output_blocks:
+          def present:
             if . == null then false
             elif type == "string" then length > 0
             elif type == "array" then length > 0
             elif type == "object" then length > 0
             else true end;
-        def text_block($kind; $title; $text): {
+          def text_block($kind; $title; $text): {
             kind:$kind,
             title:$title,
             text:($text // ""),
             truncated_bytes:0
-        };
-        def json_block($kind; $title; $json): {
+          };
+          def json_block($kind; $title; $json): {
             kind:$kind,
             title:$title,
             json:$json
-        };
-        def output_payload:
+          };
+          def output_payload:
             if (.output? | type) == "object" then .output else null end;
-        # An MCP tool result is projected into its own block so the frontend
-        # never has to guess a type from an arbitrary JSON shape. Media and
-        # resources are reduced to MIME + size here: the console must not be
-        # handed anything it could turn into an outbound fetch.
-        def is_mcp_result:
+          # An MCP tool result is projected into its own block so the frontend
+          # never has to guess a type from an arbitrary JSON shape. Media and
+          # resources are reduced to MIME + size here: the console must not be
+          # handed anything it could turn into an outbound fetch.
+          def is_mcp_result:
             ((.mcp? | type) == "object")
             and ((output_payload | type) == "object")
             and (
@@ -96,20 +96,33 @@ linux_agent_output_blocks_from_result() {
                 or (output_payload | has("structuredContent"))
                 or (output_payload | has("isError"))
             );
-        def b64_pad($s):
+          def b64_pad($s):
             if ($s | endswith("==")) then 2 elif ($s | endswith("=")) then 1 else 0 end;
-        def b64_bytes($s):
+          def b64_bytes($s):
             if (($s | type) == "string") and (($s | length) > 0)
             then ((($s | length) / 4 | floor) * 3) - b64_pad($s)
             else 0 end;
-        def mcp_content_item:
-            (if (.type | type) == "string" then .type else "" end) as $type
-            | if $type == "text" then
-                {type:"text", text:(.text // ""), size_bytes:((.text // "") | utf8bytelength)}
+          def mcp_content_item:
+            if type != "object" then
+                {type:"unknown"}
+            else
+              (if (.type | type) == "string" then .type else "" end) as $type
+              | if $type == "text" then
+                (if (.text | type) == "string" then .text else "" end) as $text
+                | {type:"text", text:$text, size_bytes:($text | utf8bytelength)}
               elif ($type == "image") or ($type == "audio") then
-                {type:$type, mime_type:(.mimeType // .mime_type // ""), size_bytes:b64_bytes(.data // "")}
+                {
+                    type:$type,
+                    mime_type:(if (.mimeType | type) == "string" then .mimeType elif (.mime_type | type) == "string" then .mime_type else "" end),
+                    size_bytes:b64_bytes(.data // "")
+                }
               elif $type == "resource_link" then
-                {type:"resource_link", uri:(.uri // ""), name:(.name // ""), mime_type:(.mimeType // .mime_type // "")}
+                {
+                    type:"resource_link",
+                    uri:(if (.uri | type) == "string" then .uri else "" end),
+                    name:(if (.name | type) == "string" then .name else "" end),
+                    mime_type:(if (.mimeType | type) == "string" then .mimeType elif (.mime_type | type) == "string" then .mime_type else "" end)
+                }
               elif $type == "resource" then
                 (if (.resource | type) == "object" then .resource else {} end) as $resource
                 | {
@@ -124,8 +137,9 @@ linux_agent_output_blocks_from_result() {
                   }
               else
                 {type:(if $type == "" then "unknown" else $type end)}
-              end;
-        [
+              end
+            end;
+          [
             (if (.stdout? | present) then text_block("stdout"; "标准输出"; .stdout) else empty end),
             (if (.stderr? | present) then text_block("stderr"; "错误输出"; .stderr) else empty end),
             (if is_mcp_result then
@@ -140,7 +154,11 @@ linux_agent_output_blocks_from_result() {
                         fallback_used:(.mcp.fallback_used == true),
                         fallback_reason:(.mcp.fallback_reason // ""),
                         is_error:((output_payload.isError // false) == true),
-                        content:[(output_payload.content // [])[] | mcp_content_item],
+                        content:[(
+                            if (output_payload.content | type) == "array" then output_payload.content else [] end
+                            | .[]
+                            | mcp_content_item
+                        )],
                         structured_content:(output_payload.structuredContent // null)
                     }
                 }
@@ -165,8 +183,16 @@ linux_agent_output_blocks_from_result() {
         ] | map(select(
             (.kind != "meta") or
             ((.json // {}) | length > 0)
-        ))
-    ' <<<"${result_json}"
+          ))
+        ;'
+}
+
+linux_agent_output_blocks_from_result() {
+    local result_json="$1"
+    local output_blocks_filter
+    output_blocks_filter="$(linux_agent_output_blocks_jq)"
+    jq -c "${output_blocks_filter}
+        linux_agent_output_blocks" <<<"${result_json}"
 }
 
 linux_agent_output_blocks_from_review() {
@@ -208,7 +234,9 @@ linux_agent_timeline_plan_items() {
 
 linux_agent_timeline_execution_items() {
     local execution_json="$1"
-    jq -c '
+    local output_blocks_filter
+    output_blocks_filter="$(linux_agent_output_blocks_jq)"
+    jq -c "${output_blocks_filter}"'
         [(.results // []) | to_entries[] | .key as $index | .value | (.iteration // null) as $iteration | {
             id:("execution-" + (if $iteration == null then "" else ("i" + ($iteration | tostring) + "-") end) + (($index + 1) | tostring) + "-" + (.step.id // ("result-" + ((.result.exit_code // 0) | tostring)))),
             kind:"execution",
@@ -229,59 +257,16 @@ linux_agent_timeline_execution_items() {
             ),
             risk_level:(.step.risk_level // null),
             step:(.step // {}),
-            output_blocks:(
-                [
-                    (if (.result.output? | type) == "object" then
-                        if (.result.output | has("raw")) then
-                            {kind:"stdout", title:"执行输出", text:(.result.output.raw // ""), truncated_bytes:0}
-                        else
-                            {kind:"json", title:"执行输出", json:.result.output}
-                        end
-                     else empty end),
-                    (if (.result.review? | type) == "object" then {kind:"review", title:"策略审查", json:.result.review} else empty end),
-                    (if (.result.observer? | type) == "object" then {kind:"observer", title:"Observer", json:.result.observer} else empty end),
-                    (if (.result.execution_proxy? | type) == "object" then {kind:"meta", title:"执行代理", json:.result.execution_proxy} else empty end),
-                    {kind:"meta", title:"执行摘要", json:{
-                        ok:(.result.ok // null),
-                        status:(.result.status // null),
-                        exit_code:(.result.exit_code // null),
-                        auto_approved:(.result.auto_approved // null)
-                    } | with_entries(select(.value != null))}
-                ]
-            )
+            output_blocks:((.result // {}) | linux_agent_output_blocks)
         }]
     ' <<<"${execution_json}" | linux_agent_protocol_normalize_timeline_items
 }
 
 linux_agent_timeline_step_state_items() {
     local execution_json="$1"
-    jq -c '
-        def present:
-            if . == null then false
-            elif type == "string" then length > 0
-            elif type == "array" then length > 0
-            elif type == "object" then length > 0
-            else true end;
-        def result_blocks($result): [
-            (if ($result.output? | type) == "object" then
-                if ($result.output | has("raw")) then
-                    {kind:"stdout", title:"执行输出", text:($result.output.raw // ""), truncated_bytes:0}
-                else
-                    {kind:"json", title:"执行输出", json:$result.output}
-                end
-             else empty end),
-            (if ($result.review? | present) then {kind:"review", title:"策略审查", json:$result.review} else empty end),
-            (if ($result.observer? | present) then {kind:"observer", title:"Observer", json:$result.observer} else empty end),
-            (if ($result.execution_proxy? | present) then {kind:"meta", title:"执行代理", json:$result.execution_proxy} else empty end),
-            (if ($result | type) == "object" and (($result.ok != null) or ($result.status != null) or ($result.exit_code != null) or ($result.auto_approved != null)) then
-                {kind:"meta", title:"执行摘要", json:{
-                    ok:($result.ok // null),
-                    status:($result.status // null),
-                    exit_code:($result.exit_code // null),
-                    auto_approved:($result.auto_approved // null)
-                } | with_entries(select(.value != null))}
-             else empty end)
-        ];
+    local output_blocks_filter
+    output_blocks_filter="$(linux_agent_output_blocks_jq)"
+    jq -c "${output_blocks_filter}"'
         (.results // []) as $results
         | [(.step_states // [])[] | . as $state
             | ([$results[] | select(
@@ -314,8 +299,7 @@ linux_agent_timeline_step_state_items() {
                 ),
                 risk_level:($state.step.risk_level // null),
                 step:($state.step // {}),
-                result:$result,
-                output_blocks:result_blocks($result)
+                output_blocks:($result | linux_agent_output_blocks)
             }
         ]
     ' <<<"${execution_json}" | linux_agent_protocol_normalize_timeline_items

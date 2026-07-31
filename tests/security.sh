@@ -818,6 +818,37 @@ mcp_work_plan="$(jq -cn '{
     }]
 }')"
 linux_agent_validate_work_response "${mcp_work_plan}"
+# Policy review and the approval card must consume the same tools/list
+# snapshot. Use a nonexistent server id so an accidental second lookup cannot
+# reproduce the marker carried by the supplied snapshot.
+mcp_snapshot_step='{
+    "id":"snapshot-1",
+    "title":"snapshot probe",
+    "executor_type":"mcp_tool",
+    "mcp_server":"snapshot-server",
+    "mcp_tool":"snapshot-tool",
+    "arguments":{"text":"hello"}
+}'
+mcp_review_snapshot='{
+    "ok":true,
+    "status":"found",
+    "server_id":"snapshot-server",
+    "tool":"snapshot-tool",
+    "transport":"stdio",
+    "metadata":{
+        "name":"snapshot-tool",
+        "description":"review-snapshot-marker",
+        "inputSchema":{"type":"object","properties":{"text":{"type":"string"}}},
+        "annotations":{}
+    }
+}'
+mcp_snapshot_material="$(linux_agent_step_review_material \
+    "${mcp_snapshot_step}" "${mcp_review_snapshot}")"
+grep -Fq 'review-snapshot-marker' <<<"${mcp_snapshot_material}"
+mcp_snapshot_card="$(linux_agent_mcp_tool_approval_metadata \
+    "snapshot-server" "snapshot-tool" "${mcp_review_snapshot}")"
+jq -e '.available == true and .description == "review-snapshot-marker"' \
+    <<<"${mcp_snapshot_card}" >/dev/null
 LINUX_AGENT_API_MODE=1
 LINUX_AGENT_API_INPUT_JSON='["y"]'
 mcp_execution="$(linux_agent_execute_work_plan "${mcp_work_plan}" "call mcp echo" "{}")"

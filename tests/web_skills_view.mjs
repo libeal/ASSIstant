@@ -22,6 +22,17 @@ assert.equal(runner.kind, "exec-runner");
 assert.equal(runner.capability, "");
 assert.notEqual(runner.kind, helper.kind, "runner 与 host_helper 在界面上必须可区分");
 
+const credentialHelper = skillExecutionPresentation({
+  execution_class: "credential_helper",
+  capability: "credential.resolve",
+});
+assert.equal(credentialHelper.label, "credential_helper");
+assert.equal(credentialHelper.kind, "exec-credential");
+assert.equal(credentialHelper.capability, "credential.resolve");
+assert.notEqual(credentialHelper.kind, helper.kind);
+assert.notEqual(credentialHelper.kind, runner.kind);
+assert.match(credentialHelper.title, /credential helper/);
+
 // `/api/tools` 用 "invalid" 表示包没有声明合法执行类。
 assert.equal(skillExecutionPresentation({ execution_class: "invalid" }).kind, "exec-unknown");
 assert.equal(skillExecutionPresentation({}).label, "invalid");

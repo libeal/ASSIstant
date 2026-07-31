@@ -13,7 +13,7 @@ import {
   mcpManifestVersionLabel,
   mcpProtocolPresentation,
 } from "./mcp-catalog.js";
-import { schemaControlValue, schemaFormHtml } from "./schema-form.js";
+import { schemaFormHtml, schemaFormValues } from "./schema-form.js";
 
 /** @typedef {import("./types.js").AppContext} AppContext */
 /** @typedef {import("./types.js").SkillsView} SkillsView */
@@ -211,15 +211,7 @@ export function createSkillsView(app) {
   function collectScriptArguments() {
     const form = $("scriptParamsForm");
     if (!form || form.hidden) return app.parseJsonText("scriptArgs");
-    const args = {};
-    form.querySelectorAll("[data-mcp-property]").forEach((control) => {
-      if (!control.reportValidity()) throw new Error("参数不合法");
-      const property = decodeURIComponent(control.dataset.mcpProperty || "");
-      const value = schemaControlValue(control);
-      if (value === "" || (typeof value === "number" && Number.isNaN(value))) return;
-      args[property] = value;
-    });
-    return args;
+    return schemaFormValues(form.querySelectorAll("[data-mcp-property]"), "参数不合法");
   }
 
   async function loadSkillTree() {

@@ -37,6 +37,14 @@ export function skillExecutionPresentation(tool) {
       title: "包声明经由 Runner 执行；实际隔离身份以标题栏 execution 药丸为准。",
     };
   }
+  if (declared === "credential_helper") {
+    return {
+      kind: "exec-credential",
+      label: "credential_helper",
+      capability,
+      title: "包声明经由固定 capability 的 credential helper 执行；凭据不会交给普通脚本，实际隔离身份以标题栏 execution 药丸为准。",
+    };
+  }
   return {
     kind: "exec-unknown",
     label: declared || "invalid",

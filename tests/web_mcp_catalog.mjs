@@ -24,6 +24,10 @@ assert.deepEqual(
   { state: modern.state, label: modern.label, kind: modern.kind },
   { state: "modern", label: "2025-06-18", kind: "low" },
 );
+assert.deepEqual(
+  mcpProtocolPresentation({ contacted: true, protocol_family: "modern" }),
+  { state: "modern", label: "modern", detail: "", kind: "low" },
+);
 
 const legacy = mcpProtocolPresentation({
   contacted: true,
@@ -35,6 +39,31 @@ assert.equal(legacy.state, "legacy", "回退过的会话不能显示成 modern")
 assert.equal(legacy.label, "legacy");
 assert.equal(legacy.detail, "streamable_http 返回 405", "回退原因必须有可见详情");
 assert.equal(legacy.kind, "medium");
+
+const declaredLegacy = mcpProtocolPresentation({
+  contacted: true,
+  transport: "stdio",
+  protocol: { mode: "legacy_only" },
+  protocol_family: "legacy",
+  protocol_version: "2024-11-05",
+  fallback_used: false,
+});
+assert.equal(declaredLegacy.state, "legacy");
+assert.match(declaredLegacy.detail, /legacy_only/);
+// Older API snapshots may not carry protocol_family yet; the manifest
+// declaration alone must still prevent a false modern label.
+assert.equal(mcpProtocolPresentation({
+  contacted: true,
+  protocol: { mode: "legacy_only" },
+  protocol_version: "2024-11-05",
+  fallback_used: false,
+}).state, "legacy");
+assert.equal(mcpProtocolPresentation({
+  contacted: true,
+  transport: "sse",
+  protocol_version: "2024-11-05",
+  fallback_used: false,
+}).state, "legacy");
 
 // 回退但 server 没给原因时也要有兜底文案，不能留空。
 assert.match(mcpProtocolPresentation({ contacted: true, fallback_used: true }).detail, /未提供回退原因/);

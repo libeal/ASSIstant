@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import os
 import re
 import stat
@@ -70,6 +71,10 @@ def _reject_duplicate_json_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
             raise SkillPackageError(f"duplicate JSON key: {key}")
         result[key] = value
     return result
+
+
+def _reject_nonfinite_json_constant(value: str) -> None:
+    raise SkillPackageError(f"linux-agent.json contains non-finite JSON number: {value}")
 
 
 def _plain_scalar(value: str) -> str:
@@ -345,7 +350,9 @@ def _matches_input_scalar(value: Any, expected: Any) -> bool:
     if expected == "integer":
         return isinstance(value, int) and not isinstance(value, bool)
     if expected == "number":
-        return isinstance(value, (int, float)) and not isinstance(value, bool)
+        return (isinstance(value, int) and not isinstance(value, bool)) or (
+            isinstance(value, float) and math.isfinite(value)
+        )
     return False
 
 
@@ -497,6 +504,7 @@ def _load_extension(package: Path, origin: str) -> dict[str, Any] | None:
         extension = json.loads(
             extension_path.read_text(encoding="utf-8"),
             object_pairs_hook=_reject_duplicate_json_keys,
+            parse_constant=_reject_nonfinite_json_constant,
         )
     except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise SkillPackageError("linux-agent.json is invalid UTF-8 JSON") from exc

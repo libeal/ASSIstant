@@ -198,7 +198,7 @@ export function createAuditView(app, hooks) {
       state.auditEvents = [];
       state.auditWebTimeline = null;
       state.auditIntegrityOk = null;
-      state.auditIntegrity = { state: "unknown", label: "integrity: unknown", kind: "medium", breaks: [] };
+      state.auditIntegrity = auditIntegrityStatus(null);
       setStatus("auditIntegrityPill", state.auditIntegrity.label, state.auditIntegrity.kind);
       state.auditTimelineUnavailableReason = data.code || data.status || "read_failed";
       renderAuditEventTimeline();
@@ -408,6 +408,8 @@ export function createAuditView(app, hooks) {
     setText("auditOutput", "等待选择审计 session。");
     state.auditWebTimeline = null;
     state.auditIntegrityOk = null;
+    state.auditIntegrity = auditIntegrityStatus(null);
+    setStatus("auditIntegrityPill", state.auditIntegrity.label, state.auditIntegrity.kind);
     if ($("auditRestoreTimelineBtn")) $("auditRestoreTimelineBtn").disabled = true;
   }
 

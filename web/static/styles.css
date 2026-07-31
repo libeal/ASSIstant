@@ -355,6 +355,7 @@ label.small { display: block; }
    privileged capability never reads as a risk verdict, and vice versa. */
 .pill.exec-runner { color: #cfe4ff; background: rgba(10,132,255,0.10); border-color: rgba(10,132,255,0.26); }
 .pill.exec-helper { color: #e6d6ff; background: rgba(175,82,222,0.13); border-color: rgba(175,82,222,0.34); }
+.pill.exec-credential { color: #d5f4df; background: rgba(48,209,88,0.10); border-color: rgba(48,209,88,0.28); }
 .pill.exec-unknown { color: var(--text-3); background: #242426; border-color: var(--line-soft); }
 .skill-component-finding { border-color: rgba(255,214,10,0.28); }
 .muted-text { color: var(--muted); }

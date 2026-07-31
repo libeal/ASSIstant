@@ -1310,6 +1310,7 @@ linux_agent_remote_script_policy() {
 
 linux_agent_step_review_material() {
     local step_json="$1"
+    local mcp_tool_metadata="${2:-}"
     local executor_type
     executor_type="$(jq -r '.executor_type' <<<"${step_json}")"
 
@@ -1335,7 +1336,7 @@ linux_agent_step_review_material() {
             done
             ;;
         mcp_tool)
-            linux_agent_mcp_step_review_material "${step_json}"
+            linux_agent_mcp_step_review_material "${step_json}" "${mcp_tool_metadata}"
             ;;
         *)
             printf ''
@@ -1936,8 +1937,9 @@ linux_agent_abandon_mcp_resume() {
 linux_agent_mcp_input_review() {
     local step_json="$1"
     local responses_json="$2"
+    local mcp_tool_metadata="${3:-}"
     local material review
-    material="$(linux_agent_step_review_material "${step_json}")"$'\n'"input_responses=${responses_json}"
+    material="$(linux_agent_step_review_material "${step_json}" "${mcp_tool_metadata}")"$'\n'"input_responses=${responses_json}"
     review="$(linux_agent_policy_review_step "${step_json}" "${material}" "mcp")"
     jq -c '
         .findings = ([.findings[]? | {
@@ -2652,11 +2654,12 @@ linux_agent_execute_work_plan() {
     local i="${resume_index}"
     while [[ "${i}" -lt "${step_count}" ]]; do
         local step step_review_text review result skipped prepared step_decision revision_request auto_approved disclosure_block
-        local mcp_metadata
+        local mcp_metadata mcp_tool_metadata
         local mcp_resuming continuation_id continuation_path step_key
         step="$(jq -c --argjson index "${i}" '.steps[$index]' <<<"${plan_json}")"
         auto_approved=0
         mcp_resuming=0
+        mcp_tool_metadata='null'
         continuation_id=""
         continuation_path=""
         step_key="$(jq -r --argjson index "${i}" '.[$index].key' <<<"${step_states}")"
@@ -2822,7 +2825,12 @@ linux_agent_execute_work_plan() {
             linux_agent_finalize_work_plan_execution "${execution_result}" "${plan_json}" "${step_states}" "${iteration}" "${step_scope}" "${i}" "${prior_results}" "${prior_step_states}"
             return 0
         fi
-        if [[ "$(jq -r '.executor_type' <<<"${step}")" == "mcp_tool" ]] && ! linux_agent_mcp_tool_is_available "$(jq -r '.mcp_server // empty' <<<"${step}")" "$(jq -r '.mcp_tool // empty' <<<"${step}")"; then
+        if [[ "$(jq -r '.executor_type' <<<"${step}")" == "mcp_tool" ]]; then
+            mcp_tool_metadata="$(linux_agent_mcp_tool_metadata \
+                "$(jq -r '.mcp_server // empty' <<<"${step}")" \
+                "$(jq -r '.mcp_tool // empty' <<<"${step}")")"
+        fi
+        if [[ "$(jq -r '.executor_type' <<<"${step}")" == "mcp_tool" && "$(jq -r '.ok // false' <<<"${mcp_tool_metadata}")" != "true" ]]; then
             local blocked_detail skipped_steps
             blocked_detail="$(jq -cn \
                 --arg server_id "$(jq -r '.mcp_server // empty' <<<"${step}")" \
@@ -2841,19 +2849,17 @@ linux_agent_execute_work_plan() {
             return 0
         fi
         if [[ "${mcp_resuming}" -eq 1 ]]; then
-            review="$(linux_agent_mcp_input_review "${step}" "${mcp_input_responses}")"
+            review="$(linux_agent_mcp_input_review "${step}" "${mcp_input_responses}" "${mcp_tool_metadata}")"
         else
-            step_review_text="$(linux_agent_step_review_material "${step}")"
+            step_review_text="$(linux_agent_step_review_material "${step}" "${mcp_tool_metadata}")"
             review="$(linux_agent_policy_review_step "${step}" "${step_review_text}" "$(case "$(jq -r '.executor_type' <<<"${step}")" in remote_script) printf 'remote' ;; mcp_tool) printf 'mcp' ;; *) printf 'local' ;; esac)")"
         fi
-        # Keep the structure the review just consumed, instead of throwing it
-        # away once it has been folded into the review text. tools/list is
-        # cached by the client, so this reads the same snapshot.
         mcp_metadata='null'
         if [[ "$(jq -r '.executor_type' <<<"${step}")" == "mcp_tool" ]]; then
             mcp_metadata="$(linux_agent_mcp_tool_approval_metadata \
                 "$(jq -r '.mcp_server // empty' <<<"${step}")" \
-                "$(jq -r '.mcp_tool // empty' <<<"${step}")")"
+                "$(jq -r '.mcp_tool // empty' <<<"${step}")" \
+                "${mcp_tool_metadata}")"
         fi
         case "$(jq -r '.executor_type' <<<"${step}")" in
             shell | skill_script | remote_script)

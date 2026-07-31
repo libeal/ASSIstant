@@ -1,9 +1,10 @@
 /**
  * Pure presentation helpers for the MCP manifest table.
  *
- * Everything here relabels values the backend already decided. The frontend
- * never negotiates, never infers whether a session was modern, and never
- * treats a server's self-description as a security guarantee.
+ * Everything here relabels backend negotiation facts. The frontend never
+ * negotiates and never treats a server's self-description as a security
+ * guarantee; declared legacy-only transports are used only as compatibility
+ * facts when an older backend snapshot lacks `protocol_family`.
  */
 
 /** @typedef {Record<string, any>} McpServerSummary */
@@ -27,18 +28,27 @@ export function mcpProtocolPresentation(server) {
       kind: "",
     };
   }
-  if (server?.fallback_used === true) {
+  const family = String(server?.protocol_family || "").trim();
+  const declaredMode = String(server?.protocol?.mode || "").trim();
+  const declaredLegacy = declaredMode === "legacy_only" || server?.transport === "sse";
+  if (family === "legacy" || server?.fallback_used === true || declaredLegacy) {
     const reason = String(server?.fallback_reason || "").trim();
+    const detail = reason
+      || (declaredMode === "legacy_only"
+        ? "server 使用 manifest 声明的 legacy_only 协议。"
+        : server?.transport === "sse"
+          ? "SSE transport 使用 legacy 协议。"
+          : "server 未提供回退原因。");
     return {
       state: "legacy",
       label: "legacy",
-      detail: reason || "server 未提供回退原因。",
+      detail,
       kind: "medium",
     };
   }
   const version = String(server?.protocol_version || "").trim();
-  if (version) {
-    return { state: "modern", label: version, detail: "", kind: "low" };
+  if (family === "modern" || version) {
+    return { state: "modern", label: version || "modern", detail: "", kind: "low" };
   }
   return {
     state: "unreachable",

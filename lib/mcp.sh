@@ -75,6 +75,66 @@ linux_agent_mcp_public_manifest() {
     ' <<<"${manifest_json}"
 }
 
+linux_agent_mcp_public_tool_data() {
+    local tool_json="$1"
+    jq -c '
+        def secret_key:
+            test("(?i)(authorization|cookie|token|secret|password|passwd|api[_-]?key|credential|private[_-]?key)");
+        def redact_schema($sensitive_field):
+            if type == "object" then
+                (if $sensitive_field then del(.default, .examples, .enum, .const) else . end)
+                | with_entries(
+                    .value = (
+                        if ((.key == "properties") or (.key == "patternProperties") or (.key == "dependentSchemas"))
+                            and (.value | type) == "object"
+                        then
+                            .value
+                            | with_entries(
+                                .key as $property_name
+                                | .value = (.value | redact_schema($sensitive_field or ($property_name | secret_key)))
+                            )
+                        elif ((.key == "$defs") or (.key == "definitions")) and (.value | type) == "object" then
+                            .value
+                            | with_entries(
+                                .key as $definition_name
+                                | .value = (.value | redact_schema($sensitive_field or ($definition_name | secret_key)))
+                            )
+                        elif (.key == "dependentRequired") and (.value | type) == "object" then
+                            .value
+                        elif (.key | secret_key) then
+                            "[REDACTED]"
+                        else
+                            (.value | redact_schema($sensitive_field))
+                        end
+                    )
+                )
+            elif type == "array" then
+                map(redact_schema($sensitive_field))
+            else
+                .
+            end;
+        def redact:
+            if type == "object" then
+                with_entries(
+                    .value = (
+                        if (.key == "inputSchema") or (.key == "outputSchema") then
+                            (.value | redact_schema(false))
+                        elif (.key | secret_key) then
+                            "[REDACTED]"
+                        else
+                            (.value | redact)
+                        end
+                    )
+                )
+            elif type == "array" then
+                map(redact)
+            else
+                .
+            end;
+        redact
+    ' <<<"${tool_json}"
+}
+
 linux_agent_mcp_validate_manifest_path() {
     local path="$1"
     local mcp_dir rel validator schema output
@@ -369,12 +429,21 @@ linux_agent_mcp_tool_catalog() {
         # Negotiated protocol truth. Without this the UI cannot tell a modern
         # MCP session apart from a legacy fallback, which is precisely what
         # manifest v2's protocol.mode / require_modern exist to control.
-        protocol_meta='{"protocol_version":null,"server_capabilities":{},"fallback_used":false,"fallback_reason":"","contacted":false}'
+        protocol_meta='{"protocol_version":null,"protocol_family":null,"server_capabilities":{},"fallback_used":false,"fallback_reason":"","contacted":false}'
 
         if [[ "${enabled}" == "true" && "${valid}" == "true" ]]; then
             tools_result="$(linux_agent_mcp_server_tools_from_path "${path}" "${refresh}")"
-            protocol_meta="$(jq -c '{
+            protocol_meta="$(jq -c \
+                --arg protocol_mode "$(jq -r '.protocol.mode // ""' <<<"${server}")" \
+                --arg transport "$(jq -r '.transport // ""' <<<"${server}")" \
+                '{
                 protocol_version:(if (.protocol_version | type) == "string" then .protocol_version else null end),
+                protocol_family:(
+                    if (.ok == true) and ((.fallback_used == true) or ($protocol_mode == "legacy_only") or ($transport == "sse")) then "legacy"
+                    elif (.ok == true) and ((.protocol_version | type) == "string") then "modern"
+                    else null
+                    end
+                ),
                 server_capabilities:(if (.server_capabilities | type) == "object" then .server_capabilities else {} end),
                 fallback_used:(.fallback_used == true),
                 fallback_reason:(if (.fallback_reason | type) == "string" then .fallback_reason else "" end),
@@ -382,7 +451,7 @@ linux_agent_mcp_tool_catalog() {
             }' <<<"${tools_result}")"
             if [[ "$(jq -r '.ok // false' <<<"${tools_result}")" == "true" ]]; then
                 server_tools="$(jq -c '.tools // [] | if type == "array" then . else [] end' <<<"${tools_result}")"
-                server_tools="$(linux_agent_mcp_public_manifest "${server_tools}")"
+                server_tools="$(linux_agent_mcp_public_tool_data "${server_tools}")"
                 server_info="$(jq -c '.server_info // {} | if type == "object" then . else {} end' <<<"${tools_result}")"
             else
                 error="$(jq -r '.error // .status // "unknown"' <<<"${tools_result}")"
@@ -488,10 +557,10 @@ linux_agent_mcp_tool_metadata() {
 linux_agent_mcp_tool_approval_metadata() {
     local server_id="$1"
     local tool_name="$2"
-    local metadata
+    local metadata="${3:-}"
 
-    metadata="$(linux_agent_mcp_tool_metadata "${server_id}" "${tool_name}")"
-    metadata="$(linux_agent_mcp_public_manifest "${metadata}")"
+    [[ -n "${metadata}" ]] || metadata="$(linux_agent_mcp_tool_metadata "${server_id}" "${tool_name}")"
+    metadata="$(linux_agent_mcp_public_tool_data "${metadata}")"
     jq -c \
         --arg server_id "${server_id}" \
         --arg tool "${tool_name}" \
@@ -568,11 +637,12 @@ linux_agent_mcp_call_tool() {
 
 linux_agent_mcp_step_review_material() {
     local step_json="$1"
-    local server_id tool_name args metadata
+    local metadata="${2:-}"
+    local server_id tool_name args
     server_id="$(jq -r '.mcp_server // empty' <<<"${step_json}")"
     tool_name="$(jq -r '.mcp_tool // empty' <<<"${step_json}")"
     args="$(linux_agent_step_arguments_json "${step_json}")"
-    metadata="$(linux_agent_mcp_tool_metadata "${server_id}" "${tool_name}")"
+    [[ -n "${metadata}" ]] || metadata="$(linux_agent_mcp_tool_metadata "${server_id}" "${tool_name}")"
     jq -nr \
         --arg server_id "${server_id}" \
         --arg tool "${tool_name}" \
