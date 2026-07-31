@@ -47,6 +47,7 @@ import { createPolicyView } from "./modules/view-policy.js";
 import { createSkillComponentLoader } from "./modules/skill-components.js";
 import { bindApplicationEvents } from "./modules/app-bindings.js";
 import { consumeBootstrapFromLocation } from "./modules/auth.js";
+import { releaseVersionLabel } from "./modules/config-utils.js";
 
 /** @typedef {import("./modules/types.js").ApplicationController} ApplicationController */
 
@@ -169,6 +170,7 @@ async function connect() {
   if (!health?.ok) {
     setStatus("connectionState", "offline", "high");
     setText("rootPath", "未连接");
+    setText("appVersion", "未连接");
     if (health?.status === "unauthorized") localStorage.removeItem("linuxAgentToken");
     throw new Error(health?.error || health?.status || "连接失败");
   }
@@ -185,6 +187,7 @@ async function connect() {
   setLayoutRunId(health.web_server?.run_id || "");
   setStatus("connectionState", "online", "ok");
   setText("rootPath", health.root || "connected");
+  setText("appVersion", releaseVersionLabel(health.version));
   await loadDomainSchema();
   await app.loadConfig();
   await app.loadSessionState();

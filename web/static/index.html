@@ -3,7 +3,7 @@
   <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>ASSIstant 前端外壳 - macOS 控制台</title>
+    <title>Linux 运维 Agent 控制台</title>
     <link rel="icon" href="/mark.svg">
     <link rel="stylesheet" href="/styles.css">
   </head>
@@ -21,8 +21,8 @@
           </button>
         </div>
         <div class="brand">
-          <div class="brand-title">ASSIstant</div>
-          <p>CLI 项目的桌面前端外壳</p>
+          <div class="brand-title">Linux 运维 Agent</div>
+          <p>同一套 CLI 能力的本机 Web 控制台</p>
         </div>
         <nav class="nav" id="nav">
           <button class="active" data-screen="workbench" data-key="1" data-order="10" aria-current="page"><span class="icon" aria-hidden="true">⌘</span><span class="label">工作台</span><span class="key" aria-hidden="true">1</span></button>
@@ -36,13 +36,14 @@
           <strong>运行会话</strong>
           <p class="mono" id="rootPath">未连接</p>
           <div class="divider"></div>
+          <div class="kv"><div class="k">版本</div><div class="v mono" id="appVersion">未连接</div></div>
         </div>
       </aside>
 
       <main class="main" id="mainContent" tabindex="-1">
         <header class="titlebar">
           <div>
-            <div class="crumb">libeal / ASSIstant / frontend-shell</div>
+            <div class="crumb">libeal / linux-agent / web-console</div>
             <h1 id="screenTitle" aria-live="polite">工作台</h1>
           </div>
           <div class="status">
@@ -76,7 +77,7 @@
                   </div>
                   <div id="workModePanel">
                     <label class="small" for="workInput">当前请求</label>
-                    <textarea class="textarea" id="workInput" placeholder="例如：检查磁盘空间、定位服务异常、生成安全清理计划">帮我检查磁盘热点</textarea>
+                    <textarea class="textarea" id="workInput" placeholder="例如：检查磁盘空间、定位服务异常、生成安全清理计划"></textarea>
                     <div class="toolbar action-gap" id="workActions">
                       <button class="btn" id="workRunBtn" type="button">发送</button>
                       <button class="btn danger" id="workCancelBtn" type="button" disabled>终止</button>
@@ -87,7 +88,7 @@
                   </div>
                   <div id="terminalModePanel" hidden>
                     <label class="small" for="terminalCommand">bash -lc 命令</label>
-                    <input class="field mono" id="terminalCommand" value="df -h && du -sh /var/log 2>/dev/null">
+                    <input class="field mono" id="terminalCommand" placeholder="例如：df -h">
                     <div class="toolbar action-gap">
                       <button class="btn" id="terminalRunBtn" type="button">执行</button>
                     </div>
@@ -202,9 +203,12 @@
                   </div>
                   <div id="scriptPanel">
                     <div class="form-grid">
+                      <label class="small" for="scriptFilter">筛选 Skill<input class="field" id="scriptFilter" placeholder="按 ref、分类或描述过滤"></label>
                       <label class="small" for="scriptSelect">Skill 引用<select class="select" id="scriptSelect"><option>连接后加载 skill</option></select></label>
-                      <label class="small" for="scriptArgs">JSON 参数<input class="field mono" id="scriptArgs" value='{"top_n": 5}'></label>
                     </div>
+                    <div id="scriptParamsForm" class="mcp-input-fields action-gap" hidden></div>
+                    <label class="small" id="scriptArgsField" for="scriptArgs">JSON 参数<input class="field mono" id="scriptArgs" placeholder='例如：{"top_n": 5}'></label>
+                    <div class="list action-gap" id="scriptPackageInfo"></div>
                     <div class="toolbar action-gap">
                       <button class="btn secondary" id="scriptReviewBtn" type="button">审查</button>
                       <button class="btn" id="scriptRunBtn" type="button">运行</button>
@@ -221,7 +225,7 @@
                       <label class="small" for="editFolderSelect">编辑入口<select class="select" id="editFolderSelect"><option value="skills">skills</option></select></label>
                       <label class="small">未保存状态<input class="field" id="editDirtyState" value="clean" disabled></label>
                     </div>
-                    <label class="small edit-request-label" for="editInput">需求<textarea class="textarea" id="editInput" placeholder="描述要新增或修改的 skill 能力。已有未保存编辑时，可输入新的修改需求并重新生成。">为 log-search 增加 include_journal=false 的显式默认值，并补充参数校验说明。</textarea></label>
+                    <label class="small edit-request-label" for="editInput">需求<textarea class="textarea" id="editInput" placeholder="描述要新增或修改的 skill 能力。已有未保存编辑时，可输入新的修改需求并重新生成。"></textarea></label>
                     <div class="toolbar action-gap">
                       <button class="btn" id="editPlanBtn" type="button">发送</button>
                       <button class="btn secondary" id="editReviewBtn" type="button" disabled>审查</button>
@@ -239,14 +243,16 @@
 
                 <div class="panel">
                   <div class="panel-header">
-                    <div><h3>已有 Skill 列表</h3><p>表格展示分类、风险等级与索引状态；点击行可查看对应脚本。</p></div>
+                    <div><h3>已有 Skill 列表</h3><p>表格展示分类、风险、包声明的执行类与物化状态；点击行可查看对应脚本。</p></div>
                     <button class="btn secondary" id="skillsValidateBtn" type="button">校验 Skill</button>
                   </div>
+                  <div class="list" id="skillComponentFindings" hidden role="status" aria-live="polite"></div>
+                  <p class="small">执行类是包自身的声明；本机实际的执行隔离身份以标题栏的 <span class="mono">execution</span> 药丸为准。</p>
                   <div class="table-scroll" role="region" aria-label="Skill 列表，可左右滑动查看完整信息" tabindex="0">
                     <table class="table">
-                    <thead><tr><th>Skill</th><th>分类</th><th>风险</th><th>INDEX</th><th>远程状态</th></tr></thead>
+                    <thead><tr><th>Skill</th><th>分类</th><th>风险</th><th>执行类 · capability</th><th>来源</th><th>物化状态</th></tr></thead>
                     <tbody id="skillsCatalog">
-                      <tr><td colspan="5">正在读取 Skill 目录…</td></tr>
+                      <tr><td colspan="6">正在读取 Skill 目录…</td></tr>
                     </tbody>
                     </table>
                   </div>
@@ -295,7 +301,7 @@
                   <div class="panel-header"><div><h3>MCP manifest</h3><p>用户可将外部 MCP 能力安装为 mcp/&lt;id&gt;/mcp.json；敏感 header/env 只展示脱敏状态。</p></div></div>
                   <div class="table-scroll" role="region" aria-label="MCP manifest 列表，可左右滑动查看完整信息" tabindex="0">
                     <table class="table">
-                    <thead><tr><th>Server</th><th>Transport</th><th>Enabled</th><th>Status</th><th>Manifest</th></tr></thead>
+                    <thead><tr><th>Server</th><th>Transport · 协议</th><th>Enabled</th><th>状态</th><th>Manifest</th></tr></thead>
                     <tbody id="mcpCatalog">
                       <tr><td colspan="5">连接后加载 MCP registry。</td></tr>
                     </tbody>
@@ -385,12 +391,7 @@
                     <table class="table">
                     <thead><tr><th>级别</th><th>正则 / 关键词</th><th>动作</th><th>原因</th></tr></thead>
                     <tbody id="riskRulesSummary">
-                      <tr><td><span class="pill risk high">block</span></td><td class="mono">rm\s+-rf\s+/</td><td>禁止执行</td><td>阻止根目录递归删除。</td></tr>
-                      <tr><td><span class="pill risk high">block</span></td><td class="mono">curl\s+.*\|\s*sh</td><td>禁止执行</td><td>禁止流式远程脚本执行。</td></tr>
-                      <tr><td><span class="pill risk high">block</span></td><td class="mono">chmod\s+-R\s+777\s+/</td><td>禁止执行</td><td>阻止破坏性权限变更。</td></tr>
-                      <tr><td><span class="pill risk medium">warn</span></td><td class="mono">systemctl\s+restart</td><td>人工审批</td><td>重启服务可能造成中断。</td></tr>
-                      <tr><td><span class="pill risk medium">warn</span></td><td class="mono">kill\s+-9</td><td>人工审批</td><td>强制结束进程需要确认。</td></tr>
-                      <tr><td><span class="pill risk medium">warn</span></td><td class="mono">sudo\s+</td><td>升级风险</td><td>涉及提权操作。</td></tr>
+                      <tr><td colspan="4">未加载 risk-rules.json</td></tr>
                     </tbody>
                     </table>
                   </div>
@@ -436,7 +437,7 @@
                 </div>
 
                 <div class="panel">
-                  <div class="panel-header"><div><h3>会话审计时间线</h3><p>上方筛选控制 session 列表；读取后事件会分批渲染，直至完整显示该 session 的时间线。</p></div></div>
+                  <div class="panel-header"><div><h3>会话审计时间线</h3><p>上方筛选控制 session 列表；读取后事件会分批渲染，直至完整显示该 session 的时间线。</p></div><span class="pill risk medium" id="auditIntegrityPill">integrity: unknown</span></div>
                   <div class="timeline" id="auditList">
                     <div class="event"><time>--</time><div class="body"><strong>等待连接</strong><span>连接 token 后加载真实审计会话。</span></div></div>
                   </div>

@@ -72,6 +72,18 @@
  * @property {string} [text]
  * @property {unknown} [json]
  * @property {number} [truncated_bytes]
+ * @property {McpResultBlock} [mcp]
+ *
+ * @typedef {object} McpResultBlock
+ * @property {string} [server_id]
+ * @property {string} [tool]
+ * @property {string|null} [transport]
+ * @property {string|null} [protocol_version]
+ * @property {boolean} [fallback_used]
+ * @property {string} [fallback_reason]
+ * @property {boolean} [is_error]
+ * @property {Array<Record<string, any>>} [content]
+ * @property {unknown} [structured_content]
  *
  * @typedef {object} ConfigSnapshot
  * @property {string} [provider]
@@ -123,6 +135,7 @@
  * @property {Array<Record<string, any>>} mcpFindings
  * @property {string} mcpRoot
  * @property {Array<Record<string, any>>} skillWebComponents
+ * @property {Array<{component: string, severity: string, stage: string, code: string, message: string}>} skillComponentFindings
  * @property {string} activeWorkJobId
  * @property {string} activeScriptJobId
  * @property {string} activeTerminalJobId
@@ -144,6 +157,7 @@
  * @property {AuditEvent[]} auditEvents
  * @property {Record<string, any>|null} auditWebTimeline
  * @property {boolean|null} auditIntegrityOk
+ * @property {{state: string, label: string, kind: string, breaks: Array<Record<string, any>>}|null} auditIntegrity
  * @property {string} auditTimelineUnavailableReason
  * @property {string} currentAuditSession
  * @property {ConfigSnapshot|null} configSnapshot
@@ -276,6 +290,8 @@
  * @typedef {object} SkillsViewContract
  * @property {ViewAction} loadSense
  * @property {ViewAction} loadTools
+ * @property {ViewAction} renderScriptSelect
+ * @property {ViewAction} renderScriptPackageInfo
  * @property {ViewAction} loadSkillTree
  * @property {ViewAction} validateSkills
  * @property {ViewAction} loadMcpRegistry

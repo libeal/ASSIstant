@@ -21,6 +21,7 @@ CAPABILITY_PATTERN = re.compile(r"^(?:|[a-z][a-z0-9-]*(?:\.[a-z][a-z0-9-]*)+)$")
 APPROVAL_PATTERN = re.compile(r"^[a-z][a-z0-9_.-]{0,63}$")
 ENVIRONMENT_NAME_PATTERN = re.compile(r"^[A-Z][A-Z0-9_]{0,127}$")
 GUARD_FIELD_PATTERN = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
+INPUT_PROPERTY_PATTERN = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
 ERROR_CODE_PATTERN = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
 WEB_ROUTE_PATTERN = re.compile(r"^/api/[a-z0-9][a-z0-9_./-]{0,190}$")
 ALLOWED_FRONTMATTER = {
@@ -35,6 +36,15 @@ SCALAR_FRONTMATTER = ALLOWED_FRONTMATTER - {"metadata"}
 RISK_LEVELS = frozenset({"low", "medium", "high", "critical"})
 EXECUTION_CLASSES = frozenset({"runner", "host_helper", "credential_helper"})
 DISPATCH_MODES = frozenset({"always", "apply_only"})
+# Deliberately a small, closed subset of JSON Schema. A Skill parameter form is
+# a convenience over the existing JSON textbox, not a general schema engine:
+# anything outside this subset is rejected at install/validate time so it can
+# never reach the Remote contract chain or the console half-supported.
+INPUT_SCHEMA_SCALAR_TYPES = frozenset({"string", "number", "integer", "boolean"})
+INPUT_SCHEMA_PROPERTY_KEYS = frozenset({"type", "title", "description", "enum", "items", "default"})
+MAX_INPUT_SCHEMA_PROPERTIES = 24
+MAX_INPUT_SCHEMA_ENUM_VALUES = 32
+MAX_INPUT_SCHEMA_BYTES = 8 * 1024
 MAX_SKILL_MD_BYTES = 256 * 1024
 MAX_DESCRIPTION_LENGTH = 1024
 MAX_COMPATIBILITY_LENGTH = 500
@@ -213,6 +223,130 @@ def _regular_package_file(package: Path, relative: str, label: str) -> Path:
     if candidate.is_symlink() or not candidate.is_file():
         raise SkillPackageError(f"{label} must be a regular non-symlink file")
     return resolved
+
+
+def _normalize_input_schema(schema: Any, tool_name: str) -> dict[str, Any]:
+    """Validate and normalize a tool's optional `input_schema`.
+
+    The accepted subset is: a root object with one flat level of `properties`,
+    scalar property types plus `array` of `string`, and `enum` as an optional
+    constraint that must agree with the declared type. Nesting, `$ref`,
+    combinators and unknown keywords are rejected outright rather than
+    silently dropped, so what the console renders is exactly what the package
+    declared and what a signed Remote release will carry.
+    """
+    if not isinstance(schema, dict):
+        raise SkillPackageError(f"Skill tool {tool_name} input_schema must be an object")
+    encoded = json.dumps(schema, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    if len(encoded) > MAX_INPUT_SCHEMA_BYTES:
+        raise SkillPackageError(f"Skill tool {tool_name} input_schema is too large")
+    if set(schema) - {"type", "properties", "required", "additionalProperties"}:
+        raise SkillPackageError(f"Skill tool {tool_name} input_schema has unsupported keys")
+    if schema.get("type") != "object":
+        raise SkillPackageError(f"Skill tool {tool_name} input_schema root must be type object")
+    properties = schema.get("properties", {})
+    if not isinstance(properties, dict) or not properties:
+        raise SkillPackageError(f"Skill tool {tool_name} input_schema needs properties")
+    if len(properties) > MAX_INPUT_SCHEMA_PROPERTIES:
+        raise SkillPackageError(f"Skill tool {tool_name} input_schema declares too many properties")
+    additional = schema.get("additionalProperties", False)
+    if not isinstance(additional, bool):
+        raise SkillPackageError(f"Skill tool {tool_name} input_schema additionalProperties must be boolean")
+
+    normalized_properties: dict[str, Any] = {}
+    for key, entry in properties.items():
+        if not isinstance(key, str) or INPUT_PROPERTY_PATTERN.fullmatch(key) is None:
+            raise SkillPackageError(f"Skill tool {tool_name} input_schema property name is invalid")
+        if not isinstance(entry, dict):
+            raise SkillPackageError(f"Skill tool {tool_name} input_schema property {key} must be an object")
+        if set(entry) - INPUT_SCHEMA_PROPERTY_KEYS:
+            raise SkillPackageError(f"Skill tool {tool_name} input_schema property {key} has unsupported keys")
+        property_type = entry.get("type")
+        if property_type == "array":
+            items = entry.get("items")
+            if not isinstance(items, dict) or set(items) - {"type"} or items.get("type") != "string":
+                raise SkillPackageError(
+                    f"Skill tool {tool_name} input_schema property {key} array items must be string"
+                )
+        elif property_type not in INPUT_SCHEMA_SCALAR_TYPES:
+            raise SkillPackageError(f"Skill tool {tool_name} input_schema property {key} type is unsupported")
+        normalized: dict[str, Any] = {"type": property_type}
+        if property_type == "array":
+            normalized["items"] = {"type": "string"}
+        for optional_key in ("title", "description"):
+            value = entry.get(optional_key)
+            if value is None:
+                continue
+            if not isinstance(value, str) or not value.strip():
+                raise SkillPackageError(
+                    f"Skill tool {tool_name} input_schema property {key} {optional_key} is invalid"
+                )
+            normalized[optional_key] = value
+        if "enum" in entry:
+            values = entry["enum"]
+            if (
+                not isinstance(values, list)
+                or not values
+                or len(values) > MAX_INPUT_SCHEMA_ENUM_VALUES
+                or len(values) != len({json.dumps(item, sort_keys=True) for item in values})
+            ):
+                raise SkillPackageError(f"Skill tool {tool_name} input_schema property {key} enum is invalid")
+            # `enum` constrains a declared type; it never replaces one.
+            if property_type == "array":
+                raise SkillPackageError(
+                    f"Skill tool {tool_name} input_schema property {key} enum is not supported for arrays"
+                )
+            if not all(_matches_input_scalar(item, property_type) for item in values):
+                raise SkillPackageError(
+                    f"Skill tool {tool_name} input_schema property {key} enum values must match its type"
+                )
+            normalized["enum"] = list(values)
+        if "default" in entry:
+            default = entry["default"]
+            valid_default = (
+                all(isinstance(item, str) for item in default)
+                if property_type == "array" and isinstance(default, list)
+                else _matches_input_scalar(default, property_type)
+            )
+            if not valid_default:
+                raise SkillPackageError(
+                    f"Skill tool {tool_name} input_schema property {key} default does not match its type"
+                )
+            if "enum" in normalized and default not in normalized["enum"]:
+                raise SkillPackageError(
+                    f"Skill tool {tool_name} input_schema property {key} default is outside its enum"
+                )
+            normalized["default"] = default
+        normalized_properties[key] = normalized
+
+    required = schema.get("required", [])
+    if not isinstance(required, list) or not all(isinstance(item, str) for item in required):
+        raise SkillPackageError(f"Skill tool {tool_name} input_schema required must be a string array")
+    if len(required) != len(set(required)):
+        raise SkillPackageError(f"Skill tool {tool_name} input_schema required has duplicates")
+    for item in required:
+        if item not in normalized_properties:
+            raise SkillPackageError(
+                f"Skill tool {tool_name} input_schema requires undeclared property {item}"
+            )
+    return {
+        "type": "object",
+        "properties": normalized_properties,
+        "required": list(required),
+        "additionalProperties": additional,
+    }
+
+
+def _matches_input_scalar(value: Any, expected: Any) -> bool:
+    if expected == "string":
+        return isinstance(value, str)
+    if expected == "boolean":
+        return isinstance(value, bool)
+    if expected == "integer":
+        return isinstance(value, int) and not isinstance(value, bool)
+    if expected == "number":
+        return isinstance(value, (int, float)) and not isinstance(value, bool)
+    return False
 
 
 def _normalize_guard(guard: dict[str, Any], tool_name: str) -> dict[str, Any]:
@@ -409,6 +543,7 @@ def _load_extension(package: Path, origin: str) -> dict[str, Any] | None:
             "execution",
             "runtime_inputs",
             "guards",
+            "input_schema",
         }
         if set(tool) - allowed:
             raise SkillPackageError("Skill tool has unsupported fields")
@@ -466,6 +601,11 @@ def _load_extension(package: Path, origin: str) -> dict[str, Any] | None:
         if not isinstance(guards, list) or not all(isinstance(value, dict) for value in guards):
             raise SkillPackageError(f"Skill tool {name} guards are invalid")
         guards = [_normalize_guard(value, name) for value in guards]
+        input_schema = (
+            _normalize_input_schema(tool["input_schema"], name)
+            if "input_schema" in tool
+            else None
+        )
         normalized_tools.append(
             {
                 **tool,
@@ -478,6 +618,7 @@ def _load_extension(package: Path, origin: str) -> dict[str, Any] | None:
                 },
                 "runtime_inputs": runtime_inputs,
                 "guards": guards,
+                **({"input_schema": input_schema} if input_schema else {}),
             }
         )
     raw_components = extension.get("components", {})
@@ -938,6 +1079,8 @@ def load_package(package: Path, origin: str) -> dict[str, Any]:
         "frontmatter": frontmatter,
         "body": body,
         "category": extension["category"] if extension else "custom",
+        "package_version": extension["package_version"] if extension else "",
+        "core_api": extension["core_api"] if extension else 0,
         "tools": extension["tools"] if extension else [],
         "components": extension["components"] if extension else {},
         "extension": extension,
@@ -1134,6 +1277,8 @@ def validate_builtin_root(root: Path, *, strict: bool = False) -> dict[str, Any]
                 "origin": "builtin",
                 "state": "installed",
                 "category": loaded["category"],
+                "package_version": loaded["package_version"],
+                "core_api": loaded["core_api"],
                 "package": os.fspath(package),
                 "package_tools": loaded["tools"],
                 "components": loaded["components"],
@@ -1289,6 +1434,8 @@ def catalog(builtin_root: Path, user_root: Path | None) -> dict[str, Any]:
                         "origin": "user",
                         "state": "installed",
                         "category": "custom",
+                        "package_version": loaded["package_version"],
+                        "core_api": loaded["core_api"],
                         "package": os.fspath(package),
                         "tools": [
                             {
@@ -1318,9 +1465,12 @@ def catalog(builtin_root: Path, user_root: Path | None) -> dict[str, Any]:
                     "execution": tool.get("execution", {}),
                     "runtime_inputs": tool.get("runtime_inputs", []),
                     "guards": tool.get("guards", []),
+                    "input_schema": tool.get("input_schema"),
                     "origin": skill["origin"],
                     "state": skill["state"],
                     "category": skill.get("category", "custom"),
+                    "package_version": skill.get("package_version", ""),
+                    "core_api": skill.get("core_api", 0),
                 }
             )
     return {

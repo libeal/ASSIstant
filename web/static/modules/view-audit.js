@@ -1,7 +1,11 @@
 /** @typedef {import("./types.js").AppContext} AppContext */
 /** @typedef {import("./types.js").AuditView} AuditView */
 
-import { nextAuditRenderBatch } from "./audit-view-utils.js";
+import {
+  auditIntegrityStatus,
+  auditIntegrityTimelineNotice,
+  nextAuditRenderBatch,
+} from "./audit-view-utils.js";
 
 /**
  * @param {AppContext} app
@@ -194,6 +198,8 @@ export function createAuditView(app, hooks) {
       state.auditEvents = [];
       state.auditWebTimeline = null;
       state.auditIntegrityOk = null;
+      state.auditIntegrity = { state: "unknown", label: "integrity: unknown", kind: "medium", breaks: [] };
+      setStatus("auditIntegrityPill", state.auditIntegrity.label, state.auditIntegrity.kind);
       state.auditTimelineUnavailableReason = data.code || data.status || "read_failed";
       renderAuditEventTimeline();
       renderAuditObserverSummary();
@@ -204,7 +210,9 @@ export function createAuditView(app, hooks) {
       return data;
     }
     state.auditEvents = Array.isArray(data.events) ? data.events : [];
-    state.auditIntegrityOk = data.integrity_ok === true;
+    state.auditIntegrity = auditIntegrityStatus(data);
+    state.auditIntegrityOk = state.auditIntegrity.state === "ok";
+    setStatus("auditIntegrityPill", state.auditIntegrity.label, state.auditIntegrity.kind);
     state.auditWebTimeline = state.auditIntegrityOk ? data.web_timeline || null : null;
     state.auditTimelineUnavailableReason = data.timeline_unavailable_reason || "";
     renderAuditEventTimeline();
@@ -229,6 +237,13 @@ export function createAuditView(app, hooks) {
     const events = filteredAuditEvents();
     const batchSize = auditEventBatchSize();
     container.innerHTML = "";
+    const integrityNotice = auditIntegrityTimelineNotice(state.auditIntegrity || { state: "unknown", breaks: [] });
+    if (integrityNotice) {
+      const notice = document.createElement("div");
+      notice.className = "event audit-integrity-notice";
+      notice.innerHTML = `<time>--</time><div class="body"><strong>完整性校验失败</strong><span>${escapeHtml(integrityNotice)}</span></div>`;
+      container.appendChild(notice);
+    }
     if (!events.length) {
       container.appendChild(emptyEvent(state.currentAuditSession ? "当前筛选下没有事件" : "尚未选择 session"));
       return;

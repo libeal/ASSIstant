@@ -201,8 +201,20 @@ jq -e '
 [[ -f "${project}/tmp/web/jobs/${legacy_job_id}.json.migrated" ]]
 
 index_html="$(curl --noproxy '*' -sS "${base_url}/")"
-grep -q 'ASSIstant 前端外壳' <<<"${index_html}"
+grep -q 'Linux 运维 Agent' <<<"${index_html}"
+# The retired brand and the fabricated policy rows must be gone, not merely
+# overwritten once the console connects.
+! grep -q 'ASSIstant' <<<"${index_html}"
+! grep -q 'macOS 控制台' <<<"${index_html}"
+grep -q '未加载 risk-rules.json' <<<"${index_html}"
+! grep -q '阻止根目录递归删除' <<<"${index_html}"
 grep -q '结束进程' <<<"${index_html}"
+grep -q 'id="appVersion"' <<<"${index_html}"
+grep -q 'id="skillComponentFindings"' <<<"${index_html}"
+grep -q 'id="scriptFilter"' <<<"${index_html}"
+grep -q 'id="scriptPackageInfo"' <<<"${index_html}"
+grep -q 'id="scriptParamsForm"' <<<"${index_html}"
+grep -q 'id="auditIntegrityPill"' <<<"${index_html}"
 grep -q 'id="senseTopicSelect"' <<<"${index_html}"
 grep -q 'id="skillsValidateBtn"' <<<"${index_html}"
 grep -q 'id="runtimeBackupBtn"' <<<"${index_html}"

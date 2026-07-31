@@ -114,7 +114,7 @@ linux_agent_mcp_validate_manifest_path() {
 
 linux_agent_mcp_server_summary() {
     local path="$1"
-    local mcp_dir rel payload payload_type validation public server_id transport name description enabled
+    local mcp_dir rel payload payload_type validation public server_id transport name description enabled manifest_meta
     mcp_dir="$(linux_agent_mcp_dir)"
     rel="${path#${mcp_dir%/}/}"
     validation="$(linux_agent_mcp_validate_manifest_path "${path}")"
@@ -141,6 +141,27 @@ linux_agent_mcp_server_summary() {
         enabled="true"
     fi
 
+    # Manifest v2 declarations that the UI needs in order to explain what a
+    # server is allowed to negotiate. Projected only from a manifest that
+    # passed schema validation, and only as a read-only summary: the
+    # credential profile is reported as an id plus a bound/not-bound flag —
+    # the profile file itself belongs to Runner and is never read here.
+    # This deliberately does not go through linux_agent_mcp_public_manifest,
+    # whose redactor blanks any key matching /credential/ wholesale.
+    manifest_meta='{"manifest_version":null,"protocol":null,"credential_profile_id":"","credential_bound":false}'
+    if [[ "$(jq -r '.ok // false' <<<"${validation}")" == "true" && "${payload_type}" == "object" ]]; then
+        manifest_meta="$(jq -c '{
+            manifest_version:(if (.manifest_version | type) == "number" then .manifest_version else 1 end),
+            protocol:{
+                mode:(if (.protocol.mode | type) == "string" then .protocol.mode else "modern_then_legacy" end),
+                require_modern:(.protocol.require_modern == true),
+                allow_legacy_sse:(.compatibility.allow_legacy_sse == true)
+            },
+            credential_profile_id:(if (.credential_profile | type) == "string" then .credential_profile else "" end),
+            credential_bound:(((.credential_profile | type) == "string") and ((.credential_profile | length) > 0))
+        }' <<<"${payload}")"
+    fi
+
     jq -cn \
         --arg id "${server_id}" \
         --arg name "${name}" \
@@ -150,6 +171,7 @@ linux_agent_mcp_server_summary() {
         --argjson enabled "${enabled}" \
         --argjson config "${public}" \
         --argjson validation "${validation}" \
+        --argjson manifest_meta "${manifest_meta}" \
         '{
             id:$id,
             name:$name,
@@ -160,7 +182,7 @@ linux_agent_mcp_server_summary() {
             valid:($validation.ok // false),
             config:$config,
             findings:($validation.findings // [])
-        }'
+        } + $manifest_meta'
 }
 
 linux_agent_validate_mcp() {
@@ -326,7 +348,7 @@ linux_agent_mcp_tool_list_finding() {
 # shellcheck disable=SC2120 # refresh is passed by bin/agent and lib/api.sh.
 linux_agent_mcp_tool_catalog() {
     local refresh="${1:-false}"
-    local mcp_dir servers tools findings path server enabled valid tools_result server_tools server_info error
+    local mcp_dir servers tools findings path server enabled valid tools_result server_tools server_info error protocol_meta
     mcp_dir="$(linux_agent_mcp_dir)"
     mkdir -p "${mcp_dir}"
     servers='[]'
@@ -344,9 +366,20 @@ linux_agent_mcp_tool_catalog() {
         valid="$(jq -r '.valid // false' <<<"${server}")"
         server_tools='[]'
         server_info='{}'
+        # Negotiated protocol truth. Without this the UI cannot tell a modern
+        # MCP session apart from a legacy fallback, which is precisely what
+        # manifest v2's protocol.mode / require_modern exist to control.
+        protocol_meta='{"protocol_version":null,"server_capabilities":{},"fallback_used":false,"fallback_reason":"","contacted":false}'
 
         if [[ "${enabled}" == "true" && "${valid}" == "true" ]]; then
             tools_result="$(linux_agent_mcp_server_tools_from_path "${path}" "${refresh}")"
+            protocol_meta="$(jq -c '{
+                protocol_version:(if (.protocol_version | type) == "string" then .protocol_version else null end),
+                server_capabilities:(if (.server_capabilities | type) == "object" then .server_capabilities else {} end),
+                fallback_used:(.fallback_used == true),
+                fallback_reason:(if (.fallback_reason | type) == "string" then .fallback_reason else "" end),
+                contacted:true
+            }' <<<"${tools_result}")"
             if [[ "$(jq -r '.ok // false' <<<"${tools_result}")" == "true" ]]; then
                 server_tools="$(jq -c '.tools // [] | if type == "array" then . else [] end' <<<"${tools_result}")"
                 server_tools="$(linux_agent_mcp_public_manifest "${server_tools}")"
@@ -364,7 +397,8 @@ linux_agent_mcp_tool_catalog() {
         server="$(jq -c \
             --argjson tool_list "${server_tools}" \
             --argjson server_info "${server_info}" \
-            '. + {tools:$tool_list, tool_count:($tool_list | length), server_info:$server_info}' \
+            --argjson protocol_meta "${protocol_meta}" \
+            '. + {tools:$tool_list, tool_count:($tool_list | length), server_info:$server_info} + $protocol_meta' \
             <<<"${server}")"
         tools="$(jq -cn \
             --argjson prior "${tools}" \
@@ -444,6 +478,34 @@ linux_agent_mcp_tool_metadata() {
                 metadata:$found
             }
           end'
+}
+
+# Redacted snapshot of the tool metadata this approval is actually about.
+# Captured at policy-review time so the approval card never has to depend on
+# the console's own /api/mcp/tools cache, which may be empty or already
+# drifted. Everything in here is the server's self-description — it is data to
+# display, never an instruction and never a safety guarantee.
+linux_agent_mcp_tool_approval_metadata() {
+    local server_id="$1"
+    local tool_name="$2"
+    local metadata
+
+    metadata="$(linux_agent_mcp_tool_metadata "${server_id}" "${tool_name}")"
+    metadata="$(linux_agent_mcp_public_manifest "${metadata}")"
+    jq -c \
+        --arg server_id "${server_id}" \
+        --arg tool "${tool_name}" \
+        '{
+            server_id:$server_id,
+            tool:$tool,
+            available:(.ok // false),
+            status:(.status // "unknown"),
+            transport:(.transport // ""),
+            description:(.metadata.description // ""),
+            input_schema:(if (.metadata.inputSchema | type) == "object" then .metadata.inputSchema else null end),
+            output_schema:(if (.metadata.outputSchema | type) == "object" then .metadata.outputSchema else null end),
+            annotations:(if (.metadata.annotations | type) == "object" then .metadata.annotations else {} end)
+        }' <<<"${metadata}"
 }
 
 linux_agent_mcp_tool_is_available() {

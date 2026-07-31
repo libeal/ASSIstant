@@ -3,6 +3,20 @@ import {
   remoteSecretTransmissionBlocked as isRemoteSecretTransmissionBlocked,
   runtimeBackupAvailable,
 } from "./config-utils.js";
+import {
+  MCP_INPUT_SOURCE_NOTICE,
+  mcpInputExpiry,
+  mcpInputExpiryHtml,
+  mcpInputMetaRows,
+  mcpInputRequestsHtml,
+} from "./mcp-input.js";
+import {
+  MCP_ANNOTATION_CAVEAT,
+  mcpAnnotationRows,
+  mcpArgumentRows,
+  mcpDestructiveWarning,
+  mcpSchemaPrecheck,
+} from "./mcp-approval.js";
 
 /** @typedef {import("./types.js").AppContext} AppContext */
 /** @typedef {import("./types.js").WorkbenchView} WorkbenchView */
@@ -158,83 +172,55 @@ export function createWorkbenchView(app) {
     state.approvalDrawerOpen = false;
     state.pendingApproval = null;
     state.awaitingWorkApproval = false;
+    stopMcpInputCountdown();
     document.body.classList.remove("terminal-approval");
     document.body.classList.remove("mcp-input-approval");
     const drawer = $("approvalDrawer");
     if (drawer) drawer.hidden = true;
     const approveButton = $("approvalApproveBtn");
     const rejectButton = $("approvalRejectBtn");
-    if (approveButton) approveButton.textContent = "批准执行";
+    if (approveButton) {
+      approveButton.textContent = "批准执行";
+      approveButton.disabled = false;
+      approveButton.title = "";
+    }
     if (rejectButton) rejectButton.textContent = "拒绝";
     updateWorkActionLabel();
     updateTerminalActionState();
   }
 
-  function mcpInputControl(requestKey, propertyName, schema, required) {
-    const encodedRequest = encodeURIComponent(requestKey);
-    const encodedProperty = encodeURIComponent(propertyName);
-    const label = schema?.title || propertyName;
-    const description = schema?.description || "";
-    const attributes = `data-mcp-request-key="${escapeHtml(encodedRequest)}" data-mcp-property="${escapeHtml(encodedProperty)}"`;
-    const requiredAttribute = required ? " required" : "";
-    let control = "";
-    if (Array.isArray(schema?.enum) && schema.enum.length) {
-      const options = schema.enum.map((value) => {
-        const encoded = encodeURIComponent(JSON.stringify(value));
-        return `<option value="${escapeHtml(encoded)}">${escapeHtml(String(value))}</option>`;
-      }).join("");
-      control = `<select class="select" ${attributes} data-mcp-value-kind="enum"${requiredAttribute}>${options}</select>`;
-    } else if (schema?.type === "boolean") {
-      control = `<input type="checkbox" ${attributes} data-mcp-value-kind="boolean">`;
-    } else if (schema?.type === "integer" || schema?.type === "number") {
-      const step = schema.type === "integer" ? "1" : "any";
-      const min = Number.isFinite(schema.minimum) ? ` min="${escapeHtml(schema.minimum)}"` : "";
-      const max = Number.isFinite(schema.maximum) ? ` max="${escapeHtml(schema.maximum)}"` : "";
-      control = `<input class="field" type="number" step="${step}" ${attributes} data-mcp-value-kind="${schema.type}"${min}${max}${requiredAttribute}>`;
-    } else if (schema?.type === "array" && schema?.items?.type === "string") {
-      control = `<textarea class="textarea mcp-array-input" ${attributes} data-mcp-value-kind="string-array"${requiredAttribute}></textarea>`;
-    } else {
-      const format = schema?.format === "email" ? "email" : schema?.format === "uri" ? "url" : "text";
-      const min = Number.isInteger(schema?.minLength) ? ` minlength="${schema.minLength}"` : "";
-      const max = Number.isInteger(schema?.maxLength) ? ` maxlength="${schema.maxLength}"` : "";
-      control = `<input class="field" type="${format}" ${attributes} data-mcp-value-kind="string"${min}${max}${requiredAttribute}>`;
-    }
-    return `<label class="small mcp-input-field"><span>${escapeHtml(label)}${required ? " *" : ""}</span>${control}${description ? `<small>${escapeHtml(description)}</small>` : ""}</label>`;
+  let mcpInputCountdownTimer = 0;
+
+  function stopMcpInputCountdown() {
+    if (!mcpInputCountdownTimer) return;
+    window.clearInterval(mcpInputCountdownTimer);
+    mcpInputCountdownTimer = 0;
   }
 
-  function mcpInputRequestHtml(requestKey, request) {
-    const params = request?.params && typeof request.params === "object" ? request.params : {};
-    const mode = params.mode || "form";
-    const message = params.message || requestKey;
-    const encodedRequest = encodeURIComponent(requestKey);
-    const action = `
-      <label class="small mcp-input-action"><span>响应</span>
-        <select class="select" data-mcp-action="${escapeHtml(encodedRequest)}">
-          <option value="accept">accept</option>
-          <option value="decline">decline</option>
-          <option value="cancel">cancel</option>
-        </select>
-      </label>`;
-    if (mode === "url") {
-      const url = String(params.url || "");
-      const safeUrl = /^https?:\/\//i.test(url);
-      return `<section class="mcp-input-request" data-mcp-request="${escapeHtml(encodedRequest)}" data-mcp-mode="url">
-        <strong>${escapeHtml(message)}</strong>
-        ${safeUrl ? `<a class="mcp-input-url" href="${escapeHtml(url)}" target="_blank" rel="noopener noreferrer">${escapeHtml(url)}</a>` : `<code class="mcp-input-url">${escapeHtml(url)}</code>`}
-        ${action}
-      </section>`;
+  /**
+   * Refresh the countdown line and gate submission once the round expires, so
+   * the user learns the elicitation is dead before filling the form rather
+   * than after submitting it.
+   */
+  function refreshMcpInputExpiry() {
+    const pending = state.pendingApproval;
+    if (!pending || pending.type !== "mcp_input") {
+      stopMcpInputCountdown();
+      return;
     }
-    const schema = params.requestedSchema || params.requested_schema || {};
-    const properties = schema?.properties && typeof schema.properties === "object" ? schema.properties : null;
-    const required = new Set(Array.isArray(schema?.required) ? schema.required : []);
-    const controls = properties
-      ? Object.entries(properties).map(([name, propertySchema]) => mcpInputControl(requestKey, name, propertySchema, required.has(name))).join("")
-      : `<label class="small mcp-input-field"><span>JSON content</span><textarea class="textarea" data-mcp-content-json="${escapeHtml(encodedRequest)}" required>{}</textarea></label>`;
-    return `<section class="mcp-input-request" data-mcp-request="${escapeHtml(encodedRequest)}" data-mcp-mode="form">
-      <strong>${escapeHtml(message)}</strong>
-      ${action}
-      <div class="mcp-input-fields">${controls}</div>
-    </section>`;
+    const expiry = mcpInputExpiry(pending.card?.expires_at, Date.now());
+    const line = $("mcpInputExpiry");
+    if (line) {
+      line.textContent = `有效期 ${expiry.label}${expiry.expired ? "：本轮 elicitation 已过期，请重新发起。" : ""}`;
+      line.classList.toggle("urgent", !expiry.expired && expiry.urgent);
+      line.classList.toggle("expired", expiry.expired);
+    }
+    const approveButton = $("approvalApproveBtn");
+    if (approveButton) {
+      approveButton.disabled = expiry.expired;
+      approveButton.title = expiry.expired ? "本轮 elicitation 已过期，请重新发起" : "";
+    }
+    if (expiry.expired) stopMcpInputCountdown();
   }
 
   function openMcpInputDrawer(result, input, card) {
@@ -255,16 +241,14 @@ export function createWorkbenchView(app) {
     document.body.classList.add("mcp-input-approval");
     setText("approvalTitle", card?.title || "MCP input required");
     setStatus("approvalRisk", "awaiting_mcp_input", "medium");
+    const expiry = mcpInputExpiry(card?.expires_at, Date.now());
     const body = $("approvalBody");
     if (body) {
       body.innerHTML = `
-        <div class="approval-meta">${app.renderMetaRows([
-          ["MCP server", card?.server_id || ""],
-          ["MCP tool", card?.tool || ""],
-          ["协议", card?.protocol_version || ""],
-          ["轮次", card?.round || 1],
-        ])}</div>
-        <div class="mcp-input-requests">${Object.entries(requests).map(([key, request]) => mcpInputRequestHtml(key, request)).join("")}</div>
+        <div class="approval-meta">${app.renderMetaRows(mcpInputMetaRows(card, expiry))}</div>
+        ${mcpInputExpiryHtml(expiry)}
+        <p class="small mcp-input-notice">${escapeHtml(MCP_INPUT_SOURCE_NOTICE)}</p>
+        <div class="mcp-input-requests">${mcpInputRequestsHtml(requests)}</div>
         <label class="mcp-input-confirm"><input id="mcpInputConfirm" type="checkbox"> <span>确认将这些响应发送到 MCP server</span></label>
       `;
     }
@@ -274,6 +258,11 @@ export function createWorkbenchView(app) {
     if (rejectButton) rejectButton.textContent = "取消请求";
     const drawer = $("approvalDrawer");
     if (drawer) drawer.hidden = false;
+    stopMcpInputCountdown();
+    refreshMcpInputExpiry();
+    if (expiry.known && !expiry.expired) {
+      mcpInputCountdownTimer = window.setInterval(refreshMcpInputExpiry, 1000);
+    }
     updateWorkActionLabel();
   }
 
@@ -357,6 +346,7 @@ export function createWorkbenchView(app) {
           ])}
         </div>
         ${app.renderJsonDetails("策略审查 findings", state.pendingApproval?.review?.findings || [], false)}
+        ${mcpApprovalSectionHtml(card, step)}
         ${app.renderJsonDetails("步骤 JSON", step, false)}
       `;
     }
@@ -365,6 +355,52 @@ export function createWorkbenchView(app) {
     const drawer = $("approvalDrawer");
     if (drawer) drawer.hidden = false;
     updateWorkActionLabel();
+  }
+
+  /**
+   * MCP-specific section of a work approval card, rendered from the snapshot
+   * the execution layer captured — never from state.mcpTools.
+   */
+  function mcpApprovalSectionHtml(card, step) {
+    const metadata = card?.mcp_metadata;
+    if (!metadata || typeof metadata !== "object") return "";
+    const argumentRows = mcpArgumentRows(step?.arguments);
+    const annotationRows = mcpAnnotationRows(metadata.annotations);
+    const destructive = mcpDestructiveWarning(metadata.annotations);
+    const precheck = mcpSchemaPrecheck(metadata.input_schema, step?.arguments);
+    const unavailable = metadata.available === false
+      ? `<p class="mcp-approval-warn">未能读取该 tool 的 tools/list 声明（${escapeHtml(String(metadata.status || "unknown"))}）。</p>`
+      : "";
+    const argumentsHtml = argumentRows.length
+      ? `<table class="table mcp-approval-args"><tbody>${argumentRows.map((row) => `
+          <tr><td class="mono">${escapeHtml(row.key)}</td><td>${
+        row.long
+          ? `<details><summary>展开（${row.value.length} 字符）</summary><pre class="inline-code">${escapeHtml(row.value)}</pre></details>`
+          : `<span class="mono">${escapeHtml(row.value)}</span>`
+      }</td></tr>`).join("")}</tbody></table>`
+      : '<p class="small">本步骤未携带参数。</p>';
+    const precheckHtml = precheck.ok
+      ? ""
+      : `<div class="mcp-approval-warn"><strong>参数与 server 声明的 inputSchema 不一致（仅提示，最终以执行层判定为准）：</strong><ul>${
+        precheck.issues.map((issue) => `<li>${escapeHtml(issue)}</li>`).join("")
+      }</ul></div>`;
+    const annotationsHtml = annotationRows.length
+      ? `<h6>annotations</h6><p class="small">${escapeHtml(MCP_ANNOTATION_CAVEAT)}</p>
+         <div class="approval-meta">${app.renderMetaRows(annotationRows.map((row) => [row.key, row.value]))}</div>`
+      : "";
+    return `
+      <section class="mcp-approval">
+        <h6>MCP 调用参数</h6>
+        ${unavailable}
+        ${metadata.description ? `<p class="small">${escapeHtml(String(metadata.description))}</p>` : ""}
+        ${argumentsHtml}
+        ${precheckHtml}
+        ${destructive ? `<p class="mcp-approval-warn">${escapeHtml(destructive)}</p>` : ""}
+        ${annotationsHtml}
+        ${app.renderJsonDetails("inputSchema（server 自述）", metadata.input_schema || {}, false)}
+        ${metadata.output_schema ? app.renderJsonDetails("outputSchema（server 自述）", metadata.output_schema, false) : ""}
+      </section>
+    `;
   }
 
   function openTerminalApprovalDrawer(command, review) {
@@ -438,6 +474,9 @@ export function createWorkbenchView(app) {
       if (decision === "n") {
         payload.mcp_input_cancelled = true;
       } else if (decision === "y") {
+        if (mcpInputExpiry(pendingApproval.card?.expires_at, Date.now()).expired) {
+          return showToast("本轮 elicitation 已过期，请重新发起");
+        }
         if (!$("mcpInputConfirm")?.checked) return showToast("请先确认 MCP 输入");
         try {
           payload.mcp_input_responses = collectMcpInputResponses();

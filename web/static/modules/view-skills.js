@@ -1,4 +1,19 @@
 import { remoteSecretTransmissionBlocked } from "./config-utils.js";
+import {
+  groupToolsForSelect,
+  skillExecutionPresentation,
+  skillGuardSummaries,
+  skillMaterializationPresentation,
+  skillOriginPresentation,
+  skillPackageRows,
+} from "./skill-catalog.js";
+import {
+  mcpCredentialPresentation,
+  mcpDeclaredProtocolLabel,
+  mcpManifestVersionLabel,
+  mcpProtocolPresentation,
+} from "./mcp-catalog.js";
+import { schemaControlValue, schemaFormHtml } from "./schema-form.js";
 
 /** @typedef {import("./types.js").AppContext} AppContext */
 /** @typedef {import("./types.js").SkillsView} SkillsView */
@@ -110,15 +125,101 @@ export function createSkillsView(app) {
       const category = String(left.category || "custom").localeCompare(String(right.category || "custom"));
       return category || String(left.ref || "").localeCompare(String(right.ref || ""));
     });
-    const select = $("scriptSelect");
-    select.innerHTML = "";
-    for (const tool of state.tools) {
-      const option = document.createElement("option");
-      option.value = tool.ref;
-      option.textContent = `${tool.ref} · ${tool.description || ""}`;
-      select.appendChild(option);
-    }
+    renderScriptSelect();
     renderToolCatalog();
+  }
+
+  /** Rebuild the Skill `<select>` as filtered `category / skill` optgroups. */
+  function renderScriptSelect() {
+    const select = $("scriptSelect");
+    if (!select) return;
+    const previous = select.value;
+    const filter = $("scriptFilter")?.value || "";
+    const groups = groupToolsForSelect(state.tools, filter);
+    select.innerHTML = "";
+    if (!groups.length) {
+      const option = document.createElement("option");
+      option.value = "";
+      option.textContent = state.tools.length ? "没有匹配的 Skill" : "连接后加载 skill";
+      select.appendChild(option);
+      renderScriptPackageInfo();
+      return;
+    }
+    for (const group of groups) {
+      const optgroup = document.createElement("optgroup");
+      optgroup.label = group.label;
+      for (const tool of group.tools) {
+        const option = document.createElement("option");
+        option.value = String(tool.ref || "");
+        option.textContent = `${tool.ref} · ${tool.description || ""}`;
+        optgroup.appendChild(option);
+      }
+      select.appendChild(optgroup);
+    }
+    if (previous && groups.some((group) => group.tools.some((tool) => tool.ref === previous))) {
+      select.value = previous;
+    }
+    renderScriptPackageInfo();
+  }
+
+  /** Package facts and declared guards for the currently selected tool. */
+  function renderScriptPackageInfo() {
+    renderScriptParamsForm();
+    const container = $("scriptPackageInfo");
+    if (!container) return;
+    const ref = $("scriptSelect")?.value || "";
+    const tool = state.tools.find((item) => item.ref === ref) || null;
+    container.innerHTML = "";
+    if (!tool) {
+      container.appendChild(emptyItem("选择一个 Skill 查看包信息。"));
+      return;
+    }
+    const guards = skillGuardSummaries(tool);
+    const item = document.createElement("article");
+    item.className = "item";
+    item.innerHTML = `
+      <div class="item-head"><h4 class="mono">${escapeHtml(tool.ref || "")}</h4></div>
+      <div class="approval-meta">${app.renderMetaRows(skillPackageRows(tool))}</div>
+      ${guards.length
+        ? `<div class="skill-guard-list"><strong class="white">前置约束</strong><ul>${
+          guards.map((text) => `<li>${escapeHtml(text)}</li>`).join("")
+        }</ul></div>`
+        : '<p class="small">该 tool 未声明前置约束。</p>'}
+    `;
+    container.appendChild(item);
+  }
+
+  /**
+   * Render a parameter form when the package declares `input_schema`, and fall
+   * back to the raw JSON textbox otherwise. The schema is only a convenience:
+   * the executor still validates whatever is submitted.
+   */
+  function renderScriptParamsForm() {
+    const form = $("scriptParamsForm");
+    const jsonField = $("scriptArgsField");
+    if (!form) return;
+    const ref = $("scriptSelect")?.value || "";
+    const tool = state.tools.find((item) => item.ref === ref) || null;
+    const schema = tool?.input_schema;
+    const html = schemaFormHtml(ref || "script", schema);
+    form.innerHTML = html;
+    form.hidden = !html;
+    if (jsonField) jsonField.hidden = Boolean(html);
+  }
+
+  /** Collect script arguments from whichever input mode is active. */
+  function collectScriptArguments() {
+    const form = $("scriptParamsForm");
+    if (!form || form.hidden) return app.parseJsonText("scriptArgs");
+    const args = {};
+    form.querySelectorAll("[data-mcp-property]").forEach((control) => {
+      if (!control.reportValidity()) throw new Error("参数不合法");
+      const property = decodeURIComponent(control.dataset.mcpProperty || "");
+      const value = schemaControlValue(control);
+      if (value === "" || (typeof value === "number" && Number.isNaN(value))) return;
+      args[property] = value;
+    });
+    return args;
   }
 
   async function loadSkillTree() {
@@ -193,14 +294,22 @@ export function createSkillsView(app) {
     }
     for (const server of state.mcpServers) {
       const findingCount = Array.isArray(server.findings) ? server.findings.length : 0;
+      const protocol = mcpProtocolPresentation(server);
+      const declared = mcpDeclaredProtocolLabel(server);
+      const credential = mcpCredentialPresentation(server);
+      const manifestVersion = mcpManifestVersionLabel(server);
       const row = document.createElement("tr");
       row.className = "clickable";
       row.innerHTML = `
-        <td><span class="mono">${escapeHtml(server.id || server.name || "mcp")}</span><div class="small">${escapeHtml(server.description || server.name || "")}</div></td>
-        <td><span class="pill">${escapeHtml(server.transport || "unknown")}</span></td>
+        <td><span class="mono">${escapeHtml(server.id || server.name || "mcp")}</span><div class="small">${escapeHtml(server.description || server.name || "")}</div><div class="small mono ${credential.bound ? "" : "muted-text"}">${escapeHtml(credential.label)}</div></td>
+        <td><span class="pill">${escapeHtml(server.transport || "unknown")}</span>
+          <span class="pill ${protocol.kind ? `risk ${protocol.kind}` : ""}">${escapeHtml(protocol.label)}</span>
+          ${server.fallback_used === true ? '<span class="pill risk medium">fallback</span>' : ""}
+          ${protocol.detail ? `<div class="small">${escapeHtml(protocol.detail)}</div>` : ""}
+          ${declared ? `<div class="small">${escapeHtml(declared)}</div>` : ""}</td>
         <td>${server.enabled === false ? "false" : "true"}</td>
         <td><span class="pill risk ${server.valid ? "low" : "high"}">${escapeHtml(server.valid ? `valid · ${server.tool_count ?? 0} tools` : `${findingCount} issue${findingCount === 1 ? "" : "s"}`)}</span></td>
-        <td class="mono">${escapeHtml(server.path || "")}</td>
+        <td class="mono">${escapeHtml(server.path || "")}${manifestVersion ? `<div class="small">manifest ${escapeHtml(manifestVersion)}</div>` : ""}</td>
       `;
       row.addEventListener("click", () => {
         setStatus("mcpStatus", server.valid ? "selected" : "invalid", server.valid ? "ok" : "failed");
@@ -245,7 +354,7 @@ export function createSkillsView(app) {
     container.innerHTML = "";
     if (!state.tools.length) {
       const row = document.createElement("tr");
-      row.innerHTML = '<td colspan="5">暂无已登记 skill</td>';
+      row.innerHTML = '<td colspan="6">暂无已登记 skill</td>';
       container.appendChild(row);
       return;
     }
@@ -258,22 +367,26 @@ export function createSkillsView(app) {
       const risk = tool.risk || "low";
       const row = document.createElement("tr");
       const scriptPath = `${packageName.split(" / ").join("/")}/scripts/${name}.sh`;
-      const materialization = tool.materialization || "local";
-      const remoteCell = materialization === "local"
-        ? '<span class="pill">local</span>'
-        : materialization === "ready"
-          ? '<span class="pill risk low">ready</span>'
-          : materialization === "materializing"
-            ? '<button class="btn secondary compact-btn" type="button" disabled aria-busy="true">加载中</button>'
-            : `<button class="btn secondary compact-btn" type="button" data-materialize-skill="${escapeHtml(tool.skill || group)}"${sensitiveEditsEnabled() ? "" : " disabled title=\"服务器已禁用 Web 敏感编辑\""}>${materialization === "failed" ? "重试加载" : "加载 Skill"}</button>`;
+      const execution = skillExecutionPresentation(tool);
+      const origin = skillOriginPresentation(tool);
+      const materialization = skillMaterializationPresentation(tool);
+      const executionCell = `<span class="pill ${escapeHtml(execution.kind)}" title="${escapeHtml(execution.title)}">${escapeHtml(execution.label)}</span>${
+        execution.capability ? `<div class="small mono">${escapeHtml(execution.capability)}</div>` : ""
+      }`;
+      const materializationCell = materialization.busy
+        ? '<button class="btn secondary compact-btn" type="button" disabled aria-busy="true">加载中</button>'
+        : materialization.actionable
+          ? `<button class="btn secondary compact-btn" type="button" data-materialize-skill="${escapeHtml(tool.skill || group)}" title="${escapeHtml(materialization.title)}"${sensitiveEditsEnabled() ? "" : " disabled title=\"服务器已禁用 Web 敏感编辑\""}>${escapeHtml(materialization.label)}</button>`
+          : `<span class="pill risk ${materialization.state === "ready" ? "low" : "medium"}" title="${escapeHtml(materialization.title)}">${escapeHtml(materialization.label)}</span>`;
       row.className = "clickable";
       row.dataset.path = scriptPath;
       row.innerHTML = `
         <td class="mono">${escapeHtml(name)}</td>
         <td>${escapeHtml(group)}</td>
         <td><span class="pill risk ${riskKind(risk)}">${escapeHtml(risk)}</span></td>
-        <td>已登记</td>
-        <td>${remoteCell}</td>
+        <td>${executionCell}</td>
+        <td><span class="pill" title="${escapeHtml(origin.title)}">${escapeHtml(origin.label)}</span></td>
+        <td>${materializationCell}</td>
       `;
       row.addEventListener("click", (event) => {
         const target = event.target instanceof Element ? event.target : null;
@@ -283,13 +396,33 @@ export function createSkillsView(app) {
           app.safeAction(() => materializeSkill(button.dataset.materializeSkill));
           return;
         }
-        if (materialization === "available") {
+        if (materialization.actionable && !materialization.busy) {
           app.safeAction(() => materializeSkill(tool.skill || group));
           return;
         }
         readSkillFile(scriptPath, "script");
       });
       container.appendChild(row);
+    }
+  }
+
+  function renderSkillComponentFindings() {
+    const container = $("skillComponentFindings");
+    if (!container) return;
+    const findings = Array.isArray(state.skillComponentFindings) ? state.skillComponentFindings : [];
+    container.innerHTML = "";
+    container.hidden = findings.length === 0;
+    if (!findings.length) return;
+    for (const finding of findings) {
+      const item = document.createElement("article");
+      item.className = "item skill-component-finding";
+      item.innerHTML = `
+        <div class="item-head"><h4 class="mono">${escapeHtml(finding.component || "unknown")}</h4><span class="pill risk ${
+        finding.severity === "error" ? "high" : "medium"
+      }">${escapeHtml(finding.stage || "component")}</span></div>
+        <p>${escapeHtml(finding.message || "Skill Web 组件不可用。")}</p>
+      `;
+      container.appendChild(item);
     }
   }
 
@@ -400,7 +533,7 @@ export function createSkillsView(app) {
   async function reviewScript() {
     const ref = $("scriptSelect").value;
     if (!ref) return showToast("Skill required");
-    const args = app.parseJsonText("scriptArgs");
+    const args = collectScriptArguments();
     setStatus("scriptJobStatus", "review", "review");
     const data = await app.api("/api/script/review", { method: "POST", body: { ref, arguments: args } });
     setStatus("scriptJobStatus", data.status, data.ok ? "ok" : "failed");
@@ -410,7 +543,7 @@ export function createSkillsView(app) {
   async function runScript() {
     const ref = $("scriptSelect").value;
     if (!ref) return showToast("Skill required");
-    const args = app.parseJsonText("scriptArgs");
+    const args = collectScriptArguments();
     const job = await app.createJob("script", "run", { ref, arguments: args, approve: true });
     state.activeScriptJobId = job.job_id;
     $("scriptCancelBtn").disabled = false;
@@ -542,6 +675,8 @@ export function createSkillsView(app) {
     loadSense,
     renderSense,
     loadTools,
+    renderScriptSelect,
+    renderScriptPackageInfo,
     loadSkillTree,
     validateSkills,
     loadMcpRegistry,
@@ -550,6 +685,7 @@ export function createSkillsView(app) {
     renderMcpRegistry,
     renderMcpTools,
     renderToolCatalog,
+    renderSkillComponentFindings,
     materializeSkill,
     renderSkillTree,
     renderTreeNode,

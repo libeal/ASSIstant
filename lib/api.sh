@@ -242,6 +242,11 @@ linux_agent_api_tools_list() {
         category,
         execution_class:(.execution.class // "invalid"),
         capability:(.execution.capability // ""),
+        approval_scope:(.approval_scope // ""),
+        guards:(.guards // []),
+        input_schema:(.input_schema // null),
+        package_version:(.package_version // ""),
+        core_api:(.core_api // 0),
         origin,
         materialization:(if .state == "installed" then "ready" else .state end)
     }]' <<<"${catalog}")"

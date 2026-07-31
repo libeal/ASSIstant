@@ -24,6 +24,25 @@
       "entrypoint": "scripts/disk-hotspots.sh",
       "risk": "low",
       "approval_scope": "skill_readonly",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string",
+            "title": "采集路径",
+            "description": "要统计的目录，默认 /var。",
+            "default": "/var"
+          },
+          "top_n": {
+            "type": "integer",
+            "title": "返回条数",
+            "description": "正整数，默认 10。",
+            "default": 10
+          }
+        },
+        "required": [],
+        "additionalProperties": false
+      },
       "execution": {
         "class": "runner",
         "capability": "",
@@ -52,6 +71,37 @@
       "entrypoint": "scripts/log-search.sh",
       "risk": "low",
       "approval_scope": "skill_readonly",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string",
+            "title": "日志路径",
+            "description": "必须位于 /var/log，默认 /var/log。",
+            "default": "/var/log"
+          },
+          "keyword": {
+            "type": "string",
+            "title": "关键词",
+            "description": "检索关键词，默认 error。",
+            "default": "error"
+          },
+          "lines": {
+            "type": "integer",
+            "title": "返回行数",
+            "description": "正整数，默认 20。",
+            "default": 20
+          },
+          "include_journal": {
+            "type": "boolean",
+            "title": "包含 journal",
+            "description": "默认 false，不读取 journal。",
+            "default": false
+          }
+        },
+        "required": [],
+        "additionalProperties": false
+      },
       "execution": {
         "class": "runner",
         "capability": "",
@@ -80,6 +130,19 @@
       "entrypoint": "scripts/resource-inspect.sh",
       "risk": "low",
       "approval_scope": "skill_readonly",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "top_n": {
+            "type": "integer",
+            "title": "返回条数",
+            "description": "正整数，默认 10。",
+            "default": 10
+          }
+        },
+        "required": [],
+        "additionalProperties": false
+      },
       "execution": {
         "class": "runner",
         "capability": "",

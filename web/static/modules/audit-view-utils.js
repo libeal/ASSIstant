@@ -49,3 +49,38 @@ export function auditSummaryText(event) {
   if (typeof event.summary === "string" && event.summary.trim()) return event.summary.trim();
   return String(event.stage || event.type || event.name || "event");
 }
+
+/**
+ * Hash-chain verdict for one audit session read.
+ *
+ * "unknown" is deliberately distinct from "failed": a report that carries no
+ * verdict at all must not be presented as a passed check, and must not be
+ * presented as tampering either.
+ * @param {Record<string, any>|null|undefined} data
+ * @returns {{state: string, label: string, kind: string, breaks: Array<Record<string, any>>}}
+ */
+export function auditIntegrityStatus(data) {
+  const integrity = data?.integrity && typeof data.integrity === "object" ? data.integrity : {};
+  const known = typeof data?.integrity_ok === "boolean" || typeof integrity.ok === "boolean";
+  const breaks = Array.isArray(integrity.breaks) ? integrity.breaks : [];
+  if (!known) return { state: "unknown", label: "integrity: unknown", kind: "medium", breaks };
+  const ok = data?.integrity_ok === true && integrity.ok !== false;
+  return ok
+    ? { state: "ok", label: "integrity: ok", kind: "low", breaks }
+    : { state: "failed", label: "integrity: failed", kind: "high", breaks };
+}
+
+/**
+ * Why the timeline is empty when the chain did not verify. Replaces a silent
+ * empty state that read as "this session did nothing".
+ * @param {{state: string, breaks: Array<Record<string, any>>}} status
+ * @returns {string}
+ */
+export function auditIntegrityTimelineNotice(status) {
+  if (status?.state !== "failed") return "";
+  const breaks = Array.isArray(status.breaks) ? status.breaks : [];
+  const detail = breaks.length
+    ? `断点：${breaks.map((item) => `${item?.line || "?"}:${item?.reason || "unknown"}`).join("、")}`
+    : "后端未提供断点位置。";
+  return `哈希链校验未通过，已停用该 session 的时间线恢复。${detail}`;
+}

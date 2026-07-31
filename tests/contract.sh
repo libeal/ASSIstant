@@ -15,6 +15,8 @@ source "${ROOT_DIR}/lib/provider_resilience.sh"
 source "${ROOT_DIR}/lib/ai.sh"
 # shellcheck source=../lib/protocol.sh
 source "${ROOT_DIR}/lib/protocol.sh"
+# shellcheck source=../lib/skills.sh
+source "${ROOT_DIR}/lib/skills.sh"
 # shellcheck source=../lib/api.sh
 source "${ROOT_DIR}/lib/api.sh"
 
@@ -312,6 +314,119 @@ jq -e '
     and (.timeline | length) == 1
     and .timeline[0].status == "failed"
 ' <<<"${unknown_state_protocol}" >/dev/null
+
+# 3b) MCP tool results get their own authoritative output block, so the console# never has to guess a type from an arbitrary JSON shape. Media and embedded
+# resources are reduced to MIME + size: no base64 payload may reach the client.
+mcp_result_blocks="$(linux_agent_output_blocks_from_result '{
+    "ok": true,
+    "status": "executed",
+    "exit_code": 0,
+    "output": {
+        "tool": "mcp.files.read",
+        "server_id": "files",
+        "mcp_tool": "read",
+        "content": [
+            {"type": "text", "text": "hello"},
+            {"type": "image", "mimeType": "image/png", "data": "aGVsbG8gd29ybGQh"},
+            {"type": "resource_link", "uri": "https://example.test/x"},
+            {"type": "resource", "resource": {"uri": "file:///tmp/a.txt", "mimeType": "text/plain", "text": "inline"}},
+            {"type": "resource", "resource": {"uri": "file:///tmp/b.bin", "blob": "QUJDRA=="}}
+        ],
+        "structuredContent": {"rows": 2},
+        "isError": false
+    },
+    "mcp": {
+        "server_id": "files",
+        "tool": "read",
+        "transport": "stdio",
+        "protocol_version": "2025-06-18",
+        "fallback_used": true,
+        "fallback_reason": "streamable_http 405"
+    }
+}')"
+jq -e '
+    ([.[] | select(.kind == "mcp_result")] | length) == 1
+    and ([.[] | select(.kind == "json" and .title == "执行输出")] | length) == 0
+    and ([.[] | select(.kind == "mcp_result")] | first) as $block
+    | $block.mcp.server_id == "files"
+    and $block.mcp.tool == "read"
+    and $block.mcp.protocol_version == "2025-06-18"
+    and $block.mcp.fallback_used == true
+    and $block.mcp.fallback_reason == "streamable_http 405"
+    and $block.mcp.is_error == false
+    and $block.mcp.structured_content.rows == 2
+    and ($block.mcp.content | length) == 5
+    and ($block.mcp.content[0] | .type == "text" and .text == "hello" and .size_bytes == 5)
+    and ($block.mcp.content[1] | .type == "image" and .mime_type == "image/png" and .size_bytes == 12)
+    and ($block.mcp.content[2] | .type == "resource_link" and .uri == "https://example.test/x")
+    and ($block.mcp.content[3] | .type == "resource" and .text == "inline" and .size_bytes == 6)
+    and ($block.mcp.content[4] | .type == "resource" and .text == null and .size_bytes == 4)
+' <<<"${mcp_result_blocks}" >/dev/null
+if grep -qE 'aGVsbG8gd29ybGQh|QUJDRA==' <<<"${mcp_result_blocks}"; then
+    printf 'mcp_result block leaked raw base64 payload\n' >&2
+    exit 1
+fi
+# A non-MCP result must keep the previous generic projection.
+jq -e '([.[] | select(.kind == "mcp_result")] | length) == 0
+    and ([.[] | select(.kind == "json" and .title == "执行输出")] | length) == 1' \
+    <<<"$(linux_agent_output_blocks_from_result '{"ok":true,"status":"executed","output":{"tool":"fixture.tool"}}')" >/dev/null
+
+# 3c) The approval card carries the MCP metadata snapshot taken at review time,
+# so the console never has to re-query its own /api/mcp/tools cache.
+mcp_approval_card="$(linux_agent_approval_card_for_work '{}' '{
+    "status": "approval_required",
+    "approval_step": {"id": "s1", "title": "调用 MCP", "executor_type": "mcp_tool", "risk_level": "medium"},
+    "approval_step_key": "iteration-1:0:s1",
+    "review": {"risk_level": "medium", "findings": []},
+    "mcp_metadata": {
+        "server_id": "files",
+        "tool": "read",
+        "available": true,
+        "status": "found",
+        "transport": "stdio",
+        "description": "read a file",
+        "input_schema": {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]},
+        "output_schema": null,
+        "annotations": {"destructiveHint": false}
+    }
+}')"
+jq -e '
+    .type == "work"
+    and .mcp_metadata.server_id == "files"
+    and .mcp_metadata.tool == "read"
+    and .mcp_metadata.available == true
+    and .mcp_metadata.input_schema.required[0] == "path"
+    and .mcp_metadata.annotations.destructiveHint == false
+' <<<"${mcp_approval_card}" >/dev/null
+# Non-MCP approvals must not grow a phantom snapshot.
+jq -e '.type == "work" and .mcp_metadata == null' \
+    <<<"$(linux_agent_approval_card_for_work '{}' '{
+        "status": "approval_required",
+        "approval_step": {"id": "s1", "title": "shell", "executor_type": "shell"},
+        "review": {"risk_level": "medium"}
+    }')" >/dev/null
+
+# 3d) /api/tools carries the package facts and the optional parameter schema
+# verbatim, so the console renders a form instead of inferring one.
+api_tools="$(linux_agent_api_tools_list)"
+jq -e '[.scripts[] | select(.ref == "ops-basic/log-search")] | first
+    | .package_version == "1.0.0"
+    and .core_api == 1
+    and .approval_scope == "skill_readonly"
+    and (.guards | type) == "array"
+    and .origin == "builtin"
+    and .execution_class == "runner"
+    and .materialization == "ready"
+    and .input_schema.type == "object"
+    and .input_schema.additionalProperties == false
+    and .input_schema.properties.include_journal.type == "boolean"
+    and .input_schema.properties.include_journal.default == false
+    and .input_schema.properties.lines.type == "integer"' <<<"${api_tools}" >/dev/null
+# A tool without a declared schema stays null; the console falls back to JSON.
+jq -e '[.scripts[] | select(.ref == "ops-basic/service-restart-plan")] | first
+    | .input_schema == null' <<<"${api_tools}" >/dev/null
+# /api/tools must never emit the retired "local" materialization state.
+jq -e '[.scripts[].materialization] | all(. == "ready" or . == "available")' <<<"${api_tools}" >/dev/null
 
 # 4) Error normalization follows the schema contract and preserves explicit
 # false booleans instead of treating them as missing jq alternatives.

@@ -90,6 +90,8 @@ export function bindApplicationEvents(app, shell) {
     on("scriptReviewBtn", "click", () => safeAction(app.reviewScript));
     on("scriptRunBtn", "click", () => safeAction(app.runScript));
     on("scriptCancelBtn", "click", () => safeAction(app.cancelScript));
+    on("scriptFilter", "input", () => app.renderScriptSelect());
+    on("scriptSelect", "change", () => app.renderScriptPackageInfo());
     on("skillsValidateBtn", "click", () => safeAction(app.validateSkills));
     on("mcpReloadBtn", "click", () => safeAction(app.loadMcpRegistry));
     on("mcpToolsBtn", "click", () => safeAction(app.loadMcpTools));

@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
 
 import {
+  auditIntegrityStatus,
+  auditIntegrityTimelineNotice,
   auditSummaryText,
   filteredAuditEvents,
   filteredAuditSessions,
@@ -125,6 +127,7 @@ const auditProtocol = {
 let auditResponse = null;
 const apiCalls = [];
 const toasts = [];
+const statusCalls = [];
 const view = createAuditView({
   state,
   request() {},
@@ -134,6 +137,7 @@ const view = createAuditView({
   },
   $(id) { return controls[id] || null; },
   setText(id, text) { if (controls[id]) controls[id].textContent = text; },
+  setStatus(id, text, kind) { statusCalls.push([id, text, kind]); },
   showToast(message) { toasts.push(message); },
   pretty: JSON.stringify,
   escapeHtml: String,
@@ -176,6 +180,29 @@ const brokenReport = view.renderAuditReadableReport({
 });
 assert.match(brokenReport, /完整性: 失败/);
 assert.match(brokenReport, /2:hash_mismatch/);
+
+// --- 完整性状态位：ok / failed / unknown 三态 ------------------------------
+assert.deepEqual(
+  auditIntegrityStatus({ integrity_ok: true, integrity: { ok: true } }),
+  { state: "ok", label: "integrity: ok", kind: "low", breaks: [] },
+);
+assert.equal(auditIntegrityStatus({ integrity_ok: false }).state, "failed");
+assert.equal(auditIntegrityStatus({ integrity: { ok: false } }).state, "failed");
+// 后端根本没给校验结论时，不得冒充通过，也不得冒充篡改。
+assert.equal(auditIntegrityStatus({}).state, "unknown");
+assert.equal(auditIntegrityStatus(null).state, "unknown");
+// integrity_ok 为 true 但明细为 false 时按失败处理。
+assert.equal(auditIntegrityStatus({ integrity_ok: true, integrity: { ok: false } }).state, "failed");
+
+assert.equal(auditIntegrityTimelineNotice({ state: "ok", breaks: [] }), "");
+assert.equal(auditIntegrityTimelineNotice({ state: "unknown", breaks: [] }), "");
+const failedNotice = auditIntegrityTimelineNotice({
+  state: "failed",
+  breaks: [{ line: 2, reason: "hash_mismatch" }],
+});
+assert.match(failedNotice, /已停用该 session 的时间线恢复/);
+assert.match(failedNotice, /2:hash_mismatch/);
+assert.match(auditIntegrityTimelineNotice({ state: "failed", breaks: [] }), /后端未提供断点位置/);
 
 auditResponse = {
   ok: false,

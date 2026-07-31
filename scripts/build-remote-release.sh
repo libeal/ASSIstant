@@ -173,10 +173,13 @@ while IFS= read -r skill_dir; do
         capability:.execution.capability,
         dispatch:.execution.dispatch,
         runtime_inputs,
-        guards
+        guards,
+        input_schema:(.input_schema // null)
     }]' <<<"${package_json}")"
     skill_description="$(jq -r '.description // empty' <<<"${package_json}")"
     skill_category="$(jq -r '.category // empty' <<<"${package_json}")"
+    skill_package_version="$(jq -r '.package_version // ""' <<<"${package_json}")"
+    skill_core_api="$(jq -r '.core_api // 0' <<<"${package_json}")"
     components="$(jq -c '.components // {}' <<<"${package_json}")"
     contract_digest="$(python3 "${ROOT_DIR}/lib/skill_package.py" digest "${skill_dir}" --origin builtin | jq -r '.contract_digest')"
     index_section_digest="$(jq -r --arg skill "${skill_name}" '.skills[] | select(.name == $skill) | .section_digest' <<<"${index_json}")"
@@ -198,13 +201,15 @@ while IFS= read -r skill_dir; do
         --arg skill "${skill_name}" \
         --arg description "${skill_description}" \
         --arg category "${skill_category}" \
+        --arg package_version "${skill_package_version}" \
+        --argjson core_api "${skill_core_api}" \
         --arg risk "${skill_risk}" \
         --arg contract_digest "${contract_digest}" \
         --arg index_section_digest "${index_section_digest}" \
         --argjson asset "$(asset_json "${asset_name}")" \
         --argjson refs "${refs}" \
         --argjson components "${components}" \
-        '$prior + {($skill): {description:$description, category:$category, risk:$risk, asset:$asset, refs:$refs, components:$components, contract_digest:$contract_digest, index_section_digest:$index_section_digest}}')"
+        '$prior + {($skill): {description:$description, category:$category, package_version:$package_version, core_api:$core_api, risk:$risk, asset:$asset, refs:$refs, components:$components, contract_digest:$contract_digest, index_section_digest:$index_section_digest}}')"
 done < <(find "${ROOT_DIR}/skills" -mindepth 1 -maxdepth 1 -type d | sort)
 
 {

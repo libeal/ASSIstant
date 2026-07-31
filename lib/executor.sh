@@ -2652,6 +2652,7 @@ linux_agent_execute_work_plan() {
     local i="${resume_index}"
     while [[ "${i}" -lt "${step_count}" ]]; do
         local step step_review_text review result skipped prepared step_decision revision_request auto_approved disclosure_block
+        local mcp_metadata
         local mcp_resuming continuation_id continuation_path step_key
         step="$(jq -c --argjson index "${i}" '.steps[$index]' <<<"${plan_json}")"
         auto_approved=0
@@ -2845,6 +2846,15 @@ linux_agent_execute_work_plan() {
             step_review_text="$(linux_agent_step_review_material "${step}")"
             review="$(linux_agent_policy_review_step "${step}" "${step_review_text}" "$(case "$(jq -r '.executor_type' <<<"${step}")" in remote_script) printf 'remote' ;; mcp_tool) printf 'mcp' ;; *) printf 'local' ;; esac)")"
         fi
+        # Keep the structure the review just consumed, instead of throwing it
+        # away once it has been folded into the review text. tools/list is
+        # cached by the client, so this reads the same snapshot.
+        mcp_metadata='null'
+        if [[ "$(jq -r '.executor_type' <<<"${step}")" == "mcp_tool" ]]; then
+            mcp_metadata="$(linux_agent_mcp_tool_approval_metadata \
+                "$(jq -r '.mcp_server // empty' <<<"${step}")" \
+                "$(jq -r '.mcp_tool // empty' <<<"${step}")")"
+        fi
         case "$(jq -r '.executor_type' <<<"${step}")" in
             shell | skill_script | remote_script)
                 # These step types all execute shell source. Unknown static
@@ -2902,8 +2912,9 @@ linux_agent_execute_work_plan() {
                     --arg approval_step_key "$(jq -r --argjson index "${i}" '.[$index].key' <<<"${step_states}")" \
                     --argjson approval_step "${step}" \
                     --argjson review "${review}" \
+                    --argjson mcp_metadata "${mcp_metadata:-null}" \
                     --argjson results "${results}" \
-                    '{status:"approval_required", execution_user:$execution_user, sudo_probe:$sudo_probe, approval_step:$approval_step, approval_step_key:$approval_step_key, review:$review, results:$results}')"
+                    '{status:"approval_required", execution_user:$execution_user, sudo_probe:$sudo_probe, approval_step:$approval_step, approval_step_key:$approval_step_key, review:$review, mcp_metadata:$mcp_metadata, results:$results}')"
                 linux_agent_finalize_work_plan_execution "${execution_result}" "${plan_json}" "${step_states}" "${iteration}" "${step_scope}" "${i}" "${prior_results}" "${prior_step_states}"
                 return 0
                 ;;

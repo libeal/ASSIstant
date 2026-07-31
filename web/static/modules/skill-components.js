@@ -1,5 +1,38 @@
 /** Load signed builtin Skill UI fragments and modules without core knowledge. */
 
+/**
+ * Normalize a `/api/skill-components` finding into the shape the Skill 库
+ * warning strip renders. The backend reports manifest-level rejections; the
+ * loader itself reports registration failures.
+ * @param {Record<string, any>} finding
+ * @returns {{component: string, severity: string, stage: string, code: string, message: string}}
+ */
+export function normalizeComponentFinding(finding) {
+  const source = finding && typeof finding === "object" ? finding : {};
+  return {
+    component: String(source.skill || source.component || source.code || "unknown"),
+    severity: source.severity === "error" ? "error" : "warning",
+    stage: "manifest",
+    code: String(source.code || ""),
+    message: String(source.message || "Skill Web 组件被拒绝加载。"),
+  };
+}
+
+/**
+ * @param {string} component
+ * @param {unknown} error
+ * @returns {{component: string, severity: string, stage: string, code: string, message: string}}
+ */
+export function normalizeRegistrationFailure(component, error) {
+  return {
+    component: String(component || "unknown"),
+    severity: "error",
+    stage: "register",
+    code: "SKILL_WEB_COMPONENT_REGISTER_FAILED",
+    message: error instanceof Error ? error.message : String(error ?? "组件注册失败。"),
+  };
+}
+
 /** @param {Record<string, any>} app @returns {{loadSkillWebComponents: Function}} */
 export function createSkillComponentLoader(app) {
   const registered = new Map();
@@ -66,17 +99,20 @@ export function createSkillComponentLoader(app) {
   async function loadSkillWebComponents() {
     const result = await app.api("/api/skill-components");
     const components = Array.isArray(result.components) ? result.components : [];
-    for (const finding of Array.isArray(result.findings) ? result.findings : []) {
-      console.warn("Skill Web component disabled", finding);
-    }
+    // Rebuilt from scratch on every load so repeated reloads replace the
+    // previous verdict instead of accumulating duplicate warnings.
+    const findings = (Array.isArray(result.findings) ? result.findings : []).map(normalizeComponentFinding);
     for (const component of components) {
       try {
         const lifecycle = await register(component);
         if (typeof lifecycle.onConnect === "function") await lifecycle.onConnect();
       } catch (error) {
         console.error("Skill Web component registration failed", component.name, error);
+        findings.push(normalizeRegistrationFailure(component.name, error));
       }
     }
+    app.state.skillComponentFindings = findings;
+    if (typeof app.renderSkillComponentFindings === "function") app.renderSkillComponentFindings();
     return result;
   }
 

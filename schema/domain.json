@@ -74,7 +74,31 @@
       "risk_by_value",
       "runner_fallthrough",
       "backup_proof"
-    ]
+    ],
+    "input_schema_subset": {
+      "root_type": "object",
+      "property_types": [
+        "string",
+        "number",
+        "integer",
+        "boolean",
+        "array"
+      ],
+      "array_item_types": [
+        "string"
+      ],
+      "property_keys": [
+        "type",
+        "title",
+        "description",
+        "enum",
+        "items",
+        "default"
+      ],
+      "max_properties": 24,
+      "max_enum_values": 32,
+      "max_bytes": 8192
+    }
   },
   "execution_isolation": [
     "runner_uid",

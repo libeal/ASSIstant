@@ -176,7 +176,7 @@ button:focus-visible, a:focus-visible, input:focus-visible, textarea:focus-visib
 .app.sidebar-collapsed .nav .key,
 .app.sidebar-collapsed .side-card { display: none; }
 .app.sidebar-collapsed .brand { display: grid; place-items: center; padding: 13px 8px; }
-.app.sidebar-collapsed .brand::before { content: "A"; color: var(--text); font-family: var(--title-font); font-size: 20px; font-weight: 600; }
+.app.sidebar-collapsed .brand::before { content: "L"; color: var(--text); font-family: var(--title-font); font-size: 20px; font-weight: 600; }
 .app.sidebar-collapsed .nav button { grid-template-columns: 1fr; place-items: center; padding-inline: 8px; }
 .app.sidebar-collapsed .sidebar-toggle-icon { transform: translateX(1px) rotate(180deg); }
 
@@ -348,10 +348,30 @@ label.small { display: block; }
   min-height: 32px;
 }
 .pill.status-action:hover { border-color: rgba(255,255,255,0.22); color: var(--text); }
-.risk { color: var(--text-2); border-color: var(--line-soft); background: #242426; }
-.risk.low { color: #d9f8df; background: rgba(48,209,88,0.10); border-color: rgba(48,209,88,0.22); }
+.risk { color: var(--text-2); border-color: var(--line-soft); background: #242426; }.risk.low { color: #d9f8df; background: rgba(48,209,88,0.10); border-color: rgba(48,209,88,0.22); }
 .risk.medium { color: #fff2b8; background: rgba(255,214,10,0.11); border-color: rgba(255,214,10,0.22); }
 .risk.high, .risk.critical { color: #ffd7d2; background: #49302f; border-color: rgba(255,69,58,0.30); }
+/* Package-declared execution class. Deliberately distinct from .risk so a
+   privileged capability never reads as a risk verdict, and vice versa. */
+.pill.exec-runner { color: #cfe4ff; background: rgba(10,132,255,0.10); border-color: rgba(10,132,255,0.26); }
+.pill.exec-helper { color: #e6d6ff; background: rgba(175,82,222,0.13); border-color: rgba(175,82,222,0.34); }
+.pill.exec-unknown { color: var(--text-3); background: #242426; border-color: var(--line-soft); }
+.skill-component-finding { border-color: rgba(255,214,10,0.28); }
+.muted-text { color: var(--muted); }
+.mcp-content-item { display: grid; gap: 6px; padding: 8px 0; border-bottom: 1px solid var(--line-soft); }
+.mcp-content-item:last-child { border-bottom: 0; }
+.mcp-content-meta { margin: 0; color: var(--muted); font-size: 12px; }
+.mcp-content-meta.warn { color: #fff2b8; }
+.mcp-content-uri { color: var(--text-2); overflow-wrap: anywhere; font-size: 12px; }
+.mcp-result-error { margin: 0; color: #ffd7d2; font-size: 12px; font-weight: 600; }
+.mcp-approval { display: grid; gap: 8px; margin: 10px 0; }
+.mcp-approval h6 { margin: 0; color: var(--text-2); font-size: 12px; text-transform: uppercase; letter-spacing: 0.04em; }
+.mcp-approval-args td { vertical-align: top; }
+.mcp-approval-warn { margin: 0; padding: 8px 10px; border: 1px solid rgba(255,214,10,0.28); border-radius: 9px; color: #fff2b8; font-size: 12px; }
+.mcp-approval-warn ul { margin: 6px 0 0; padding-left: 18px; }
+.audit-integrity-notice .body strong { color: #ffd7d2; }
+.skill-guard-list { margin-top: 8px; font-size: 12px; color: var(--text-2); }
+.skill-guard-list ul { margin: 6px 0 0; padding-left: 18px; }
 .metric { background: var(--panel-3); border: 1px solid var(--line-soft); border-radius: var(--radius-xl); padding: 14px; min-width: 0; }
 .metric .label { color: var(--text-3); font-size: 12px; }
 .metric .value { color: var(--text); font-family: var(--title-font); font-size: 24px; margin-top: 4px; }
@@ -639,6 +659,10 @@ body.mcp-input-approval #approvalTerminateBtn { display: none; }
 .mcp-input-url { color: var(--blue); overflow-wrap: anywhere; }
 .mcp-input-confirm { display: flex; gap: 8px; align-items: flex-start; color: var(--text-2); font-size: 13px; }
 .mcp-input-confirm input { margin-top: 2px; flex: 0 0 auto; }
+.mcp-input-notice { color: var(--muted); margin: 0; }
+.mcp-input-expiry { margin: 0; font-size: 12px; color: var(--text-3); }
+.mcp-input-expiry.urgent { color: #ffd7d2; }
+.mcp-input-expiry.expired { color: #ffd7d2; font-weight: 600; }
 
 .observer-dialog {
   width: min(540px, calc(100vw - 28px));

@@ -398,5 +398,164 @@ class SkillLifecycleTest(unittest.TestCase):
         self.assertTrue(Path(result["cleanup_pending"][0]).is_dir())
 
 
+class InputSchemaSubsetTest(unittest.TestCase):
+    """`input_schema` is a closed JSON Schema subset, enforced at load time.
+
+    A parameter form is a convenience over the JSON textbox. Anything outside
+    the subset must be rejected here rather than reaching the signed Remote
+    contract chain or the console, which would then render it half-supported.
+    """
+
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.root = Path(self.temporary.name)
+
+    def tearDown(self) -> None:
+        self.temporary.cleanup()
+
+    def _load(self, schema: object) -> dict:
+        package = write_skill(self.root, "probe")
+        (package / "scripts").mkdir()
+        (package / "scripts" / "probe.sh").write_text("#!/bin/sh\n", encoding="utf-8")
+        extension = {
+            "schema_version": 1,
+            "package_version": "1.0.0",
+            "core_api": 1,
+            "category": "custom",
+            "tools": [
+                {
+                    "name": "probe",
+                    "description": "probe",
+                    "entrypoint": "scripts/probe.sh",
+                    "risk": "low",
+                    "approval_scope": "skill_readonly",
+                    "execution": {"class": "runner", "capability": "", "dispatch": "always"},
+                    "runtime_inputs": [],
+                    "guards": [],
+                    "input_schema": schema,
+                }
+            ],
+            "components": {},
+        }
+        (package / "linux-agent.json").write_text(json.dumps(extension), encoding="utf-8")
+        try:
+            return load_package(package, "user")
+        finally:
+            for path in sorted(package.rglob("*"), reverse=True):
+                path.unlink() if path.is_file() else path.rmdir()
+            package.rmdir()
+
+    def test_supported_subset_is_normalized(self) -> None:
+        loaded = self._load(
+            {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "title": "路径", "default": "/var"},
+                    "top_n": {"type": "integer", "default": 10},
+                    "ratio": {"type": "number"},
+                    "verbose": {"type": "boolean", "default": False},
+                    "tags": {"type": "array", "items": {"type": "string"}},
+                    "mode": {"type": "string", "enum": ["fast", "full"], "default": "full"},
+                },
+                "required": ["path"],
+            }
+        )
+        schema = loaded["tools"][0]["input_schema"]
+        self.assertEqual("object", schema["type"])
+        self.assertEqual(["path"], schema["required"])
+        # additionalProperties defaults to closed rather than being dropped.
+        self.assertFalse(schema["additionalProperties"])
+        self.assertEqual({"type": "string"}, schema["properties"]["tags"]["items"])
+        self.assertEqual(["fast", "full"], schema["properties"]["mode"]["enum"])
+        self.assertEqual(10, schema["properties"]["top_n"]["default"])
+
+    def test_tool_without_schema_stays_absent(self) -> None:
+        package = write_skill(self.root, "plain")
+        (package / "scripts").mkdir()
+        (package / "scripts" / "probe.sh").write_text("#!/bin/sh\n", encoding="utf-8")
+        extension = {
+            "schema_version": 1,
+            "package_version": "1.0.0",
+            "core_api": 1,
+            "category": "custom",
+            "tools": [
+                {
+                    "name": "probe",
+                    "description": "probe",
+                    "entrypoint": "scripts/probe.sh",
+                    "risk": "low",
+                    "approval_scope": "skill_readonly",
+                    "execution": {"class": "runner", "capability": "", "dispatch": "always"},
+                    "runtime_inputs": [],
+                    "guards": [],
+                }
+            ],
+            "components": {},
+        }
+        (package / "linux-agent.json").write_text(json.dumps(extension), encoding="utf-8")
+        loaded = load_package(package, "user")
+        self.assertNotIn("input_schema", loaded["tools"][0])
+
+    def test_out_of_subset_schemas_are_rejected(self) -> None:
+        cases = {
+            "root must be object": {"type": "array", "items": {"type": "string"}},
+            "nested object": {"type": "object", "properties": {"a": {"type": "object"}}},
+            "non-string array items": {
+                "type": "object",
+                "properties": {"a": {"type": "array", "items": {"type": "integer"}}},
+            },
+            "unknown property keyword": {
+                "type": "object",
+                "properties": {"a": {"type": "string", "pattern": "^x$"}},
+            },
+            "unknown root keyword": {
+                "type": "object",
+                "properties": {"a": {"type": "string"}},
+                "$schema": "https://json-schema.org/draft/2020-12/schema",
+            },
+            "ref": {"type": "object", "properties": {"a": {"$ref": "#/definitions/x"}}},
+            "enum type mismatch": {
+                "type": "object",
+                "properties": {"a": {"type": "string", "enum": [1, 2]}},
+            },
+            "enum on array": {
+                "type": "object",
+                "properties": {"a": {"type": "array", "items": {"type": "string"}, "enum": ["x"]}},
+            },
+            "default type mismatch": {
+                "type": "object",
+                "properties": {"a": {"type": "integer", "default": "3"}},
+            },
+            "default outside enum": {
+                "type": "object",
+                "properties": {"a": {"type": "string", "enum": ["x"], "default": "y"}},
+            },
+            "required names an undeclared property": {
+                "type": "object",
+                "properties": {"a": {"type": "string"}},
+                "required": ["b"],
+            },
+            "empty properties": {"type": "object", "properties": {}},
+            "invalid property name": {"type": "object", "properties": {"Bad-Name": {"type": "string"}}},
+            "too many properties": {
+                "type": "object",
+                "properties": {f"p{index}": {"type": "string"} for index in range(25)},
+            },
+            "oversized": {
+                "type": "object",
+                "properties": {"a": {"type": "string", "description": "x" * 9000}},
+            },
+            "not an object": ["nope"],
+        }
+        for label, schema in cases.items():
+            with self.subTest(label):
+                with self.assertRaises(SkillPackageError):
+                    self._load(schema)
+
+    def test_boolean_is_not_accepted_as_an_integer_default(self) -> None:
+        with self.assertRaises(SkillPackageError):
+            self._load({"type": "object", "properties": {"a": {"type": "integer", "default": True}}})
+
+
 if __name__ == "__main__":
     unittest.main()

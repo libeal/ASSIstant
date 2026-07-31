@@ -84,10 +84,68 @@ linux_agent_output_blocks_from_result() {
         };
         def output_payload:
             if (.output? | type) == "object" then .output else null end;
+        # An MCP tool result is projected into its own block so the frontend
+        # never has to guess a type from an arbitrary JSON shape. Media and
+        # resources are reduced to MIME + size here: the console must not be
+        # handed anything it could turn into an outbound fetch.
+        def is_mcp_result:
+            ((.mcp? | type) == "object")
+            and ((output_payload | type) == "object")
+            and (
+                (output_payload | has("content"))
+                or (output_payload | has("structuredContent"))
+                or (output_payload | has("isError"))
+            );
+        def b64_pad($s):
+            if ($s | endswith("==")) then 2 elif ($s | endswith("=")) then 1 else 0 end;
+        def b64_bytes($s):
+            if (($s | type) == "string") and (($s | length) > 0)
+            then ((($s | length) / 4 | floor) * 3) - b64_pad($s)
+            else 0 end;
+        def mcp_content_item:
+            (if (.type | type) == "string" then .type else "" end) as $type
+            | if $type == "text" then
+                {type:"text", text:(.text // ""), size_bytes:((.text // "") | utf8bytelength)}
+              elif ($type == "image") or ($type == "audio") then
+                {type:$type, mime_type:(.mimeType // .mime_type // ""), size_bytes:b64_bytes(.data // "")}
+              elif $type == "resource_link" then
+                {type:"resource_link", uri:(.uri // ""), name:(.name // ""), mime_type:(.mimeType // .mime_type // "")}
+              elif $type == "resource" then
+                (if (.resource | type) == "object" then .resource else {} end) as $resource
+                | {
+                    type:"resource",
+                    uri:($resource.uri // ""),
+                    mime_type:($resource.mimeType // $resource.mime_type // ""),
+                    text:(if ($resource.text | type) == "string" then $resource.text else null end),
+                    size_bytes:(
+                        if ($resource.text | type) == "string" then ($resource.text | utf8bytelength)
+                        else b64_bytes($resource.blob // "") end
+                    )
+                  }
+              else
+                {type:(if $type == "" then "unknown" else $type end)}
+              end;
         [
             (if (.stdout? | present) then text_block("stdout"; "标准输出"; .stdout) else empty end),
             (if (.stderr? | present) then text_block("stderr"; "错误输出"; .stderr) else empty end),
-            (if ((output_payload // null) | type) == "object" then
+            (if is_mcp_result then
+                {
+                    kind:"mcp_result",
+                    title:"MCP 调用结果",
+                    mcp:{
+                        server_id:(.mcp.server_id // ""),
+                        tool:(.mcp.tool // ""),
+                        transport:(.mcp.transport // null),
+                        protocol_version:(.mcp.protocol_version // null),
+                        fallback_used:(.mcp.fallback_used == true),
+                        fallback_reason:(.mcp.fallback_reason // ""),
+                        is_error:((output_payload.isError // false) == true),
+                        content:[(output_payload.content // [])[] | mcp_content_item],
+                        structured_content:(output_payload.structuredContent // null)
+                    }
+                }
+             else empty end),
+            (if ((output_payload // null) | type) == "object" and (is_mcp_result | not) then
                 if ((output_payload | has("raw")) and ((output_payload.raw // "") | length > 0)) then
                     text_block("stdout"; "执行输出"; output_payload.raw)
                 else
@@ -337,6 +395,7 @@ linux_agent_approval_card_for_work() {
                 risk_level:($execution.review.risk_level // $step.risk_level // "medium"),
                 step:$step,
                 review:($execution.review // null),
+                mcp_metadata:($execution.mcp_metadata // null),
                 actions:["approve","reject","skip","terminate"]
             }
         else null

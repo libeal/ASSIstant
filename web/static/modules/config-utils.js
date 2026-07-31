@@ -55,6 +55,18 @@ export function runtimeBackupAvailable(config) {
 }
 
 /**
+ * Render the `/api/health` top-level `version` for the sidebar.
+ * The API defaults to "local" when no signed remote release is pinned.
+ * @param {unknown} version
+ * @returns {string}
+ */
+export function releaseVersionLabel(version) {
+  const text = String(version ?? "").trim();
+  if (!text || text === "local") return "本地源码";
+  return text;
+}
+
+/**
  * @param {{type?: string}} field
  * @param {any} value
  * @param {{prefix_rules?: Array<{prefix?: string, canonical?: string}>, aliases?: Record<string, string>}|null} [providerRules]

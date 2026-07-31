@@ -194,9 +194,12 @@ linux_agent_skill_catalog_json() {
                         },
                         runtime_inputs:($ref.runtime_inputs // []),
                         guards:($ref.guards // []),
+                        input_schema:($ref.input_schema // null),
                         origin:"builtin",
                         state:"available",
-                        category:($skill.value.category // "custom")
+                        category:($skill.value.category // "custom"),
+                        package_version:($skill.value.package_version // ""),
+                        core_api:($skill.value.core_api // 0)
                     }
                   ] as $pending
                 | ($installed + $pending | sort_by(.ref))

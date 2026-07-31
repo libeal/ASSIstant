@@ -322,7 +322,7 @@ rm -rf "${remote_missing_index_root}"
 mcp_root="$(mktemp -d)"
 original_mcp_dir="${LINUX_AGENT_MCP_DIR}"
 LINUX_AGENT_MCP_DIR="${mcp_root}"
-mkdir -p "${mcp_root}/stdio-sample" "${mcp_root}/streamable-sample" "${mcp_root}/sse-sample" "${mcp_root}/broken-sample" "${mcp_root}/array-sample" "${mcp_root}/stdio-tools"
+mkdir -p "${mcp_root}/stdio-sample" "${mcp_root}/streamable-sample" "${mcp_root}/sse-sample" "${mcp_root}/broken-sample" "${mcp_root}/array-sample" "${mcp_root}/stdio-tools" "${mcp_root}/v2-sample"
 cat >"${mcp_root}/stdio-sample/mcp.json" <<'JSON'
 {
   "id": "stdio-sample",
@@ -365,6 +365,18 @@ cat >"${mcp_root}/array-sample/mcp.json" <<'JSON'
   {"id": "array-sample", "transport": "stdio", "command": "node"}
 ]
 JSON
+cat >"${mcp_root}/v2-sample/mcp.json" <<'JSON'
+{
+  "manifest_version": 2,
+  "id": "v2-sample",
+  "name": "Manifest v2 sample",
+  "transport": "streamable_http",
+  "url": "http://127.0.0.1:9125/mcp",
+  "protocol": {"mode": "modern_only", "require_modern": true},
+  "credential_profile": "sample-profile",
+  "headers": {"Authorization": "Bearer should-not-leak"}
+}
+JSON
 cat >"${mcp_root}/stdio-tools/mcp.json" <<JSON
 {
   "id": "stdio-tools",
@@ -386,6 +398,30 @@ if grep -q 'should-not-leak' <<<"${mcp_list}"; then
     printf 'mcp list leaked secret material\n' >&2
     exit 1
 fi
+# manifest v2 declarations must reach the console, and the credential summary
+# must stay a bound/not-bound flag plus the profile id — never profile content.
+jq -e '[.servers[] | select(.id == "v2-sample")] | first
+    | .manifest_version == 2
+    and .protocol.mode == "modern_only"
+    and .protocol.require_modern == true
+    and .protocol.allow_legacy_sse == false
+    and .credential_profile_id == "sample-profile"
+    and .credential_bound == true
+    and .config.credential_profile == "[REDACTED]"
+    and (.config.headers.Authorization == "[REDACTED]")' <<<"${mcp_list}" >/dev/null
+# A manifest that does not validate must not publish declarations at all.
+jq -e '[.servers[] | select(.id == "broken-sample")] | first
+    | .valid == false
+    and .manifest_version == null
+    and .protocol == null
+    and .credential_profile_id == ""
+    and .credential_bound == false' <<<"${mcp_list}" >/dev/null
+# Defaults, not absence, for a v1 manifest without a protocol block.
+jq -e '[.servers[] | select(.id == "stdio-sample")] | first
+    | .manifest_version == 1
+    and .protocol.mode == "modern_then_legacy"
+    and .protocol.require_modern == false
+    and .credential_bound == false' <<<"${mcp_list}" >/dev/null
 mcp_validate="$(linux_agent_validate_mcp)"
 jq -e '.ok == false
     and ([.findings[]?.code] | index("MCP_STDIO_COMMAND_MISSING"))
@@ -394,6 +430,32 @@ mcp_tools="$(linux_agent_mcp_tool_catalog)"
 jq -e '.ok == true
     and ([.servers[] | select(.id == "stdio-tools") | .tools[].name] | index("echo"))
     and ([.tools[] | select(.server_id == "stdio-tools" and .name == "echo") | .ref] | first) == "stdio-tools/echo"' <<<"${mcp_tools}" >/dev/null
+# Negotiated protocol truth must survive the catalog assembly, otherwise the
+# console cannot tell a modern session from a legacy fallback.
+jq -e '[.servers[] | select(.id == "stdio-tools")] | first
+    | .contacted == true
+    and (.protocol_version | type) == "string"
+    and (.server_capabilities | type) == "object"
+    and .fallback_used == false
+    and .fallback_reason == ""' <<<"${mcp_tools}" >/dev/null
+# A server that was never contacted must say so rather than look "not modern".
+jq -e '[.servers[] | select(.id == "broken-sample")] | first
+    | .contacted == false and .protocol_version == null' <<<"${mcp_tools}" >/dev/null
+if grep -q 'should-not-leak' <<<"${mcp_tools}"; then
+    printf 'mcp catalog leaked secret material\n' >&2
+    exit 1
+fi
+# The approval-card snapshot is redacted and carries the structure the review
+# actually used.
+mcp_approval_metadata="$(linux_agent_mcp_tool_approval_metadata "stdio-tools" "echo")"
+jq -e '.available == true
+    and .server_id == "stdio-tools"
+    and .tool == "echo"
+    and .transport == "stdio"
+    and (.input_schema | type) == "object"
+    and (.annotations | type) == "object"' <<<"${mcp_approval_metadata}" >/dev/null
+jq -e '.available == false and .status == "tool_not_found"' \
+    <<<"$(linux_agent_mcp_tool_approval_metadata "stdio-tools" "no-such-tool")" >/dev/null
 mcp_call="$(linux_agent_mcp_call_tool "stdio-tools" "echo" '{"text":"hello"}')"
 jq -e '.ok == true
     and .status == "executed"
@@ -403,5 +465,85 @@ jq -e '.ok == true
     and ([.result.content[]? | select(.type == "text") | .text] | first) == "echo:hello"' <<<"${mcp_call}" >/dev/null
 LINUX_AGENT_MCP_DIR="${original_mcp_dir}"
 rm -rf "${mcp_root}"
+
+# The Skill package view must carry the package facts and the optional
+# parameter schema all the way to /api/tools, so the console never infers them.
+catalog_json="$(linux_agent_skill_catalog_json)"
+jq -e '[.tools[] | select(.ref == "ops-basic/disk-hotspots")] | first
+    | .package_version == "1.0.0"
+    and .core_api == 1
+    and .approval_scope == "skill_readonly"
+    and (.guards | type) == "array"
+    and .input_schema.type == "object"
+    and .input_schema.additionalProperties == false
+    and .input_schema.properties.top_n.type == "integer"
+    and .input_schema.properties.top_n.default == 10
+    and .input_schema.properties.path.type == "string"' <<<"${catalog_json}" >/dev/null
+# Tools that declare no schema must stay null rather than get an empty object.
+jq -e '[.tools[] | select(.ref == "ops-basic/service-restart-plan")] | first
+    | .input_schema == null' <<<"${catalog_json}" >/dev/null
+
+# The input_schema subset is enforced at package validation time: anything
+# outside it must fail loudly instead of reaching the Remote contract chain.
+schema_probe_root="$(mktemp -d)"
+mkdir -p "${schema_probe_root}/probe-skill/scripts"
+cat >"${schema_probe_root}/probe-skill/SKILL.md" <<'MD'
+---
+name: probe-skill
+description: schema subset probe
+---
+
+# probe-skill
+MD
+printf '#!/usr/bin/env bash\nexit 0\n' >"${schema_probe_root}/probe-skill/scripts/probe.sh"
+chmod 0755 "${schema_probe_root}/probe-skill/scripts/probe.sh"
+write_probe_extension() {
+    jq -n --argjson schema "$1" '{
+        schema_version:1,
+        package_version:"1.0.0",
+        core_api:1,
+        category:"system",
+        tools:[{
+            name:"probe",
+            description:"probe",
+            entrypoint:"scripts/probe.sh",
+            risk:"low",
+            approval_scope:"skill_readonly",
+            execution:{class:"runner", capability:"", dispatch:"always"},
+            runtime_inputs:[],
+            guards:[],
+            input_schema:$schema
+        }],
+        components:{}
+    }' >"${schema_probe_root}/probe-skill/linux-agent.json"
+}
+probe_schema_accepted() {
+    write_probe_extension "$1"
+    python3 "${ROOT_DIR}/lib/skill_package.py" inspect "${schema_probe_root}/probe-skill" --origin user >/dev/null 2>&1
+}
+probe_schema_accepted '{"type":"object","properties":{"a":{"type":"string"}},"required":["a"],"additionalProperties":false}' || {
+    printf 'input_schema subset rejected a valid schema\n' >&2
+    exit 1
+}
+probe_schema_accepted '{"type":"object","properties":{"a":{"type":"array","items":{"type":"string"}}}}' || {
+    printf 'input_schema subset rejected a string array\n' >&2
+    exit 1
+}
+for rejected in \
+    '{"type":"array","items":{"type":"string"}}' \
+    '{"type":"object","properties":{"a":{"type":"object","properties":{"b":{"type":"string"}}}}}' \
+    '{"type":"object","properties":{"a":{"type":"array","items":{"type":"integer"}}}}' \
+    '{"type":"object","properties":{"a":{"type":"string","pattern":"^x$"}}}' \
+    '{"type":"object","properties":{"a":{"type":"string","enum":[1,2]}}}' \
+    '{"type":"object","properties":{"a":{"type":"string"}},"required":["missing"]}' \
+    '{"type":"object","properties":{"a":{"type":"string","default":3}}}' \
+    '{"type":"object","properties":{"a":{"$ref":"#/definitions/x"}}}' \
+    '{"type":"object","properties":{}}'; do
+    if probe_schema_accepted "${rejected}"; then
+        printf 'input_schema subset accepted an out-of-contract schema: %s\n' "${rejected}" >&2
+        exit 1
+    fi
+done
+rm -rf "${schema_probe_root}"
 
 printf 'tools: ok\n'
