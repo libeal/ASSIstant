@@ -12,6 +12,7 @@ export function createInitialState() {
     editPackage: null,
     policyFiles: [],
     currentPolicyPath: "",
+    policyCapabilities: null,
     auditBoundaries: null,
     skillTree: null,
     skillFiles: { markdown: [], scripts: [] },

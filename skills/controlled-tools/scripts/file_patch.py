@@ -210,13 +210,15 @@ def _restore(path: Path, payload: bytes, metadata: os.stat_result) -> None:
         os.fchown(descriptor, metadata.st_uid, metadata.st_gid)
         _write_all(descriptor, payload)
         os.close(descriptor)
+        descriptor = -1
         os.replace(temporary, path)
         _fsync_directory(path.parent)
     finally:
-        try:
-            os.close(descriptor)
-        except OSError:
-            pass
+        if descriptor >= 0:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
         try:
             temporary.unlink()
         except FileNotFoundError:
@@ -244,6 +246,7 @@ def _commit_existing(
             os.fchown(descriptor, metadata.st_uid, metadata.st_gid)
             _write_all(descriptor, proposed)
             os.close(descriptor)
+            descriptor = -1
             _check_target(path, expected, maximum)
             backup = path.with_name(f"{path.name}.bak.{time.time_ns()}")
             backup_flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
@@ -276,10 +279,11 @@ def _commit_existing(
                     pass
             raise
         finally:
-            try:
-                os.close(descriptor)
-            except OSError:
-                pass
+            if descriptor >= 0:
+                try:
+                    os.close(descriptor)
+                except OSError:
+                    pass
             try:
                 temporary.unlink()
             except FileNotFoundError:

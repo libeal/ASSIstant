@@ -444,6 +444,14 @@ set -euo pipefail
 command_name="${1:-}"
 shift || true
 printf '%s\n' "${command_name}" >>"${FAKE_SYSTEMD_STATE}/commands"
+printf '%s\t%s\n' "${command_name}" "$*" >>"${FAKE_SYSTEMD_STATE}/command-args"
+
+pid_is_live() {
+    local pid="$1" state=""
+    [[ "${pid}" =~ ^[0-9]+$ && -r "/proc/${pid}/stat" ]] || return 1
+    state="$(awk '{print $3}' "/proc/${pid}/stat" 2>/dev/null)" || return 1
+    [[ "${state}" != "Z" ]]
+}
 
 stop_service() {
     local pid="" helper_pid=""
@@ -451,7 +459,7 @@ stop_service() {
         pid="$(<"${FAKE_SYSTEMD_STATE}/service.pid")"
         kill "${pid}" >/dev/null 2>&1 || true
         for _ in $(seq 1 100); do
-            kill -0 "${pid}" >/dev/null 2>&1 || break
+            pid_is_live "${pid}" || break
             sleep 0.02
         done
         rm -f -- "${FAKE_SYSTEMD_STATE}/service.pid"
@@ -465,11 +473,12 @@ stop_service() {
     rm -f -- "${LINUX_AGENT_OBSERVER_HELPER_SOCKET}" "${LINUX_AGENT_RUNNER_SOCKET}" \
         "${LINUX_AGENT_HOST_HELPER_SOCKET}" "${LINUX_AGENT_POLICY_HELPER_SOCKET}" \
         "${LINUX_AGENT_DATABASE_HELPER_SOCKET}"
+    : >"${FAKE_SYSTEMD_STATE}/database-socket.inactive"
 }
 
 start_helper() {
     if [[ -f "${FAKE_SYSTEMD_STATE}/helper.pid" ]] &&
-        kill -0 "$(<"${FAKE_SYSTEMD_STATE}/helper.pid")" >/dev/null 2>&1; then
+        pid_is_live "$(<"${FAKE_SYSTEMD_STATE}/helper.pid")"; then
         return 0
     fi
     [[ "${FAKE_HELPER_FAIL:-0}" != "1" ]] || return 0
@@ -559,14 +568,14 @@ case "${command_name}" in
         active=0
         if [[ " $* " == *" linux-agent-web.service "* &&
             -f "${FAKE_SYSTEMD_STATE}/service.pid" ]] &&
-            kill -0 "$(<"${FAKE_SYSTEMD_STATE}/service.pid")" >/dev/null 2>&1; then
+            pid_is_live "$(<"${FAKE_SYSTEMD_STATE}/service.pid")"; then
             active=1
         elif [[ " $* " == *" linux-agent-observer-helper.socket "* &&
             -S "${LINUX_AGENT_OBSERVER_HELPER_SOCKET}" ]]; then
             active=1
         elif [[ " $* " == *" linux-agent-observer-helper.service "* &&
             -f "${FAKE_SYSTEMD_STATE}/helper.pid" ]] &&
-            kill -0 "$(<"${FAKE_SYSTEMD_STATE}/helper.pid")" >/dev/null 2>&1; then
+            pid_is_live "$(<"${FAKE_SYSTEMD_STATE}/helper.pid")"; then
             active=1
         elif [[ " $* " == *" linux-agent-runner.socket "* &&
             -S "${LINUX_AGENT_RUNNER_SOCKET}" ]]; then
@@ -578,6 +587,7 @@ case "${command_name}" in
             -S "${LINUX_AGENT_POLICY_HELPER_SOCKET}" ]]; then
             active=1
         elif [[ " $* " == *" linux-agent-database-inspector.socket "* &&
+            ! -f "${FAKE_SYSTEMD_STATE}/database-socket.inactive" &&
             -S "${LINUX_AGENT_DATABASE_HELPER_SOCKET}" ]]; then
             active=1
         fi
@@ -603,7 +613,12 @@ case "${command_name}" in
             stop_service
         fi
         ;;
-    restart) start_service ;;
+    restart)
+        start_service
+        if [[ " $* " == *" linux-agent-database-inspector.socket "* ]]; then
+            rm -f -- "${FAKE_SYSTEMD_STATE}/database-socket.inactive"
+        fi
+        ;;
     try-restart)
         if [[ "${FAKE_REJECT_EARLY_SKILL_WEB_RESTART:-0}" == "1" &&
             ! -f "${FAKE_SYSTEMD_PREFIX}/systemd/linux-agent-database-inspector.service" &&
@@ -623,14 +638,29 @@ case "${command_name}" in
             " $* " != *" linux-agent-web.service "* ]]; then
             start_helper
         elif [[ ! -f "${FAKE_SYSTEMD_STATE}/service.pid" ]] ||
-            ! kill -0 "$(<"${FAKE_SYSTEMD_STATE}/service.pid")" >/dev/null 2>&1; then
+            ! pid_is_live "$(<"${FAKE_SYSTEMD_STATE}/service.pid")"; then
             start_service
+        fi
+        if [[ " $* " == *" linux-agent-database-inspector.socket "* ]]; then
+            rm -f -- "${FAKE_SYSTEMD_STATE}/database-socket.inactive"
         fi
         ;;
     stop)
-        if [[ " $* " == *" linux-agent-database-inspector."* &&
+        if [[ " $* " == *" linux-agent-database-inspector.socket "* &&
             " $* " != *" linux-agent-web.service "* ]]; then
+            : >"${FAKE_SYSTEMD_STATE}/database-socket.inactive"
             rm -f -- "${LINUX_AGENT_DATABASE_HELPER_SOCKET}"
+        elif [[ " $* " == *" linux-agent-observer-helper.socket "* &&
+            " $* " != *" linux-agent-observer-helper.service "* &&
+            " $* " != *" linux-agent-web.service "* ]]; then
+            rm -f -- "${LINUX_AGENT_OBSERVER_HELPER_SOCKET}"
+        elif [[ " $* " == *" linux-agent-mcp-stdio."* &&
+            " $* " != *" linux-agent-web.service "* ]]; then
+            :
+        elif [[ " $* " == *".service "* &&
+            " $* " != *" linux-agent-web.service "* &&
+            " $* " != *" linux-agent-observer-helper.service "* ]]; then
+            :
         else
             stop_service
         fi
@@ -794,6 +824,11 @@ SH
     jq -e '.skills["database-inspect"].installed == false' \
         "${managed_prefix}/data/skill-components.json" >/dev/null
     run_managed_installer upgrade --version v0.0.1-test --from-dist "${managed_dist_two}"
+    if [[ -f "${fake_systemd_dir}/service.pid" ]]; then
+        printf 'inactive managed Web was unexpectedly left running after upgrade\n' >&2
+        exit 1
+    fi
+    [[ -f "${fake_systemd_dir}/helper.pid" ]]
     [[ ! -e "${managed_prefix}/skills/database-inspect" ]]
     [[ ! -e "${managed_prefix}/systemd/linux-agent-database-inspector.service" ]]
     [[ ! -e "${managed_prefix}/systemd/linux-agent-database-inspector.socket" ]]
@@ -870,6 +905,22 @@ SH
         "${managed_prefix}/systemd/linux-agent-observer-helper.socket"
     run_managed_installer repair-observer
     grep -q '^SocketGroup=root$' "${managed_prefix}/systemd/linux-agent-observer-helper.socket"
+    FAKE_SYSTEMD_PREFIX="${managed_prefix}" FAKE_SYSTEMD_STATE="${fake_systemd_dir}" \
+        LINUX_AGENT_OBSERVER_HELPER_SOCKET="${managed_observer_socket}" \
+        "${fake_systemd_bin}/systemctl" restart linux-agent-web.service
+    [[ -f "${fake_systemd_dir}/service.pid" ]]
+    kill -0 "$(<"${fake_systemd_dir}/service.pid")"
+    managed_web_ready=0
+    for _ in $(seq 1 100); do
+        if curl -fsS -H "Authorization: Bearer ${MANAGED_TEST_TOKEN}" \
+            "http://127.0.0.1:${MANAGED_TEST_PORT}/api/health" |
+            jq -e '.ok == true and .status == "ok"' >/dev/null 2>&1; then
+            managed_web_ready=1
+            break
+        fi
+        sleep 0.02
+    done
+    [[ "${managed_web_ready}" -eq 1 ]]
     rm -f -- "${managed_observer_socket}"
     if run_managed_installer repair-observer \
         >"${tmp_root}/managed-inconsistent-state.stdout" \
@@ -934,11 +985,57 @@ SH
     grep -q 'observer helper request failed' "${tmp_root}/managed-helper-failure.stderr"
     [[ "$(readlink "${managed_prefix}/current")" == "releases/v0.0.1-test" ]]
     [[ ! -e "${managed_prefix}/releases/v0.0.2-test" ]]
+    FAKE_SYSTEMD_PREFIX="${managed_prefix}" FAKE_SYSTEMD_STATE="${fake_systemd_dir}" \
+        LINUX_AGENT_OBSERVER_HELPER_SOCKET="${managed_observer_socket}" \
+        "${fake_systemd_bin}/systemctl" stop linux-agent-database-inspector.socket
+    [[ -f "${fake_systemd_dir}/service.pid" ]]
+    [[ -f "${fake_systemd_dir}/helper.pid" ]]
+    rm -f -- "${managed_observer_socket}"
+    [[ ! -S "${managed_observer_socket}" ]]
+    [[ ! -S "${managed_database_socket}" ]]
+    : >"${fake_systemd_dir}/command-args"
     run_managed_installer upgrade --version v0.0.2-test --from-dist "${dist_three}"
     [[ "$(readlink "${managed_prefix}/current")" == "releases/v0.0.2-test" ]]
+    [[ -f "${fake_systemd_dir}/service.pid" ]]
+    [[ -f "${fake_systemd_dir}/helper.pid" ]]
+    [[ ! -S "${managed_observer_socket}" ]]
+    [[ ! -S "${managed_database_socket}" ]]
+    for inactive_unit in \
+        linux-agent-runner.service \
+        linux-agent-mcp-stdio.service linux-agent-mcp-stdio.socket \
+        linux-agent-host-ops.service linux-agent-policy-writer.service \
+        linux-agent-database-inspector.service linux-agent-database-inspector.socket; do
+        if ! grep -Fqx $'stop\t'"${inactive_unit}" "${fake_systemd_dir}/command-args"; then
+            printf 'inactive unit was not stopped after the health check: %s\n' \
+                "${inactive_unit}" >&2
+            sed -n '1,240p' "${fake_systemd_dir}/command-args" >&2
+            exit 1
+        fi
+    done
+    grep -Fqx $'stop\tlinux-agent-observer-helper.socket' \
+        "${fake_systemd_dir}/command-args"
+    if grep -Fqx $'stop\tlinux-agent-observer-helper.service' \
+        "${fake_systemd_dir}/command-args"; then
+        printf 'active observer helper service was stopped while restoring its inactive socket\n' >&2
+        exit 1
+    fi
+    if awk -F '\t' '
+        $1 == "restart" { after_health_restart = 1; next }
+        after_health_restart && $1 == "stop" && $2 == "linux-agent-web.service" { found = 1 }
+        END { exit(found ? 0 : 1) }
+    ' "${fake_systemd_dir}/command-args"; then
+        printf 'active managed Web was stopped while restoring post-health unit state\n' >&2
+        exit 1
+    fi
     ! grep -q 'LINUX_AGENT_UNIT_MARKER' "${managed_unit_path}"
+    FAKE_SYSTEMD_PREFIX="${managed_prefix}" FAKE_SYSTEMD_STATE="${fake_systemd_dir}" \
+        LINUX_AGENT_OBSERVER_HELPER_SOCKET="${managed_observer_socket}" \
+        "${fake_systemd_bin}/systemctl" stop linux-agent-web.service
     run_managed_installer rollback
     [[ "$(readlink "${managed_prefix}/current")" == "releases/v0.0.1-test" ]]
+    [[ ! -f "${fake_systemd_dir}/service.pid" ]]
+    [[ ! -f "${fake_systemd_dir}/helper.pid" ]]
+    [[ ! -S "${managed_observer_socket}" ]]
     grep -q '^Environment=LINUX_AGENT_UNIT_MARKER=v2$' "${managed_unit_path}"
     [[ -z "$(find "${managed_prefix}" -maxdepth 1 -name '.linux-agent-web.service.*' -print -quit)" ]]
     FAKE_SYSTEMD_PREFIX="${managed_prefix}" FAKE_SYSTEMD_STATE="${fake_systemd_dir}" \

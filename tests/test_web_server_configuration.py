@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 
 import os
+import stat
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -25,6 +27,46 @@ class ServerConfigurationTests(unittest.TestCase):
             remote_mode=True,
             managed_execution=False,
         )
+
+    def test_ephemeral_token_is_atomically_written_with_private_permissions(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            token_path = root / "tmp" / "web" / "auth-token"
+            with mock.patch.object(server, "ROOT", root), mock.patch.object(
+                server, "MANAGED_LAYOUT", False
+            ), mock.patch.object(
+                server, "EPHEMERAL_TOKEN_FILE", token_path
+            ), mock.patch.object(
+                server, "AUTH_TOKEN", "ephemeral-test-token"
+            ):
+                server.persist_ephemeral_token()
+
+            self.assertEqual("ephemeral-test-token\n", token_path.read_text())
+            self.assertEqual(0o600, stat.S_IMODE(token_path.stat().st_mode))
+            self.assertEqual(0o700, stat.S_IMODE(token_path.parent.stat().st_mode))
+            self.assertEqual([], list(token_path.parent.glob(".auth-token.*.tmp")))
+
+    def test_ephemeral_token_rejects_symlink_without_touching_target(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            token_directory = root / "tmp" / "web"
+            token_directory.mkdir(parents=True)
+            victim = root / "victim"
+            victim.write_text("keep\n", encoding="utf-8")
+            token_path = token_directory / "auth-token"
+            token_path.symlink_to(victim)
+
+            with mock.patch.object(server, "ROOT", root), mock.patch.object(
+                server, "MANAGED_LAYOUT", False
+            ), mock.patch.object(
+                server, "EPHEMERAL_TOKEN_FILE", token_path
+            ), mock.patch.object(
+                server, "AUTH_TOKEN", "must-not-be-written"
+            ), self.assertRaisesRegex(OSError, "regular file"):
+                server.persist_ephemeral_token()
+
+            self.assertTrue(token_path.is_symlink())
+            self.assertEqual("keep\n", victim.read_text(encoding="utf-8"))
 
     def test_session_restore_and_leave_destroy_database_credentials(self):
         registry = self.database_registry()
@@ -259,6 +301,24 @@ class ServerConfigurationTests(unittest.TestCase):
         self.assertNotIn("invalid-scope", approvals["scope_catalog"])
         self.assertNotIn("wrong_type", approvals["auto"])
         self.assertNotIn("ignored_scope", approvals["scope_catalog"])
+
+    def test_config_public_state_reports_deployment_capabilities(self):
+        with mock.patch.object(server, "read_config", return_value={}), mock.patch.object(
+            server.SKILL_SERVICE,
+            "list_packages",
+            return_value=[],
+        ), mock.patch.object(server, "REMOTE_MODE", False), mock.patch.object(
+            server, "MANAGED_LAYOUT", True
+        ), mock.patch.object(server, "MANAGED_EXECUTION", False), mock.patch.object(
+            server, "DEPLOYMENT_MODE", "no_systemd"
+        ):
+            result = server.config_public_state()
+
+        runtime = result["config"]["runtime"]
+        self.assertEqual("no_systemd", runtime["deployment_mode"])
+        self.assertTrue(runtime["managed_layout"])
+        self.assertFalse(runtime["managed_execution"])
+        self.assertTrue(runtime["runtime_backup_available"])
 
     def test_database_job_uses_job_id_as_query_id(self):
         job_id = "a" * 32

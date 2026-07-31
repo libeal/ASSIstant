@@ -380,6 +380,10 @@ jq -e '.ok == true and (.config.agent_loop.thinking_trace_enabled | type == "boo
     and .config.agent_loop.max_iterations == 12
     and .config.execution.timeout_sec == 300
     and .config.remote.allow_api_key_transmission == false
+    and .config.runtime.deployment_mode == "source"
+    and .config.runtime.managed_layout == false
+    and .config.runtime.managed_execution == false
+    and .config.runtime.runtime_backup_available == false
     and .config.web.sensitive_edits_enabled == true' <<<"${config_state}" >/dev/null
 
 readonly_config_file="${tmp_root}/readonly-config.json"

@@ -1,6 +1,7 @@
 import {
   configInputId,
   remoteSecretTransmissionBlocked as isRemoteSecretTransmissionBlocked,
+  runtimeBackupAvailable,
 } from "./config-utils.js";
 
 /** @typedef {import("./types.js").AppContext} AppContext */
@@ -139,7 +140,7 @@ export function createWorkbenchView(app) {
       editButton.title = blocked ? "Remote runtime 尚未允许向 AI Provider 传输 API Key" : "";
     }
     const backupButton = $("runtimeBackupBtn");
-    if (backupButton) backupButton.hidden = state.configSnapshot?.remote?.enabled !== true;
+    if (backupButton) backupButton.hidden = !runtimeBackupAvailable(state.configSnapshot);
     for (const id of ["workRemoteTransmissionNotice", "editRemoteTransmissionNotice"]) {
       const notice = $(id);
       if (!notice) continue;

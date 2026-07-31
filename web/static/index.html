@@ -343,7 +343,7 @@
                 <div class="split">
                   <div class="locked-note">
                     <strong class="white">授权边界</strong>
-                    <p class="small">已认证的 Web Bearer Token 授权受限写入；服务器不会收集或传递 sudo 密码。</p>
+                    <p class="small">策略保存不使用 sudo 密码：源码、Remote 和无 systemd 安装以当前 UID 写 overlay；受管 systemd 安装只走 policy-writer。</p>
                     <div class="kv"><div class="k">control</div><div class="v mono">web.sensitive_edits_enabled</div></div>
                   </div>
                   <div class="locked-note">
@@ -500,8 +500,8 @@
           </div>
           <span class="pill risk medium" id="observerAuditStatus">pending</span>
         </div>
-        <label class="small" id="observerAuditPasswordField" for="observerAuditPassword" hidden>服务器 sudo 密码
-          <input class="field" id="observerAuditPassword" type="password" autocomplete="current-password" placeholder="仅发送给本机 sudo 标准输入">
+        <label class="small" id="observerAuditPasswordField" for="observerAuditPassword" hidden>本机 sudo 密码
+          <input class="field" id="observerAuditPassword" type="password" autocomplete="current-password" placeholder="仅用于启动本次 Web 的审计 helper">
         </label>
         <pre class="code observer-dialog-output" id="observerAuditOutput">等待授权。</pre>
         <div class="approval-actions">

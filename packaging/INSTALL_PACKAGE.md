@@ -30,7 +30,7 @@ sudo bash install.sh --provider-cidr 203.0.113.0/24
 
 安装器会要求 Bash 4.3+、Python 3.10+ 和 GNU coreutils/findutils/tar，并在启动前用 `systemd-analyze verify` 检查 unit。SELinux 已启用时会对安装目录、unit 和 helper runtime 执行 `restorecon`；Enforcing 模式缺少 `restorecon` 时安装失败，而不是留下只在服务启动后才暴露的 EACCES。安装包不是原生 `.rpm`，升级、回滚和卸载都使用包内 `release/linux-agent-install.sh`。
 
-安装器默认安装到 `/opt/linux-agent` 并写入 Web、Runner、MCP stdio relay、observer、host-ops、policy-writer 全部 systemd unit。安装期间会先停止遗留实例，再临时启动新版本完成健康检查，检查结束后自动停止这些服务。安装器不会修改原有开机启用状态；全新安装默认未启用。Runner socket 为 `0600`，MCP stdio relay socket 为 `0660` 且只允许 Runner 组连接，三个特权 helper socket 为 `0660` 且只允许 Web 服务组访问。需要正式运行时显式执行：
+安装器默认安装到 `/opt/linux-agent` 并写入 Web、Runner、MCP stdio relay、observer、host-ops、policy-writer 全部 systemd unit。首次安装会先停止遗留实例，再临时启动新版本完成健康检查，检查结束后自动停止这些服务。升级与回滚也会临时启动新版本做认证健康检查，但检查后恢复操作前的运行状态：原本停止的 Web 保持停止，原本运行的 Web 保持运行。安装器不会修改原有开机启用状态；全新安装默认未启用。Runner socket 为 `0600`，MCP stdio relay socket 为 `0660` 且只允许 Runner 组连接，三个特权 helper socket 为 `0660` 且只允许 Web 服务组访问。需要正式运行时显式执行：
 
 ```bash
 sudo systemctl enable --now linux-agent-observer-helper.socket linux-agent-runner.socket \
@@ -53,4 +53,4 @@ sudo bash linux-agent-install.sh repair-observer
 
 安装边界分为四类：源码 checkout 和已验证 remote runtime 由当前 UID 持有本地 overlay；Remote 的内置 Skill 固定在 `skills/`、用户 Skill 固定在 `data/skills/`，只允许导出 backup，不允许就地 restore；`--no-systemd` 使用持久 release/data 布局，但仍是安装用户的 `degraded_same_uid`；managed systemd 则分离 Web、Runner 和 root helper。四类都把 `flock`（`util-linux`）作为硬依赖并使用 `data/.runtime.lock`：前三类当前 UID、`0600`，managed 为 Web:Runner 组、`0640`。普通业务持共享锁；source、`--no-systemd` 和 managed restore 与持久安装的升级/回滚切换持独占锁，managed restore 仅本机 root 可用，不会因此授予 Web root 写权限。
 
-测试或无 systemd 环境可传 `--skip-dependencies --no-systemd --prefix <目录>`；该形态不要求不存在的 Runner/helper socket。loopback Web 可通过本机 sudo 标准输入一次性启用 observer，非 loopback 监听不接受密码。卸载默认保留 `data/`；确认不再需要配置、Skill overlay、策略和审计数据时使用 `uninstall --purge-data`。
+测试或无 systemd 环境可传 `--skip-dependencies --no-systemd --prefix <目录>`；该形态不要求不存在的 Runner/helper socket。loopback Web 可通过本机 sudo 标准输入密码启动一个仅服务当前 Web 进程、只接受固定 auditd 协议的临时 observer helper；非 loopback 监听不接受密码。卸载默认保留 `data/`；确认不再需要配置、Skill overlay、策略和审计数据时使用 `uninstall --purge-data`。

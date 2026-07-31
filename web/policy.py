@@ -168,7 +168,10 @@ class PolicyService:
         config_updater=None,
         effective_uid=os.geteuid,
         privileged_writer=None,
+        privileged_writer_probe=None,
         managed_execution=None,
+        config_path=None,
+        deployment_mode=None,
         # Kept as accepted compatibility parameters for third-party adapters;
         # policy editing no longer invokes sudo or a password-bearing runner.
         process_runner=None,
@@ -190,8 +193,17 @@ class PolicyService:
             raise TypeError("effective_uid must be an integer or callable")
         if privileged_writer is not None and not callable(privileged_writer):
             raise TypeError("privileged_writer must be callable")
+        if privileged_writer_probe is not None and not callable(privileged_writer_probe):
+            raise TypeError("privileged_writer_probe must be callable")
         if managed_execution is not None and not isinstance(managed_execution, bool):
             raise TypeError("managed_execution must be a boolean or None")
+        if deployment_mode is not None and deployment_mode not in {
+            "source",
+            "remote",
+            "no_systemd",
+            "managed",
+        }:
+            raise ValueError("deployment_mode is invalid")
 
         self.root = Path(root).resolve()
         self.policies_root = self.root / "policies"
@@ -208,15 +220,25 @@ class PolicyService:
             if managed_execution is None
             else managed_execution
         )
-        self.temp_root = self.root / "tmp" / "web" / "policy-edits"
+        self.deployment_mode = deployment_mode or (
+            "managed"
+            if self.managed
+            else ("no_systemd" if self.root.parent.name == "releases" else "source")
+        )
         self._config_reader = config_reader
         self._config_writer = config_writer
         self._config_updater = config_updater
+        self._config_path = (
+            Path(os.path.abspath(os.fspath(config_path)))
+            if config_path is not None
+            else None
+        )
         self._agent_api = agent_api
         self._audit = audit
         self._config_public_state = config_public_state
         self._effective_uid = effective_uid
         self._privileged_writer = privileged_writer
+        self._privileged_writer_probe = privileged_writer_probe
 
     def _begin_audited_mutation(self, stage, payload):
         audit_payload = dict(payload)
@@ -278,6 +300,110 @@ class PolicyService:
     def _require_mutation_allowed(self):
         if not self._mutation_allowed():
             raise SensitiveEditsDisabled
+
+    @staticmethod
+    def _capability(*, available, allowed, method, code="", reason=""):
+        return {
+            "available": bool(available),
+            "allowed": bool(allowed),
+            "method": str(method or "unavailable"),
+            "code": str(code or ""),
+            "reason": str(reason or "")[:400],
+        }
+
+    def _direct_policy_available(self, target=None):
+        try:
+            self._assert_overlay_root()
+        except (OSError, ValueError):
+            return False
+        candidate = Path(target) if target is not None else self.overlay_root / ".write-check"
+        return self._has_writable_ancestor(candidate)
+
+    def _direct_config_available(self):
+        if self._config_path is None:
+            return True
+        try:
+            _assert_no_symlink_components(self._config_path.parent)
+        except (OSError, ValueError):
+            return False
+        return self._has_writable_ancestor(self._config_path)
+
+    def mutation_capabilities(self):
+        """Report effective Web mutation channels for the current deployment."""
+
+        mutation_enabled = self._mutation_allowed()
+        if self.managed:
+            helper_result = None
+            if self._privileged_writer_probe is not None:
+                try:
+                    helper_result = self._privileged_writer_probe()
+                except (OSError, ValueError) as exc:
+                    helper_result = {
+                        "ok": False,
+                        "status": "helper_unavailable",
+                        "error": str(exc),
+                    }
+            helper_available = bool(
+                isinstance(helper_result, dict)
+                and helper_result.get("ok") is True
+                and helper_result.get("status") in {"ready", "ok"}
+            )
+            helper_code = "" if helper_available else str(
+                (helper_result or {}).get("code")
+                or (helper_result or {}).get("status")
+                or "helper_unavailable"
+            )
+            helper_reason = "" if helper_available else str(
+                (helper_result or {}).get("error")
+                or "Policy writer helper is unavailable."
+            )
+            policy_available = helper_available
+            guard_available = helper_available
+            policy_method = guard_method = "policy_helper"
+            policy_code = guard_code = helper_code
+            policy_reason = guard_reason = helper_reason
+        else:
+            policy_available = self._direct_policy_available()
+            guard_available = self._direct_config_available()
+            policy_method = guard_method = "root" if self._euid() == 0 else "direct"
+            policy_code = "" if policy_available else "policy_write_failed"
+            guard_code = "" if guard_available else "config_write_failed"
+            policy_reason = (
+                ""
+                if policy_available
+                else "The policy overlay directory is not writable by the Web process."
+            )
+            guard_reason = (
+                ""
+                if guard_available
+                else "The configuration directory is not writable by the Web process."
+            )
+
+        if not mutation_enabled:
+            policy_code = guard_code = "sensitive_edits_disabled"
+            policy_reason = guard_reason = (
+                "Sensitive Web edits are disabled by server configuration."
+            )
+
+        return {
+            "deployment_mode": self.deployment_mode,
+            "sensitive_edits_enabled": mutation_enabled,
+            "policy_sudo_password_supported": False,
+            "policy_write": self._capability(
+                available=policy_available,
+                allowed=mutation_enabled and policy_available,
+                method=policy_method,
+                code=policy_code,
+                reason=policy_reason,
+            ),
+            "command_guard_write": self._capability(
+                available=guard_available,
+                allowed=mutation_enabled and guard_available,
+                method=guard_method,
+                code=guard_code,
+                reason=guard_reason,
+            ),
+        }
 
     def _assert_policies_root(self):
         if self.policies_root.is_symlink():
@@ -444,21 +570,15 @@ class PolicyService:
         return normalized, None
 
     def _create_temp_file(self, target, normalized_content):
-        current = self.root
-        for part in self.temp_root.relative_to(self.root).parts:
-            current = current / part
-            if current.is_symlink():
-                raise OSError("policy temporary directory must not contain symbolic links")
-            current.mkdir(exist_ok=True, mode=0o700)
-        try:
-            self.temp_root.resolve().relative_to(self.root)
-        except ValueError as exc:
-            raise OSError("policy temporary directory escaped the project root") from exc
-        os.chmod(self.temp_root, 0o700)
+        directory = Path(target).parent
+        _assert_no_symlink_components(directory)
+        directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+        if directory.is_symlink() or not directory.is_dir():
+            raise OSError("policy overlay directory is invalid")
         descriptor, raw_path = tempfile.mkstemp(
             prefix=f"{target.name}.",
             suffix=".tmp",
-            dir=self.temp_root,
+            dir=directory,
         )
         temp_path = Path(raw_path)
         try:
@@ -480,7 +600,8 @@ class PolicyService:
         target.parent.mkdir(parents=True, exist_ok=True)
         if target.parent.is_symlink() or target.is_symlink():
             raise OSError("policy target must not be a symbolic link")
-        os.chmod(temp_path, 0o644)
+        target_mode = 0o644 if self.overlay_root == self.policies_root else 0o600
+        os.chmod(temp_path, target_mode)
         _fsync_file(temp_path)
         snapshot = None
         replaced = False
@@ -503,8 +624,6 @@ class PolicyService:
             replaced = True
             _fsync_file(target)
             _fsync_directory(target.parent)
-            if self.temp_root != target.parent:
-                _fsync_directory(self.temp_root)
         except Exception as exc:
             if replaced:
                 try:
@@ -547,11 +666,22 @@ class PolicyService:
         if not self._mutation_allowed():
             return self._mutation_blocked_result()
 
-        direct_write = not self.managed and (
-            self._euid() == 0 or self._has_writable_ancestor(target)
+        direct_write = not self.managed and self._direct_policy_available(target)
+        method = (
+            ("root" if self._euid() == 0 else "direct")
+            if not self.managed
+            else "policy_helper"
         )
-        method = ("root" if self._euid() == 0 else "direct") if direct_write else "policy_helper"
-        if not direct_write and self._privileged_writer is None:
+        if not self.managed and not direct_write:
+            return {
+                "ok": False,
+                "status": "policy_write_failed",
+                "code": "policy_write_failed",
+                "error": (
+                    "The policy overlay directory is not writable by the Web process."
+                ),
+            }
+        if self.managed and self._privileged_writer is None:
             return {
                 "ok": False,
                 "status": "helper_unavailable",
@@ -566,8 +696,9 @@ class PolicyService:
         )
         helper_warning = None
         if direct_write:
-            temp_path = self._create_temp_file(target, normalized_content)
+            temp_path = None
             try:
+                temp_path = self._create_temp_file(target, normalized_content)
                 try:
                     self._root_replace(
                         temp_path,
@@ -576,11 +707,19 @@ class PolicyService:
                     )
                 except SensitiveEditsDisabled:
                     return self._mutation_blocked_result()
+            except (OSError, ValueError) as exc:
+                return {
+                    "ok": False,
+                    "status": "policy_write_failed",
+                    "code": "policy_write_failed",
+                    "error": f"Could not save policy: {exc}",
+                }
             finally:
-                try:
-                    temp_path.unlink()
-                except FileNotFoundError:
-                    pass
+                if temp_path is not None:
+                    try:
+                        temp_path.unlink()
+                    except FileNotFoundError:
+                        pass
         else:
             if not self._mutation_allowed():
                 return self._mutation_blocked_result()
@@ -620,9 +759,22 @@ class PolicyService:
         if not self._mutation_allowed():
             return self._mutation_blocked_result()
 
-        direct_write = not self.managed
-        method = ("root" if self._euid() == 0 else "direct") if direct_write else "policy_helper"
-        if not direct_write and self._privileged_writer is None:
+        direct_write = not self.managed and self._direct_config_available()
+        method = (
+            ("root" if self._euid() == 0 else "direct")
+            if not self.managed
+            else "policy_helper"
+        )
+        if not self.managed and not direct_write:
+            return {
+                "ok": False,
+                "status": "config_write_failed",
+                "code": "config_write_failed",
+                "error": (
+                    "The configuration directory is not writable by the Web process."
+                ),
+            }
+        if self.managed and self._privileged_writer is None:
             return {
                 "ok": False,
                 "status": "helper_unavailable",
@@ -674,6 +826,7 @@ class PolicyService:
             return {
                 "ok": False,
                 "status": "config_write_failed",
+                "code": "config_write_failed",
                 "error": f"Could not save command guard setting: {exc}",
             }
 

@@ -122,7 +122,7 @@ LINUX_AGENT_VERSION="${version}" LINUX_AGENT_REQUIRE_SIGNATURE=1 bash "${verify_
 
 Remote CLI 会从 `/dev/tty` 读取审批和可选 API key，密钥不写入配置文件。Remote Web 强制监听 `127.0.0.1`，从其他机器访问时使用启动日志打印的 SSH 转发命令。示例模板的 `web.token` 为空；启动时用系统 CSPRNG 生成本次运行的临时 token，并写入权限 `0600` 的 `tmp/web/auth-token`（不在终端回显）。Remote 部署会自动把 `providers_security.require_https` 置为 `true`（仅允许 HTTPS Provider）。
 
-Remote 模式默认禁止向 AI Provider 传输 API key。CLI 会在需要 AI 时询问；Web 需在配置中心开启“允许远程传输 API Key”。Terminal、Doctor、Audit 和不需要模型的 Skill 不受此开关影响。验证并按需物化的内置 Skill 固定在 `skills/`，Remote Web/CLI 创建的用户 Skill 固定在 `data/skills/`，远程 manifest 登记的名称属于不可覆盖的内置命名空间。运行日志、脱敏配置、用户 Skill overlay 和有效策略可通过 `agent backup <output.tar.gz>` 或 Web“下载运行时备份”按钮显式导出；Remote 退出即清理，`agent restore` 始终返回 `restore_unavailable`，归档须在 source checkout、`--no-systemd` 或 managed 安装中恢复。
+Remote 模式默认禁止向 AI Provider 传输 API key。CLI 会在需要 AI 时询问；Web 需在配置中心开启“允许远程传输 API Key”。Terminal、Doctor、Audit 和不需要模型的 Skill 不受此开关影响。验证并按需物化的内置 Skill 固定在 `skills/`，Remote Web/CLI 创建的用户 Skill 固定在 `data/skills/`，远程 manifest 登记的名称属于不可覆盖的内置命名空间。运行日志、脱敏配置、用户 Skill overlay 和有效策略可通过 `agent backup <output.tar.gz>` 显式导出；Web“下载运行时备份”按钮仅在 Remote 或已安装 release 布局显示，源码 checkout 使用 CLI。Remote 退出即清理，`agent restore` 始终返回 `restore_unavailable`，归档须在 source checkout、`--no-systemd` 或 managed 安装中恢复。
 
 ### 生产部署（systemd）
 
@@ -160,7 +160,7 @@ sudo bash linux-agent-install.sh status
 
 如果 Web 控制台报告 `observer_helper_failed` 且错误是 observer socket 权限不足，运行 `repair-observer` 会重新应用当前服务用户对应的 `SocketGroup`，重建 socket inode，并以 Web 服务用户执行 helper 健康检查；它不会切换版本或修改持久配置。
 
-Git 源码目录直接运行时会优先使用已存在的 observer helper；若没有 helper，则保留本机兼容路径：root 直接调用 auditd，非 root 可在仅监听 loopback 的 Web 页面中验证一次 sudo。密码只写入本机 `sudo -S` 的标准输入，不进入 argv、环境、配置或审计日志。若希望源码版也采用生产 helper 边界，且主机已经安装 `linux-agent-observer-helper.socket`，可在源码目录执行：
+Git 源码目录直接运行时会优先使用已存在的 observer helper；若没有 helper，则保留本机兼容路径：root 直接调用 auditd，非 root 可在仅监听 loopback 的 Web 页面中用一次 sudo 授权启动随 Web 进程退出的临时 observer helper。该 helper 在 `/run` 创建仅当前 UID 可访问的随机 socket，绑定 Web PID 与进程启动时间，并且只接受既有 auditd 固定协议；后续 Job 不依赖 sudo timestamp。密码只写入启动命令的 `sudo -S` 标准输入，不进入 argv、环境、配置或审计日志。Remote 与 `--no-systemd` Web 使用相同的短生命周期兼容路径。若希望源码版也采用生产 helper 边界，且主机已经安装 `linux-agent-observer-helper.socket`，可在源码目录执行：
 
 ```bash
 sudo bash scripts/install.sh repair-observer --prefix "$PWD" --service-user "$USER"
@@ -190,7 +190,7 @@ scrape_configs:
       - targets: ["127.0.0.1:8765"]
 ```
 
-首次 `install` 会写入代码、配置模板和 Web/Runner/host-ops/policy-writer/observer systemd unit，先停止可能残留的旧实例，再临时启动新版本完成认证健康检查；检查结束后自动停止这些服务。安装器不修改原有开机启用状态，全新安装默认未启用。管理员完成 Provider/API key 配置后，再显式执行上面的 `systemctl enable --now`。`upgrade` 切换后会重启已部署的 socket 与 Web 服务，并轮询认证后的 `/api/health`，失败时自动恢复旧版本。主 Web 进程仍以专用非 root 用户运行，普通步骤进入独立 Runner UID；root helper 只接受固定 JSON 操作和结构化参数，不接受命令文本、任意路径或 argv。默认保留最近两个版本，可用 `--keep` 调整；`uninstall` 默认保留 `data/`，只有 `uninstall --purge-data` 会删除持久数据。systemd 模式的自定义 `--prefix` 应位于 `/opt`、`/srv` 等系统服务目录，安装器会拒绝被 `ProtectHome` 或 `PrivateTmp` 隐藏的 `/home`、`/root`、`/run/user`、`/tmp` 和 `/var/tmp`。容器和测试环境可使用 `--no-systemd --prefix <目录>`，本地发布演练可增加 `--from-dist <目录>`。
+首次 `install` 会写入代码、配置模板和 Web/Runner/host-ops/policy-writer/observer systemd unit，先停止可能残留的旧实例，再临时启动新版本完成认证健康检查；检查结束后自动停止这些服务。安装器不修改原有开机启用状态，全新安装默认未启用。管理员完成 Provider/API key 配置后，再显式执行上面的 `systemctl enable --now`。`upgrade` 与 `rollback` 切换后会临时启动已部署的 socket 与 Web 服务并轮询认证后的 `/api/health`，失败时自动恢复旧版本；检查通过后恢复操作前的运行状态，原本停止的 Web 不会被升级意外拉起，原本运行的 Web 会保持运行。主 Web 进程仍以专用非 root 用户运行，普通步骤进入独立 Runner UID；root helper 只接受固定 JSON 操作和结构化参数，不接受命令文本、任意路径或 argv。默认保留最近两个版本，可用 `--keep` 调整；`uninstall` 默认保留 `data/`，只有 `uninstall --purge-data` 会删除持久数据。systemd 模式的自定义 `--prefix` 应位于 `/opt`、`/srv` 等系统服务目录，安装器会拒绝被 `ProtectHome` 或 `PrivateTmp` 隐藏的 `/home`、`/root`、`/run/user`、`/tmp` 和 `/var/tmp`。容器和测试环境可使用 `--no-systemd --prefix <目录>`，本地发布演练可增加 `--from-dist <目录>`。
 
 首次 systemd 安装必须明确网络出口策略。重复传入 `--provider-cidr` 后，安装器会事务化生成 `IPAddressDeny=any`、放行 localhost 和所列 IPv4/IPv6 CIDR 的 drop-in；升级和回滚默认保留该策略，失败回滚也会恢复旧文件。CIDR 应覆盖主 Provider、所有 failover Provider，以及未使用本机 DNS stub 时的 DNS 服务地址；地址变化后重新运行 upgrade 并传入新列表。确实无法固定出口网段时必须显式使用 `--allow-unrestricted-provider-egress`，安装器会给出警告，不能以“未配置”静默获得无限制出口。
 
@@ -622,7 +622,7 @@ GitHub Actions 会构建确定性资产与 SPDX 2.3 SBOM，使用 GitHub OIDC �
 | `audit.min_free_bytes` | 审计目录最小可用空间阈值；`0` 禁用检查。 |
 | `audit.on_full` | 空间不足时 `degrade`（写最小事件）或 `block`（拒绝操作）。 |
 | `observer.enabled` | observer 开关，默认 `auto`。 |
-| `observer.privilege` | auditd observer 的兼容权限策略；受管安装只用 observer helper，源码/Remote/no-systemd 的 loopback Web 可一次性验证本机 sudo。 |
+| `observer.privilege` | auditd observer 的兼容权限策略；受管安装只用 systemd helper，源码/Remote/no-systemd 的 loopback Web 可用一次本机 sudo 启动随 Web 退出的临时受限 helper。 |
 | `observer.max_events` | observer 汇总事件上限。 |
 | `observer.require` | 强合规开关；为 `true` 时 observer 未完整生效即拒绝真实执行。 |
 | `execution.min_privilege_proxy` | root 运行时是否尽量降权执行普通命令。 |
@@ -803,7 +803,7 @@ bash scripts/lint.sh
 | `lib/file_vault.py` | 文件保险箱静态访问分类器，把命令文本按保险箱路径判定为读取、修改或未知（保险箱为空时保持惰性），供 `policy.sh` 决定阻断或审批。 |
 | `lib/protocol.sh` | 为 API/CLI 构造 `timeline`、`approval_card`、`output_blocks` 工作台协议。 |
 | `lib/observer.sh` | auditd observer 预检、规则安装和清理、`ausearch` 解析、执行过程 marker 和降级记录。 |
-| `lib/observer_helper.py` | systemd socket 激活的最小 auditd privileged helper，执行固定协议、peer uid 校验、输出/超时限制和工具所有权校验。 |
+| `lib/observer_helper.py` | systemd socket 激活或非托管 Web 临时启动的最小 auditd privileged helper，执行固定协议、peer uid 校验、输出/超时限制和工具所有权校验；临时模式还绑定 Web PID 启动时间。 |
 | `lib/runner.py` / `lib/helper_protocol.py` | 普通执行 Runner 及版本化 Unix socket JSON 协议；受管模式由独立 UID 运行。 |
 | `lib/host_ops_helper.py` / `lib/policy_helper.py` | firewall/hosts 与策略/command guard 的固定 root 操作 helper；拒绝任意命令、路径和 argv。 |
 | `lib/pinned_http.py` | Provider 与 file-download 共用的固定解析 IP HTTPS 客户端，逐跳校验地址并保持原 hostname 的 Host/SNI。 |

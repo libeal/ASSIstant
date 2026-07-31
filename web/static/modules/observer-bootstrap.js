@@ -100,7 +100,7 @@ export function createObserverBootstrap(app) {
     const description = $("observerAuditDescription");
     if (description) {
       if (passwordAllowed) {
-        description.textContent = "源码版、远程临时版或无 systemd 安装可在本机页面验证一次 sudo；密码只进入本机 sudo 标准输入，不会保存或写入日志。";
+        description.textContent = "源码版、远程临时版或无 systemd 安装可用一次本机 sudo 授权启动随 Web 关闭的受限审计 helper；密码只进入 sudo 标准输入，不会保存或写入日志。";
       } else if (data?.authorization_mode === "root") {
         description.textContent = "当前 Web 进程可直接检查本机 auditd，不需要 sudo 密码。";
       } else {

@@ -3,11 +3,23 @@
 from __future__ import annotations
 
 import os
+import secrets
 import shutil
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
+
+
+def _process_start_time(process_id):
+    try:
+        raw = Path(f"/proc/{process_id}/stat").read_text(encoding="ascii")
+    except (FileNotFoundError, PermissionError, OSError, UnicodeDecodeError):
+        return ""
+    _prefix, separator, remainder = raw.rpartition(")")
+    fields = remainder.strip().split() if separator else []
+    return fields[19] if len(fields) > 19 else ""
 
 
 class ObserverService:
@@ -22,8 +34,13 @@ class ObserverService:
         lib_root,
         server_started_at,
         process_runner=subprocess.run,
+        process_launcher=subprocess.Popen,
         effective_uid=os.geteuid,
+        process_id=os.getpid,
+        process_start_time=_process_start_time,
         which=shutil.which,
+        token_factory=lambda: secrets.token_hex(12),
+        sleeper=time.sleep,
         managed_execution=False,
         allow_sudo_password=True,
         helper_socket_checker=None,
@@ -34,8 +51,13 @@ class ObserverService:
             ("audit", audit),
             ("env_builder", env_builder),
             ("process_runner", process_runner),
+            ("process_launcher", process_launcher),
             ("effective_uid", effective_uid),
+            ("process_id", process_id),
+            ("process_start_time", process_start_time),
             ("which", which),
+            ("token_factory", token_factory),
+            ("sleeper", sleeper),
         ):
             if not callable(callback):
                 raise TypeError(f"{name} must be callable")
@@ -49,14 +71,22 @@ class ObserverService:
         self.lib_root = Path(lib_root)
         self.server_started_at = str(server_started_at)
         self.process_runner = process_runner
+        self.process_launcher = process_launcher
         self.effective_uid = effective_uid
+        self.process_id = process_id
+        self.process_start_time = process_start_time
         self.which = which
+        self.token_factory = token_factory
+        self.sleeper = sleeper
         self.managed_execution = bool(managed_execution)
         self.allow_sudo_password = bool(allow_sudo_password)
         self.helper_socket_checker = helper_socket_checker or (lambda path: path.is_socket())
         self.now_iso = now_iso or (
             lambda: time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
         )
+        self.runtime_helper_process = None
+        self.runtime_helper_socket = None
+        self.runtime_helper_lock = threading.Lock()
         self.state = {
             "status": "pending",
             "ok": True,
@@ -102,8 +132,9 @@ class ObserverService:
             "require": observer.get("require", False) is True,
         }
 
-    @staticmethod
-    def helper_socket_path():
+    def helper_socket_path(self):
+        if self.runtime_helper_socket is not None:
+            return self.runtime_helper_socket
         return Path(
             os.environ.get(
                 "LINUX_AGENT_OBSERVER_HELPER_SOCKET",
@@ -113,6 +144,40 @@ class ObserverService:
 
     def helper_available(self):
         return bool(self.helper_socket_checker(self.helper_socket_path()))
+
+    def child_env_override(self):
+        if self.runtime_helper_socket is None:
+            return {}
+        if not self.helper_socket_checker(self.runtime_helper_socket):
+            return {}
+        return {
+            "LINUX_AGENT_OBSERVER_HELPER_SOCKET": str(self.runtime_helper_socket),
+        }
+
+    def close(self):
+        self._discard_runtime_helper()
+
+    def _discard_runtime_helper(self):
+        with self.runtime_helper_lock:
+            process = self.runtime_helper_process
+            self.runtime_helper_process = None
+            self.runtime_helper_socket = None
+        if process is None:
+            return
+        self._stop_runtime_helper(process)
+
+    @staticmethod
+    def _stop_runtime_helper(process):
+        try:
+            if process.poll() is None:
+                process.terminate()
+                try:
+                    process.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait(timeout=2)
+        except (OSError, ProcessLookupError, PermissionError, subprocess.TimeoutExpired):
+            return
 
     def requires_permission(self, observer):
         return (
@@ -194,6 +259,9 @@ class ObserverService:
         return result
 
     def skip(self):
+        # Revoke only the helper launched for this Web process. Managed
+        # systemd helpers are deployment-owned and are not tracked here.
+        self._discard_runtime_helper()
         result = self.update_state(
             "skipped",
             True,
@@ -238,36 +306,155 @@ class ObserverService:
         except (OSError, subprocess.TimeoutExpired) as exc:
             return exc
 
-    def sudo_cached(self):
-        if not self.which("sudo"):
-            return False
-        try:
-            process = self._run(["sudo", "-n", "true"], timeout=5)
-        except (OSError, subprocess.TimeoutExpired):
-            return False
-        return process.returncode == 0
+    @staticmethod
+    def valid_password(password):
+        return (
+            isinstance(password, str)
+            and bool(password)
+            and len(password) <= 4096
+            and not any(character in password for character in ("\x00", "\n", "\r"))
+        )
 
-    def validate_sudo(self, password):
-        if (
-            not isinstance(password, str)
-            or not password
-            or len(password) > 4096
-            or any(character in password for character in ("\x00", "\n", "\r"))
-        ):
-            return {"ok": False, "status": "invalid_password"}
-        try:
-            process = self._run(
-                ["sudo", "-S", "-p", "", "-v"],
-                timeout=15,
-                input_text=f"{password}\n",
+    def _launch_runtime_helper(self, password=""):
+        with self.runtime_helper_lock:
+            if self.runtime_helper_socket is not None and self.helper_socket_checker(
+                self.runtime_helper_socket
+            ):
+                return {"ok": True, "status": "ready"}
+
+            owner_pid = self.process_id()
+            owner_start_time = str(self.process_start_time(owner_pid) or "")
+            expected_uid = self.effective_uid()
+            nonce = str(self.token_factory() or "")
+            if (
+                expected_uid <= 0
+                or owner_pid <= 1
+                or not owner_start_time.isdigit()
+                or len(nonce) != 24
+                or any(character not in "0123456789abcdef" for character in nonce)
+            ):
+                return {"ok": False, "status": "observer_helper_identity_invalid"}
+
+            socket_path = Path(
+                f"/run/linux-agent-observer-{expected_uid}-{owner_pid}-{nonce}.sock"
             )
-        except FileNotFoundError:
-            return {"ok": False, "status": "sudo_not_found"}
-        except subprocess.TimeoutExpired:
-            return {"ok": False, "status": "sudo_timeout"}
-        if process.returncode == 0:
-            return {"ok": True, "status": "sudo_validated"}
-        return {"ok": False, "status": "sudo_denied"}
+            password_supplied = bool(password)
+            sudo_args = ["sudo"]
+            if password_supplied:
+                sudo_args.extend(["-S", "-p", ""])
+            else:
+                sudo_args.append("-n")
+            command = [
+                *sudo_args,
+                "--",
+                sys.executable,
+                str(self.lib_root / "observer_helper.py"),
+                "serve-local",
+                "--socket",
+                str(socket_path),
+                "--expected-uid",
+                str(expected_uid),
+                "--owner-pid",
+                str(owner_pid),
+                "--owner-start-time",
+                owner_start_time,
+            ]
+            process = None
+            try:
+                process = self.process_launcher(
+                    command,
+                    env=self.env_builder(include_api_key=False),
+                    text=True,
+                    stdin=subprocess.PIPE if password_supplied else subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    start_new_session=True,
+                )
+                if password_supplied:
+                    process.stdin.write(f"{password}\n")
+                    process.stdin.flush()
+                    process.stdin.close()
+                    process.stdin = None
+                password = ""
+            except OSError as exc:
+                password = ""
+                if process is not None:
+                    self._stop_runtime_helper(process)
+                return {
+                    "ok": False,
+                    "status": "observer_helper_start_failed",
+                    "error": str(exc),
+                }
+
+            self.runtime_helper_process = process
+            self.runtime_helper_socket = socket_path
+            for _attempt in range(200):
+                if self.helper_socket_checker(socket_path):
+                    return {"ok": True, "status": "ready"}
+                if process.poll() is not None:
+                    self.runtime_helper_process = None
+                    self.runtime_helper_socket = None
+                    return {
+                        "ok": False,
+                        "status": "sudo_denied" if password_supplied else "sudo_required",
+                    }
+                self.sleeper(0.05)
+
+            self._stop_runtime_helper(process)
+            self.runtime_helper_process = None
+            self.runtime_helper_socket = None
+            return {"ok": False, "status": "observer_helper_start_timeout"}
+
+    def _runtime_helper_failure(self, launch, *, password_supplied):
+        status = str(launch.get("status") or "observer_helper_start_failed")
+        error = str(launch.get("error") or "")
+        if status == "sudo_required":
+            diagnostic = (
+                "No non-interactive sudo authorization can start the temporary "
+                "observer helper; enter the local sudo password or install the system helper."
+            )
+        elif status == "sudo_denied":
+            diagnostic = (
+                "The sudo credential was rejected or sudo policy does not allow the "
+                "temporary observer helper; the credential was not stored or logged."
+            )
+        else:
+            diagnostic = (
+                "The temporary observer helper did not become ready; no Web Job will "
+                "use a partially initialized privilege path."
+            )
+        if password_supplied and status == "sudo_required":
+            status = "sudo_denied"
+        return self._failed(
+            status,
+            "sudo_helper",
+            error or "Could not start the temporary observer helper.",
+            diagnostic,
+        )
+
+    def _runtime_helper_preflight_result(self):
+        helper = self.helper_preflight()
+        if helper is not None and hasattr(helper, "returncode") and helper.returncode == 0:
+            return self._record(
+                "observer_bootstrap_enabled",
+                self.update_state(
+                    "enabled",
+                    True,
+                    method="helper",
+                    diagnostic="A Web-lifetime privileged observer helper is ready; Jobs use its fixed auditd protocol without reusing sudo credentials.",
+                ),
+            )
+        if helper is not None and hasattr(helper, "returncode"):
+            detail = (helper.stderr or helper.stdout or "observer helper failed").strip()
+        else:
+            detail = str(helper or "observer helper socket is unavailable")
+        self._discard_runtime_helper()
+        return self._failed(
+            "observer_helper_failed",
+            "helper",
+            detail,
+            "The temporary helper started but its auditd preflight failed; Web will not fall back to direct sudo.",
+        )
 
     def _failed(self, status, method, error, diagnostic):
         return self._record(
@@ -352,43 +539,55 @@ class ObserverService:
                     "sudo is not installed.",
                     "Install sudo, run Web as root, or use a managed installation with the observer helper.",
                 )
-            if not self.sudo_cached():
+            password_supplied = bool(password)
+            if password_supplied:
                 if observer.get("privilege") != "sudo_interactive":
+                    password = ""
                     return self._failed(
-                        "sudo_required",
-                        "sudo",
-                        "Passwordless sudo is not available.",
-                        "observer.privilege=passwordless only uses an existing sudo -n authorization.",
+                        "sudo_password_not_allowed",
+                        "sudo_helper",
+                        "observer.privilege does not allow an interactive sudo credential.",
+                        "Set observer.privilege=sudo_interactive or install the system observer helper; the password was not used.",
                     )
                 if not self.allow_sudo_password:
+                    password = ""
                     return self._failed(
                         "sudo_transport_disabled",
-                        "sudo",
+                        "sudo_helper",
                         "Interactive sudo is restricted to a loopback Web listener.",
                         "Bind Web to 127.0.0.1/localhost or use the managed observer helper; the password was not used.",
                     )
-                if not password:
+                if not self.valid_password(password):
+                    password = ""
                     return self._failed(
-                        "sudo_required",
-                        "sudo",
-                        "sudo password is required.",
-                        "The local Web adapter validates the password once through sudo stdin and does not store or log it.",
+                        "invalid_password",
+                        "sudo_helper",
+                        "The sudo password format is invalid.",
+                        "The credential was not sent, stored, or logged.",
                     )
-                check = self.validate_sudo(password)
-                password = ""
-                if not check.get("ok"):
-                    status = str(check.get("status") or "sudo_denied")
+
+            launch = self._launch_runtime_helper(password if password_supplied else "")
+            password = ""
+            if not launch.get("ok"):
+                if (
+                    launch.get("status") == "sudo_required"
+                    and observer.get("privilege") == "sudo_interactive"
+                    and not self.allow_sudo_password
+                ):
                     return self._failed(
-                        status,
-                        "sudo",
-                        "sudo credential validation failed.",
-                        "The credential was not stored or logged; auditd observer was not enabled for Web Jobs.",
+                        "sudo_transport_disabled",
+                        "sudo_helper",
+                        "Interactive sudo is restricted to a loopback Web listener.",
+                        "No non-interactive authorization was available; use a loopback listener or install the managed observer helper.",
                     )
+                return self._runtime_helper_failure(
+                    launch,
+                    password_supplied=password_supplied,
+                )
+            return self._runtime_helper_preflight_result()
 
         if effective_uid == 0:
             command, method = ["auditctl", "-s"], "root"
-        else:
-            command, method = ["sudo", "-n", "auditctl", "-s"], "sudo"
         try:
             process = self._run(command, timeout=10)
         except subprocess.TimeoutExpired:

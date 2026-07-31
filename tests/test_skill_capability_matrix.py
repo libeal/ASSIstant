@@ -86,6 +86,7 @@ INTENTIONAL_ERROR_CODE_ADDITIONS = {
     "mcp_sdk_unavailable",
     "mcp_tool_invalid",
     "mcp_tool_list_invalid",
+    "policy_write_failed",
     "runtime_busy",
     "skill_component_install_failed",
     "skill_component_uninstall_failed",

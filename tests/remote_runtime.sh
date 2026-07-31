@@ -8,6 +8,7 @@ source "${ROOT_DIR}/tests/cosign_compat.sh"
 tmp_root="$(mktemp -d)"
 web_pid=""
 release_http_pid=""
+observer_helper_pid=""
 
 cleanup() {
     local status=$?
@@ -25,6 +26,10 @@ cleanup() {
     if [[ -n "${release_http_pid}" ]] && kill -0 "${release_http_pid}" >/dev/null 2>&1; then
         kill "${release_http_pid}" >/dev/null 2>&1 || true
         wait "${release_http_pid}" 2>/dev/null || true
+    fi
+    if [[ -n "${observer_helper_pid}" ]] && kill -0 "${observer_helper_pid}" >/dev/null 2>&1; then
+        kill "${observer_helper_pid}" >/dev/null 2>&1 || true
+        wait "${observer_helper_pid}" 2>/dev/null || true
     fi
     rm -rf "${tmp_root}"
     return "${status}"
@@ -167,39 +172,71 @@ fi
 
 web_stdout="${tmp_root}/remote-web.stdout"
 web_stderr="${tmp_root}/remote-web.stderr"
-observer_fake_bin="${tmp_root}/observer-fake-bin"
-mkdir -p "${observer_fake_bin}"
-cat >"${observer_fake_bin}/sudo" <<'EOF'
-#!/usr/bin/env bash
-set -euo pipefail
-state="$(dirname "$0")/sudo.state"
-if [[ "${1:-}" == "-n" && "${2:-}" == "true" ]]; then
-    [[ -f "${state}" ]]
-    exit
-fi
-if [[ "${1:-}" == "-S" && "${2:-}" == "-p" && "${4:-}" == "-v" ]]; then
-    IFS= read -r password
-    [[ "${password}" == "remote-observer-password" ]]
-    : >"${state}"
-    exit
-fi
-if [[ "${1:-}" == "-n" ]]; then
-    shift
-    [[ -f "${state}" ]]
-    exec "$@"
-fi
-exit 1
-EOF
-cat >"${observer_fake_bin}/auditctl" <<'EOF'
-#!/usr/bin/env bash
-printf 'enabled 1\n'
-EOF
-cat >"${observer_fake_bin}/ausearch" <<'EOF'
-#!/usr/bin/env bash
-exit 0
-EOF
-chmod 0755 "${observer_fake_bin}/sudo" "${observer_fake_bin}/auditctl" \
-    "${observer_fake_bin}/ausearch"
+observer_helper_socket="${tmp_root}/observer-helper.sock"
+observer_helper_script="${tmp_root}/observer-helper.py"
+cat >"${observer_helper_script}" <<'PY'
+#!/usr/bin/env python3
+import json
+import os
+import signal
+import socket
+import sys
+
+socket_path = sys.argv[1]
+stopping = False
+
+
+def stop(_signum, _frame):
+    global stopping
+    stopping = True
+
+
+signal.signal(signal.SIGTERM, stop)
+listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+listener.bind(socket_path)
+listener.listen(16)
+listener.settimeout(0.2)
+try:
+    while not stopping:
+        try:
+            connection, _ = listener.accept()
+        except socket.timeout:
+            continue
+        with connection:
+            payload = bytearray()
+            while True:
+                chunk = connection.recv(65536)
+                if not chunk:
+                    break
+                payload.extend(chunk)
+            request = json.loads(payload.decode("utf-8"))
+            operation = request.get("operation")
+            response = {
+                "protocol_version": request.get("protocol_version"),
+                "request_id": request.get("request_id"),
+                "ok": True,
+                "status": "executed",
+                "exit_code": 0,
+                "stdout": "enabled 1\n" if operation == "status" else "",
+                "stderr": "",
+            }
+            connection.sendall(
+                json.dumps(response, separators=(",", ":")).encode("utf-8") + b"\n"
+            )
+finally:
+    listener.close()
+    try:
+        os.unlink(socket_path)
+    except FileNotFoundError:
+        pass
+PY
+python3 "${observer_helper_script}" "${observer_helper_socket}" &
+observer_helper_pid="$!"
+for _ in $(seq 1 100); do
+    [[ -S "${observer_helper_socket}" ]] && break
+    sleep 0.05
+done
+[[ -S "${observer_helper_socket}" ]]
 
 remote_web_token() {
     local config_file="" token="" token_file=""
@@ -236,8 +273,8 @@ wait_remote_job() {
 }
 
 curl -fsSL "file://${release_dir}/linux-agent-web.sh" |
-    PATH="${observer_fake_bin}:${PATH}" \
-        XDG_RUNTIME_DIR="${runtime_base}" \
+    XDG_RUNTIME_DIR="${runtime_base}" \
+        LINUX_AGENT_OBSERVER_HELPER_SOCKET="${observer_helper_socket}" \
         LINUX_AGENT_REMOTE_WEB_PORT="${web_port}" \
         LINUX_AGENT_ALLOW_INSECURE_TEST_URL=1 \
         LINUX_AGENT_RELEASE_BASE_URL="file://${release_dir}" \
@@ -265,20 +302,17 @@ fi
 remote_observer_state="$(curl -fsS -H "Authorization: Bearer ${web_token}" \
     "http://127.0.0.1:${web_port}/api/observer/bootstrap")"
 jq -e '.managed_execution == false
-    and .requires_permission == true
-    and (.authorization_mode == "root" or .authorization_mode == "sudo_interactive")' \
+    and .requires_permission == false
+    and .password_allowed == false
+    and .authorization_mode == "helper"' \
     <<<"${remote_observer_state}" >/dev/null
 remote_observer_enabled="$(curl -fsS -X POST \
     -H "Authorization: Bearer ${web_token}" \
     -H 'Content-Type: application/json' \
-    -d '{"action":"enable","password":"remote-observer-password"}' \
+    -d '{"action":"enable"}' \
     "http://127.0.0.1:${web_port}/api/observer/bootstrap")"
-jq -e '.ok == true and .status == "enabled" and (.method == "root" or .method == "sudo")' \
+jq -e '.ok == true and .status == "enabled" and .method == "helper"' \
     <<<"${remote_observer_enabled}" >/dev/null
-if grep -Fq -- 'remote-observer-password' "${web_stdout}" "${web_stderr}"; then
-    printf 'remote observer password was echoed to stdout/stderr\n' >&2
-    exit 1
-fi
 tools_json="$(curl -fsS -H "Authorization: Bearer ${web_token}" "http://127.0.0.1:${web_port}/api/tools")"
 jq -e '
     ([.scripts[].materialization] | all(. == "available"))
@@ -498,10 +532,6 @@ jq -e '.builtin[] | select(.name == "os-deep-inspect" and .installed == true and
     "${web_backup_extract}/skills/installation-state.json" >/dev/null
 if grep -R -Fq -- "${web_token}" "${web_backup_extract}"; then
     printf 'remote Web backup contains the Web token\n' >&2
-    exit 1
-fi
-if grep -R -Fq -- 'remote-observer-password' "${web_backup_extract}"; then
-    printf 'remote Web backup contains the observer password\n' >&2
     exit 1
 fi
 grep -R -Eq -- '"stage":"remote_bootstrap_verified"' "${web_backup_extract}/logs"

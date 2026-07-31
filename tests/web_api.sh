@@ -25,6 +25,7 @@ copy_project() {
         "${ROOT_DIR}/lib" \
         "${ROOT_DIR}/policies" \
         "${ROOT_DIR}/prompts" \
+        "${ROOT_DIR}/schema" \
         "${ROOT_DIR}/skills" \
         "${ROOT_DIR}/mcp" \
         "${ROOT_DIR}/web" \
@@ -57,6 +58,7 @@ jq -e '([.scripts[] | select(.skill == "network-ops-tools")] | length) == 25
 
 mcp_project="${tmp_root}/project-mcp-api"
 copy_project "${mcp_project}"
+cp -a "${ROOT_DIR}/third_party" "${mcp_project}/"
 mkdir -p "${mcp_project}/mcp/stdio-api" "${mcp_project}/mcp/http-api" "${mcp_project}/mcp/sse-api"
 cat >"${mcp_project}/mcp/stdio-api/mcp.json" <<JSON
 {
@@ -106,7 +108,9 @@ mcp_validate="$(
     linux_agent_test_capture "API MCP validate" 45 "${mcp_project}" inherit \
         bash bin/agent api mcp validate
 )"
-jq -e '.ok == true and .status == "validated" and (.validation.findings | length) == 0' <<<"${mcp_validate}" >/dev/null
+jq -e '.ok == true and .status == "validated" and .validation.ok == true
+    and ([.validation.findings[].code] | sort) == ["MCP_INLINE_SECRET_DEPRECATED","MCP_SSE_DEPRECATED"]
+    and all(.validation.findings[]; .severity == "low")' <<<"${mcp_validate}" >/dev/null
 mcp_tools="$(
     linux_agent_test_capture "API MCP tools" 60 "${mcp_project}" inherit \
         bash bin/agent api mcp tools

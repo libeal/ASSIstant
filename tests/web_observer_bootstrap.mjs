@@ -117,7 +117,7 @@ function createHarness() {
   harness.app.state.observerBootstrap = {
     ok: false,
     status: "sudo_required",
-    method: "sudo",
+    method: "sudo_helper",
     requires_permission: true,
     password_allowed: true,
     authorization_mode: "sudo_interactive",

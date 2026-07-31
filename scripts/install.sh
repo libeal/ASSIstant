@@ -816,7 +816,7 @@ install_prepared_builtin_skills() {
 
 capture_systemd_state() {
     local path backup_name existed_var egress_dir unit enabled active _package component
-    local _client _socket_env _socket_path _service_asset socket_asset _egress_dropin
+    local _client _socket_env _socket_path service_asset socket_asset _egress_dropin
     [[ "${NO_SYSTEMD}" -eq 0 ]] || return 0
     command -v systemctl >/dev/null 2>&1 || fail '缺少 systemctl'
     egress_dir="$(dirname -- "${SYSTEMD_EGRESS_DROPIN_PATH}")"
@@ -881,25 +881,35 @@ EOF
         fi
     done < <(transaction_credential_file_rows)
     : >"${TRANSACTION_BACKUP_DIR}/systemd-extra/runtime.tsv"
-    for unit in linux-agent-runner.socket linux-agent-mcp-stdio.socket \
-        linux-agent-host-ops.socket linux-agent-policy-writer.socket; do
-        enabled=0
+    for unit in linux-agent-observer-helper.service \
+        linux-agent-runner.service linux-agent-runner.socket \
+        linux-agent-mcp-stdio.service linux-agent-mcp-stdio.socket \
+        linux-agent-host-ops.service linux-agent-host-ops.socket \
+        linux-agent-policy-writer.service linux-agent-policy-writer.socket; do
+        enabled=-1
         active=0
-        systemctl is-enabled --quiet "${unit}" >/dev/null 2>&1 && enabled=1
+        if [[ "${unit}" == *.socket ]]; then
+            enabled=0
+            systemctl is-enabled --quiet "${unit}" >/dev/null 2>&1 && enabled=1
+        fi
         systemctl is-active --quiet "${unit}" >/dev/null 2>&1 && active=1
         printf '%s\t%s\t%s\n' "${unit}" "${enabled}" "${active}" >>"${TRANSACTION_BACKUP_DIR}/systemd-extra/runtime.tsv"
     done
     while IFS=$'\t' read -r _package component _client _socket_env _socket_path \
-        _service_asset socket_asset _egress_dropin; do
+        service_asset socket_asset _egress_dropin; do
         [[ -n "${component}" ]] || continue
-        unit="$(basename -- "${socket_asset}")"
-        grep -Fq "${unit}"$'\t' "${TRANSACTION_BACKUP_DIR}/systemd-extra/runtime.tsv" && continue
-        enabled=0
-        active=0
-        systemctl is-enabled --quiet "${unit}" >/dev/null 2>&1 && enabled=1
-        systemctl is-active --quiet "${unit}" >/dev/null 2>&1 && active=1
-        printf '%s\t%s\t%s\n' "${unit}" "${enabled}" "${active}" \
-            >>"${TRANSACTION_BACKUP_DIR}/systemd-extra/runtime.tsv"
+        for unit in "$(basename -- "${service_asset}")" "$(basename -- "${socket_asset}")"; do
+            grep -Fq "${unit}"$'\t' "${TRANSACTION_BACKUP_DIR}/systemd-extra/runtime.tsv" && continue
+            enabled=-1
+            active=0
+            if [[ "${unit}" == *.socket ]]; then
+                enabled=0
+                systemctl is-enabled --quiet "${unit}" >/dev/null 2>&1 && enabled=1
+            fi
+            systemctl is-active --quiet "${unit}" >/dev/null 2>&1 && active=1
+            printf '%s\t%s\t%s\n' "${unit}" "${enabled}" "${active}" \
+                >>"${TRANSACTION_BACKUP_DIR}/systemd-extra/runtime.tsv"
+        done
     done < <(transaction_credential_component_rows | sort -u)
     if systemctl is-enabled --quiet linux-agent-web.service >/dev/null 2>&1; then
         SYSTEMD_WAS_ENABLED=1
@@ -1064,7 +1074,7 @@ restore_systemd_state() {
             [[ -n "${unit}" ]] || continue
             if [[ "${enabled}" -eq 1 ]]; then
                 systemctl enable "${unit}" >/dev/null 2>&1 || warn "无法恢复 ${unit} enabled 状态"
-            else
+            elif [[ "${enabled}" -eq 0 ]]; then
                 systemctl disable "${unit}" >/dev/null 2>&1 || true
             fi
             if [[ "${active}" -eq 1 ]]; then
@@ -2795,6 +2805,67 @@ restart_and_check() {
     units+=("${credential_units[@]}" linux-agent-web.service)
     systemctl restart "${units[@]}" || return 1
     wait_for_health >/dev/null || return 1
+    restore_runtime_activity_after_health || return 1
+}
+
+restore_runtime_activity_after_health() {
+    local unit _enabled active cleanup_ok=1
+    local -a credential_units=()
+    local -a units=(
+        linux-agent-web.service
+        linux-agent-observer-helper.service
+        linux-agent-observer-helper.socket
+        linux-agent-runner.service
+        linux-agent-runner.socket
+        linux-agent-mcp-stdio.service
+        linux-agent-mcp-stdio.socket
+        linux-agent-host-ops.service
+        linux-agent-host-ops.socket
+        linux-agent-policy-writer.service
+        linux-agent-policy-writer.socket
+    )
+    local -a restore_units=()
+
+    [[ "${NO_SYSTEMD}" -eq 0 && "${SYSTEMD_STATE_CAPTURED}" -eq 1 ]] || return 0
+
+    if [[ "${SYSTEMD_WAS_ACTIVE}" -eq 1 ]]; then
+        if [[ "${SYSTEMD_HELPER_SOCKET_WAS_ACTIVE}" -eq 0 ]]; then
+            systemctl stop linux-agent-observer-helper.socket || cleanup_ok=0
+        fi
+        if [[ -f "${TRANSACTION_BACKUP_DIR}/systemd-extra/runtime.tsv" ]]; then
+            while IFS=$'\t' read -r unit _enabled active; do
+                [[ -n "${unit}" && "${active}" -eq 0 ]] || continue
+                # A removed Skill component no longer has a unit to restore.
+                [[ -f "${SYSTEMD_UNIT_DIR}/${unit}" ]] || continue
+                systemctl stop "${unit}" || cleanup_ok=0
+            done <"${TRANSACTION_BACKUP_DIR}/systemd-extra/runtime.tsv"
+        fi
+        [[ "${cleanup_ok}" -eq 1 ]] || return 1
+        systemctl is-active --quiet linux-agent-web.service
+        return
+    fi
+
+    mapfile -t credential_units < <(installed_credential_unit_names)
+    units+=("${credential_units[@]}")
+    for unit in "${units[@]}"; do
+        systemctl stop "${unit}" || cleanup_ok=0
+    done
+    [[ "${cleanup_ok}" -eq 1 ]] || return 1
+
+    if [[ "${SYSTEMD_HELPER_SOCKET_WAS_ACTIVE}" -eq 1 ]]; then
+        restore_units+=(linux-agent-observer-helper.socket)
+    fi
+    if [[ -f "${TRANSACTION_BACKUP_DIR}/systemd-extra/runtime.tsv" ]]; then
+        while IFS=$'\t' read -r unit _enabled active; do
+            [[ -n "${unit}" && "${active}" -eq 1 ]] || continue
+            [[ -f "${SYSTEMD_UNIT_DIR}/${unit}" ]] || continue
+            restore_units+=("${unit}")
+        done <"${TRANSACTION_BACKUP_DIR}/systemd-extra/runtime.tsv"
+    fi
+    if [[ "${#restore_units[@]}" -gt 0 ]]; then
+        systemctl start "${restore_units[@]}" || return 1
+    fi
+    ! systemctl is-active --quiet linux-agent-web.service
 }
 
 run_install_health_check() {

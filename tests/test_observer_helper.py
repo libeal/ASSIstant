@@ -326,6 +326,70 @@ class ObserverHelperProtocolTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "symbolic link"):
                 observer_helper.configure_capability_state(linked_parent / "state.json")
 
+    def test_local_runtime_socket_is_bound_to_run_uid_pid_and_start_time(self):
+        process_id = 4242
+        process_uid = 1000
+        start_time = "987654"
+        socket_path = (
+            f"/run/linux-agent-observer-{process_uid}-{process_id}-"
+            "0123456789abcdef01234567.sock"
+        )
+
+        with mock.patch.object(
+            observer_helper,
+            "_process_owner_uid",
+            return_value=process_uid,
+        ), mock.patch.object(
+            observer_helper,
+            "_process_start_time",
+            return_value=start_time,
+        ):
+            validated = observer_helper._validate_local_runtime(
+                socket_path,
+                expected_uid=process_uid,
+                owner_pid=process_id,
+                owner_start_time=start_time,
+            )
+
+        self.assertEqual(Path(socket_path), validated)
+        with self.assertRaisesRegex(RuntimeError, "fixed /run name format"):
+            observer_helper._validate_local_runtime(
+                socket_path.replace("/run/", "/tmp/"),
+                expected_uid=process_uid,
+                owner_pid=process_id,
+                owner_start_time=start_time,
+            )
+        with mock.patch.object(
+            observer_helper,
+            "_process_owner_uid",
+            return_value=process_uid,
+        ), mock.patch.object(
+            observer_helper,
+            "_process_start_time",
+            return_value=start_time,
+        ), self.assertRaisesRegex(RuntimeError, "identity does not match"):
+            observer_helper._validate_local_runtime(
+                socket_path,
+                expected_uid=process_uid + 1,
+                owner_pid=process_id,
+                owner_start_time=start_time,
+            )
+        with mock.patch.object(
+            observer_helper,
+            "_process_owner_uid",
+            return_value=process_uid,
+        ), mock.patch.object(
+            observer_helper,
+            "_process_start_time",
+            return_value="stale",
+        ), self.assertRaisesRegex(RuntimeError, "identity is stale"):
+            observer_helper._validate_local_runtime(
+                socket_path,
+                expected_uid=process_uid,
+                owner_pid=process_id,
+                owner_start_time=start_time,
+            )
+
     def test_disconnected_peer_does_not_escape_connection_handler(self):
         server, client = socket.socketpair()
         try:

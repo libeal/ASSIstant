@@ -694,7 +694,10 @@ class PolicyServiceTests(unittest.TestCase):
         effective_uid=0,
         root=None,
         privileged_writer=None,
+        privileged_writer_probe=None,
         managed_execution=None,
+        config_path=None,
+        deployment_mode=None,
     ):
         def write_config(config):
             self.config = dict(config)
@@ -721,9 +724,14 @@ class PolicyServiceTests(unittest.TestCase):
                 "root tests must not run sudo"
             ),
             "privileged_writer": privileged_writer,
+            "privileged_writer_probe": privileged_writer_probe,
         }
         if managed_execution is not None:
             options["managed_execution"] = managed_execution
+        if config_path is not None:
+            options["config_path"] = config_path
+        if deployment_mode is not None:
+            options["deployment_mode"] = deployment_mode
         if overlay_root is not None:
             options["overlay_root"] = overlay_root
         return PolicyService(
@@ -914,6 +922,99 @@ class PolicyServiceTests(unittest.TestCase):
             json.loads((overlay / "example.json").read_text(encoding="utf-8")),
             {"enabled": True},
         )
+
+    def test_mutation_capabilities_follow_deployment_and_effective_channels(self):
+        config_path = self.root / "config" / "config.json"
+        config_path.parent.mkdir(parents=True)
+        config_path.write_text("{}\n", encoding="utf-8")
+        overlay = self.root / "data" / "policies"
+
+        for deployment_mode in ("source", "remote", "no_systemd"):
+            with self.subTest(deployment_mode=deployment_mode):
+                capabilities = self.service(
+                    overlay_root=overlay,
+                    effective_uid=1000,
+                    managed_execution=False,
+                    config_path=config_path,
+                    deployment_mode=deployment_mode,
+                ).mutation_capabilities()
+                self.assertEqual(capabilities["deployment_mode"], deployment_mode)
+                self.assertTrue(capabilities["policy_write"]["allowed"])
+                self.assertTrue(capabilities["command_guard_write"]["allowed"])
+                self.assertEqual(capabilities["policy_write"]["method"], "direct")
+                self.assertFalse(capabilities["policy_sudo_password_supported"])
+
+        managed = self.service(
+            overlay_root=overlay,
+            managed_execution=True,
+            deployment_mode="managed",
+            privileged_writer_probe=lambda: {"ok": True, "status": "ready"},
+        ).mutation_capabilities()
+        self.assertEqual(managed["deployment_mode"], "managed")
+        self.assertTrue(managed["policy_write"]["allowed"])
+        self.assertEqual(managed["policy_write"]["method"], "policy_helper")
+
+    def test_managed_capability_requires_successful_helper_probe(self):
+        capabilities = self.service(
+            managed_execution=True,
+            deployment_mode="managed",
+            privileged_writer_probe=lambda: {
+                "ok": False,
+                "status": "helper_unavailable",
+                "code": "helper_unavailable",
+                "error": "socket missing",
+            },
+        ).mutation_capabilities()
+
+        self.assertFalse(capabilities["policy_write"]["available"])
+        self.assertFalse(capabilities["policy_write"]["allowed"])
+        self.assertEqual(capabilities["policy_write"]["code"], "helper_unavailable")
+        self.assertEqual(capabilities["policy_write"]["reason"], "socket missing")
+
+    def test_disabled_sensitive_edits_override_effective_write_channel(self):
+        self.config["web"] = {"sensitive_edits_enabled": False}
+        capabilities = self.service(
+            managed_execution=True,
+            deployment_mode="managed",
+            privileged_writer_probe=lambda: {"ok": True, "status": "ready"},
+        ).mutation_capabilities()
+
+        self.assertTrue(capabilities["policy_write"]["available"])
+        self.assertFalse(capabilities["policy_write"]["allowed"])
+        self.assertEqual(
+            capabilities["policy_write"]["code"],
+            "sensitive_edits_disabled",
+        )
+
+    def test_nonmanaged_unwritable_policy_never_falls_back_to_system_helper(self):
+        helper_calls = []
+        service = self.service(
+            managed_execution=False,
+            privileged_writer=lambda *args: helper_calls.append(args),
+        )
+
+        with mock.patch.object(service, "_direct_policy_available", return_value=False):
+            result = service.write_file("example.json", '{"enabled":true}')
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["code"], "policy_write_failed")
+        self.assertEqual(helper_calls, [])
+        self.assertEqual(self.audit_events, [])
+
+    def test_nonmanaged_unwritable_config_never_falls_back_to_system_helper(self):
+        helper_calls = []
+        service = self.service(
+            managed_execution=False,
+            privileged_writer=lambda *args: helper_calls.append(args),
+        )
+
+        with mock.patch.object(service, "_direct_config_available", return_value=False):
+            result = service.update_command_guard(True)
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["code"], "config_write_failed")
+        self.assertEqual(helper_calls, [])
+        self.assertEqual(self.audit_events, [])
 
     def test_audit_intent_failure_prevents_policy_write(self):
         before = self.policy_path.read_bytes()

@@ -13,6 +13,7 @@ import socket
 import sqlite3
 import stat
 import sys
+import tempfile
 import threading
 import time
 import uuid
@@ -214,6 +215,15 @@ EPHEMERAL_TOKEN_FILE = (
 WEB_AUDIT_SESSION_ID = f"web_{SERVER_RUN_ID[:16]}"
 WEB_AUDIT_LOG = LOG_ROOT / f"{WEB_AUDIT_SESSION_ID}.jsonl"
 REMOTE_MODE = os.environ.get("LINUX_AGENT_REMOTE_MODE", "0") == "1"
+DEPLOYMENT_MODE = (
+    "remote"
+    if REMOTE_MODE
+    else "managed"
+    if MANAGED_EXECUTION
+    else "no_systemd"
+    if MANAGED_LAYOUT
+    else "source"
+)
 RUNTIME_SECRET_LOCK = threading.RLock()
 RUNTIME_API_KEY = ""
 CONFIG_STORE = ConfigStore(CONFIG_PATH, DATA_ROOT / ".runtime.lock")
@@ -498,6 +508,12 @@ def config_public_state():
                 "storage_backend": str(remote.get("storage_backend") or os.environ.get("LINUX_AGENT_REMOTE_STORAGE_BACKEND", "local")),
                 "allow_api_key_transmission": bool(remote.get("allow_api_key_transmission", False)),
             },
+            "runtime": {
+                "deployment_mode": DEPLOYMENT_MODE,
+                "managed_layout": MANAGED_LAYOUT,
+                "managed_execution": MANAGED_EXECUTION,
+                "runtime_backup_available": REMOTE_MODE or MANAGED_LAYOUT,
+            },
             "web": {
                 "enabled": bool(web.get("enabled", True)),
                 "host": web.get("host", HOST),
@@ -631,6 +647,9 @@ def agent_subprocess_env(include_api_key=False):
     # dedicated AI-calling actions.
     env = build_subprocess_env(include_api_key=False)
     env["LINUX_AGENT_WEB"] = "1"
+    observer_service = globals().get("OBSERVER_SERVICE")
+    if observer_service is not None:
+        env.update(observer_service.child_env_override())
     if not include_api_key:
         return env
     config = read_config()
@@ -697,11 +716,11 @@ def create_runtime_backup():
         return {
             "ok": False,
             "status": "backup_unavailable",
-            "error": "Runtime backup is only available in a managed or remote runtime.",
+            "error": "Runtime backup is only available in an installed release or remote runtime.",
         }
     # Managed releases are immutable.  Keep the temporary archive in the
     # persistent data tree that the Web unit is explicitly allowed to write;
-    # source/remote runtimes retain the historical sibling-of-root location
+    # Remote runtimes retain the historical sibling-of-root location
     # because backup.sh intentionally rejects paths inside the runtime root.
     managed_layout = MANAGED_LAYOUT
     if managed_layout:
@@ -834,13 +853,36 @@ def persist_ephemeral_token():
     listings while still letting the local operator read it over the same
     trust boundary that can read config.json.
     """
-    EPHEMERAL_TOKEN_FILE.parent.mkdir(parents=True, exist_ok=True)
-    fd = os.open(str(EPHEMERAL_TOKEN_FILE), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    trusted_root = DATA_ROOT if MANAGED_LAYOUT else ROOT
+    token_directory = _prepare_private_directory(trusted_root, "tmp", "web")
+    if token_directory != EPHEMERAL_TOKEN_FILE.parent:
+        raise OSError("ephemeral token path escaped its private runtime directory")
+    if EPHEMERAL_TOKEN_FILE.is_symlink() or (
+        EPHEMERAL_TOKEN_FILE.exists() and not EPHEMERAL_TOKEN_FILE.is_file()
+    ):
+        raise OSError("ephemeral token path must be a regular file")
+
+    fd, raw_temp_path = tempfile.mkstemp(
+        prefix=".auth-token.", suffix=".tmp", dir=token_directory
+    )
+    temp_path = Path(raw_temp_path)
     try:
-        os.write(fd, (AUTH_TOKEN + "\n").encode("utf-8"))
-    finally:
+        os.fchmod(fd, 0o600)
+        payload = (AUTH_TOKEN + "\n").encode("utf-8")
+        offset = 0
+        while offset < len(payload):
+            written = os.write(fd, payload[offset:])
+            if written <= 0:
+                raise OSError("ephemeral token write made no forward progress")
+            offset += written
+        os.fsync(fd)
         os.close(fd)
-    os.chmod(EPHEMERAL_TOKEN_FILE, 0o600)
+        fd = -1
+        os.replace(temp_path, EPHEMERAL_TOKEN_FILE)
+    finally:
+        if fd >= 0:
+            os.close(fd)
+        temp_path.unlink(missing_ok=True)
 
 
 def metrics_enabled(config=None):
@@ -1145,6 +1187,21 @@ def write_with_policy_helper(operation, params):
         }
 
 
+def probe_policy_helper():
+    """Verify the managed writer through its authenticated socket protocol."""
+
+    try:
+        request = build_helper_request("ping", {}, summary="Policy writer readiness")
+        return helper_client_request(POLICY_HELPER_SOCKET, request, timeout=5)
+    except (OSError, HelperProtocolError) as exc:
+        return {
+            "ok": False,
+            "status": "helper_unavailable",
+            "code": "helper_unavailable",
+            "error": f"Policy writer helper is unavailable: {exc}",
+        }
+
+
 def policy_service():
     global _POLICY_SERVICE
     if _POLICY_SERVICE is None:
@@ -1159,7 +1216,10 @@ def policy_service():
             config_public_state=config_public_state,
             env_builder=agent_subprocess_env,
             privileged_writer=write_with_policy_helper,
+            privileged_writer_probe=probe_policy_helper,
             managed_execution=MANAGED_EXECUTION,
+            config_path=CONFIG_PATH,
+            deployment_mode=DEPLOYMENT_MODE,
         )
     return _POLICY_SERVICE
 
@@ -2358,6 +2418,7 @@ class Handler(SimpleHTTPRequestHandler):
                     "files": files,
                     "orphaned": orphaned,
                     "authorization": "web_bearer",
+                    "capabilities": policy_service().mutation_capabilities(),
                 },
             )
             return
@@ -2469,10 +2530,9 @@ class Handler(SimpleHTTPRequestHandler):
             return
         if path == "/api/policies/command-guard":
             result = update_command_guard(body.get("enabled"))
-            status = (
-                HTTPStatus.FORBIDDEN
-                if result.get("code") == "sensitive_edits_disabled"
-                else HTTPStatus.OK
+            status = HTTPStatus.OK if result.get("ok") else domain_error_http(
+                str(result.get("code") or result.get("status") or ""),
+                HTTPStatus.BAD_REQUEST,
             )
             json_response(self, status, result)
             return
@@ -2499,10 +2559,9 @@ class Handler(SimpleHTTPRequestHandler):
                 )
             except ValueError as exc:
                 result = {"ok": False, "status": "invalid_path", "error": str(exc)}
-            status = (
-                HTTPStatus.FORBIDDEN
-                if result.get("code") == "sensitive_edits_disabled"
-                else HTTPStatus.OK
+            status = HTTPStatus.OK if result.get("ok") else domain_error_http(
+                str(result.get("code") or result.get("status") or ""),
+                HTTPStatus.BAD_REQUEST,
             )
             json_response(self, status, result)
             return
@@ -2924,6 +2983,7 @@ def main():
         print("\n[信息] Web 控制台已停止。", file=sys.stderr, flush=True)
     finally:
         SKILL_WEB_COMPONENTS.clear_secrets()
+        OBSERVER_SERVICE.close()
         if AUTH_TOKEN_EPHEMERAL:
             try:
                 EPHEMERAL_TOKEN_FILE.unlink()

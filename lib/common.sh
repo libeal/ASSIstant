@@ -207,9 +207,11 @@ linux_agent_init_env() {
     if ! linux_agent_managed_mode_enabled; then
         mkdir -p \
             "${LINUX_AGENT_USER_SKILLS_DIR}" \
+            "${LINUX_AGENT_USER_POLICIES_DIR}" \
             "${LINUX_AGENT_DATA_DIR}/mcp/credentials" || return 1
         chmod 0700 \
             "${LINUX_AGENT_USER_SKILLS_DIR}" \
+            "${LINUX_AGENT_USER_POLICIES_DIR}" \
             "${LINUX_AGENT_DATA_DIR}/mcp" \
             "${LINUX_AGENT_DATA_DIR}/mcp/credentials" || return 1
     fi

@@ -49,6 +49,11 @@ export function remoteSecretTransmissionBlocked(config) {
   return remote.enabled === true && remote.allow_api_key_transmission !== true;
 }
 
+/** @param {ConfigSnapshot|null|undefined} config @returns {boolean} */
+export function runtimeBackupAvailable(config) {
+  return config?.runtime?.runtime_backup_available === true;
+}
+
 /**
  * @param {{type?: string}} field
  * @param {any} value

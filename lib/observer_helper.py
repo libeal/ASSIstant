@@ -16,6 +16,7 @@ import subprocess
 import sys
 import threading
 import time
+from contextlib import nullcontext
 from pathlib import Path
 
 from subprocess_env import build_subprocess_env
@@ -41,6 +42,9 @@ CAPABILITY_STATE_VERSION = 1
 DEFAULT_CAPABILITY_STATE_PATH = "/run/linux-agent/observer-capabilities.json"
 KEY_PATTERN = re.compile(r"^linux_agent_[A-Za-z0-9_]{1,112}$")
 CAPABILITY_PATTERN = re.compile(r"^[0-9a-f]{64}$")
+LOCAL_SOCKET_PATTERN = re.compile(
+    r"^linux-agent-observer-(?P<uid>[0-9]+)-(?P<pid>[0-9]+)-(?P<nonce>[0-9a-f]{24})\.sock$"
+)
 MAX_AUTHORIZED_SESSIONS = 256
 ALLOWED_SYSCALLS = frozenset(
     {
@@ -614,7 +618,12 @@ def _validate_operation_params(operation: str, params: dict[str, object]) -> dic
     return {"operation": operation, **params}
 
 
-def handle_connection(connection: socket.socket, expected_uid: int | None = None) -> None:
+def handle_connection(
+    connection: socket.socket,
+    expected_uid: int | None = None,
+    *,
+    use_runtime_lock: bool = True,
+) -> None:
     peer_pid = peer_uid = peer_gid = -1
     operation = ""
     request = None
@@ -636,7 +645,8 @@ def handle_connection(connection: socket.socket, expected_uid: int | None = None
                 "stderr": "",
             }
         else:
-            with runtime_shared_lock():
+            lock_context = runtime_shared_lock() if use_runtime_lock else nullcontext()
+            with lock_context:
                 authorization = authorize_request(
                     request,
                     peer_pid=peer_pid,
@@ -748,6 +758,130 @@ def serve() -> int:
                 )
 
 
+def _process_start_time(process_id: int) -> str:
+    try:
+        raw = Path(f"/proc/{process_id}/stat").read_text(encoding="ascii")
+        _prefix, separator, remainder = raw.rpartition(")")
+        fields = remainder.strip().split() if separator else []
+    except (FileNotFoundError, PermissionError, OSError, UnicodeDecodeError):
+        return ""
+    if len(fields) <= 19:
+        return ""
+    return fields[19]
+
+
+def _process_owner_uid(process_id: int) -> int:
+    try:
+        return Path(f"/proc/{process_id}").stat().st_uid
+    except (FileNotFoundError, PermissionError, OSError):
+        return -1
+
+
+def _validate_local_runtime(
+    socket_path: str,
+    *,
+    expected_uid: int,
+    owner_pid: int,
+    owner_start_time: str,
+) -> Path:
+    path = Path(socket_path)
+    match = LOCAL_SOCKET_PATTERN.fullmatch(path.name)
+    if path.parent != Path("/run") or match is None:
+        raise RuntimeError("local observer socket must use the fixed /run name format")
+    if int(match.group("uid")) != expected_uid or int(match.group("pid")) != owner_pid:
+        raise RuntimeError("local observer socket identity does not match its owner")
+    if expected_uid <= 0 or owner_pid <= 1 or not owner_start_time.isdigit():
+        raise RuntimeError("local observer owner identity is invalid")
+    owner_uid = _process_owner_uid(owner_pid)
+    if owner_uid < 0:
+        raise RuntimeError("local observer owner process is unavailable")
+    if (
+        owner_uid != expected_uid
+        or _process_start_time(owner_pid) != owner_start_time
+    ):
+        raise RuntimeError("local observer owner process identity is stale")
+    try:
+        path.lstat()
+    except FileNotFoundError:
+        pass
+    else:
+        raise RuntimeError("local observer socket path already exists")
+    return path
+
+
+def serve_local(
+    socket_path: str,
+    *,
+    expected_uid: int,
+    owner_pid: int,
+    owner_start_time: str,
+) -> int:
+    """Serve one source-runtime Web process without relying on sudo tickets."""
+
+    if os.geteuid() != 0:
+        raise RuntimeError("local observer helper must run as root")
+    path = _validate_local_runtime(
+        socket_path,
+        expected_uid=expected_uid,
+        owner_pid=owner_pid,
+        owner_start_time=owner_start_time,
+    )
+    configure_capability_state(None)
+    stop_event = threading.Event()
+
+    def request_stop(_signum, _frame):
+        stop_event.set()
+
+    signal.signal(signal.SIGTERM, request_stop)
+    signal.signal(signal.SIGINT, request_stop)
+    listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    previous_umask = os.umask(0o177)
+    try:
+        listener.bind(os.fspath(path))
+    finally:
+        os.umask(previous_umask)
+    try:
+        os.chown(path, expected_uid, -1)
+        os.chmod(path, 0o600)
+        listener.listen(16)
+        listener.settimeout(1.0)
+        while not stop_event.is_set():
+            if _process_start_time(owner_pid) != owner_start_time:
+                break
+            try:
+                connection, _ = listener.accept()
+            except socket.timeout:
+                continue
+            with connection:
+                connection.settimeout(5.0)
+                try:
+                    handle_connection(
+                        connection,
+                        expected_uid,
+                        use_runtime_lock=False,
+                    )
+                except Exception as exc:
+                    print(
+                        json.dumps(
+                            {
+                                "event": "observer_helper_connection_failed",
+                                "error": str(exc)[:200],
+                            },
+                            separators=(",", ":"),
+                        ),
+                        file=sys.stderr,
+                        flush=True,
+                    )
+    finally:
+        listener.close()
+        try:
+            if stat.S_ISSOCK(path.lstat().st_mode):
+                path.unlink()
+        except FileNotFoundError:
+            pass
+    return 0
+
+
 def client_request(socket_path: str, request: dict[str, object]) -> int:
     if not isinstance(request, dict):
         raise HelperRequestError("request must be a JSON object")
@@ -782,6 +916,11 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     subparsers = parser.add_subparsers(dest="command", required=True)
     subparsers.add_parser("serve")
+    local_parser = subparsers.add_parser("serve-local")
+    local_parser.add_argument("--socket", required=True)
+    local_parser.add_argument("--expected-uid", required=True, type=int)
+    local_parser.add_argument("--owner-pid", required=True, type=int)
+    local_parser.add_argument("--owner-start-time", required=True)
     request_parser = subparsers.add_parser("request")
     request_parser.add_argument("--socket", required=True)
     request_parser.add_argument(
@@ -803,6 +942,13 @@ def main() -> int:
     args = parser.parse_args()
     if args.command == "serve":
         return serve()
+    if args.command == "serve-local":
+        return serve_local(
+            args.socket,
+            expected_uid=args.expected_uid,
+            owner_pid=args.owner_pid,
+            owner_start_time=args.owner_start_time,
+        )
     request = {"operation": args.operation}
     if args.audit_uid is not None:
         request["audit_uid"] = args.audit_uid

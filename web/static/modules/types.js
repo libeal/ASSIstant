@@ -78,6 +78,7 @@
  * @property {string} [provider_id]
  * @property {Record<string, unknown>} [agent_loop]
  * @property {{enabled?: boolean, allow_api_key_transmission?: boolean, release_version?: string}} [remote]
+ * @property {{deployment_mode?: string, managed_layout?: boolean, managed_execution?: boolean, runtime_backup_available?: boolean}} [runtime]
  * @property {{enabled?: boolean, host?: string, port?: number, metrics_enabled?: boolean, sensitive_edits_enabled?: boolean}} [web]
  * @property {number} [context_turns]
  * @property {{enabled?: boolean}} [command_guard]
@@ -147,6 +148,7 @@
  * @property {string} currentAuditSession
  * @property {ConfigSnapshot|null} configSnapshot
  * @property {Record<string, any>|null} healthSnapshot
+ * @property {Record<string, any>|null} policyCapabilities
  * @property {boolean} commandGuardEnabled
  * @property {Record<string, any>} configOriginal
  * @property {Record<string, any>} configDraft

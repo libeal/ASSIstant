@@ -91,17 +91,57 @@ export function createPolicyView(app) {
   }
 
   function sensitiveEditsEnabled() {
+    if (state.policyCapabilities) {
+      return state.policyCapabilities.sensitive_edits_enabled === true;
+    }
     const value = state.configSnapshot?.web?.sensitive_edits_enabled;
     return value === undefined || value === true;
   }
 
+  function policyCapability(name) {
+    const capability = state.policyCapabilities?.[name];
+    return capability && typeof capability === "object" ? capability : null;
+  }
+
+  function mutationAllowed(name) {
+    const capability = policyCapability(name);
+    return capability ? capability.allowed === true : sensitiveEditsEnabled();
+  }
+
+  function deploymentLabel() {
+    const labels = {
+      source: "源码模式",
+      remote: "临时 Remote",
+      no_systemd: "无 systemd 安装",
+      managed: "受管 systemd",
+    };
+    return labels[state.policyCapabilities?.deployment_mode] || "当前部署";
+  }
+
+  function mutationDescription(name) {
+    const capability = policyCapability(name);
+    if (!capability) {
+      return sensitiveEditsEnabled() ? "Web 保存已启用" : "Web 保存已禁用";
+    }
+    if (capability.allowed) {
+      const method = capability.method === "policy_helper" ? "policy-writer" : "当前 UID";
+      return `${deploymentLabel()} · ${method} 可写`;
+    }
+    return capability.reason || `${deploymentLabel()} · 当前不可写`;
+  }
+
   function updatePolicyEditState() {
-    const enabled = sensitiveEditsEnabled();
+    const enabled = mutationAllowed("policy_write");
     if ($("policyEditor")) $("policyEditor").disabled = false;
     if ($("policySaveBtn")) $("policySaveBtn").disabled = !enabled || !state.currentPolicyPath;
     if ($("policyBoundaryOptions")) $("policyBoundaryOptions").hidden = false;
-    setStatus("policyLockPill", enabled ? "允许保存" : "仅草稿", enabled ? "ok" : "medium");
-    setText("policyEditMode", enabled ? "Web 保存已启用" : "Web 保存已禁用");
+    const gateDisabled = !sensitiveEditsEnabled();
+    setStatus(
+      "policyLockPill",
+      enabled ? "允许保存" : gateDisabled ? "仅草稿" : "不可保存",
+      enabled ? "ok" : gateDisabled ? "medium" : "high",
+    );
+    setText("policyEditMode", mutationDescription("policy_write"));
     renderCommandGuardState();
     renderPolicyFileDialog();
   }
@@ -118,11 +158,12 @@ export function createPolicyView(app) {
     );
     const button = $("policyGuardToggleBtn");
     if (button) {
-      button.disabled = !sensitiveEditsEnabled();
+      const canUpdate = mutationAllowed("command_guard_write");
+      button.disabled = !canUpdate;
       button.textContent = enabled ? "关闭检查" : "启用检查";
-      button.title = sensitiveEditsEnabled()
-        ? "使用当前 Web Bearer 授权切换"
-        : "服务器已禁用 Web 敏感编辑";
+      button.title = canUpdate
+        ? mutationDescription("command_guard_write")
+        : policyCapability("command_guard_write")?.reason || "服务器已禁用 Web 敏感编辑";
     }
   }
 
@@ -132,6 +173,7 @@ export function createPolicyView(app) {
     if (!data.ok) {
       state.policyFiles = [];
       state.currentPolicyPath = "";
+      state.policyCapabilities = null;
       select.innerHTML = "";
       $("policyEditor").value = "";
       updatePolicyEditState();
@@ -143,6 +185,7 @@ export function createPolicyView(app) {
       return data;
     }
     state.policyFiles = data.files || [];
+    state.policyCapabilities = data.capabilities || null;
     select.innerHTML = "";
     for (const file of state.policyFiles) {
       const option = document.createElement("option");
@@ -152,7 +195,9 @@ export function createPolicyView(app) {
     }
     updatePolicyEditState();
     if (!state.policyFiles.length) {
+      state.currentPolicyPath = "";
       $("policyEditor").value = "";
+      updatePolicyEditState();
       renderPolicyFileDialog();
       app.printOutput("policyOutput", { ok: true, status: "no_policy_files" });
       renderRiskRules(null);
@@ -231,7 +276,7 @@ export function createPolicyView(app) {
 
   function renderPolicyFileDialog() {
     const path = state.currentPolicyPath || "未选择文件";
-    const canSave = sensitiveEditsEnabled();
+    const canSave = mutationAllowed("policy_write");
     const editor = $("policyEditor");
     const preview = $("policyFilePreview");
     const saveButton = $("policySaveBtn");
@@ -239,7 +284,7 @@ export function createPolicyView(app) {
     setText(
       "policyFileDialogMeta",
       state.currentPolicyPath
-        ? (canSave ? "修改内容后可保存当前文件。" : "可编辑和校验草稿；服务器已禁止保存。")
+        ? (canSave ? "修改内容后可保存当前文件。" : `可编辑和校验草稿；${mutationDescription("policy_write")}。`)
         : "选择文件后点击“查阅文件”。",
     );
     if (editor) {
@@ -273,8 +318,8 @@ export function createPolicyView(app) {
   }
 
   async function toggleCommandGuard() {
-    if (!sensitiveEditsEnabled()) {
-      showToast("服务器已禁用 Web 敏感编辑");
+    if (!mutationAllowed("command_guard_write")) {
+      showToast(mutationDescription("command_guard_write"));
       return;
     }
     const enabled = state.commandGuardEnabled === false;
@@ -294,7 +339,7 @@ export function createPolicyView(app) {
   }
 
   async function savePolicy() {
-    if (!sensitiveEditsEnabled()) return showToast("服务器已禁用 Web 敏感编辑");
+    if (!mutationAllowed("policy_write")) return showToast(mutationDescription("policy_write"));
     const validation = await validatePolicy({ silent: true });
     if (!validation.ok) {
       showToast(validation.error || validation.status || "策略校验失败，未保存");

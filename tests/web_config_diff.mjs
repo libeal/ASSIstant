@@ -6,6 +6,7 @@ import {
   normalizeConfigFieldValue,
   pendingConfigChanges,
   remoteSecretTransmissionBlocked,
+  runtimeBackupAvailable,
 } from "../web/static/modules/config-utils.js";
 import {
   CONFIG_GROUPS,
@@ -33,6 +34,9 @@ assert.equal(configInputId("agent_loop.thinking_trace_enabled"), "config-agent_l
 assert.equal(remoteSecretTransmissionBlocked({ remote: { enabled: true } }), true);
 assert.equal(remoteSecretTransmissionBlocked({ remote: { enabled: true, allow_api_key_transmission: true } }), false);
 assert.equal(remoteSecretTransmissionBlocked({ remote: { enabled: false } }), false);
+assert.equal(runtimeBackupAvailable({ runtime: { runtime_backup_available: true } }), true);
+assert.equal(runtimeBackupAvailable({ runtime: { runtime_backup_available: false } }), false);
+assert.equal(runtimeBackupAvailable({ remote: { enabled: true } }), false);
 
 syncApprovalScopeFields({
   approvals: {

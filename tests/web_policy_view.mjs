@@ -35,6 +35,8 @@ const controls = Object.fromEntries([
   "policyFileSelect",
   "policyEditor",
   "policySaveBtn",
+  "policyLockPill",
+  "policyEditMode",
   "policyBoundaryOptions",
   "policyGuardToggleBtn",
   "policyFilePreview",
@@ -53,7 +55,7 @@ const state = {
 };
 const output = [];
 const toasts = [];
-const response = {
+let response = {
   ok: false,
   status: "read_failed",
   code: "read_failed",
@@ -67,7 +69,7 @@ const app = {
     return response;
   },
   request() {},
-  setStatus() {},
+  setStatus(id, text) { if (controls[id]) controls[id].textContent = text; },
   setText(id, text) { if (controls[id]) controls[id].textContent = text; },
   showToast(message) { toasts.push(message); },
   printOutput(id, value) { output.push([id, value]); },
@@ -85,5 +87,37 @@ assert.equal(toasts.at(-1), "policy overlay is invalid");
 assert.match(controls.riskRulesSummary.children[0].innerHTML, /未加载/);
 assert.match(controls.policyBoundaryList.innerHTML, /未加载/);
 assert.match(controls.policyVaultSummary.innerHTML, /未加载/);
+
+state.currentPolicyPath = "audit-boundaries.json";
+response = {
+  ok: true,
+  status: "listed",
+  files: [],
+  capabilities: {
+    deployment_mode: "source",
+    sensitive_edits_enabled: true,
+    policy_write: {
+      available: false,
+      allowed: false,
+      method: "direct",
+      code: "policy_write_failed",
+      reason: "策略 overlay 对当前 Web 用户不可写",
+    },
+    command_guard_write: {
+      available: true,
+      allowed: true,
+      method: "direct",
+      code: "",
+      reason: "",
+    },
+  },
+};
+
+await createPolicyView(app).loadPolicies();
+assert.equal(state.currentPolicyPath, "");
+assert.equal(controls.policySaveBtn.disabled, true);
+assert.equal(controls.policyLockPill.textContent, "不可保存");
+assert.equal(controls.policyEditMode.textContent, "策略 overlay 对当前 Web 用户不可写");
+assert.equal(controls.policyGuardToggleBtn.disabled, false);
 
 console.log("web_policy_view: ok");

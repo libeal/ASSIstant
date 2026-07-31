@@ -410,6 +410,10 @@
       "retryable": false,
       "http": 403
     },
+    "policy_write_failed": {
+      "retryable": true,
+      "http": 500
+    },
     "target_changed": {
       "retryable": false,
       "http": 409
